@@ -23,7 +23,7 @@ second:
 | # | Plan | File | Depends on | Status |
 |---|---|---|---|---|
 | 1 | Routing graph core | `2026-06-16-routing-graph-core.md` | — | written |
-| 2 | Data pipeline (OSM → elevation → grade graph) | _(to write)_ | Plan 1 (graph types) | not started |
+| 2 | Data pipeline (OSM → elevation → grade graph) | `2026-06-16-data-pipeline.md` | Plan 1 (graph types) | written |
 | 3 | Runtime map app (heatmap → router → honesty/zones) | _(to write)_ | Plans 1 & 2 | not started |
 
 ### Plan 1 — routing graph core (scope locked)
