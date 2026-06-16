@@ -4,6 +4,7 @@
   "main": "index.ts",
   "dependencies": {
     "@maplibre/maplibre-react-native": "^11.3.4",
+    "@react-native-community/slider": "5.2.0",
     "expo": "~56.0.12",
     "expo-status-bar": "~56.0.4",
     "react": "19.2.3",
