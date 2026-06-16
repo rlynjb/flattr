@@ -26,7 +26,7 @@ second:
 | 2 | Data pipeline (OSM → elevation → grade graph) | `2026-06-16-data-pipeline.md` | Plan 1 (graph types) | written |
 | 3 | Android app (React Native / Expo) — decomposed into 3a/3b/3c below | — | Plans 1 & 2 | in progress |
 | 3a | Expo scaffold + grade heatmap | plan: `plans/2026-06-16-android-heatmap.md` | Plans 1 & 2 | code complete; device run pending (MapLibre RN **v11**) |
-| 3b | Routing UI (A→B, on-device engine, route, `userMax` slider) | _(to spec)_ | Plan 3a | not started |
+| 3b | Routing UI (A→B, on-device engine, route, `userMax` slider) | plan: `plans/2026-06-16-android-routing.md` | Plan 3a | plan written |
 | 3c | Honesty messaging + zone choropleth | _(to spec)_ | Plan 3b | not started |
 
 ### Plan 1 — routing graph core (scope locked)
