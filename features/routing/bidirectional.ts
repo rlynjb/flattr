@@ -1,9 +1,9 @@
 // Bidirectional A* with a balanced consistent potential. Forward from start, backward from goal.
 import type { CostFn, Edge, Graph, SearchResult } from "./types";
 import { PQueue } from "./pqueue";
-import { edgeById, otherEnd } from "./graph";
+import { otherEnd } from "./graph";
 import { haversine } from "../../lib/geo";
-import { summarizePath } from "./astar";
+import { summarizePath, indexEdges } from "./astar";
 
 export function bidirectional(
   graph: Graph,
@@ -21,8 +21,10 @@ export function bidirectional(
   if (!start || !goal) return { path: null, nodesExpanded, pushes, pops };
 
   if (startId === goalId) {
-    return { path: summarizePath(graph, [startId], userMax, costFn), nodesExpanded, pushes, pops };
+    return { path: summarizePath([startId], [], userMax, costFn), nodesExpanded, pushes, pops };
   }
+
+  const byId = indexEdges(graph);
 
   // Balanced potential: pf consistent for forward, pr = -pf consistent for reverse.
   const pf = (id: string) =>
@@ -62,7 +64,7 @@ export function bidirectional(
         continue;
       }
       for (const edgeId of graph.adjacency[u] ?? []) {
-        const edge = edgeById(graph, edgeId);
+        const edge = byId.get(edgeId)!;
         const v = otherEnd(edge, u);
         const tentative = gf.get(u)! + costFn(edge, u, userMax); // forward: from = u
         if (tentative < (gf.get(v) ?? Infinity)) {
@@ -92,7 +94,7 @@ export function bidirectional(
         continue;
       }
       for (const edgeId of graph.adjacency[u] ?? []) {
-        const edge = edgeById(graph, edgeId);
+        const edge = byId.get(edgeId)!;
         const v = otherEnd(edge, u); // v is the predecessor in the forward path
         const tentative = gr.get(u)! + costFn(edge, v, userMax); // forward dir: from = v
         if (tentative < (gr.get(v) ?? Infinity)) {
@@ -114,27 +116,34 @@ export function bidirectional(
 
   if (meet === null) return { path: null, nodesExpanded, pushes, pops };
 
-  // Reconstruct start..meet (forward) and meet..goal (reverse), then summarize.
+  // Reconstruct start..meet (forward) and meet..goal (reverse), collecting the
+  // exact relaxed edges (not re-resolved by node pair) so parallel edges stay correct.
   const front: string[] = [meet];
+  const frontEdges: Edge[] = [];
   let cur = meet;
   while (cur !== startId) {
     const entry = cameF.get(cur)!;
+    frontEdges.push(entry.edge);
     cur = entry.prev;
     front.push(cur);
   }
   front.reverse(); // [start, ..., meet]
+  frontEdges.reverse(); // edges in start->meet order
 
   const back: string[] = [];
+  const backEdges: Edge[] = [];
   cur = meet;
   while (cur !== goalId) {
     const entry = cameR.get(cur)!;
+    backEdges.push(entry.edge); // edge from cur toward goal (cur -> entry.next)
     cur = entry.next;
     back.push(cur);
   }
-  // back = [nodeAfterMeet, ..., goal]; front ends with meet -> concatenate
+  // back = [nodeAfterMeet, ..., goal]; front ends with meet -> concatenate.
   const nodes = [...front, ...back];
+  const edges = [...frontEdges, ...backEdges];
   return {
-    path: summarizePath(graph, nodes, userMax, costFn),
+    path: summarizePath(nodes, edges, userMax, costFn),
     nodesExpanded,
     pushes,
     pops,
