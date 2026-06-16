@@ -1449,19 +1449,28 @@ describe("bidirectional A* (stage 5)", () => {
     expect(b.path!.cost).toBeCloseTo(d.path!.cost, 6);
   });
 
-  it("matches grade A*'s cost on the larger grid (directed cost)", () => {
-    const g = makeGridGraph(14);
-    const ref = directedAstar(g, "0,0", "13,13", 6);
-    const b = bidirectional(g, "0,0", "13,13", 6, gradeCostDirected);
+  it("matches directional A*'s optimal cost on the grid (directed cost)", () => {
+    // Interior pair + userMax=10 (grid30 max grade is 6.25%, so nothing is BLOCKED):
+    // a clean grade-aware optimum, not an all-too-steep fallback path.
+    const g = makeGridGraph(30);
+    const ref = directedAstar(g, "12,12", "17,17", 10);
+    const b = bidirectional(g, "12,12", "17,17", 10, gradeCostDirected);
     expect(b.path).not.toBeNull();
     expect(b.path!.cost).toBeCloseTo(ref.path!.cost, 4);
   });
 
-  it("expands no more nodes than one-directional A* on the grid", () => {
-    const g = makeGridGraph(14);
-    const ref = directedAstar(g, "0,0", "13,13", 6);
-    const b = bidirectional(g, "0,0", "13,13", 6, gradeCostDirected);
-    expect(b.nodesExpanded).toBeLessThanOrEqual(ref.nodesExpanded);
+  it("expands far fewer nodes than uninformed Dijkstra (meet-in-the-middle)", () => {
+    // EXECUTION FINDING (2026-06-16): bidirectional A* does NOT reliably beat
+    // unidirectional A* with a strong near-exact heuristic on a Euclidean grid —
+    // it legitimately expands slightly more (e.g. 43 vs 32). Its provable win is
+    // meeting in the middle vs the uninformed FLOOD. Compare against Dijkstra with
+    // the SAME cost function on an INTERIOR pair (corner-to-corner is degenerate:
+    // the goal is the farthest node, so Dijkstra expands the whole graph).
+    const g = makeGridGraph(30);
+    const dj = dijkstra(g, "12,12", "17,17");
+    const b = bidirectional(g, "12,12", "17,17", Infinity, distanceCost);
+    expect(b.path!.cost).toBeCloseTo(dj.path!.cost, 6); // same optimal cost
+    expect(b.nodesExpanded).toBeLessThan(dj.nodesExpanded); // ~43 << ~203
   });
 
   it("respects direction like the forward engine (flat fixture)", () => {
@@ -1747,12 +1756,19 @@ import { formatTable, type BenchRow } from "./report";
 import { performance } from "node:perf_hooks";
 import type { SearchResult } from "../features/routing/types";
 
-const USER_MAX = 6;
+// userMax=10 keeps interior grid paths below the grid's 6.25% max grade, so the
+// grade router returns a clean optimum (no all-BLOCKED 1e11 costs in the table).
+const USER_MAX = 10;
 
+// INTERIOR pairs only. Corner-to-corner is degenerate: the goal is the farthest
+// node, so Dijkstra expands the whole graph and NOTHING can be pruned — the table
+// would show dijkstra == astar == bidirectional (all-nodes), hiding the very effect
+// it exists to demonstrate. Interior pairs leave most of the graph outside the
+// search ellipse, so A* drives a narrow cone and bidirectional two meeting cones.
 const pairs: Array<{ name: string; start: string; goal: string; size: number }> = [
-  { name: "grid20 corner->corner", start: "0,0", goal: "19,19", size: 20 },
-  { name: "grid20 edge->edge", start: "0,10", goal: "19,10", size: 20 },
-  { name: "grid30 corner->corner", start: "0,0", goal: "29,29", size: 30 },
+  { name: "grid30 12,12->17,17 (near interior)", start: "12,12", goal: "17,17", size: 30 },
+  { name: "grid40 10,10->30,20 (mid interior)", start: "10,10", goal: "30,20", size: 40 },
+  { name: "grid40 18,18->21,21 (short interior)", start: "18,18", goal: "21,21", size: 40 },
 ];
 
 function time(fn: () => SearchResult): { result: SearchResult; ms: number } {
@@ -1795,7 +1811,7 @@ console.log("\n(dijkstra vs astar share cost; gradeAstar/directedAstar/bidirecti
 - [ ] **Step 6: Run the benchmark**
 
 Run: `npm run bench`
-Expected: three tables print; for each, `astar` shows fewer `expanded` than `dijkstra` at equal `cost`, and `bidirectional` shows `expanded` ≤ `directedAstar` at equal `cost`. (`gradeAstar`/`directedAstar` costs differ from the distance algorithms — that's the grade penalty, by design.)
+Expected: three tables print; for each, `astar` shows fewer `expanded` than `dijkstra` at equal `cost`, and `bidirectional` shows far fewer `expanded` than `dijkstra` (meet-in-the-middle vs flood) — though typically *slightly more* than unidirectional `astar`, which is expected on a near-Euclidean grid with a strong heuristic, not a bug. (`gradeAstar`/`directedAstar` costs differ from the distance algorithms — that's the grade penalty, by design.)
 
 - [ ] **Step 7: Run the full test suite + typecheck**
 
@@ -1822,6 +1838,21 @@ git commit -m "feat: add benchmark harness comparing algorithm stages"
 Next plan (per `ROADMAP.md`): **Plan 2 — data pipeline** (`pipeline/osm.ts → split.ts → elevation.ts → grade.ts → build-graph.ts`), producing the `graph.json` this engine consumes.
 
 ---
+
+## Execution findings (2026-06-16)
+
+- **Bidirectional A* vs unidirectional A*.** Measured on the grid fixtures:
+  bidirectional does *not* reliably expand fewer nodes than unidirectional A*
+  when the heuristic is strong and near-exact (Euclidean grid) — it expanded
+  ~43 vs A*'s ~32 on an interior pair. This is the known theory, not a bug.
+  Its provable win is meet-in-the-middle vs the *uninformed* flood (43 vs
+  Dijkstra's 203). Tasks 11 and 12 assert/​demonstrate that sound invariant.
+- **Corner-to-corner is a degenerate routing fixture.** The goal is the farthest
+  node, so Dijkstra must expand the whole graph and no algorithm can prune
+  (all expand n²−1). Tasks 11 and 12 use **interior** pairs so pruning is visible.
+- **Grade benchmark `userMax`.** grid30's max abs grade is 6.25%; `userMax=6`
+  blocks edges and yields ~1e11 (BLOCKED-laden) costs. The benchmark uses
+  `userMax=10` for a clean grade-aware optimum.
 
 ## Self-review notes (spec coverage)
 
