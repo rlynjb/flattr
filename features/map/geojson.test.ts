@@ -51,10 +51,9 @@ describe("graphToGeoJSON", () => {
 });
 
 describe("bboxToCameraBounds", () => {
-  it("maps [minLng,minLat,maxLng,maxLat] to {ne,sw} in [lng,lat]", () => {
-    expect(bboxToCameraBounds([-122.34, 47.6, -122.31, 47.62])).toEqual({
-      ne: [-122.31, 47.62],
-      sw: [-122.34, 47.6],
-    });
+  it("returns MapLibre v11 LngLatBounds [west,south,east,north] (= our bbox)", () => {
+    expect(bboxToCameraBounds([-122.34, 47.6, -122.31, 47.62])).toEqual([
+      -122.34, 47.6, -122.31, 47.62,
+    ]);
   });
 });

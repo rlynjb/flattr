@@ -31,10 +31,12 @@ export function graphToGeoJSON(graph: Graph, bands?: Bands): EdgeFeatureCollecti
   return { type: "FeatureCollection", features };
 }
 
-export type CameraBounds = { ne: [number, number]; sw: [number, number] };
+// MapLibre RN v11 LngLatBounds is a flat [west, south, east, north] tuple — which
+// is exactly our Graph bbox [minLng, minLat, maxLng, maxLat]. This named helper
+// documents that match and gives the map a typed bounds value.
+export type LngLatBounds = [west: number, south: number, east: number, north: number];
 
-/** [minLng,minLat,maxLng,maxLat] -> MapLibre camera bounds ({ne,sw} in [lng,lat]). */
-export function bboxToCameraBounds(bbox: [number, number, number, number]): CameraBounds {
-  const [minLng, minLat, maxLng, maxLat] = bbox;
-  return { ne: [maxLng, maxLat], sw: [minLng, minLat] };
+/** Graph bbox [minLng,minLat,maxLng,maxLat] -> MapLibre v11 LngLatBounds (identical shape). */
+export function bboxToCameraBounds(bbox: [number, number, number, number]): LngLatBounds {
+  return [bbox[0], bbox[1], bbox[2], bbox[3]];
 }
