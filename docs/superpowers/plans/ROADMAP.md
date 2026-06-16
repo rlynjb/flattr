@@ -27,7 +27,13 @@ second:
 | 3 | Android app (React Native / Expo) — decomposed into 3a/3b/3c below | — | Plans 1 & 2 | in progress |
 | 3a | Expo scaffold + grade heatmap | plan: `plans/2026-06-16-android-heatmap.md` | Plans 1 & 2 | code complete; device run pending (MapLibre RN **v11**) |
 | 3b | Routing UI (A→B, on-device engine, route, `userMax` slider) | plan: `plans/2026-06-16-android-routing.md` | Plan 3a | code complete; device run pending |
-| 3c | Honesty messaging + zone choropleth | plan: `plans/2026-06-16-android-honesty-zones.md` | Plan 3b | plan written |
+| 3c | Honesty messaging + zone choropleth | plan: `plans/2026-06-16-android-honesty-zones.md` | Plan 3b | code complete; device run pending |
+
+**Android MVP (spec §10 Phases 1–3) is code-complete** as of 2026-06-16: engine
+(Plan 1) + pipeline (Plan 2) + Expo app with heatmap, grade-aware routing, `userMax`
+slider, honesty card, and zone choropleth (Plans 3a/3b/3c). Pending: device run of the
+Expo dev build; a real `graph.json` via `npm run build:graph` (Overpass + elevation).
+Beyond MVP → Plan 4 (spec §13): vehicle preset refinement, multi-city, saved routes.
 
 ### Plan 1 — routing graph core (scope locked)
 
