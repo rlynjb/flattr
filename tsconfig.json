@@ -10,5 +10,5 @@
     "types": ["vitest/globals", "node"],
     "noEmit": true
   },
-  "include": ["features", "lib", "bench"]
+  "include": ["features", "lib", "bench", "pipeline"]
 }
