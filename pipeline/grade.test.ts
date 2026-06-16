@@ -47,3 +47,21 @@ describe("computeGrades", () => {
     expect(e.gradePct).toBe(0);
   });
 });
+
+import { MAX_GRADE_PCT } from "./grade";
+
+describe("computeGrades grade clamp (coarse-DEM noise)", () => {
+  it("clamps an absurd grade to ±MAX_GRADE_PCT but keeps true riseM", () => {
+    const A: Node = { id: "A", lat: 47.6, lng: -122.33, elevationM: 0 };
+    const B: Node = { id: "B", lat: 47.60002, lng: -122.33, elevationM: 8 }; // ~2m apart, +8m
+    const e: Edge = {
+      id: "spike", fromNode: "A", toNode: "B",
+      geometry: [[A.lat, A.lng], [B.lat, B.lng]],
+      lengthM: 0, riseM: 0, gradePct: 0, absGradePct: 0, kind: "footway",
+    };
+    const [out] = computeGrades({ A, B }, [e]);
+    expect(out.gradePct).toBe(MAX_GRADE_PCT); // would be ~400%, clamped
+    expect(out.absGradePct).toBe(MAX_GRADE_PCT);
+    expect(out.riseM).toBe(8); // true elevation delta preserved
+  });
+});
