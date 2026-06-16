@@ -114,3 +114,32 @@ describe("routeToGeoJSON (directed-grade coloring)", () => {
     expect(routeToGeoJSON(g, path, 8).features).toEqual([]);
   });
 });
+
+import { zonesToGeoJSON } from "./geojson";
+import type { ZoneCell } from "../grade/zones";
+
+describe("zonesToGeoJSON", () => {
+  const cells: ZoneCell[] = [
+    { bbox: [-122.34, 47.6, -122.33, 47.61], value: 2 }, // green at userMax 8 (<=4)
+    { bbox: [-122.33, 47.6, -122.32, 47.61], value: 10 }, // red at userMax 8 (>8)
+  ];
+
+  it("emits one closed [lng,lat] Polygon ring per cell", () => {
+    const fc = zonesToGeoJSON(cells, 8);
+    expect(fc.features).toHaveLength(2);
+    const ring = fc.features[0].geometry.coordinates[0];
+    expect(ring).toHaveLength(5);
+    expect(ring[0]).toEqual(ring[4]);
+    expect(ring[0]).toEqual([-122.34, 47.6]);
+  });
+
+  it("colors cells by the userMax-driven abs-grade bands", () => {
+    const fc = zonesToGeoJSON(cells, 8);
+    expect(fc.features[0].properties.color).toBe("#2e9e3f"); // value 2 -> green
+    expect(fc.features[1].properties.color).toBe("#d23b2e"); // value 10 -> red
+  });
+
+  it("empty cells -> empty FeatureCollection", () => {
+    expect(zonesToGeoJSON([], 8).features).toEqual([]);
+  });
+});

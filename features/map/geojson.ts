@@ -1,8 +1,9 @@
 // features/map/geojson.ts — Graph -> GeoJSON for the MapLibre heatmap layer.
 // Edge.geometry is [lat,lng]; GeoJSON requires [lng,lat] — we flip here (and test it).
 import type { Graph, Path } from "../routing/types";
-import { classifyAbs, classifyDirected, bandColor, type Bands } from "../grade/classify";
+import { classifyAbs, classifyDirected, bandColor, bandsForUserMax, type Bands } from "../grade/classify";
 import { directedGrade, edgeById } from "../routing/graph";
+import type { ZoneCell } from "../grade/zones";
 
 export type EdgeFeature = {
   type: "Feature";
@@ -63,6 +64,38 @@ export function routeToGeoJSON(graph: Graph, path: Path, userMax: number): EdgeF
         absGradePct: edge.absGradePct,
         color: bandColor(classifyDirected(g, userMax)),
       },
+    };
+  });
+  return { type: "FeatureCollection", features };
+}
+
+export type ZoneFeature = {
+  type: "Feature";
+  geometry: { type: "Polygon"; coordinates: [number, number][][] };
+  properties: { color: string; value: number };
+};
+
+export type ZoneFeatureCollection = {
+  type: "FeatureCollection";
+  features: ZoneFeature[];
+};
+
+/** Zone cells as colored GeoJSON polygons; color via userMax-driven abs-grade bands. */
+export function zonesToGeoJSON(cells: ZoneCell[], userMax: number): ZoneFeatureCollection {
+  const bands = bandsForUserMax(userMax);
+  const features: ZoneFeature[] = cells.map((c) => {
+    const [minLng, minLat, maxLng, maxLat] = c.bbox;
+    const ring: [number, number][] = [
+      [minLng, minLat],
+      [maxLng, minLat],
+      [maxLng, maxLat],
+      [minLng, maxLat],
+      [minLng, minLat], // closed
+    ];
+    return {
+      type: "Feature",
+      geometry: { type: "Polygon", coordinates: [ring] },
+      properties: { color: bandColor(classifyAbs(c.value, bands)), value: c.value },
     };
   });
   return { type: "FeatureCollection", features };
