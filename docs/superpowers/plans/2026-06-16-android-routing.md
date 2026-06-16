@@ -10,7 +10,7 @@
 
 **Source spec:** `docs/superpowers/specs/2026-06-16-android-routing-design.md`. Decisions: `docs/superpowers/plans/ROADMAP.md`. Reuses Plan 1 `features/routing/{astar,graph,types}.ts`, `lib/geo.ts`; 3a `features/grade/classify.ts`, `features/map/geojson.ts`, `mobile/`.
 
-**Verified v11 API facts (used below):** `Map` `onPress={(e)=>...}` with `e.nativeEvent.lngLat` = `[lng, lat]` tuple; `Marker` takes `coordinate={[lng,lat]}`; `Layer type="line"` with `style={{ lineColor, lineWidth }}`.
+**Verified v11 API facts (used below):** `Map` `onPress={(e)=>...}` with `e.nativeEvent.lngLat` = `[lng, lat]` tuple; `Marker` takes `lngLat={[lng,lat]}` (pin as child); `Layer type="line"` with `style={{ lineColor, lineWidth }}`.
 
 ---
 
@@ -516,7 +516,11 @@ export function MapScreen(): React.JSX.Element {
 
   const marker = (id: string, color: string) => {
     const n = graph.nodes[id];
-    return <Marker key={id} coordinate={[n.lng, n.lat]} children={<View style={[styles.pin, { backgroundColor: color }]} />} />;
+    return (
+      <Marker key={id} lngLat={[n.lng, n.lat]}>
+        <View style={[styles.pin, { backgroundColor: color }]} />
+      </Marker>
+    );
   };
 
   return (
@@ -555,10 +559,10 @@ const styles = StyleSheet.create({
 });
 ```
 
-> Version note (v11, verified against installed types): `onPress` gives
-> `event.nativeEvent.lngLat` as `[lng, lat]`; `Marker` takes `coordinate={[lng,lat]}`.
-> If the installed `Marker` renders children differently, pass the pin `View` as a
-> normal child instead of the `children` prop. The data (route/heatmap) is unchanged.
+> Version note (v11, verified against installed types AND by typecheck during
+> implementation): `onPress` gives `event.nativeEvent.lngLat` as `[lng, lat]`;
+> `Marker` takes **`lngLat={[lng,lat]}`** (not `coordinate`) with the pin as a child
+> element. The data (route/heatmap) is unchanged.
 
 - [ ] **Step 2: Typecheck the app**
 
