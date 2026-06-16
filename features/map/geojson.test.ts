@@ -57,3 +57,60 @@ describe("bboxToCameraBounds", () => {
     ]);
   });
 });
+
+import { routeToGeoJSON } from "./geojson";
+import type { Path } from "../routing/types";
+
+// Two-node route on a steep edge; directed color depends on travel direction.
+function steepGraph(): Graph {
+  const A = { id: "A", lat: 47.6, lng: -122.33, elevationM: 0 };
+  const B = { id: "B", lat: 47.601, lng: -122.33, elevationM: 10 };
+  const e: Edge = {
+    id: "ab",
+    fromNode: "A",
+    toNode: "B",
+    geometry: [[47.6, -122.33], [47.601, -122.33]],
+    lengthM: 100,
+    riseM: 10,
+    gradePct: 10, // +10% A->B (steep climb), -10% B->A (descent)
+    absGradePct: 10,
+    kind: "footway",
+  };
+  return {
+    city: "t",
+    bbox: [-122.34, 47.6, -122.31, 47.62],
+    nodes: { A, B },
+    edges: [e],
+    adjacency: { A: ["ab"], B: ["ab"] },
+  };
+}
+
+describe("routeToGeoJSON (directed-grade coloring)", () => {
+  it("colors a steep CLIMB grey when it exceeds userMax (A->B direction)", () => {
+    const g = steepGraph();
+    const path: Path = { nodes: ["A", "B"], edges: ["ab"], cost: 0, lengthM: 100, steepEdges: [] };
+    const fc = routeToGeoJSON(g, path, 8); // 10% > 8% userMax -> grey
+    expect(fc.features).toHaveLength(1);
+    expect(fc.features[0].properties.color).toBe("#9aa0a6"); // grey, over max
+  });
+
+  it("colors the same edge GREEN in the descending B->A direction (free)", () => {
+    const g = steepGraph();
+    const path: Path = { nodes: ["B", "A"], edges: ["ab"], cost: 0, lengthM: 100, steepEdges: [] };
+    const fc = routeToGeoJSON(g, path, 8);
+    expect(fc.features[0].properties.color).toBe("#2e9e3f"); // downhill green
+  });
+
+  it("flips coordinates to [lng,lat]", () => {
+    const g = steepGraph();
+    const path: Path = { nodes: ["A", "B"], edges: ["ab"], cost: 0, lengthM: 100, steepEdges: [] };
+    const fc = routeToGeoJSON(g, path, 8);
+    expect(fc.features[0].geometry.coordinates).toEqual([[-122.33, 47.6], [-122.33, 47.601]]);
+  });
+
+  it("empty path -> empty FeatureCollection", () => {
+    const g = steepGraph();
+    const path: Path = { nodes: [], edges: [], cost: 0, lengthM: 0, steepEdges: [] };
+    expect(routeToGeoJSON(g, path, 8).features).toEqual([]);
+  });
+});
