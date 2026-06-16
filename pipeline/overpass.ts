@@ -14,13 +14,35 @@ out body;
 out skel qt;`;
 }
 
+// Overpass public servers commonly return these transiently under load.
+const RETRYABLE = new Set([429, 502, 503, 504]);
+
 /** Fetch raw OSM for a bbox. `fetchImpl` is injectable so tests never hit the network. */
 export async function fetchOverpass(
   bbox: [number, number, number, number],
   endpoint: string = DEFAULT_ENDPOINT,
-  fetchImpl: typeof fetch = fetch
+  fetchImpl: typeof fetch = fetch,
+  opts: { retries?: number; delayMs?: number } = {}
 ): Promise<OverpassResponse> {
-  const res = await fetchImpl(endpoint, { method: "POST", body: buildOverpassQuery(bbox) });
-  if (!res.ok) throw new Error(`Overpass request failed: ${res.status}`);
-  return (await res.json()) as OverpassResponse;
+  const retries = opts.retries ?? 3;
+  const delayMs = opts.delayMs ?? 2000;
+  const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+  const body = "data=" + encodeURIComponent(buildOverpassQuery(bbox));
+
+  for (let attempt = 0; ; attempt++) {
+    const res = await fetchImpl(endpoint, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "User-Agent": "flatr/0.1 (grade-aware routing graph builder)",
+      },
+      body,
+    });
+    if (res.ok) return (await res.json()) as OverpassResponse;
+    if (RETRYABLE.has(res.status) && attempt < retries) {
+      await sleep(delayMs * (attempt + 1));
+      continue;
+    }
+    throw new Error(`Overpass request failed: ${res.status}`);
+  }
 }
