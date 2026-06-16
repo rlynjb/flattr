@@ -45,3 +45,48 @@ describe("googleProvider", () => {
     await expect(p.sample([{ lat: 1, lng: 1 }])).rejects.toThrow(/REQUEST_DENIED/);
   });
 });
+
+import { openMeteoProvider } from "./elevation";
+
+describe("openMeteoProvider", () => {
+  it("parses the Open-Meteo elevation array and batches by 100", async () => {
+    const fakeFetch = vi.fn(async (url: string) => {
+      const lats = new URL(url).searchParams.get("latitude")!.split(",");
+      const elevation = lats.map((_, i) => 100 + i);
+      return new Response(JSON.stringify({ elevation }), { status: 200 });
+    });
+    const p = openMeteoProvider(fakeFetch as unknown as typeof fetch, { delayMs: 0 });
+    const pts = Array.from({ length: 150 }, (_, i) => ({ lat: 47 + i * 0.001, lng: -122 }));
+    const elevs = await p.sample(pts);
+    expect(elevs).toHaveLength(150);
+    expect(fakeFetch).toHaveBeenCalledTimes(2); // 100 + 50
+    expect(elevs[0]).toBe(100);
+  });
+
+  it("throws on a non-OK response", async () => {
+    const fakeFetch = vi.fn(async () => new Response("rate limited", { status: 429 }));
+    const p = openMeteoProvider(fakeFetch as unknown as typeof fetch, { delayMs: 0, retries: 0 });
+    await expect(p.sample([{ lat: 47, lng: -122 }])).rejects.toThrow(/429/);
+  });
+});
+
+describe("sampleElevations dedup", () => {
+  it("queries one representative point per cell and maps it back to all nodes there", async () => {
+    const nodes = {
+      a: { id: "a", lat: 47.6000, lng: -122.33, elevationM: 0 },
+      b: { id: "b", lat: 47.6003, lng: -122.33, elevationM: 0 }, // same ~90m cell as a
+      c: { id: "c", lat: 47.6100, lng: -122.33, elevationM: 0 }, // different cell
+    };
+    const calls: number[] = [];
+    const provider = {
+      async sample(pts: { lat: number; lng: number }[]) {
+        calls.push(pts.length);
+        return pts.map((_, i) => 1000 + i);
+      },
+    };
+    const out = await sampleElevations(nodes, provider, { dedupePrecision: 0.0008 });
+    expect(calls[0]).toBe(2); // a&b collapse to one cell, c is another -> 2 unique points
+    expect(out.a.elevationM).toBe(out.b.elevationM); // same cell -> same elevation
+    expect(out.c.elevationM).not.toBe(out.a.elevationM);
+  });
+});
