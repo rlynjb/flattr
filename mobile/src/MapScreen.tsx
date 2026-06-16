@@ -1,16 +1,25 @@
-// mobile/src/MapScreen.tsx — heatmap + tap-to-route + userMax slider (v11 MapLibre).
+// mobile/src/MapScreen.tsx — heatmap/zones toggle + tap-to-route + slider + honesty card.
 import React, { useMemo, useState } from "react";
-import { View, Text, StyleSheet } from "react-native";
+import { View, Text, Pressable, StyleSheet } from "react-native";
 import { Map, Camera, GeoJSONSource, Layer, Marker } from "@maplibre/maplibre-react-native";
-import { graphToGeoJSON, routeToGeoJSON, bboxToCameraBounds } from "../../features/map/geojson";
+import {
+  graphToGeoJSON,
+  routeToGeoJSON,
+  zonesToGeoJSON,
+  bboxToCameraBounds,
+} from "../../features/map/geojson";
 import { bandsForUserMax } from "../../features/grade/classify";
+import { computeZones } from "../../features/grade/zones";
 import { nearestNode } from "../../features/routing/nearest";
 import { directedAstar } from "../../features/routing/astar";
+import { routeSummary, type RouteSummary } from "../../features/routing/summary";
 import { loadGraph } from "./loadGraph";
 import { GradeSlider } from "./GradeSlider";
+import { RouteSummaryCard } from "./RouteSummaryCard";
 
 const STYLE_URL = "https://tiles.openfreemap.org/styles/liberty";
-const DEFAULT_USERMAX = 8; // Walking preset
+const DEFAULT_USERMAX = 8;
+const GRID_N = 16;
 
 export function MapScreen(): React.JSX.Element {
   const graph = useMemo(() => {
@@ -24,21 +33,28 @@ export function MapScreen(): React.JSX.Element {
   const [userMax, setUserMax] = useState(DEFAULT_USERMAX);
   const [startId, setStartId] = useState<string | null>(null);
   const [endId, setEndId] = useState<string | null>(null);
+  const [view, setView] = useState<"edges" | "zones">("edges");
 
-  // Heatmap recolors with userMax (abs-grade bands).
   const heatmap = useMemo(
     () => (graph ? graphToGeoJSON(graph, bandsForUserMax(userMax)) : null),
     [graph, userMax]
   );
+  const zoneCells = useMemo(() => (graph ? computeZones(graph, GRID_N) : []), [graph]);
+  const zonesFC = useMemo(() => zonesToGeoJSON(zoneCells, userMax), [zoneCells, userMax]);
 
-  // Route is derived from endpoints + userMax (directedAstar on-device).
-  const route = useMemo(() => {
-    if (!graph || !startId || !endId) return null;
+  // One directedAstar call -> route line + summary + found flag.
+  const routed = useMemo(() => {
+    if (!graph || !startId || !endId) {
+      return { fc: null as ReturnType<typeof routeToGeoJSON> | null, summary: null as RouteSummary | null, found: true };
+    }
     const r = directedAstar(graph, startId, endId, userMax);
-    return r.path ? routeToGeoJSON(graph, r.path, userMax) : null;
+    if (!r.path) return { fc: null, summary: null as RouteSummary | null, found: false };
+    return {
+      fc: routeToGeoJSON(graph, r.path, userMax),
+      summary: routeSummary(graph, r.path, userMax),
+      found: true,
+    };
   }, [graph, startId, endId, userMax]);
-
-  const noRoute = graph != null && startId != null && endId != null && route == null;
 
   if (!graph || !heatmap) {
     return (
@@ -52,7 +68,6 @@ export function MapScreen(): React.JSX.Element {
     const [lng, lat] = event.nativeEvent.lngLat;
     const id = nearestNode(graph, { lat, lng });
     if (!startId || (startId && endId)) {
-      // first tap, or third tap after a complete pair -> restart
       setStartId(id);
       setEndId(null);
     } else {
@@ -69,15 +84,23 @@ export function MapScreen(): React.JSX.Element {
     );
   };
 
+  const showCard = startId != null && endId != null;
+
   return (
     <View style={styles.root}>
       <Map style={styles.map} mapStyle={STYLE_URL} onPress={handlePress}>
         <Camera bounds={bboxToCameraBounds(graph.bbox)} />
-        <GeoJSONSource id="edges" data={heatmap as unknown as GeoJSON.FeatureCollection}>
-          <Layer id="edge-lines" type="line" style={{ lineColor: ["get", "color"], lineWidth: 2 }} />
-        </GeoJSONSource>
-        {route && (
-          <GeoJSONSource id="route" data={route as unknown as GeoJSON.FeatureCollection}>
+        {view === "edges" ? (
+          <GeoJSONSource id="edges" data={heatmap as unknown as GeoJSON.FeatureCollection}>
+            <Layer id="edge-lines" type="line" style={{ lineColor: ["get", "color"], lineWidth: 2 }} />
+          </GeoJSONSource>
+        ) : (
+          <GeoJSONSource id="zones" data={zonesFC as unknown as GeoJSON.FeatureCollection}>
+            <Layer id="zone-fill" type="fill" style={{ fillColor: ["get", "color"], fillOpacity: 0.5 }} />
+          </GeoJSONSource>
+        )}
+        {routed.fc && (
+          <GeoJSONSource id="route" data={routed.fc as unknown as GeoJSON.FeatureCollection}>
             <Layer
               id="route-line"
               type="line"
@@ -88,11 +111,16 @@ export function MapScreen(): React.JSX.Element {
         {startId && marker(startId, "#1565c0")}
         {endId && marker(endId, "#000000")}
       </Map>
-      {noRoute && (
-        <View style={styles.banner}>
-          <Text style={styles.bannerText}>No route between those points.</Text>
-        </View>
-      )}
+
+      <View style={styles.toggle}>
+        {(["edges", "zones"] as const).map((v) => (
+          <Pressable key={v} onPress={() => setView(v)} style={[styles.toggleBtn, view === v && styles.toggleOn]}>
+            <Text style={[styles.toggleText, view === v && styles.toggleTextOn]}>{v}</Text>
+          </Pressable>
+        ))}
+      </View>
+
+      {showCard && <RouteSummaryCard found={routed.found} summary={routed.summary} userMax={userMax} />}
       <GradeSlider userMax={userMax} onChange={setUserMax} />
     </View>
   );
@@ -104,14 +132,18 @@ const styles = StyleSheet.create({
   center: { flex: 1, alignItems: "center", justifyContent: "center", padding: 24 },
   error: { color: "#d23b2e", textAlign: "center" },
   pin: { width: 16, height: 16, borderRadius: 8, borderWidth: 2, borderColor: "#fff" },
-  banner: {
+  toggle: {
     position: "absolute",
-    top: 12,
-    left: 12,
+    top: 64,
     right: 12,
-    backgroundColor: "rgba(210,59,46,0.92)",
+    flexDirection: "row",
     borderRadius: 8,
-    padding: 10,
+    overflow: "hidden",
+    borderWidth: 1,
+    borderColor: "#fff",
   },
-  bannerText: { color: "#fff", textAlign: "center" },
+  toggleBtn: { paddingHorizontal: 12, paddingVertical: 6, backgroundColor: "rgba(255,255,255,0.9)" },
+  toggleOn: { backgroundColor: "#1565c0" },
+  toggleText: { fontSize: 12, color: "#1565c0" },
+  toggleTextOn: { color: "#fff", fontWeight: "700" },
 });
