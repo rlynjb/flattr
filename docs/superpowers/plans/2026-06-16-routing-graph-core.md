@@ -64,12 +64,16 @@ Build order is strict dependency order: scaffold → geo → types → pqueue �
     "bench": "tsx bench/run.ts"
   },
   "devDependencies": {
+    "@types/node": "^20.14.0",
     "tsx": "^4.7.0",
     "typescript": "^5.4.0",
     "vitest": "^1.6.0"
   }
 }
 ```
+
+(`@types/node` is required by Task 12's `bench/run.ts`, which imports
+`node:perf_hooks`. Added here so the scaffold typechecks once bench lands.)
 
 - [ ] **Step 2: Create `tsconfig.json`**
 
@@ -83,7 +87,7 @@ Build order is strict dependency order: scaffold → geo → types → pqueue �
     "esModuleInterop": true,
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
-    "types": ["vitest/globals"],
+    "types": ["vitest/globals", "node"],
     "noEmit": true
   },
   "include": ["features", "lib", "bench"]
@@ -1751,7 +1755,7 @@ Expected: PASS (1 test).
 import { makeGridGraph } from "../features/routing/fixtures";
 import { dijkstra, astar, gradeAstar, directedAstar } from "../features/routing/astar";
 import { bidirectional } from "../features/routing/bidirectional";
-import { gradeCostDirected } from "../features/routing/cost";
+import { distanceCost, gradeCostDirected } from "../features/routing/cost";
 import { formatTable, type BenchRow } from "./report";
 import { performance } from "node:perf_hooks";
 import type { SearchResult } from "../features/routing/types";
@@ -1779,15 +1783,20 @@ function time(fn: () => SearchResult): { result: SearchResult; ms: number } {
 
 for (const { name, start, goal, size } of pairs) {
   const g = makeGridGraph(size);
+  // Two sub-stories share one table:
+  //  - DISTANCE problem (same optimal cost): dijkstra -> astar -> bidirectional.
+  //    Shows search efficiency improving for the SAME answer (§15.2 stages 1,2,5).
+  //  - GRADE problem (different, higher cost by design): gradeAstar, directedAstar
+  //    (§15.2 stages 3,4) — the domain cost model, not a search-speed comparison.
+  // Bidirectional MUST use distanceCost here so it is comparable to dijkstra/astar;
+  // benchmarking it with gradeCostDirected against distance-cost rows is apples-to-
+  // oranges and can make it look slower than the flood.
   const algos: Array<{ algorithm: string; run: () => SearchResult }> = [
     { algorithm: "dijkstra", run: () => dijkstra(g, start, goal) },
     { algorithm: "astar", run: () => astar(g, start, goal) },
+    { algorithm: "bidirectional", run: () => bidirectional(g, start, goal, Infinity, distanceCost) },
     { algorithm: "gradeAstar", run: () => gradeAstar(g, start, goal, USER_MAX) },
     { algorithm: "directedAstar", run: () => directedAstar(g, start, goal, USER_MAX) },
-    {
-      algorithm: "bidirectional",
-      run: () => bidirectional(g, start, goal, USER_MAX, gradeCostDirected),
-    },
   ];
 
   const rows: BenchRow[] = [];
@@ -1805,7 +1814,12 @@ for (const { name, start, goal, size } of pairs) {
   }
   console.log("\n" + formatTable(name, rows));
 }
-console.log("\n(dijkstra vs astar share cost; gradeAstar/directedAstar/bidirectional optimize grade — costs differ by design.)");
+console.log(
+  "\nDISTANCE problem (dijkstra/astar/bidirectional, equal cost): A* prunes the flood to a cone;" +
+    "\nbidirectional meets in the middle — far fewer expansions than dijkstra, typically slightly more" +
+    "\nthan the single A* cone (expected on a near-Euclidean grid, not a bug)." +
+    "\nGRADE problem (gradeAstar/directedAstar): higher cost is the grade penalty, by design."
+);
 ```
 
 - [ ] **Step 6: Run the benchmark**
