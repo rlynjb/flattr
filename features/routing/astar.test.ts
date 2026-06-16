@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
-import { dijkstra, astar } from "./astar";
-import { diamondGraph, makeGridGraph } from "./fixtures";
+import { dijkstra, astar, gradeAstar } from "./astar";
+import { diamondGraph, makeGridGraph, gradeGraph } from "./fixtures";
 
 describe("dijkstra (stage 1, correctness baseline)", () => {
   it("finds the known shortest path S->G in the diamond graph", () => {
@@ -49,5 +49,23 @@ describe("astar (stage 2, informed search)", () => {
     const d = dijkstra(g, "0,0", "11,11");
     const a = astar(g, "0,0", "11,11");
     expect(a.nodesExpanded).toBeLessThanOrEqual(d.nodesExpanded);
+  });
+});
+
+describe("gradeAstar (stage 3, domain cost)", () => {
+  it("prefers the longer flat route over the shorter steep one", () => {
+    const g = gradeGraph();
+    const plain = astar(g, "S", "G");
+    expect(plain.path!.nodes).toEqual(["S", "H", "G"]);
+    const flat = gradeAstar(g, "S", "G", 5);
+    expect(flat.path!.nodes).toEqual(["S", "L", "G"]);
+    expect(flat.path!.lengthM).toBeGreaterThan(plain.path!.lengthM);
+  });
+
+  it("is symmetric: S->G and G->S give the same route (abs grade)", () => {
+    const g = gradeGraph();
+    const fwd = gradeAstar(g, "S", "G", 5);
+    const rev = gradeAstar(g, "G", "S", 5);
+    expect(rev.path!.nodes).toEqual([...fwd.path!.nodes].reverse());
   });
 });
