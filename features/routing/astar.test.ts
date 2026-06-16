@@ -95,3 +95,42 @@ describe("directedAstar (stage 4, directional cost + honesty)", () => {
     expect(directedAstar(g, "X", "ISO", 5).path).toBeNull();
   });
 });
+
+import { indexEdges } from "./astar";
+import type { Edge, Graph } from "./types";
+
+describe("path reconstruction uses the exact relaxed edge (parallel edges)", () => {
+  // Two parallel A->B edges: short+steep vs long+flat. The search (directed grade)
+  // relaxes the long+flat edge; reconstruction must report THAT edge, not the
+  // shorter steep one a length-based re-resolution would pick.
+  function parallelGraph(): Graph {
+    const e1: Edge = {
+      id: "short-steep", fromNode: "A", toNode: "B",
+      geometry: [[0, 0], [0, 0.001]], lengthM: 50, riseM: 10, gradePct: 20, absGradePct: 20,
+    };
+    const e2: Edge = {
+      id: "long-flat", fromNode: "A", toNode: "B",
+      geometry: [[0, 0], [0, 0.001]], lengthM: 100, riseM: 0, gradePct: 0, absGradePct: 0,
+    };
+    return {
+      city: "parallel", bbox: [0, 0, 0.001, 0.001],
+      nodes: { A: { id: "A", lat: 0, lng: 0, elevationM: 0 }, B: { id: "B", lat: 0, lng: 0.001, elevationM: 0 } },
+      edges: [e1, e2],
+      adjacency: { A: ["short-steep", "long-flat"], B: ["short-steep", "long-flat"] },
+    };
+  }
+
+  it("reports the flat edge the grade router chose, not the shorter steep parallel edge", () => {
+    const r = directedAstar(parallelGraph(), "A", "B", 5);
+    expect(r.path!.edges).toEqual(["long-flat"]);
+    expect(r.path!.lengthM).toBe(100);
+    expect(r.path!.steepEdges).toEqual([]);
+  });
+
+  it("indexEdges maps every edge id to its edge", () => {
+    const g = parallelGraph();
+    const idx = indexEdges(g);
+    expect(idx.size).toBe(2);
+    expect(idx.get("long-flat")).toBe(g.edges[1]);
+  });
+});

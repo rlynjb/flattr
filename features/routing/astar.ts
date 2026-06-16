@@ -1,12 +1,19 @@
 // One parametric search engine. The progression stages are just (costFn, heuristicFn) choices.
-import type { CostFn, Edge, Graph, HeuristicFn, Node, Path, SearchResult } from "./types";
+import type { CostFn, Edge, Graph, HeuristicFn, Path, SearchResult } from "./types";
 import { PQueue } from "./pqueue";
-import { edgeById, otherEnd, directedGrade } from "./graph";
+import { otherEnd, directedGrade } from "./graph";
 import { haversine } from "../../lib/geo";
 import { distanceCost, gradeCostAbs, gradeCostDirected } from "./cost";
 
 export const zeroHeuristic: HeuristicFn = () => 0;
 export const haversineHeuristic: HeuristicFn = (node, goal) => haversine(node, goal);
+
+/** Build an id->edge index once, so expansions are O(1) per edge, not O(E). */
+export function indexEdges(graph: Graph): Map<string, Edge> {
+  const m = new Map<string, Edge>();
+  for (const e of graph.edges) m.set(e.id, e);
+  return m;
+}
 
 /**
  * Generic grade-aware search with lazy-deletion + closed set.
@@ -24,6 +31,7 @@ export function search(
   const g = new Map<string, number>();
   const came = new Map<string, { edge: Edge; prev: string }>();
   const closed = new Set<string>();
+  const byId = indexEdges(graph);
   let pushes = 0;
   let pops = 0;
   let nodesExpanded = 0;
@@ -42,8 +50,9 @@ export function search(
     pops++;
     if (closed.has(current)) continue; // stale duplicate (lazy deletion)
     if (current === goalId) {
+      const { nodes, edges } = reconstruct(came, startId, goalId);
       return {
-        path: summarizePath(graph, reconstructNodes(came, startId, goalId), userMax, costFn),
+        path: summarizePath(nodes, edges, userMax, costFn),
         nodesExpanded,
         pushes,
         pops,
@@ -53,7 +62,7 @@ export function search(
     nodesExpanded++;
 
     for (const edgeId of graph.adjacency[current] ?? []) {
-      const edge = edgeById(graph, edgeId);
+      const edge = byId.get(edgeId)!;
       const next = otherEnd(edge, current);
       if (closed.has(next)) continue;
       const tentative = g.get(current)! + costFn(edge, current, userMax);
@@ -68,61 +77,57 @@ export function search(
   return { path: null, nodesExpanded, pushes, pops };
 }
 
-/** Walk came-from from goal back to start, returning the node id sequence. */
-function reconstructNodes(
+/**
+ * Walk came-from from goal back to start, returning the node id sequence AND the
+ * exact edges the search relaxed (start->goal order). Using the relaxed edges —
+ * not re-resolving by node pair — keeps cost/steepEdges correct when parallel
+ * edges share a node pair.
+ */
+function reconstruct(
   came: Map<string, { edge: Edge; prev: string }>,
   startId: string,
   goalId: string
-): string[] {
+): { nodes: string[]; edges: Edge[] } {
   const nodes: string[] = [goalId];
+  const edges: Edge[] = [];
   let cur = goalId;
   while (cur !== startId) {
     const entry = came.get(cur)!;
+    edges.push(entry.edge);
     cur = entry.prev;
     nodes.push(cur);
   }
   nodes.reverse();
-  return nodes;
+  edges.reverse();
+  return { nodes, edges };
 }
 
 /**
- * Turn a node sequence into a Path: resolve edges between consecutive nodes,
- * total cost + length, and flag edges whose DIRECTED grade exceeds userMax.
- * Shared by `search` and `bidirectional`.
+ * Turn a node sequence + the exact traversed edges into a Path: total cost +
+ * length, and flag edges whose DIRECTED grade exceeds userMax. Shared by
+ * `search` and `bidirectional`. `edges[i]` is the edge traversed from `nodes[i]`.
  */
 export function summarizePath(
-  graph: Graph,
-  nodeSeq: string[],
+  nodes: string[],
+  edges: Edge[],
   userMax: number,
   costFn: CostFn
 ): Path {
-  const edges: string[] = [];
+  const edgeIds: string[] = [];
   const steepEdges: string[] = [];
   let cost = 0;
   let lengthM = 0;
-  for (let i = 0; i + 1 < nodeSeq.length; i++) {
-    const from = nodeSeq[i];
-    const to = nodeSeq[i + 1];
-    const edge = edgeBetween(graph, from, to);
-    edges.push(edge.id);
+  for (let i = 0; i < edges.length; i++) {
+    const edge = edges[i];
+    const from = nodes[i];
+    edgeIds.push(edge.id);
     cost += costFn(edge, from, userMax);
     lengthM += edge.lengthM;
     if (Number.isFinite(userMax) && directedGrade(edge, from) > userMax) {
       steepEdges.push(edge.id);
     }
   }
-  return { nodes: nodeSeq, edges, cost, lengthM, steepEdges };
-}
-
-/** The (lowest-cost-by-length) edge connecting two adjacent nodes. */
-function edgeBetween(graph: Graph, fromId: string, toId: string): Edge {
-  let best: Edge | undefined;
-  for (const edgeId of graph.adjacency[fromId] ?? []) {
-    const e = edgeById(graph, edgeId);
-    if (otherEnd(e, fromId) === toId && (!best || e.lengthM < best.lengthM)) best = e;
-  }
-  if (!best) throw new Error(`edgeBetween: no edge connects "${fromId}" and "${toId}"`);
-  return best;
+  return { nodes, edges: edgeIds, cost, lengthM, steepEdges };
 }
 
 // --- stage wrappers ---------------------------------------------------------
