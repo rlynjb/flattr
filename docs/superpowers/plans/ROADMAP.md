@@ -65,19 +65,20 @@ honesty messaging + zone choropleth.
 | §11.C | Edge-split granularity | 10–15 m in hilly areas | Plan 2 |
 | — | Testing | Strict TDD (test-first, bite-sized commits) | all plans |
 
-## Carry-forward to Plan 2 (from Plan 1 final review, 2026-06-16)
+## Carry-forward to Plan 2 (from Plan 1 final review, 2026-06-16) — RESOLVED
 
-Plan 1 shipped APPROVED (48 tests, clean typecheck). Two parked-by-design items
-become load-bearing once Plan 2 feeds city-scale, real graphs through the engine:
+Plan 1 shipped APPROVED (48 tests). Two parked items were fixed before Plan 2
+(commit on `main`, 50 tests):
 
-- **`edgeById` is an O(E) linear scan** (`features/routing/graph.ts`). Fine for
-  tiny fixtures; O(V·E) on real graphs. Build a `Record<string, Edge>` index once
-  in graph assembly and resolve through it.
-- **`summarizePath`/`edgeBetween` re-resolve the connecting edge by shortest
-  length** (`features/routing/astar.ts`), not from the `came` map the search
-  actually relaxed. Safe only because Plan 1 fixtures (and Plan 2's post-`split.ts`
-  dedup) have ≤1 edge per node pair. If parallel edges ever exist, reconstruct edge
-  IDs from `came`/`cameF` instead. Decide explicitly in Plan 2.
+- ~~`edgeById` O(E) linear scan~~ → `search`/`bidirectional` build an
+  `indexEdges` `Map<string, Edge>` once; expansion is O(1) per edge.
+- ~~`summarizePath`/`edgeBetween` re-resolve by shortest length~~ → reconstruction
+  now uses the exact edges the search relaxed (from the `came` maps); `edgeBetween`
+  removed. Parallel-edge regression test added.
+
+Net for Plan 2: the engine is safe to feed real, possibly multi-edge graphs.
+Remaining nits (non-blocking, do opportunistically): pqueue "matches sorted array"
+test asserts priorities not items; a cost test title overstates ("blocks ... finite").
 
 ## Drift guardrails
 
