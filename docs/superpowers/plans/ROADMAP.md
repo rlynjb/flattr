@@ -65,6 +65,20 @@ honesty messaging + zone choropleth.
 | §11.C | Edge-split granularity | 10–15 m in hilly areas | Plan 2 |
 | — | Testing | Strict TDD (test-first, bite-sized commits) | all plans |
 
+## Carry-forward to Plan 2 (from Plan 1 final review, 2026-06-16)
+
+Plan 1 shipped APPROVED (48 tests, clean typecheck). Two parked-by-design items
+become load-bearing once Plan 2 feeds city-scale, real graphs through the engine:
+
+- **`edgeById` is an O(E) linear scan** (`features/routing/graph.ts`). Fine for
+  tiny fixtures; O(V·E) on real graphs. Build a `Record<string, Edge>` index once
+  in graph assembly and resolve through it.
+- **`summarizePath`/`edgeBetween` re-resolve the connecting edge by shortest
+  length** (`features/routing/astar.ts`), not from the `came` map the search
+  actually relaxed. Safe only because Plan 1 fixtures (and Plan 2's post-`split.ts`
+  dedup) have ≤1 edge per node pair. If parallel edges ever exist, reconstruct edge
+  IDs from `came`/`cameF` instead. Decide explicitly in Plan 2.
+
 ## Drift guardrails
 
 - A change to build order or any locked decision is edited **here first**, with
