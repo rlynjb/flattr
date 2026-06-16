@@ -29,11 +29,15 @@ second:
 | 3b | Routing UI (A→B, on-device engine, route, `userMax` slider) | plan: `plans/2026-06-16-android-routing.md` | Plan 3a | code complete; device run pending |
 | 3c | Honesty messaging + zone choropleth | plan: `plans/2026-06-16-android-honesty-zones.md` | Plan 3b | code complete; device run pending |
 
-**Android MVP (spec §10 Phases 1–3) is code-complete** as of 2026-06-16: engine
-(Plan 1) + pipeline (Plan 2) + Expo app with heatmap, grade-aware routing, `userMax`
-slider, honesty card, and zone choropleth (Plans 3a/3b/3c). Pending: device run of the
-Expo dev build; a real `graph.json` via `npm run build:graph` (Overpass + elevation).
-Beyond MVP → Plan 4 (spec §13): vehicle preset refinement, multi-city, saved routes.
+**Android MVP (spec §10 Phases 1–3) is code-complete + real-data-backed** as of
+2026-06-16: engine (Plan 1) + pipeline (Plan 2, now with a free Open-Meteo provider)
++ Expo app with heatmap, grade-aware routing, `userMax` slider, honesty card, and zone
+choropleth (Plans 3a/3b/3c). A **real Capitol Hill `graph.json`** (1676 nodes / 1914
+edges, real grades clamped ≤40%) is built via `npm run build:graph` and bundled at
+`mobile/assets/graph.json`. Only remaining MVP step: **run the Expo dev build on a
+device** (`cd mobile && npx expo run:android`). Beyond MVP → Plan 4 (spec §10 Phase 4):
+vehicle preset refinement, multi-city, saved routes; higher-fidelity elevation
+(Google key / USGS LIDAR) to widen the bbox without grade noise.
 
 ### Plan 1 — routing graph core (scope locked)
 
@@ -68,7 +72,7 @@ honesty messaging + zone choropleth.
 | §11.E | MVP scope | Single small bbox (commute area) | Plan 2 |
 | §11.F | Directed edges | Derive `directedGrade` at traversal (DRY), no materialized reverse edges | Plan 1 |
 | §11.G | Steep-descent penalty | Off — downhill always free | Plan 1 |
-| §11.A | Elevation source | **Google Elevation API to bootstrap, USGS 3DEP/LIDAR as accuracy target** — build a swap-in seam | Plan 2 |
+| §11.A | Elevation source | **RESOLVED 2026-06-16: tiered behind the `ElevationProvider` seam — Open-Meteo (free, 90m DEM) is the DEFAULT, Google (set `GOOGLE_ELEVATION_KEY`) is the paid upgrade, flat (`FLAT_ELEVATION=1`) is the offline fallback.** Free DEM is coarse, so the build splits at ~90m (not 12m) and clamps grades to ±40% to suppress DEM noise; USGS 3DEP/LIDAR remains the future fidelity target. | Plan 2 |
 | §11.B | Map renderer | MapLibre GL (open, no token) | Plan 3 |
 | §8 | Target platform | **RESOLVED 2026-06-16: Android via React Native (Expo).** Reuses the pure-TS engine + `graph.json` unchanged; native MapLibre map. Supersedes the spec's web/Next.js assumption. | Plan 3 |
 | — | Basemap (3a) | OpenFreeMap style (no token), edges drawn on top | Plan 3a |
