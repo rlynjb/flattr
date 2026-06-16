@@ -14,11 +14,12 @@ export async function buildGraph(
   bbox: [number, number, number, number],
   osm: OverpassResponse,
   elevation: ElevationProvider,
-  maxSegM: number = MAX_SEGMENT_M
+  maxSegM: number = MAX_SEGMENT_M,
+  sampleOpts: { dedupePrecision?: number } = {}
 ): Promise<Graph> {
   const ways = parseOsm(osm);
   const { nodes: skeletonNodes, edges: skeletonEdges } = splitWays(ways, maxSegM);
-  const nodes = await sampleElevations(skeletonNodes, elevation);
+  const nodes = await sampleElevations(skeletonNodes, elevation, sampleOpts);
   const edges = computeGrades(nodes, skeletonEdges);
   return { city, bbox, nodes, edges, adjacency: buildAdjacency(edges) };
 }

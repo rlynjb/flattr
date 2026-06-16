@@ -1,8 +1,13 @@
 // pipeline/config.ts — build-time configuration.
 import type { EdgeKind } from "../features/routing/types";
 
-/** [minLng, minLat, maxLng, maxLat] — downtown + Capitol Hill, Seattle (placeholder, §10). */
-export const BBOX: [number, number, number, number] = [-122.34, 47.6, -122.31, 47.62];
+/**
+ * [minLng, minLat, maxLng, maxLat] — a small Capitol Hill slice, Seattle (steep area
+ * near the spec's Pine St reference). Kept small so the free Open-Meteo build stays
+ * under rate limits and the bundled graph.json stays phone-friendly. Widen later
+ * (and use a Google/LIDAR key) for the full city.
+ */
+export const BBOX: [number, number, number, number] = [-122.322, 47.614, -122.315, 47.62];
 
 /** Split long edges so no segment exceeds this (§11.C: 10-15m in hilly areas). */
 export const MAX_SEGMENT_M = 12;
