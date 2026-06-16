@@ -233,7 +233,7 @@ describe("buildOverpassQuery", () => {
 describe("fetchOverpass", () => {
   it("POSTs the query and returns parsed JSON", async () => {
     const body: OverpassResponse = { elements: [{ type: "node", id: 1, lat: 47.6, lon: -122.33 }] };
-    const fakeFetch = vi.fn(async () => new Response(JSON.stringify(body), { status: 200 }));
+    const fakeFetch = vi.fn(async (_url: string, _init?: RequestInit) => new Response(JSON.stringify(body), { status: 200 }));
     const res = await fetchOverpass(bbox, "https://example/api", fakeFetch as unknown as typeof fetch);
     expect(res.elements).toHaveLength(1);
     expect(fakeFetch).toHaveBeenCalledOnce();
