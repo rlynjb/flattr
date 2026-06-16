@@ -35,3 +35,46 @@ describe("bandColor", () => {
     expect(DEFAULT_BANDS.yellowMax).toBe(8);
   });
 });
+
+import { classifyDirected, bandsForUserMax, USERMAX_PRESETS } from "./classify";
+
+describe("classifyDirected (signed directed grade, §7)", () => {
+  const max = 8;
+  it("downhill or flat is green (free), even when steep downhill", () => {
+    expect(classifyDirected(0, max)).toBe("green");
+    expect(classifyDirected(-20, max)).toBe("green");
+  });
+  it("moderate uphill (0 .. 0.5*max) is yellow", () => {
+    expect(classifyDirected(0.01, max)).toBe("yellow");
+    expect(classifyDirected(4, max)).toBe("yellow"); // 0.5*max boundary
+  });
+  it("steep uphill (0.5*max .. max) is red", () => {
+    expect(classifyDirected(4.01, max)).toBe("red");
+    expect(classifyDirected(8, max)).toBe("red"); // max boundary
+  });
+  it("above max is grey (too steep / blocked)", () => {
+    expect(classifyDirected(8.01, max)).toBe("grey");
+  });
+});
+
+describe("bandsForUserMax", () => {
+  it("derives heatmap abs-grade bands from userMax (green<=0.5*max, yellow<=max)", () => {
+    expect(bandsForUserMax(8)).toEqual({ greenMax: 4, yellowMax: 8 });
+  });
+});
+
+describe("USERMAX_PRESETS", () => {
+  it("includes the spec §7 presets with their userMax values", () => {
+    const byLabel = Object.fromEntries(USERMAX_PRESETS.map((p) => [p.label, p.userMax]));
+    expect(byLabel["Kick scooter"]).toBe(5);
+    expect(byLabel["Walking"]).toBe(8);
+    expect(byLabel["Any"]).toBe(15);
+    expect(USERMAX_PRESETS.length).toBeGreaterThanOrEqual(3);
+  });
+});
+
+describe("grey band color", () => {
+  it("has a distinct grey color", () => {
+    expect(bandColor("grey")).toMatch(/^#[0-9a-fA-F]{6}$/);
+  });
+});
