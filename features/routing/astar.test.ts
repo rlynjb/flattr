@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
-import { dijkstra, astar, gradeAstar } from "./astar";
-import { diamondGraph, makeGridGraph, gradeGraph } from "./fixtures";
+import { dijkstra, astar, gradeAstar, directedAstar } from "./astar";
+import { diamondGraph, makeGridGraph, gradeGraph, directionalGraph } from "./fixtures";
 
 describe("dijkstra (stage 1, correctness baseline)", () => {
   it("finds the known shortest path S->G in the diamond graph", () => {
@@ -67,5 +67,31 @@ describe("gradeAstar (stage 3, domain cost)", () => {
     const fwd = gradeAstar(g, "S", "G", 5);
     const rev = gradeAstar(g, "G", "S", 5);
     expect(rev.path!.nodes).toEqual([...fwd.path!.nodes].reverse());
+  });
+});
+
+describe("directedAstar (stage 4, directional cost + honesty)", () => {
+  it("detours uphill but takes the direct edge downhill (A->B != B->A)", () => {
+    const g = directionalGraph();
+    const up = directedAstar(g, "X", "Y", 5);
+    expect(up.path!.nodes).toEqual(["X", "F", "Y"]);
+    const down = directedAstar(g, "Y", "X", 5);
+    expect(down.path!.nodes).toEqual(["Y", "X"]);
+  });
+
+  it("still returns an only-steep path and flags the steep edge", () => {
+    const g = directionalGraph();
+    g.edges = g.edges.filter((e) => e.id === "xy");
+    g.adjacency = { X: ["xy"], Y: ["xy"], F: [] };
+    const r = directedAstar(g, "X", "Y", 5);
+    expect(r.path).not.toBeNull();
+    expect(r.path!.steepEdges).toEqual(["xy"]);
+  });
+
+  it("returns null only when genuinely disconnected, not when merely steep", () => {
+    const g = directionalGraph();
+    g.nodes["ISO"] = { id: "ISO", lat: 9, lng: 9, elevationM: 0 };
+    g.adjacency["ISO"] = [];
+    expect(directedAstar(g, "X", "ISO", 5).path).toBeNull();
   });
 });
