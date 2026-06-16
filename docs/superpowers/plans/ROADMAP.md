@@ -24,7 +24,10 @@ second:
 |---|---|---|---|---|
 | 1 | Routing graph core | `2026-06-16-routing-graph-core.md` | — | written |
 | 2 | Data pipeline (OSM → elevation → grade graph) | `2026-06-16-data-pipeline.md` | Plan 1 (graph types) | written |
-| 3 | Runtime map app (heatmap → router → honesty/zones) | _(to write)_ | Plans 1 & 2 | not started |
+| 3 | Android app (React Native / Expo) — decomposed into 3a/3b/3c below | — | Plans 1 & 2 | in progress |
+| 3a | Expo scaffold + grade heatmap | spec: `specs/2026-06-16-android-heatmap-design.md` | Plans 1 & 2 | spec written |
+| 3b | Routing UI (A→B, on-device engine, route, `userMax` slider) | _(to spec)_ | Plan 3a | not started |
+| 3c | Honesty messaging + zone choropleth | _(to spec)_ | Plan 3b | not started |
 
 ### Plan 1 — routing graph core (scope locked)
 
@@ -61,7 +64,9 @@ honesty messaging + zone choropleth.
 | §11.G | Steep-descent penalty | Off — downhill always free | Plan 1 |
 | §11.A | Elevation source | **Google Elevation API to bootstrap, USGS 3DEP/LIDAR as accuracy target** — build a swap-in seam | Plan 2 |
 | §11.B | Map renderer | MapLibre GL (open, no token) | Plan 3 |
-| §8 | Target platform | **Web (Next.js) per spec — but REVISIT for a native Android app before Plan 3.** Undecided. Plan 1's routing core is platform-agnostic TS and unaffected either way. | Plan 3 |
+| §8 | Target platform | **RESOLVED 2026-06-16: Android via React Native (Expo).** Reuses the pure-TS engine + `graph.json` unchanged; native MapLibre map. Supersedes the spec's web/Next.js assumption. | Plan 3 |
+| — | Basemap (3a) | OpenFreeMap style (no token), edges drawn on top | Plan 3a |
+| — | Graph delivery (MVP) | Bundle `graph.json` as an Expo asset (offline); runtime download deferred | Plan 3 |
 | §11.C | Edge-split granularity | 10–15 m in hilly areas | Plan 2 |
 | — | Testing | Strict TDD (test-first, bite-sized commits) | all plans |
 
