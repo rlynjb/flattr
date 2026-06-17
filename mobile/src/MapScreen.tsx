@@ -90,12 +90,14 @@ export function MapScreen(): React.JSX.Element {
     <View style={styles.root}>
       <Map style={styles.map} mapStyle={STYLE_URL} onPress={handlePress}>
         <Camera bounds={bboxToCameraBounds(graph.bbox)} />
+        {/* distinct `key` per branch: MapLibre freezes source/layer `id`, so React must
+            unmount one and mount the other on toggle, not mutate the id in place. */}
         {view === "edges" ? (
-          <GeoJSONSource id="edges" data={heatmap as unknown as GeoJSON.FeatureCollection}>
+          <GeoJSONSource key="src-edges" id="edges" data={heatmap as unknown as GeoJSON.FeatureCollection}>
             <Layer id="edge-lines" type="line" style={{ lineColor: ["get", "color"], lineWidth: 2 }} />
           </GeoJSONSource>
         ) : (
-          <GeoJSONSource id="zones" data={zonesFC as unknown as GeoJSON.FeatureCollection}>
+          <GeoJSONSource key="src-zones" id="zones" data={zonesFC as unknown as GeoJSON.FeatureCollection}>
             <Layer id="zone-fill" type="fill" style={{ fillColor: ["get", "color"], fillOpacity: 0.5 }} />
           </GeoJSONSource>
         )}
