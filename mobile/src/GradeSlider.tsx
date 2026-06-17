@@ -2,7 +2,7 @@
 import React from "react";
 import { View, Text, Pressable, StyleSheet } from "react-native";
 import Slider from "@react-native-community/slider";
-import { USERMAX_PRESETS } from "../../features/grade/classify";
+import { USERMAX_PRESETS } from "features/grade/classify";
 
 export function GradeSlider({
   userMax,

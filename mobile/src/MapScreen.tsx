@@ -7,12 +7,12 @@ import {
   routeToGeoJSON,
   zonesToGeoJSON,
   bboxToCameraBounds,
-} from "../../features/map/geojson";
-import { bandsForUserMax } from "../../features/grade/classify";
-import { computeZones } from "../../features/grade/zones";
-import { nearestNode } from "../../features/routing/nearest";
-import { directedAstar } from "../../features/routing/astar";
-import { routeSummary, type RouteSummary } from "../../features/routing/summary";
+} from "features/map/geojson";
+import { bandsForUserMax } from "features/grade/classify";
+import { computeZones } from "features/grade/zones";
+import { nearestNode } from "features/routing/nearest";
+import { directedAstar } from "features/routing/astar";
+import { routeSummary, type RouteSummary } from "features/routing/summary";
 import { loadGraph } from "./loadGraph";
 import { GradeSlider } from "./GradeSlider";
 import { RouteSummaryCard } from "./RouteSummaryCard";

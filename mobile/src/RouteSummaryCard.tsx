@@ -1,7 +1,7 @@
 // mobile/src/RouteSummaryCard.tsx — honest route status (clean / flattest-but-steep / no route).
 import React from "react";
 import { View, Text, StyleSheet } from "react-native";
-import type { RouteSummary } from "../../features/routing/summary";
+import type { RouteSummary } from "features/routing/summary";
 
 export function RouteSummaryCard({
   found,
