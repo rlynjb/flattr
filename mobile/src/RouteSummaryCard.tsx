@@ -42,7 +42,8 @@ export function RouteSummaryCard({
 }
 
 const styles = StyleSheet.create({
-  card: { position: "absolute", top: 12, left: 12, right: 12, borderRadius: 10, padding: 10 },
+  // Bottom (above the slider) so it never covers the top-right edges/zones toggle.
+  card: { position: "absolute", bottom: 150, left: 12, right: 12, borderRadius: 10, padding: 10 },
   ok: { backgroundColor: "rgba(46,158,63,0.92)" },
   warn: { backgroundColor: "rgba(232,181,0,0.95)" },
   bad: { backgroundColor: "rgba(210,59,46,0.92)" },
