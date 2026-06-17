@@ -16,6 +16,7 @@ import { routeSummary, type RouteSummary } from "features/routing/summary";
 import { loadGraph } from "./loadGraph";
 import { GradeSlider } from "./GradeSlider";
 import { RouteSummaryCard } from "./RouteSummaryCard";
+import { Legend } from "./Legend";
 
 const STYLE_URL = "https://tiles.openfreemap.org/styles/liberty";
 const DEFAULT_USERMAX = 8;
@@ -122,6 +123,7 @@ export function MapScreen(): React.JSX.Element {
         ))}
       </View>
 
+      <Legend userMax={userMax} />
       {showCard && <RouteSummaryCard found={routed.found} summary={routed.summary} userMax={userMax} />}
       <GradeSlider userMax={userMax} onChange={setUserMax} />
     </View>
