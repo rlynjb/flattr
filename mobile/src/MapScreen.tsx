@@ -1,7 +1,7 @@
 // mobile/src/MapScreen.tsx — heatmap/zones toggle + tap-to-route + slider + honesty card.
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { View, Text, Pressable, StyleSheet } from "react-native";
-import { Map, Camera, GeoJSONSource, Layer, Marker } from "@maplibre/maplibre-react-native";
+import { Map, Camera, GeoJSONSource, Layer, Marker, type CameraRef } from "@maplibre/maplibre-react-native";
 import * as Location from "expo-location";
 import {
   graphToGeoJSON,
@@ -41,25 +41,27 @@ export function MapScreen(): React.JSX.Element {
   const [endId, setEndId] = useState<string | null>(null);
   const [view, setView] = useState<"edges" | "zones">("edges");
   const [userLoc, setUserLoc] = useState<[number, number] | null>(null); // [lng, lat]
+  const cameraRef = useRef<CameraRef>(null);
 
-  // Locate the phone on launch; center the map there. Falls back to the data
-  // area (graph.bbox) if permission is denied or no fix is available.
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const { status } = await Location.requestForegroundPermissionsAsync();
-        if (status !== "granted") return;
-        const pos = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced });
-        if (!cancelled) setUserLoc([pos.coords.longitude, pos.coords.latitude]);
-      } catch {
-        // ignore — keep the bbox fallback
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
+  // Fetch the phone's current location. `recenter` animates the camera to it (for
+  // the locate button); at launch we just set userLoc and the Camera centers via prop.
+  const locate = useCallback(async (recenter: boolean) => {
+    try {
+      const { status } = await Location.requestForegroundPermissionsAsync();
+      if (status !== "granted") return;
+      const pos = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced });
+      const c: [number, number] = [pos.coords.longitude, pos.coords.latitude];
+      setUserLoc(c);
+      if (recenter) cameraRef.current?.easeTo({ center: c, zoom: 15, duration: 600 });
+    } catch {
+      // ignore — keep the bbox fallback
+    }
   }, []);
+
+  // Locate on launch (centers the map there; falls back to the data area if denied).
+  useEffect(() => {
+    locate(false);
+  }, [locate]);
 
   const heatmap = useMemo(
     () => (graph ? graphToGeoJSON(graph, bandsForUserMax(userMax)) : null),
@@ -116,9 +118,9 @@ export function MapScreen(): React.JSX.Element {
     <View style={styles.root}>
       <Map style={styles.map} mapStyle={STYLE_URL} onPress={handlePress} onRegionDidChange={onRegionDidChange}>
         {userLoc ? (
-          <Camera center={userLoc} zoom={15} />
+          <Camera ref={cameraRef} center={userLoc} zoom={15} />
         ) : (
-          <Camera bounds={bboxToCameraBounds(graph.bbox)} />
+          <Camera ref={cameraRef} bounds={bboxToCameraBounds(graph.bbox)} />
         )}
         {/* distinct `key` per branch: MapLibre freezes source/layer `id`, so React must
             unmount one and mount the other on toggle, not mutate the id in place. */}
@@ -163,6 +165,9 @@ export function MapScreen(): React.JSX.Element {
         </View>
       )}
       <Legend userMax={userMax} />
+      <Pressable style={styles.locate} onPress={() => locate(true)} accessibilityLabel="Center on my location">
+        <Text style={styles.locateIcon}>◎</Text>
+      </Pressable>
       {showCard && <RouteSummaryCard found={routed.found} summary={routed.summary} userMax={userMax} />}
       <GradeSlider userMax={userMax} onChange={setUserMax} />
     </View>
@@ -186,6 +191,19 @@ const styles = StyleSheet.create({
     paddingHorizontal: 14,
   },
   loadingText: { color: "#fff", fontSize: 12 },
+  locate: {
+    position: "absolute",
+    right: 16,
+    bottom: 90,
+    width: 48,
+    height: 48,
+    borderRadius: 24,
+    backgroundColor: "rgba(255,255,255,0.95)",
+    alignItems: "center",
+    justifyContent: "center",
+    elevation: 4,
+  },
+  locateIcon: { fontSize: 24, color: "#1565c0" },
   toggle: {
     position: "absolute",
     top: 196, // below the slider panel (now at the top)
