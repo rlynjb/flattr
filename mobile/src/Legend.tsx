@@ -31,7 +31,7 @@ export function Legend({ userMax }: { userMax: number }): React.JSX.Element {
 const styles = StyleSheet.create({
   panel: {
     position: "absolute",
-    top: 56,
+    top: 196, // below the slider panel (now at the top)
     left: 12,
     backgroundColor: "rgba(255,255,255,0.92)",
     borderRadius: 10,

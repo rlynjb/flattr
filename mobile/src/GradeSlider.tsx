@@ -42,7 +42,7 @@ const styles = StyleSheet.create({
     position: "absolute",
     left: 12,
     right: 12,
-    bottom: 24,
+    top: 44, // top, not bottom — the bottom overlaps the Android navigation bar
     backgroundColor: "rgba(255,255,255,0.94)",
     borderRadius: 12,
     padding: 12,

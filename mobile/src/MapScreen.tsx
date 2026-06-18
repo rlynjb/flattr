@@ -138,7 +138,7 @@ const styles = StyleSheet.create({
   pin: { width: 16, height: 16, borderRadius: 8, borderWidth: 2, borderColor: "#fff" },
   toggle: {
     position: "absolute",
-    top: 64,
+    top: 196, // below the slider panel (now at the top)
     right: 12,
     flexDirection: "row",
     borderRadius: 8,
