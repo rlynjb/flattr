@@ -63,6 +63,13 @@ export function MapScreen(): React.JSX.Element {
     locate(false);
   }, [locate]);
 
+  // Locate button: snap to the last-known location immediately (responsive), then
+  // refresh from GPS in the background and ease to the fresh fix if it moved.
+  const recenter = useCallback(() => {
+    if (userLoc) cameraRef.current?.easeTo({ center: userLoc, zoom: 15, duration: 500 });
+    locate(true);
+  }, [userLoc, locate]);
+
   const heatmap = useMemo(
     () => (graph ? graphToGeoJSON(graph, bandsForUserMax(userMax)) : null),
     [graph, userMax]
@@ -165,7 +172,7 @@ export function MapScreen(): React.JSX.Element {
         </View>
       )}
       <Legend userMax={userMax} />
-      <Pressable style={styles.locate} onPress={() => locate(true)} accessibilityLabel="Center on my location">
+      <Pressable style={styles.locate} onPress={recenter} accessibilityLabel="Center on my location">
         <Text style={styles.locateIcon}>◎</Text>
       </Pressable>
       {showCard && <RouteSummaryCard found={routed.found} summary={routed.summary} userMax={userMax} />}
