@@ -1,7 +1,7 @@
 {
   "expo": {
-    "name": "mobile",
-    "slug": "mobile",
+    "name": "flattr",
+    "slug": "flattr",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
@@ -11,10 +11,8 @@
     },
     "android": {
       "adaptiveIcon": {
-        "backgroundColor": "#E6F4FE",
-        "foregroundImage": "./assets/android-icon-foreground.png",
-        "backgroundImage": "./assets/android-icon-background.png",
-        "monochromeImage": "./assets/android-icon-monochrome.png"
+        "backgroundColor": "#000000",
+        "foregroundImage": "./assets/android-icon-foreground.png"
       },
       "predictiveBackGestureEnabled": false,
       "package": "com.anonymous.mobile"
@@ -27,7 +25,7 @@
       [
         "expo-location",
         {
-          "locationWhenInUsePermission": "flatr uses your location to center the map where you are."
+          "locationWhenInUsePermission": "flattr uses your location to center the map where you are."
         }
       ]
     ]
