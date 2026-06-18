@@ -46,6 +46,5 @@ export function bandsForUserMax(userMax: number): Bands {
 export const USERMAX_PRESETS: { label: string; userMax: number }[] = [
   { label: "Kick scooter", userMax: 5 },
   { label: "Walking", userMax: 8 },
-  { label: "Strict", userMax: 5 },
   { label: "Any", userMax: 15 },
 ];
