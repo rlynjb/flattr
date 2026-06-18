@@ -1,6 +1,6 @@
 // mobile/src/MapScreen.tsx — heatmap/zones toggle + tap-to-route + slider + honesty card.
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { View, Text, Pressable, ActivityIndicator, StyleSheet } from "react-native";
+import { View, Text, Pressable, ActivityIndicator, StatusBar, StyleSheet } from "react-native";
 import { Map, Camera, GeoJSONSource, Layer, Marker, type CameraRef } from "@maplibre/maplibre-react-native";
 import * as Location from "expo-location";
 import { graphToGeoJSON, routeToGeoJSON, zonesToGeoJSON } from "features/map/geojson";
@@ -21,6 +21,7 @@ import { AddressBar } from "./AddressBar";
 const STYLE_URL = "https://tiles.openfreemap.org/styles/liberty";
 const DEFAULT_USERMAX = 8;
 const GRID_N = 16;
+const STATUS_BAR_INSET = StatusBar.currentHeight ?? 24; // keep overlays below the phone status bar
 
 export function MapScreen(): React.JSX.Element {
   // Bundled area is the base tile; panning loads more tiles and merges them in.
@@ -175,30 +176,33 @@ export function MapScreen(): React.JSX.Element {
         )}
       </Map>
 
-      <View style={styles.toggle}>
-        {(["edges", "zones"] as const).map((v) => (
-          <Pressable key={v} onPress={() => setView(v)} style={[styles.toggleBtn, view === v && styles.toggleOn]}>
-            <Text style={[styles.toggleText, view === v && styles.toggleTextOn]}>{v}</Text>
-          </Pressable>
-        ))}
-      </View>
-
-      {loadingStep && (
-        <View style={styles.loadingOverlay} pointerEvents="none">
-          <View style={styles.loadingCard}>
-            <ActivityIndicator size="large" color="#fff" />
-            <Text style={styles.loadingTitle}>Loading grades</Text>
-            <Text style={styles.loadingStep}>{loadingStep}…</Text>
-          </View>
+      {/* All overlays sit in a status-bar-inset layer; box-none lets map gestures pass through. */}
+      <View style={styles.overlays} pointerEvents="box-none">
+        <View style={styles.toggle}>
+          {(["edges", "zones"] as const).map((v) => (
+            <Pressable key={v} onPress={() => setView(v)} style={[styles.toggleBtn, view === v && styles.toggleOn]}>
+              <Text style={[styles.toggleText, view === v && styles.toggleTextOn]}>{v}</Text>
+            </Pressable>
+          ))}
         </View>
-      )}
-      <AddressBar onRoute={handleRoute} busy={routeBusy} error={routeError} />
-      <Legend userMax={userMax} />
-      <Pressable style={styles.locate} onPress={recenter} accessibilityLabel="Center on my location">
-        <Text style={styles.locateIcon}>◎</Text>
-      </Pressable>
-      {showCard && <RouteSummaryCard found={routed.found} summary={routed.summary} userMax={userMax} />}
-      <GradeSlider userMax={userMax} onChange={setUserMax} />
+
+        {loadingStep && (
+          <View style={styles.loadingOverlay} pointerEvents="none">
+            <View style={styles.loadingCard}>
+              <ActivityIndicator size="large" color="#fff" />
+              <Text style={styles.loadingTitle}>Loading grades</Text>
+              <Text style={styles.loadingStep}>{loadingStep}…</Text>
+            </View>
+          </View>
+        )}
+        <AddressBar onRoute={handleRoute} busy={routeBusy} error={routeError} />
+        <Legend userMax={userMax} />
+        <Pressable style={styles.locate} onPress={recenter} accessibilityLabel="Center on my location">
+          <Text style={styles.locateIcon}>◎</Text>
+        </Pressable>
+        {showCard && <RouteSummaryCard found={routed.found} summary={routed.summary} userMax={userMax} />}
+        <GradeSlider userMax={userMax} onChange={setUserMax} />
+      </View>
     </View>
   );
 }
@@ -206,6 +210,7 @@ export function MapScreen(): React.JSX.Element {
 const styles = StyleSheet.create({
   root: { flex: 1 },
   map: { flex: 1 },
+  overlays: { ...StyleSheet.absoluteFillObject, paddingTop: STATUS_BAR_INSET },
   center: { flex: 1, alignItems: "center", justifyContent: "center", padding: 24 },
   error: { color: "#d23b2e", textAlign: "center" },
   pin: { width: 16, height: 16, borderRadius: 8, borderWidth: 2, borderColor: "#fff" },
