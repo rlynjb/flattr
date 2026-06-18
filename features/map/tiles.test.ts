@@ -76,3 +76,43 @@ describe("mergeGraphs", () => {
     expect(r.path!.nodes).toEqual(["t1:A", "t1:B"]);
   });
 });
+
+import { stitchGraph } from "./tiles";
+
+describe("stitchGraph", () => {
+  // Two tiles whose only common point is a shared boundary node (same coords,
+  // different prefixes). Without stitching they're disconnected.
+  function tileWithBoundary(prefix: string): Graph {
+    const inner = { id: "in", lat: 47.62, lng: -122.33, elevationM: 0 };
+    const edge = { id: "edge", lat: 47.625, lng: -122.33, elevationM: 0 }; // SHARED boundary coord
+    const e: Edge = {
+      id: "e", fromNode: "in", toNode: "edge",
+      geometry: [[inner.lat, inner.lng], [edge.lat, edge.lng]],
+      lengthM: 100, riseM: 0, gradePct: 0, absGradePct: 0, kind: "footway",
+    };
+    return prefixGraph(
+      {
+        city: "t", bbox: [-122.34, 47.61, -122.32, 47.63],
+        nodes: { in: inner, edge },
+        edges: [e],
+        adjacency: { in: ["e"], edge: ["e"] },
+      },
+      prefix
+    );
+  }
+
+  it("links coincident cross-tile nodes so a route crosses the seam", () => {
+    const merged = mergeGraphs([tileWithBoundary("t1"), tileWithBoundary("t2")]);
+    // before stitching: t1:in -> t2:in is disconnected
+    expect(dijkstra(merged, "t1:in", "t2:in").path).toBeNull();
+    const stitched = stitchGraph(merged);
+    // after stitching the shared boundary nodes connect the two tiles
+    const r = dijkstra(stitched, "t1:in", "t2:in");
+    expect(r.path).not.toBeNull();
+  });
+
+  it("adds nothing when all coordinates are unique", () => {
+    const g = mergeGraphs([prefixGraph(miniGraph(), "t1")]);
+    expect(stitchGraph(g).edges.length).toBe(g.edges.length);
+  });
+});

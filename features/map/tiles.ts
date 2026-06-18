@@ -37,6 +37,54 @@ export function prefixGraph(graph: Graph, prefix: string): Graph {
   return { ...graph, nodes, edges, adjacency };
 }
 
+/**
+ * Connect nodes that sit at the same coordinate but came from different
+ * independently-built tiles (they have different prefixed ids, so they're not
+ * otherwise linked). Adds zero-length connector edges so routing crosses seams.
+ */
+export function stitchGraph(graph: Graph): Graph {
+  const coordKey = (n: Node) => `${n.lat.toFixed(6)},${n.lng.toFixed(6)}`;
+  const byCoord = new Map<string, string[]>();
+  for (const id of Object.keys(graph.nodes)) {
+    const k = coordKey(graph.nodes[id]);
+    const list = byCoord.get(k);
+    if (list) list.push(id);
+    else byCoord.set(k, [id]);
+  }
+
+  const edges: Edge[] = [...graph.edges];
+  const adjacency: Record<string, string[]> = {};
+  for (const id of Object.keys(graph.adjacency)) adjacency[id] = [...graph.adjacency[id]];
+
+  let n = 0;
+  for (const ids of byCoord.values()) {
+    if (ids.length < 2) continue; // unique coordinate — nothing to stitch
+    const a = ids[0];
+    const node = graph.nodes[a];
+    for (let i = 1; i < ids.length; i++) {
+      const b = ids[i];
+      const id = `stitch${n++}`;
+      edges.push({
+        id,
+        fromNode: a,
+        toNode: b,
+        geometry: [
+          [node.lat, node.lng],
+          [node.lat, node.lng],
+        ],
+        lengthM: 0,
+        riseM: 0,
+        gradePct: 0,
+        absGradePct: 0,
+        kind: "footway",
+      });
+      (adjacency[a] ??= []).push(id);
+      (adjacency[b] ??= []).push(id);
+    }
+  }
+  return { ...graph, edges, adjacency };
+}
+
 /** Combine prefixed graphs into one (display + within-tile routing). Unions bbox. */
 export function mergeGraphs(graphs: Graph[]): Graph {
   const nodes: Record<string, Node> = {};

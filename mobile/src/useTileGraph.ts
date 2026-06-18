@@ -5,7 +5,7 @@
 // the free Overpass/Open-Meteo rate limits; tiles are cached and LRU-capped.
 import { useCallback, useMemo, useRef, useState } from "react";
 import type { Graph } from "features/routing/types";
-import { tileKeyOf, tileBbox, prefixGraph, mergeGraphs } from "features/map/tiles";
+import { tileKeyOf, tileBbox, prefixGraph, mergeGraphs, stitchGraph } from "features/map/tiles";
 import { fetchOverpass } from "pipeline/overpass";
 import { buildGraph } from "pipeline/build-graph";
 import { openMeteoProvider } from "pipeline/elevation";
@@ -41,7 +41,8 @@ export function useTileGraph(baseGraph: Graph | null): {
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const graph = useMemo(
-    () => (baseGraph ? mergeGraphs([baseGraph, ...tiles.map((t) => t.graph)]) : null),
+    // stitch coincident boundary nodes so routing crosses tile/base seams.
+    () => (baseGraph ? stitchGraph(mergeGraphs([baseGraph, ...tiles.map((t) => t.graph)])) : null),
     [baseGraph, tiles]
   );
 
