@@ -210,7 +210,8 @@ export function MapScreen(): React.JSX.Element {
 const styles = StyleSheet.create({
   root: { flex: 1 },
   map: { flex: 1 },
-  overlays: { ...StyleSheet.absoluteFillObject, paddingTop: STATUS_BAR_INSET },
+  // top offset (not paddingTop): absolute children ignore padding, so shift the box itself.
+  overlays: { position: "absolute", top: STATUS_BAR_INSET, left: 0, right: 0, bottom: 0 },
   center: { flex: 1, alignItems: "center", justifyContent: "center", padding: 24 },
   error: { color: "#d23b2e", textAlign: "center" },
   pin: { width: 16, height: 16, borderRadius: 8, borderWidth: 2, borderColor: "#fff" },
