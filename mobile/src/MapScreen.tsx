@@ -235,6 +235,9 @@ export function MapScreen(): React.JSX.Element {
   };
 
   const showCard = startId != null && endId != null;
+  // While the autocomplete dropdown is open it expands down over the map; hide the
+  // other fixed-offset panels so they don't render on top of the suggestion rows.
+  const searching = suggestField != null && suggestions.length > 0;
 
   return (
     <View style={styles.root}>
@@ -271,13 +274,15 @@ export function MapScreen(): React.JSX.Element {
 
       {/* All overlays sit in a status-bar-inset layer; box-none lets map gestures pass through. */}
       <View style={styles.overlays} pointerEvents="box-none">
-        <View style={styles.toggle}>
-          {(["edges", "zones"] as const).map((v) => (
-            <Pressable key={v} onPress={() => setView(v)} style={[styles.toggleBtn, view === v && styles.toggleOn]}>
-              <Text style={[styles.toggleText, view === v && styles.toggleTextOn]}>{v}</Text>
-            </Pressable>
-          ))}
-        </View>
+        {!searching && (
+          <View style={styles.toggle}>
+            {(["edges", "zones"] as const).map((v) => (
+              <Pressable key={v} onPress={() => setView(v)} style={[styles.toggleBtn, view === v && styles.toggleOn]}>
+                <Text style={[styles.toggleText, view === v && styles.toggleTextOn]}>{v}</Text>
+              </Pressable>
+            ))}
+          </View>
+        )}
 
         {loadingStep && (
           <View style={styles.loadingOverlay} pointerEvents="none">
@@ -309,12 +314,16 @@ export function MapScreen(): React.JSX.Element {
           busy={routeBusy}
           error={routeError}
         />
-        <Legend userMax={userMax} />
-        <Pressable style={styles.locate} onPress={recenter} accessibilityLabel="Center on my location">
-          <Text style={styles.locateIcon}>◎</Text>
-        </Pressable>
-        {showCard && <RouteSummaryCard found={routed.found} summary={routed.summary} userMax={userMax} />}
-        <GradeSlider userMax={userMax} onChange={setUserMax} />
+        {!searching && <Legend userMax={userMax} />}
+        {!searching && (
+          <Pressable style={styles.locate} onPress={recenter} accessibilityLabel="Center on my location">
+            <Text style={styles.locateIcon}>◎</Text>
+          </Pressable>
+        )}
+        {!searching && showCard && (
+          <RouteSummaryCard found={routed.found} summary={routed.summary} userMax={userMax} />
+        )}
+        {!searching && <GradeSlider userMax={userMax} onChange={setUserMax} />}
       </View>
     </View>
   );
