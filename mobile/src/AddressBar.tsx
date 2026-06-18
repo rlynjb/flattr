@@ -1,5 +1,6 @@
 // mobile/src/AddressBar.tsx — From/To address inputs + Route button. Controlled by
 // MapScreen so a map tap (after focusing a field) can auto-fill the address.
+// The From field has a "use current location" button on its right.
 import React from "react";
 import { View, TextInput, Pressable, Text, StyleSheet } from "react-native";
 
@@ -12,6 +13,7 @@ export function AddressBar({
   onToChange,
   onFocusField,
   activeField,
+  onUseCurrentLocation,
   onRoute,
   busy,
   error,
@@ -22,6 +24,7 @@ export function AddressBar({
   onToChange: (t: string) => void;
   onFocusField: (f: Field) => void;
   activeField: Field | null;
+  onUseCurrentLocation: () => void;
   onRoute: (from: string, to: string) => void;
   busy: boolean;
   error: string | null;
@@ -35,18 +38,23 @@ export function AddressBar({
         : null;
   return (
     <View style={styles.bar}>
+      <View style={styles.fieldRow}>
+        <TextInput
+          style={[styles.input, activeField === "from" && styles.inputActive]}
+          placeholder="From address"
+          placeholderTextColor="#888"
+          value={fromText}
+          onChangeText={onFromChange}
+          onFocus={() => onFocusField("from")}
+          autoCapitalize="none"
+          returnKeyType="next"
+        />
+        <Pressable style={styles.locBtn} onPress={onUseCurrentLocation} accessibilityLabel="Use current location">
+          <Text style={styles.locIcon}>◎</Text>
+        </Pressable>
+      </View>
       <TextInput
-        style={[styles.input, activeField === "from" && styles.inputActive]}
-        placeholder="From address"
-        placeholderTextColor="#888"
-        value={fromText}
-        onChangeText={onFromChange}
-        onFocus={() => onFocusField("from")}
-        autoCapitalize="none"
-        returnKeyType="next"
-      />
-      <TextInput
-        style={[styles.input, activeField === "to" && styles.inputActive]}
+        style={[styles.input, styles.toInput, activeField === "to" && styles.inputActive]}
         placeholder="To address"
         placeholderTextColor="#888"
         value={toText}
@@ -82,18 +90,30 @@ const styles = StyleSheet.create({
     borderRadius: 12,
     padding: 8,
   },
+  fieldRow: { flexDirection: "row", alignItems: "center", marginBottom: 6 },
   input: {
+    flex: 1,
     backgroundColor: "#f1f3f5",
     borderRadius: 8,
     paddingHorizontal: 10,
     paddingVertical: 8,
     fontSize: 14,
-    marginBottom: 6,
     color: "#111",
     borderWidth: 1,
     borderColor: "transparent",
   },
+  toInput: { marginBottom: 6 },
   inputActive: { borderColor: "#1565c0", backgroundColor: "#eaf2ff" },
+  locBtn: {
+    marginLeft: 6,
+    width: 40,
+    height: 39,
+    borderRadius: 8,
+    backgroundColor: "#1565c0",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  locIcon: { color: "#fff", fontSize: 18 },
   row: { flexDirection: "row", alignItems: "center" },
   hint: { flex: 1, color: "#1565c0", fontSize: 12, marginRight: 8 },
   error: { color: "#d23b2e" },

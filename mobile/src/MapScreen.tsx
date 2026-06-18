@@ -55,16 +55,17 @@ export function MapScreen(): React.JSX.Element {
 
   // Fetch the phone's current location. `recenter` animates the camera to it (for
   // the locate button); at launch we just set userLoc and the Camera centers via prop.
-  const locate = useCallback(async (recenter: boolean) => {
+  const locate = useCallback(async (recenter: boolean): Promise<[number, number] | null> => {
     try {
       const { status } = await Location.requestForegroundPermissionsAsync();
-      if (status !== "granted") return;
+      if (status !== "granted") return null;
       const pos = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced });
       const c: [number, number] = [pos.coords.longitude, pos.coords.latitude];
       setUserLoc(c);
       if (recenter) cameraRef.current?.easeTo({ center: c, zoom: 15, duration: 600 });
+      return c;
     } catch {
-      // ignore — keep the bbox fallback
+      return null; // keep the bbox fallback
     }
   }, []);
 
@@ -115,16 +116,28 @@ export function MapScreen(): React.JSX.Element {
     setRouteError(null);
     try {
       const viewbox = baseGraph?.bbox; // bias results toward the covered area
-      const a = await geocode(from, { viewbox });
+      // "Current location" From keeps its already-set GPS node (not geocodable).
+      let sId = startId;
+      if (from.trim() !== "Current location" || !sId) {
+        const a = await geocode(from, { viewbox });
+        if (!a) {
+          setRouteError("From not found");
+          return;
+        }
+        sId = nearestNode(graph, { lat: a.lat, lng: a.lng });
+      }
       const b = await geocode(to, { viewbox }); // sequential: Nominatim allows ~1 req/sec
-      if (!a || !b) {
-        setRouteError(!a && !b ? "Both addresses not found" : !a ? "From not found" : "To not found");
+      if (!b) {
+        setRouteError("To not found");
         return;
       }
-      setStartId(nearestNode(graph, { lat: a.lat, lng: a.lng }));
-      setEndId(nearestNode(graph, { lat: b.lat, lng: b.lng }));
+      const eId = nearestNode(graph, { lat: b.lat, lng: b.lng });
+      setStartId(sId);
+      setEndId(eId);
+      const s = graph.nodes[sId];
+      const e = graph.nodes[eId];
       cameraRef.current?.easeTo({
-        center: [(a.lng + b.lng) / 2, (a.lat + b.lat) / 2],
+        center: [(s.lng + e.lng) / 2, (s.lat + e.lat) / 2],
         zoom: 14,
         duration: 600,
       });
@@ -133,6 +146,21 @@ export function MapScreen(): React.JSX.Element {
     } finally {
       setRouteBusy(false);
     }
+  };
+
+  // "Use current location" for the From field: snap the GPS fix to a node + set text.
+  const handleUseCurrentLocation = async () => {
+    setRouteError(null);
+    const c = userLoc ?? (await locate(true));
+    if (!c) {
+      setRouteError("Location unavailable");
+      return;
+    }
+    const [lng, lat] = c;
+    setStartId(nearestNode(graph, { lat, lng }));
+    setFromText("Current location");
+    setActiveField(null);
+    cameraRef.current?.easeTo({ center: c, zoom: 15, duration: 500 });
   };
 
   // With a field focused, a map tap sets that endpoint and reverse-geocodes the
@@ -223,6 +251,7 @@ export function MapScreen(): React.JSX.Element {
           onToChange={setToText}
           onFocusField={setActiveField}
           activeField={activeField}
+          onUseCurrentLocation={handleUseCurrentLocation}
           onRoute={handleRoute}
           busy={routeBusy}
           error={routeError}
