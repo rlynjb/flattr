@@ -32,7 +32,7 @@ export function MapScreen(): React.JSX.Element {
       return null;
     }
   }, []);
-  const { graph, loadingStep, onRegionDidChange } = useTileGraph(baseGraph);
+  const { graph, loadingStep, onRegionDidChange, ensureBbox } = useTileGraph(baseGraph);
 
   // Center of the bundled base area — the camera's initial/fallback target so it
   // never opens at world view before the GPS fix lands.
@@ -50,8 +50,10 @@ export function MapScreen(): React.JSX.Element {
   }, [baseCenter]);
 
   const [userMax, setUserMax] = useState(DEFAULT_USERMAX);
-  const [startId, setStartId] = useState<string | null>(null);
-  const [endId, setEndId] = useState<string | null>(null);
+  // Endpoints are stored as COORDINATES, not node ids: the nearest node is re-derived
+  // from the current graph, so endpoints re-snap correctly as route-corridor tiles load.
+  const [startPt, setStartPt] = useState<{ lat: number; lng: number } | null>(null);
+  const [endPt, setEndPt] = useState<{ lat: number; lng: number } | null>(null);
   const [view, setView] = useState<"edges" | "zones">("edges");
   const [userLoc, setUserLoc] = useState<[number, number] | null>(null); // [lng, lat]
   const [routeBusy, setRouteBusy] = useState(false);
@@ -118,6 +120,25 @@ export function MapScreen(): React.JSX.Element {
   const zoneCells = useMemo(() => (graph ? computeZones(graph, GRID_N) : []), [graph]);
   const zonesFC = useMemo(() => zonesToGeoJSON(zoneCells, userMax), [zoneCells, userMax]);
 
+  // Re-snap each endpoint coordinate to the nearest node in the CURRENT graph, so the
+  // ids track as corridor tiles load (a closer/real node may appear mid-load).
+  const startId = useMemo(() => (graph && startPt ? nearestNode(graph, startPt) : null), [graph, startPt]);
+  const endId = useMemo(() => (graph && endPt ? nearestNode(graph, endPt) : null), [graph, endPt]);
+
+  // When both endpoints are set, bulk-load every tile spanning them (+ a tile of
+  // margin) so the graph is connected end-to-end — otherwise distant start/end land
+  // in separate components and routing fails with "no route".
+  useEffect(() => {
+    if (!startPt || !endPt) return;
+    const M = 0.004; // ~1 tile of margin so the route can bow around obstacles
+    ensureBbox([
+      Math.min(startPt.lng, endPt.lng) - M,
+      Math.min(startPt.lat, endPt.lat) - M,
+      Math.max(startPt.lng, endPt.lng) + M,
+      Math.max(startPt.lat, endPt.lat) + M,
+    ]);
+  }, [startPt, endPt, ensureBbox]);
+
   // One directedAstar call -> route line + summary + found flag.
   const routed = useMemo(() => {
     if (!graph || !startId || !endId) {
@@ -140,34 +161,33 @@ export function MapScreen(): React.JSX.Element {
     );
   }
 
-  // Geocode From/To addresses, snap each to the nearest graph node, and route.
+  // Geocode From/To addresses to coordinates, then route. Corridor tiles load via the
+  // endpoint effect; the route appears once the graph connects start to end.
   const handleRoute = async (from: string, to: string) => {
     setRouteBusy(true);
     setRouteError(null);
     try {
       const viewbox = baseGraph?.bbox; // bias results toward the covered area
-      // "Current location" From keeps its already-set GPS node (not geocodable).
-      let sId = startId;
-      if (from.trim() !== "Current location" || !sId) {
+      // "Current location" From keeps its already-set GPS point (not geocodable).
+      let sPt = startPt;
+      if (from.trim() !== "Current location" || !sPt) {
         const a = await geocode(from, { viewbox });
         if (!a) {
           setRouteError("From not found");
           return;
         }
-        sId = nearestNode(graph, { lat: a.lat, lng: a.lng });
+        sPt = { lat: a.lat, lng: a.lng };
       }
       const b = await geocode(to, { viewbox }); // sequential: Nominatim allows ~1 req/sec
       if (!b) {
         setRouteError("To not found");
         return;
       }
-      const eId = nearestNode(graph, { lat: b.lat, lng: b.lng });
-      setStartId(sId);
-      setEndId(eId);
-      const s = graph.nodes[sId];
-      const e = graph.nodes[eId];
+      const ePt = { lat: b.lat, lng: b.lng };
+      setStartPt(sPt);
+      setEndPt(ePt);
       cameraRef.current?.easeTo({
-        center: [(s.lng + e.lng) / 2, (s.lat + e.lat) / 2],
+        center: [(sPt.lng + ePt.lng) / 2, (sPt.lat + ePt.lat) / 2],
         zoom: 14,
         duration: 600,
       });
@@ -178,7 +198,7 @@ export function MapScreen(): React.JSX.Element {
     }
   };
 
-  // "Use current location" for the From field: snap the GPS fix to a node + set text.
+  // "Use current location" for the From field: store the GPS point + set text.
   const handleUseCurrentLocation = async () => {
     setRouteError(null);
     const c = userLoc ?? (await locate(true));
@@ -187,7 +207,7 @@ export function MapScreen(): React.JSX.Element {
       return;
     }
     const [lng, lat] = c;
-    setStartId(nearestNode(graph, { lat, lng }));
+    setStartPt({ lat, lng });
     setFromText("Current location");
     setActiveField(null);
     cameraRef.current?.easeTo({ center: c, zoom: 15, duration: 500 });
@@ -200,8 +220,8 @@ export function MapScreen(): React.JSX.Element {
     const field = activeField;
     const [lng, lat] = event.nativeEvent.lngLat;
     const setText = field === "from" ? setFromText : setToText;
-    if (field === "from") setStartId(nearestNode(graph, { lat, lng }));
-    else setEndId(nearestNode(graph, { lat, lng }));
+    if (field === "from") setStartPt({ lat, lng });
+    else setEndPt({ lat, lng });
     setText("Locating…");
     setActiveField(null);
     setRouteError(null);
@@ -214,9 +234,8 @@ export function MapScreen(): React.JSX.Element {
   // Pick an autocomplete suggestion: fill the field, snap to a node, recenter.
   const onSelectSuggestion = (field: Field, r: GeocodeResult) => {
     (field === "from" ? setFromText : setToText)(r.label);
-    const id = nearestNode(graph, { lat: r.lat, lng: r.lng });
-    if (field === "from") setStartId(id);
-    else setEndId(id);
+    if (field === "from") setStartPt({ lat: r.lat, lng: r.lng });
+    else setEndPt({ lat: r.lat, lng: r.lng });
     setSuggestions([]);
     setSuggestField(null);
     setActiveField(null);
@@ -320,7 +339,7 @@ export function MapScreen(): React.JSX.Element {
             <Text style={styles.locateIcon}>◎</Text>
           </Pressable>
         )}
-        {!searching && showCard && (
+        {!searching && showCard && (routed.found || !loadingStep) && (
           <RouteSummaryCard found={routed.found} summary={routed.summary} userMax={userMax} />
         )}
         {!searching && <GradeSlider userMax={userMax} onChange={setUserMax} />}
