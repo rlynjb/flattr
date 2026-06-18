@@ -13,7 +13,11 @@ const MAX_TILES = 24; // LRU cap to bound memory/render cost (smaller tiles -> k
 const MAX_SEG_M = 90; // match the ~90m free DEM (see pipeline)
 const DEDUPE = 0.0008; // ~90m sample dedup (rate-limit friendly)
 
-export type RegionEvent = { nativeEvent: { center: [number, number] } };
+export type RegionEvent = {
+  nativeEvent: { center: [number, number]; bounds?: [number, number, number, number] };
+};
+
+const MAX_LOAD_SPAN_DEG = 0.06; // ~a few km; don't load tiles when zoomed further out
 
 export function useTileGraph(baseGraph: Graph | null): {
   graph: Graph | null;
@@ -75,7 +79,11 @@ export function useTileGraph(baseGraph: Graph | null): {
 
   const onRegionDidChange = useCallback(
     (e: RegionEvent) => {
-      const [lng, lat] = e.nativeEvent.center;
+      const { center, bounds } = e.nativeEvent;
+      if (bounds && (bounds[2] - bounds[0] > MAX_LOAD_SPAN_DEG || bounds[3] - bounds[1] > MAX_LOAD_SPAN_DEG)) {
+        return; // zoomed out too far (e.g. world view before GPS) — don't load
+      }
+      const [lng, lat] = center;
       if (coveredByBase(lng, lat)) return;
       const key = tileKeyOf(lng, lat);
       if (loadedRef.current.has(key) || loadingRef.current.has(key)) return;

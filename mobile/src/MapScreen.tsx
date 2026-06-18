@@ -3,12 +3,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { View, Text, Pressable, ActivityIndicator, StyleSheet } from "react-native";
 import { Map, Camera, GeoJSONSource, Layer, Marker, type CameraRef } from "@maplibre/maplibre-react-native";
 import * as Location from "expo-location";
-import {
-  graphToGeoJSON,
-  routeToGeoJSON,
-  zonesToGeoJSON,
-  bboxToCameraBounds,
-} from "features/map/geojson";
+import { graphToGeoJSON, routeToGeoJSON, zonesToGeoJSON } from "features/map/geojson";
 import { bandsForUserMax } from "features/grade/classify";
 import { computeZones } from "features/grade/zones";
 import { nearestNode } from "features/routing/nearest";
@@ -35,6 +30,13 @@ export function MapScreen(): React.JSX.Element {
     }
   }, []);
   const { graph, loadingStep, onRegionDidChange } = useTileGraph(baseGraph);
+
+  // Center of the bundled base area — the camera's initial/fallback target so it
+  // never opens at world view before the GPS fix lands.
+  const baseCenter = useMemo<[number, number]>(() => {
+    const b = baseGraph?.bbox ?? [-122.3284, 47.6181, -122.3214, 47.6241];
+    return [(b[0] + b[2]) / 2, (b[1] + b[3]) / 2];
+  }, [baseGraph]);
 
   const [userMax, setUserMax] = useState(DEFAULT_USERMAX);
   const [startId, setStartId] = useState<string | null>(null);
@@ -124,11 +126,7 @@ export function MapScreen(): React.JSX.Element {
   return (
     <View style={styles.root}>
       <Map style={styles.map} mapStyle={STYLE_URL} onPress={handlePress} onRegionDidChange={onRegionDidChange}>
-        {userLoc ? (
-          <Camera ref={cameraRef} center={userLoc} zoom={15} />
-        ) : (
-          <Camera ref={cameraRef} bounds={bboxToCameraBounds(graph.bbox)} />
-        )}
+        <Camera ref={cameraRef} center={userLoc ?? baseCenter} zoom={userLoc ? 15 : 14} />
         {/* distinct `key` per branch: MapLibre freezes source/layer `id`, so React must
             unmount one and mount the other on toggle, not mutate the id in place. */}
         {view === "edges" ? (
