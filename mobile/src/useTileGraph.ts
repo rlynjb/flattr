@@ -17,11 +17,11 @@ export type RegionEvent = { nativeEvent: { center: [number, number] } };
 
 export function useTileGraph(baseGraph: Graph | null): {
   graph: Graph | null;
-  loadingKey: string | null;
+  loadingStep: string | null;
   onRegionDidChange: (e: RegionEvent) => void;
 } {
   const [tiles, setTiles] = useState<{ key: string; graph: Graph }[]>([]);
-  const [loadingKey, setLoadingKey] = useState<string | null>(null);
+  const [loadingStep, setLoadingStep] = useState<string | null>(null);
   const loadedRef = useRef<Set<string>>(new Set());
   const loadingRef = useRef<Set<string>>(new Set());
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -43,13 +43,19 @@ export function useTileGraph(baseGraph: Graph | null): {
   const loadTile = useCallback(async (key: string) => {
     if (loadedRef.current.has(key) || loadingRef.current.has(key)) return;
     loadingRef.current.add(key);
-    setLoadingKey(key);
+    setLoadingStep("Fetching streets");
     try {
       const bbox = tileBbox(key);
       const osm = await fetchOverpass(bbox);
-      const g = await buildGraph(key, bbox, osm, openMeteoProvider(), MAX_SEG_M, {
-        dedupePrecision: DEDUPE,
-      });
+      const g = await buildGraph(
+        key,
+        bbox,
+        osm,
+        openMeteoProvider(),
+        MAX_SEG_M,
+        { dedupePrecision: DEDUPE },
+        setLoadingStep // live phase updates: Parsing -> Splitting -> Sampling elevation -> Computing grades
+      );
       loadedRef.current.add(key);
       setTiles((prev) => {
         const next = [...prev, { key, graph: prefixGraph(g, key) }];
@@ -63,7 +69,7 @@ export function useTileGraph(baseGraph: Graph | null): {
       // rate-limited / offline — leave the area uncovered; a later pan retries.
     } finally {
       loadingRef.current.delete(key);
-      setLoadingKey((cur) => (cur === key ? null : cur));
+      setLoadingStep(null);
     }
   }, []);
 
@@ -79,5 +85,5 @@ export function useTileGraph(baseGraph: Graph | null): {
     [coveredByBase, loadTile]
   );
 
-  return { graph, loadingKey, onRegionDidChange };
+  return { graph, loadingStep, onRegionDidChange };
 }

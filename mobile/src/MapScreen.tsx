@@ -1,6 +1,6 @@
 // mobile/src/MapScreen.tsx — heatmap/zones toggle + tap-to-route + slider + honesty card.
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { View, Text, Pressable, StyleSheet } from "react-native";
+import { View, Text, Pressable, ActivityIndicator, StyleSheet } from "react-native";
 import { Map, Camera, GeoJSONSource, Layer, Marker, type CameraRef } from "@maplibre/maplibre-react-native";
 import * as Location from "expo-location";
 import {
@@ -34,7 +34,7 @@ export function MapScreen(): React.JSX.Element {
       return null;
     }
   }, []);
-  const { graph, loadingKey, onRegionDidChange } = useTileGraph(baseGraph);
+  const { graph, loadingStep, onRegionDidChange } = useTileGraph(baseGraph);
 
   const [userMax, setUserMax] = useState(DEFAULT_USERMAX);
   const [startId, setStartId] = useState<string | null>(null);
@@ -166,9 +166,13 @@ export function MapScreen(): React.JSX.Element {
         ))}
       </View>
 
-      {loadingKey && (
-        <View style={styles.loading}>
-          <Text style={styles.loadingText}>Loading grades…</Text>
+      {loadingStep && (
+        <View style={styles.loadingOverlay} pointerEvents="none">
+          <View style={styles.loadingCard}>
+            <ActivityIndicator size="large" color="#fff" />
+            <Text style={styles.loadingTitle}>Loading grades</Text>
+            <Text style={styles.loadingStep}>{loadingStep}…</Text>
+          </View>
         </View>
       )}
       <Legend userMax={userMax} />
@@ -188,16 +192,25 @@ const styles = StyleSheet.create({
   error: { color: "#d23b2e", textAlign: "center" },
   pin: { width: 16, height: 16, borderRadius: 8, borderWidth: 2, borderColor: "#fff" },
   meDot: { width: 18, height: 18, borderRadius: 9, backgroundColor: "#2979ff", borderWidth: 3, borderColor: "#fff" },
-  loading: {
+  loadingOverlay: {
     position: "absolute",
-    top: 150,
-    alignSelf: "center",
-    backgroundColor: "rgba(0,0,0,0.75)",
-    borderRadius: 14,
-    paddingVertical: 6,
-    paddingHorizontal: 14,
+    top: 0,
+    bottom: 0,
+    left: 0,
+    right: 0,
+    alignItems: "center",
+    justifyContent: "center",
   },
-  loadingText: { color: "#fff", fontSize: 12 },
+  loadingCard: {
+    backgroundColor: "rgba(0,0,0,0.82)",
+    borderRadius: 16,
+    paddingVertical: 20,
+    paddingHorizontal: 28,
+    alignItems: "center",
+    minWidth: 200,
+  },
+  loadingTitle: { color: "#fff", fontSize: 16, fontWeight: "700", marginTop: 12 },
+  loadingStep: { color: "#dfe3e6", fontSize: 13, marginTop: 4 },
   locate: {
     position: "absolute",
     right: 16,

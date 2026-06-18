@@ -15,11 +15,16 @@ export async function buildGraph(
   osm: OverpassResponse,
   elevation: ElevationProvider,
   maxSegM: number = MAX_SEGMENT_M,
-  sampleOpts: { dedupePrecision?: number } = {}
+  sampleOpts: { dedupePrecision?: number } = {},
+  onPhase?: (phase: string) => void
 ): Promise<Graph> {
+  onPhase?.("Parsing streets");
   const ways = parseOsm(osm);
+  onPhase?.("Splitting edges");
   const { nodes: skeletonNodes, edges: skeletonEdges } = splitWays(ways, maxSegM);
+  onPhase?.("Sampling elevation");
   const nodes = await sampleElevations(skeletonNodes, elevation, sampleOpts);
+  onPhase?.("Computing grades");
   const edges = computeGrades(nodes, skeletonEdges);
   return { city, bbox, nodes, edges, adjacency: buildAdjacency(edges) };
 }
