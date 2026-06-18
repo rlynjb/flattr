@@ -1,10 +1,30 @@
-// mobile/src/AddressBar.tsx — From/To address inputs + Route button. Controlled by
-// MapScreen so a map tap (after focusing a field) can auto-fill the address.
-// The From field has a "use current location" button on its right.
+// mobile/src/AddressBar.tsx — From/To inputs with autocomplete suggestions, a
+// "use current location" button on From, and a Route button. Controlled by MapScreen.
 import React from "react";
-import { View, TextInput, Pressable, Text, StyleSheet } from "react-native";
+import { View, TextInput, Pressable, Text, ScrollView, StyleSheet } from "react-native";
+import type { GeocodeResult } from "pipeline/geocode";
 
 export type Field = "from" | "to";
+
+function Suggestions({
+  items,
+  onSelect,
+}: {
+  items: GeocodeResult[];
+  onSelect: (r: GeocodeResult) => void;
+}): React.JSX.Element {
+  return (
+    <ScrollView style={styles.suggest} keyboardShouldPersistTaps="handled">
+      {items.map((r, i) => (
+        <Pressable key={`${r.lat},${r.lng},${i}`} style={styles.suggestRow} onPress={() => onSelect(r)}>
+          <Text style={styles.suggestText} numberOfLines={2}>
+            {r.label}
+          </Text>
+        </Pressable>
+      ))}
+    </ScrollView>
+  );
+}
 
 export function AddressBar({
   fromText,
@@ -14,6 +34,9 @@ export function AddressBar({
   onFocusField,
   activeField,
   onUseCurrentLocation,
+  suggestions,
+  suggestField,
+  onSelectSuggestion,
   onRoute,
   busy,
   error,
@@ -25,6 +48,9 @@ export function AddressBar({
   onFocusField: (f: Field) => void;
   activeField: Field | null;
   onUseCurrentLocation: () => void;
+  suggestions: GeocodeResult[];
+  suggestField: Field | null;
+  onSelectSuggestion: (f: Field, r: GeocodeResult) => void;
   onRoute: (from: string, to: string) => void;
   busy: boolean;
   error: string | null;
@@ -32,16 +58,16 @@ export function AddressBar({
   const canRoute = fromText.trim().length > 0 && toText.trim().length > 0 && !busy;
   const hint =
     activeField === "from"
-      ? "Tap the map to set From"
+      ? "Type, or tap the map to set From"
       : activeField === "to"
-        ? "Tap the map to set To"
+        ? "Type, or tap the map to set To"
         : null;
   return (
     <View style={styles.bar}>
       <View style={styles.fieldRow}>
         <TextInput
           style={[styles.input, activeField === "from" && styles.inputActive]}
-          placeholder="From address"
+          placeholder="From — address or place"
           placeholderTextColor="#888"
           value={fromText}
           onChangeText={onFromChange}
@@ -53,9 +79,12 @@ export function AddressBar({
           <Text style={styles.locIcon}>◎</Text>
         </Pressable>
       </View>
+      {suggestField === "from" && suggestions.length > 0 && (
+        <Suggestions items={suggestions} onSelect={(r) => onSelectSuggestion("from", r)} />
+      )}
       <TextInput
         style={[styles.input, styles.toInput, activeField === "to" && styles.inputActive]}
-        placeholder="To address"
+        placeholder="To — address or place"
         placeholderTextColor="#888"
         value={toText}
         onChangeText={onToChange}
@@ -64,6 +93,9 @@ export function AddressBar({
         returnKeyType="go"
         onSubmitEditing={() => canRoute && onRoute(fromText, toText)}
       />
+      {suggestField === "to" && suggestions.length > 0 && (
+        <Suggestions items={suggestions} onSelect={(r) => onSelectSuggestion("to", r)} />
+      )}
       <View style={styles.row}>
         <Text style={[styles.hint, error && styles.error]} numberOfLines={1}>
           {error ?? hint ?? ""}
@@ -114,6 +146,9 @@ const styles = StyleSheet.create({
     justifyContent: "center",
   },
   locIcon: { color: "#fff", fontSize: 18 },
+  suggest: { maxHeight: 168, backgroundColor: "#fff", borderRadius: 8, marginBottom: 6, borderWidth: 1, borderColor: "#e3e6e8" },
+  suggestRow: { paddingHorizontal: 10, paddingVertical: 8, borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: "#eee" },
+  suggestText: { fontSize: 13, color: "#222" },
   row: { flexDirection: "row", alignItems: "center" },
   hint: { flex: 1, color: "#1565c0", fontSize: 12, marginRight: 8 },
   error: { color: "#d23b2e" },

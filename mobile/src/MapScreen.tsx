@@ -10,7 +10,7 @@ import { nearestNode } from "features/routing/nearest";
 import { directedAstar } from "features/routing/astar";
 import { routeSummary, type RouteSummary } from "features/routing/summary";
 import { prefixGraph } from "features/map/tiles";
-import { geocode, reverseGeocode } from "pipeline/geocode";
+import { geocode, reverseGeocode, geocodeSuggest, type GeocodeResult } from "pipeline/geocode";
 import { loadGraph } from "./loadGraph";
 import { useTileGraph } from "./useTileGraph";
 import { GradeSlider } from "./GradeSlider";
@@ -51,7 +51,29 @@ export function MapScreen(): React.JSX.Element {
   const [fromText, setFromText] = useState("");
   const [toText, setToText] = useState("");
   const [activeField, setActiveField] = useState<Field | null>(null);
+  const [suggestions, setSuggestions] = useState<GeocodeResult[]>([]);
+  const [suggestField, setSuggestField] = useState<Field | null>(null);
+  const suggestTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const cameraRef = useRef<CameraRef>(null);
+
+  // Debounced autocomplete: fetch address/place suggestions as the user types.
+  const scheduleSuggest = useCallback((field: Field, text: string) => {
+    if (suggestTimer.current) clearTimeout(suggestTimer.current);
+    if (text.trim().length < 3) {
+      setSuggestions([]);
+      setSuggestField(null);
+      return;
+    }
+    suggestTimer.current = setTimeout(async () => {
+      try {
+        const results = await geocodeSuggest(text, { viewbox: baseGraph?.bbox, limit: 5 });
+        setSuggestions(results);
+        setSuggestField(field);
+      } catch {
+        // ignore transient/rate-limit errors
+      }
+    }, 400);
+  }, [baseGraph]);
 
   // Fetch the phone's current location. `recenter` animates the camera to it (for
   // the locate button); at launch we just set userLoc and the Camera centers via prop.
@@ -181,6 +203,20 @@ export function MapScreen(): React.JSX.Element {
       .catch(() => setText(`${lat.toFixed(5)}, ${lng.toFixed(5)}`));
   };
 
+  // Pick an autocomplete suggestion: fill the field, snap to a node, recenter.
+  const onSelectSuggestion = (field: Field, r: GeocodeResult) => {
+    (field === "from" ? setFromText : setToText)(r.label);
+    const id = nearestNode(graph, { lat: r.lat, lng: r.lng });
+    if (field === "from") setStartId(id);
+    else setEndId(id);
+    setSuggestions([]);
+    setSuggestField(null);
+    setActiveField(null);
+    setRouteError(null);
+    Keyboard.dismiss();
+    cameraRef.current?.easeTo({ center: [r.lng, r.lat], zoom: 15, duration: 500 });
+  };
+
   const marker = (id: string, color: string) => {
     const n = graph.nodes[id];
     return (
@@ -247,11 +283,20 @@ export function MapScreen(): React.JSX.Element {
         <AddressBar
           fromText={fromText}
           toText={toText}
-          onFromChange={setFromText}
-          onToChange={setToText}
+          onFromChange={(t) => {
+            setFromText(t);
+            scheduleSuggest("from", t);
+          }}
+          onToChange={(t) => {
+            setToText(t);
+            scheduleSuggest("to", t);
+          }}
           onFocusField={setActiveField}
           activeField={activeField}
           onUseCurrentLocation={handleUseCurrentLocation}
+          suggestions={suggestions}
+          suggestField={suggestField}
+          onSelectSuggestion={onSelectSuggestion}
           onRoute={handleRoute}
           busy={routeBusy}
           error={routeError}

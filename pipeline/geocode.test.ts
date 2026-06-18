@@ -59,3 +59,28 @@ describe("reverseGeocode", () => {
     await expect(reverseGeocode(1, 2, fakeFetch as unknown as typeof fetch)).rejects.toThrow(/429/);
   });
 });
+
+import { geocodeSuggest } from "./geocode";
+
+describe("geocodeSuggest", () => {
+  it("returns up to N matches (addresses + named places)", async () => {
+    const fakeFetch = vi.fn(async (url: string) => {
+      expect(url).toContain("limit=5");
+      return new Response(
+        JSON.stringify([
+          { lat: "47.62", lon: "-122.32", display_name: "Cal Anderson Park, Seattle" },
+          { lat: "47.61", lon: "-122.33", display_name: "Cal Anderson Pool, Seattle" },
+        ]),
+        { status: 200 }
+      );
+    });
+    const r = await geocodeSuggest("cal anderson", { limit: 5, fetchImpl: fakeFetch as unknown as typeof fetch });
+    expect(r).toHaveLength(2);
+    expect(r[0]).toEqual({ lat: 47.62, lng: -122.32, label: "Cal Anderson Park, Seattle" });
+  });
+
+  it("returns [] when there are no matches", async () => {
+    const fakeFetch = vi.fn(async () => new Response("[]", { status: 200 }));
+    expect(await geocodeSuggest("zzz", { fetchImpl: fakeFetch as unknown as typeof fetch })).toEqual([]);
+  });
+});

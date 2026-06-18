@@ -27,6 +27,26 @@ export async function geocode(
   return { lat: parseFloat(rows[0].lat), lng: parseFloat(rows[0].lon), label: rows[0].display_name };
 }
 
+/** Autocomplete: up to `limit` matches (addresses AND named places/POIs). */
+export async function geocodeSuggest(
+  query: string,
+  opts: { viewbox?: [number, number, number, number]; limit?: number; fetchImpl?: typeof fetch } = {}
+): Promise<GeocodeResult[]> {
+  const fetchImpl = opts.fetchImpl ?? fetch;
+  const params = new URLSearchParams({ q: query, format: "jsonv2", limit: String(opts.limit ?? 5) });
+  if (opts.viewbox) {
+    const [minLng, minLat, maxLng, maxLat] = opts.viewbox;
+    params.set("viewbox", `${minLng},${maxLat},${maxLng},${minLat}`);
+    params.set("bounded", "0");
+  }
+  const res = await fetchImpl(`${ENDPOINT}?${params.toString()}`, {
+    headers: { "User-Agent": "flattr/0.1 (grade-aware routing)" },
+  });
+  if (!res.ok) throw new Error(`Geocode failed: ${res.status}`);
+  const rows = (await res.json()) as NominatimRow[];
+  return rows.map((r) => ({ lat: parseFloat(r.lat), lng: parseFloat(r.lon), label: r.display_name }));
+}
+
 const REVERSE_ENDPOINT = "https://nominatim.openstreetmap.org/reverse";
 
 /** Reverse geocode a coordinate to a human address (label), or null if none. */
