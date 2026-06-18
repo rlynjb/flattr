@@ -1,45 +1,68 @@
-// mobile/src/AddressBar.tsx — From/To address inputs + Route button (replaces tap-to-route).
-import React, { useState } from "react";
+// mobile/src/AddressBar.tsx — From/To address inputs + Route button. Controlled by
+// MapScreen so a map tap (after focusing a field) can auto-fill the address.
+import React from "react";
 import { View, TextInput, Pressable, Text, StyleSheet } from "react-native";
 
+export type Field = "from" | "to";
+
 export function AddressBar({
+  fromText,
+  toText,
+  onFromChange,
+  onToChange,
+  onFocusField,
+  activeField,
   onRoute,
   busy,
   error,
 }: {
+  fromText: string;
+  toText: string;
+  onFromChange: (t: string) => void;
+  onToChange: (t: string) => void;
+  onFocusField: (f: Field) => void;
+  activeField: Field | null;
   onRoute: (from: string, to: string) => void;
   busy: boolean;
   error: string | null;
 }): React.JSX.Element {
-  const [from, setFrom] = useState("");
-  const [to, setTo] = useState("");
-  const canRoute = from.trim().length > 0 && to.trim().length > 0 && !busy;
+  const canRoute = fromText.trim().length > 0 && toText.trim().length > 0 && !busy;
+  const hint =
+    activeField === "from"
+      ? "Tap the map to set From"
+      : activeField === "to"
+        ? "Tap the map to set To"
+        : null;
   return (
     <View style={styles.bar}>
       <TextInput
-        style={styles.input}
+        style={[styles.input, activeField === "from" && styles.inputActive]}
         placeholder="From address"
         placeholderTextColor="#888"
-        value={from}
-        onChangeText={setFrom}
+        value={fromText}
+        onChangeText={onFromChange}
+        onFocus={() => onFocusField("from")}
         autoCapitalize="none"
         returnKeyType="next"
       />
       <TextInput
-        style={styles.input}
+        style={[styles.input, activeField === "to" && styles.inputActive]}
         placeholder="To address"
         placeholderTextColor="#888"
-        value={to}
-        onChangeText={setTo}
+        value={toText}
+        onChangeText={onToChange}
+        onFocus={() => onFocusField("to")}
         autoCapitalize="none"
         returnKeyType="go"
-        onSubmitEditing={() => canRoute && onRoute(from, to)}
+        onSubmitEditing={() => canRoute && onRoute(fromText, toText)}
       />
       <View style={styles.row}>
-        {error ? <Text style={styles.error}>{error}</Text> : <View style={{ flex: 1 }} />}
+        <Text style={[styles.hint, error && styles.error]} numberOfLines={1}>
+          {error ?? hint ?? ""}
+        </Text>
         <Pressable
           style={[styles.go, !canRoute && styles.goDisabled]}
-          onPress={() => canRoute && onRoute(from, to)}
+          onPress={() => canRoute && onRoute(fromText, toText)}
           disabled={!canRoute}
         >
           <Text style={styles.goText}>{busy ? "Routing…" : "Route"}</Text>
@@ -67,9 +90,13 @@ const styles = StyleSheet.create({
     fontSize: 14,
     marginBottom: 6,
     color: "#111",
+    borderWidth: 1,
+    borderColor: "transparent",
   },
+  inputActive: { borderColor: "#1565c0", backgroundColor: "#eaf2ff" },
   row: { flexDirection: "row", alignItems: "center" },
-  error: { flex: 1, color: "#d23b2e", fontSize: 12 },
+  hint: { flex: 1, color: "#1565c0", fontSize: 12, marginRight: 8 },
+  error: { color: "#d23b2e" },
   go: { backgroundColor: "#1565c0", borderRadius: 8, paddingHorizontal: 16, paddingVertical: 8 },
   goDisabled: { backgroundColor: "#9bb8da" },
   goText: { color: "#fff", fontWeight: "700" },

@@ -26,3 +26,20 @@ export async function geocode(
   if (!rows.length) return null;
   return { lat: parseFloat(rows[0].lat), lng: parseFloat(rows[0].lon), label: rows[0].display_name };
 }
+
+const REVERSE_ENDPOINT = "https://nominatim.openstreetmap.org/reverse";
+
+/** Reverse geocode a coordinate to a human address (label), or null if none. */
+export async function reverseGeocode(
+  lat: number,
+  lng: number,
+  fetchImpl: typeof fetch = fetch
+): Promise<string | null> {
+  const params = new URLSearchParams({ lat: String(lat), lon: String(lng), format: "jsonv2" });
+  const res = await fetchImpl(`${REVERSE_ENDPOINT}?${params.toString()}`, {
+    headers: { "User-Agent": "flattr/0.1 (grade-aware routing)" },
+  });
+  if (!res.ok) throw new Error(`Reverse geocode failed: ${res.status}`);
+  const json = (await res.json()) as { display_name?: string };
+  return json.display_name ?? null;
+}

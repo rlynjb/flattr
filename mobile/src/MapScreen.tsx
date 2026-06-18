@@ -1,6 +1,6 @@
 // mobile/src/MapScreen.tsx — heatmap/zones toggle + tap-to-route + slider + honesty card.
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { View, Text, Pressable, ActivityIndicator, StatusBar, StyleSheet } from "react-native";
+import { View, Text, Pressable, ActivityIndicator, StatusBar, Keyboard, StyleSheet } from "react-native";
 import { Map, Camera, GeoJSONSource, Layer, Marker, type CameraRef } from "@maplibre/maplibre-react-native";
 import * as Location from "expo-location";
 import { graphToGeoJSON, routeToGeoJSON, zonesToGeoJSON } from "features/map/geojson";
@@ -10,13 +10,13 @@ import { nearestNode } from "features/routing/nearest";
 import { directedAstar } from "features/routing/astar";
 import { routeSummary, type RouteSummary } from "features/routing/summary";
 import { prefixGraph } from "features/map/tiles";
-import { geocode } from "pipeline/geocode";
+import { geocode, reverseGeocode } from "pipeline/geocode";
 import { loadGraph } from "./loadGraph";
 import { useTileGraph } from "./useTileGraph";
 import { GradeSlider } from "./GradeSlider";
 import { RouteSummaryCard } from "./RouteSummaryCard";
 import { Legend } from "./Legend";
-import { AddressBar } from "./AddressBar";
+import { AddressBar, type Field } from "./AddressBar";
 
 const STYLE_URL = "https://tiles.openfreemap.org/styles/liberty";
 const DEFAULT_USERMAX = 8;
@@ -48,6 +48,9 @@ export function MapScreen(): React.JSX.Element {
   const [userLoc, setUserLoc] = useState<[number, number] | null>(null); // [lng, lat]
   const [routeBusy, setRouteBusy] = useState(false);
   const [routeError, setRouteError] = useState<string | null>(null);
+  const [fromText, setFromText] = useState("");
+  const [toText, setToText] = useState("");
+  const [activeField, setActiveField] = useState<Field | null>(null);
   const cameraRef = useRef<CameraRef>(null);
 
   // Fetch the phone's current location. `recenter` animates the camera to it (for
@@ -132,6 +135,24 @@ export function MapScreen(): React.JSX.Element {
     }
   };
 
+  // With a field focused, a map tap sets that endpoint and reverse-geocodes the
+  // tapped point into the field's address. Routes automatically once both are set.
+  const handleMapPress = (event: { nativeEvent: { lngLat: [number, number] } }) => {
+    if (!activeField) return;
+    const field = activeField;
+    const [lng, lat] = event.nativeEvent.lngLat;
+    const setText = field === "from" ? setFromText : setToText;
+    if (field === "from") setStartId(nearestNode(graph, { lat, lng }));
+    else setEndId(nearestNode(graph, { lat, lng }));
+    setText("Locating…");
+    setActiveField(null);
+    setRouteError(null);
+    Keyboard.dismiss();
+    reverseGeocode(lat, lng)
+      .then((label) => setText(label ?? `${lat.toFixed(5)}, ${lng.toFixed(5)}`))
+      .catch(() => setText(`${lat.toFixed(5)}, ${lng.toFixed(5)}`));
+  };
+
   const marker = (id: string, color: string) => {
     const n = graph.nodes[id];
     return (
@@ -145,7 +166,7 @@ export function MapScreen(): React.JSX.Element {
 
   return (
     <View style={styles.root}>
-      <Map style={styles.map} mapStyle={STYLE_URL} onRegionDidChange={onRegionDidChange}>
+      <Map style={styles.map} mapStyle={STYLE_URL} onPress={handleMapPress} onRegionDidChange={onRegionDidChange}>
         <Camera ref={cameraRef} center={userLoc ?? baseCenter} zoom={userLoc ? 15 : 14} />
         {/* distinct `key` per branch: MapLibre freezes source/layer `id`, so React must
             unmount one and mount the other on toggle, not mutate the id in place. */}
@@ -195,7 +216,17 @@ export function MapScreen(): React.JSX.Element {
             </View>
           </View>
         )}
-        <AddressBar onRoute={handleRoute} busy={routeBusy} error={routeError} />
+        <AddressBar
+          fromText={fromText}
+          toText={toText}
+          onFromChange={setFromText}
+          onToChange={setToText}
+          onFocusField={setActiveField}
+          activeField={activeField}
+          onRoute={handleRoute}
+          busy={routeBusy}
+          error={routeError}
+        />
         <Legend userMax={userMax} />
         <Pressable style={styles.locate} onPress={recenter} accessibilityLabel="Center on my location">
           <Text style={styles.locateIcon}>◎</Text>
