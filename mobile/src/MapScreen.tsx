@@ -226,7 +226,7 @@ const styles = StyleSheet.create({
   locateIcon: { fontSize: 24, color: "#1565c0" },
   toggle: {
     position: "absolute",
-    top: 196, // below the slider panel (now at the top)
+    top: 48, // top-right corner (legend is top-left)
     right: 12,
     flexDirection: "row",
     borderRadius: 8,
