@@ -30,14 +30,19 @@ export async function geocode(
 /** Autocomplete: up to `limit` matches (addresses AND named places/POIs). */
 export async function geocodeSuggest(
   query: string,
-  opts: { viewbox?: [number, number, number, number]; limit?: number; fetchImpl?: typeof fetch } = {}
+  opts: {
+    viewbox?: [number, number, number, number];
+    bounded?: boolean;
+    limit?: number;
+    fetchImpl?: typeof fetch;
+  } = {}
 ): Promise<GeocodeResult[]> {
   const fetchImpl = opts.fetchImpl ?? fetch;
   const params = new URLSearchParams({ q: query, format: "jsonv2", limit: String(opts.limit ?? 5) });
   if (opts.viewbox) {
     const [minLng, minLat, maxLng, maxLat] = opts.viewbox;
     params.set("viewbox", `${minLng},${maxLat},${maxLng},${minLat}`);
-    params.set("bounded", "0");
+    params.set("bounded", opts.bounded ? "1" : "0"); // 1 = restrict results to the box
   }
   const res = await fetchImpl(`${ENDPOINT}?${params.toString()}`, {
     headers: { "User-Agent": "flattr/0.1 (grade-aware routing)" },

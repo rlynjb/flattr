@@ -41,6 +41,14 @@ export function MapScreen(): React.JSX.Element {
     return [(b[0] + b[2]) / 2, (b[1] + b[3]) / 2];
   }, [baseGraph]);
 
+  // A city-sized box around the base area. Used to RESTRICT (bounded) autocomplete
+  // results to nearby places, so a search like "starbucks" returns local hits — not
+  // a Starbucks in another state/country that we have no graph coverage for.
+  const searchViewbox = useMemo<[number, number, number, number]>(() => {
+    const [cx, cy] = baseCenter;
+    return [cx - 0.2, cy - 0.15, cx + 0.2, cy + 0.15]; // ~30km box
+  }, [baseCenter]);
+
   const [userMax, setUserMax] = useState(DEFAULT_USERMAX);
   const [startId, setStartId] = useState<string | null>(null);
   const [endId, setEndId] = useState<string | null>(null);
@@ -66,14 +74,14 @@ export function MapScreen(): React.JSX.Element {
     }
     suggestTimer.current = setTimeout(async () => {
       try {
-        const results = await geocodeSuggest(text, { viewbox: baseGraph?.bbox, limit: 5 });
+        const results = await geocodeSuggest(text, { viewbox: searchViewbox, bounded: true, limit: 5 });
         setSuggestions(results);
         setSuggestField(field);
       } catch {
         // ignore transient/rate-limit errors
       }
     }, 400);
-  }, [baseGraph]);
+  }, [searchViewbox]);
 
   // Fetch the phone's current location. `recenter` animates the camera to it (for
   // the locate button); at launch we just set userLoc and the Camera centers via prop.
