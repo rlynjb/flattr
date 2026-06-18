@@ -31,7 +31,7 @@ export function Legend({ userMax }: { userMax: number }): React.JSX.Element {
 const styles = StyleSheet.create({
   panel: {
     position: "absolute",
-    top: 44, // top-left; the vertical Max-grade slider sits below it
+    top: 160, // below the address bar; the vertical Max-grade slider sits below this
     left: 12,
     backgroundColor: "rgba(255,255,255,0.92)",
     borderRadius: 10,

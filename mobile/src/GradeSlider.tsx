@@ -5,7 +5,7 @@ import { View, Text, Pressable, StyleSheet } from "react-native";
 import Slider from "@react-native-community/slider";
 import { USERMAX_PRESETS } from "features/grade/classify";
 
-const SLIDER_LEN = 180; // visual height of the rotated slider
+const SLIDER_LEN = 130; // visual height of the rotated slider
 const ICONS: Record<string, string> = {
   "Kick scooter": "🛴",
   Walking: "🚶",
@@ -57,7 +57,7 @@ const styles = StyleSheet.create({
   panel: {
     position: "absolute",
     left: 12,
-    top: 150, // below the legend
+    top: 268, // below the legend (which sits below the address bar)
     width: 64, // slim
     backgroundColor: "rgba(255,255,255,0.92)",
     borderRadius: 12,

@@ -10,11 +10,13 @@ import { nearestNode } from "features/routing/nearest";
 import { directedAstar } from "features/routing/astar";
 import { routeSummary, type RouteSummary } from "features/routing/summary";
 import { prefixGraph } from "features/map/tiles";
+import { geocode } from "pipeline/geocode";
 import { loadGraph } from "./loadGraph";
 import { useTileGraph } from "./useTileGraph";
 import { GradeSlider } from "./GradeSlider";
 import { RouteSummaryCard } from "./RouteSummaryCard";
 import { Legend } from "./Legend";
+import { AddressBar } from "./AddressBar";
 
 const STYLE_URL = "https://tiles.openfreemap.org/styles/liberty";
 const DEFAULT_USERMAX = 8;
@@ -43,6 +45,8 @@ export function MapScreen(): React.JSX.Element {
   const [endId, setEndId] = useState<string | null>(null);
   const [view, setView] = useState<"edges" | "zones">("edges");
   const [userLoc, setUserLoc] = useState<[number, number] | null>(null); // [lng, lat]
+  const [routeBusy, setRouteBusy] = useState(false);
+  const [routeError, setRouteError] = useState<string | null>(null);
   const cameraRef = useRef<CameraRef>(null);
 
   // Fetch the phone's current location. `recenter` animates the camera to it (for
@@ -101,14 +105,29 @@ export function MapScreen(): React.JSX.Element {
     );
   }
 
-  const handlePress = (event: { nativeEvent: { lngLat: [number, number] } }) => {
-    const [lng, lat] = event.nativeEvent.lngLat;
-    const id = nearestNode(graph, { lat, lng });
-    if (!startId || (startId && endId)) {
-      setStartId(id);
-      setEndId(null);
-    } else {
-      setEndId(id);
+  // Geocode From/To addresses, snap each to the nearest graph node, and route.
+  const handleRoute = async (from: string, to: string) => {
+    setRouteBusy(true);
+    setRouteError(null);
+    try {
+      const viewbox = baseGraph?.bbox; // bias results toward the covered area
+      const a = await geocode(from, { viewbox });
+      const b = await geocode(to, { viewbox }); // sequential: Nominatim allows ~1 req/sec
+      if (!a || !b) {
+        setRouteError(!a && !b ? "Both addresses not found" : !a ? "From not found" : "To not found");
+        return;
+      }
+      setStartId(nearestNode(graph, { lat: a.lat, lng: a.lng }));
+      setEndId(nearestNode(graph, { lat: b.lat, lng: b.lng }));
+      cameraRef.current?.easeTo({
+        center: [(a.lng + b.lng) / 2, (a.lat + b.lat) / 2],
+        zoom: 14,
+        duration: 600,
+      });
+    } catch {
+      setRouteError("Lookup failed — try again");
+    } finally {
+      setRouteBusy(false);
     }
   };
 
@@ -125,7 +144,7 @@ export function MapScreen(): React.JSX.Element {
 
   return (
     <View style={styles.root}>
-      <Map style={styles.map} mapStyle={STYLE_URL} onPress={handlePress} onRegionDidChange={onRegionDidChange}>
+      <Map style={styles.map} mapStyle={STYLE_URL} onRegionDidChange={onRegionDidChange}>
         <Camera ref={cameraRef} center={userLoc ?? baseCenter} zoom={userLoc ? 15 : 14} />
         {/* distinct `key` per branch: MapLibre freezes source/layer `id`, so React must
             unmount one and mount the other on toggle, not mutate the id in place. */}
@@ -173,6 +192,7 @@ export function MapScreen(): React.JSX.Element {
           </View>
         </View>
       )}
+      <AddressBar onRoute={handleRoute} busy={routeBusy} error={routeError} />
       <Legend userMax={userMax} />
       <Pressable style={styles.locate} onPress={recenter} accessibilityLabel="Center on my location">
         <Text style={styles.locateIcon}>◎</Text>
@@ -224,7 +244,7 @@ const styles = StyleSheet.create({
   locateIcon: { fontSize: 24, color: "#1565c0" },
   toggle: {
     position: "absolute",
-    top: 48, // top-right corner (legend is top-left)
+    top: 160, // below the address bar, right side
     right: 12,
     flexDirection: "row",
     borderRadius: 8,
