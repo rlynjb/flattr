@@ -9,7 +9,7 @@ import { buildGraph } from "pipeline/build-graph";
 import { openMeteoProvider } from "pipeline/elevation";
 
 const DEBOUNCE_MS = 800;
-const MAX_TILES = 10; // LRU cap to bound memory/render cost
+const MAX_TILES = 24; // LRU cap to bound memory/render cost (smaller tiles -> keep more)
 const MAX_SEG_M = 90; // match the ~90m free DEM (see pipeline)
 const DEDUPE = 0.0008; // ~90m sample dedup (rate-limit friendly)
 

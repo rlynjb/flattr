@@ -3,8 +3,8 @@
 // don't collide. (Tiles don't share boundary nodes, so routing won't cross seams yet.)
 import type { Edge, Graph, Node } from "../routing/types";
 
-export const TILE_W = 0.007; // ~0.5 km of longitude near Seattle
-export const TILE_H = 0.006; // ~0.67 km of latitude
+export const TILE_W = 0.004; // ~0.3 km of longitude near Seattle (smaller = faster loads)
+export const TILE_H = 0.003; // ~0.33 km of latitude
 
 /** Grid key "col,row" for a coordinate. */
 export function tileKeyOf(lng: number, lat: number): string {
