@@ -1,12 +1,16 @@
-// mobile/src/GradeSlider.tsx — userMax control as a VERTICAL slider (green/flat at
-// bottom, red/steep at top), presets below. The thumb is your max grade: below it
-// (gentler) reads green, above it (steeper) reads red.
+// mobile/src/GradeSlider.tsx — slim vertical Max-grade control: green/flat bottom →
+// red/steep top, with icon preset buttons below (kick scooter / walking / any).
 import React from "react";
 import { View, Text, Pressable, StyleSheet } from "react-native";
 import Slider from "@react-native-community/slider";
 import { USERMAX_PRESETS } from "features/grade/classify";
 
 const SLIDER_LEN = 180; // visual height of the rotated slider
+const ICONS: Record<string, string> = {
+  "Kick scooter": "🛴",
+  Walking: "🚶",
+  Any: "🏔️",
+};
 
 export function GradeSlider({
   userMax,
@@ -17,7 +21,7 @@ export function GradeSlider({
 }): React.JSX.Element {
   return (
     <View style={styles.panel}>
-      <Text style={styles.label}>Max grade</Text>
+      <Text style={styles.label}>Max</Text>
       <Text style={styles.value}>{userMax.toFixed(0)}%</Text>
       <View style={styles.sliderBox}>
         <Slider
@@ -27,8 +31,6 @@ export function GradeSlider({
           step={1}
           value={userMax}
           onValueChange={onChange}
-          // rotated -90deg => min (2%) at the BOTTOM, max (15%) at the TOP.
-          // filled (min->thumb) green = grades you accept; remainder red = too steep.
           minimumTrackTintColor="#2e9e3f"
           maximumTrackTintColor="#d23b2e"
           thumbTintColor="#1565c0"
@@ -36,10 +38,14 @@ export function GradeSlider({
       </View>
       <View style={styles.chips}>
         {USERMAX_PRESETS.map((p) => (
-          <Pressable key={p.label} style={styles.chip} onPress={() => onChange(p.userMax)}>
-            <Text style={styles.chipText}>
-              {p.label} {p.userMax}%
-            </Text>
+          <Pressable
+            key={p.label}
+            style={[styles.chip, userMax === p.userMax && styles.chipOn]}
+            onPress={() => onChange(p.userMax)}
+            accessibilityLabel={`${p.label} ${p.userMax}%`}
+          >
+            <Text style={styles.icon}>{ICONS[p.label] ?? "•"}</Text>
+            <Text style={styles.pct}>{p.userMax}%</Text>
           </Pressable>
         ))}
       </View>
@@ -51,25 +57,28 @@ const styles = StyleSheet.create({
   panel: {
     position: "absolute",
     left: 12,
-    top: 150, // below the legend (top-left)
+    top: 150, // below the legend
+    width: 64, // slim
     backgroundColor: "rgba(255,255,255,0.92)",
     borderRadius: 12,
     paddingVertical: 10,
-    paddingHorizontal: 12,
+    paddingHorizontal: 6,
     alignItems: "center",
   },
-  label: { fontWeight: "600", fontSize: 11, color: "#444" },
-  value: { fontWeight: "700", fontSize: 16, marginBottom: 4 },
-  // The slider lays out as SLIDER_LEN x 40, then rotates into this LEN-tall box.
-  sliderBox: { width: 44, height: SLIDER_LEN, alignItems: "center", justifyContent: "center" },
+  label: { fontWeight: "600", fontSize: 10, color: "#666" },
+  value: { fontWeight: "700", fontSize: 15, marginBottom: 4 },
+  sliderBox: { width: 40, height: SLIDER_LEN, alignItems: "center", justifyContent: "center" },
   slider: { width: SLIDER_LEN, height: 40, transform: [{ rotate: "-90deg" }] },
-  chips: { marginTop: 8, alignItems: "stretch" },
+  chips: { marginTop: 8, alignItems: "center" },
   chip: {
+    width: 50,
     backgroundColor: "#eef0f2",
-    borderRadius: 14,
-    paddingHorizontal: 10,
-    paddingVertical: 6,
+    borderRadius: 10,
+    paddingVertical: 5,
     marginTop: 6,
+    alignItems: "center",
   },
-  chipText: { fontSize: 12, textAlign: "center" },
+  chipOn: { backgroundColor: "#cfe3ff", borderWidth: 1, borderColor: "#1565c0" },
+  icon: { fontSize: 20 },
+  pct: { fontSize: 10, color: "#444", marginTop: 1 },
 });
