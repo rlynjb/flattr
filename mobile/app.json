@@ -23,7 +23,13 @@
       "favicon": "./assets/favicon.png"
     },
     "plugins": [
-      "@maplibre/maplibre-react-native"
+      "@maplibre/maplibre-react-native",
+      [
+        "expo-location",
+        {
+          "locationWhenInUsePermission": "flatr uses your location to center the map where you are."
+        }
+      ]
     ]
   }
 }

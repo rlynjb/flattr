@@ -7,7 +7,7 @@ import type { EdgeKind } from "../features/routing/types";
  * under rate limits and the bundled graph.json stays phone-friendly. Widen later
  * (and use a Google/LIDAR key) for the full city.
  */
-export const BBOX: [number, number, number, number] = [-122.322, 47.614, -122.315, 47.62];
+export const BBOX: [number, number, number, number] = [-122.3284, 47.6181, -122.3214, 47.6241];
 
 /** Split long edges so no segment exceeds this (§11.C: 10-15m in hilly areas). */
 export const MAX_SEGMENT_M = 12;

@@ -1,7 +1,8 @@
 // mobile/src/MapScreen.tsx — heatmap/zones toggle + tap-to-route + slider + honesty card.
-import React, { useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import { View, Text, Pressable, StyleSheet } from "react-native";
 import { Map, Camera, GeoJSONSource, Layer, Marker } from "@maplibre/maplibre-react-native";
+import * as Location from "expo-location";
 import {
   graphToGeoJSON,
   routeToGeoJSON,
@@ -35,6 +36,26 @@ export function MapScreen(): React.JSX.Element {
   const [startId, setStartId] = useState<string | null>(null);
   const [endId, setEndId] = useState<string | null>(null);
   const [view, setView] = useState<"edges" | "zones">("edges");
+  const [userLoc, setUserLoc] = useState<[number, number] | null>(null); // [lng, lat]
+
+  // Locate the phone on launch; center the map there. Falls back to the data
+  // area (graph.bbox) if permission is denied or no fix is available.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const { status } = await Location.requestForegroundPermissionsAsync();
+        if (status !== "granted") return;
+        const pos = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced });
+        if (!cancelled) setUserLoc([pos.coords.longitude, pos.coords.latitude]);
+      } catch {
+        // ignore — keep the bbox fallback
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const heatmap = useMemo(
     () => (graph ? graphToGeoJSON(graph, bandsForUserMax(userMax)) : null),
@@ -90,7 +111,11 @@ export function MapScreen(): React.JSX.Element {
   return (
     <View style={styles.root}>
       <Map style={styles.map} mapStyle={STYLE_URL} onPress={handlePress}>
-        <Camera bounds={bboxToCameraBounds(graph.bbox)} />
+        {userLoc ? (
+          <Camera center={userLoc} zoom={15} />
+        ) : (
+          <Camera bounds={bboxToCameraBounds(graph.bbox)} />
+        )}
         {/* distinct `key` per branch: MapLibre freezes source/layer `id`, so React must
             unmount one and mount the other on toggle, not mutate the id in place. */}
         {view === "edges" ? (
@@ -113,6 +138,11 @@ export function MapScreen(): React.JSX.Element {
         )}
         {startId && marker(startId, "#1565c0")}
         {endId && marker(endId, "#000000")}
+        {userLoc && (
+          <Marker id="me" lngLat={userLoc}>
+            <View style={styles.meDot} />
+          </Marker>
+        )}
       </Map>
 
       <View style={styles.toggle}>
@@ -136,6 +166,7 @@ const styles = StyleSheet.create({
   center: { flex: 1, alignItems: "center", justifyContent: "center", padding: 24 },
   error: { color: "#d23b2e", textAlign: "center" },
   pin: { width: 16, height: 16, borderRadius: 8, borderWidth: 2, borderColor: "#fff" },
+  meDot: { width: 18, height: 18, borderRadius: 9, backgroundColor: "#2979ff", borderWidth: 3, borderColor: "#fff" },
   toggle: {
     position: "absolute",
     top: 196, // below the slider panel (now at the top)
