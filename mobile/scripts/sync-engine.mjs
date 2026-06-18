@@ -12,7 +12,7 @@ const dest = path.resolve(here, "../.engine");
 rmSync(dest, { recursive: true, force: true });
 mkdirSync(dest, { recursive: true });
 
-for (const dir of ["features", "lib"]) {
+for (const dir of ["features", "lib", "pipeline"]) {
   cpSync(path.join(repoRoot, dir), path.join(dest, dir), {
     recursive: true,
     filter: (src) => !src.endsWith(".test.ts"), // skip vitest tests (not app deps)

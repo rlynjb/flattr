@@ -1,10 +1,16 @@
 // pipeline/run-build.ts — CLI: fetch OSM for BBOX, sample elevation, write data/graph.json.
 // Elevation source: GOOGLE_ELEVATION_KEY (paid, best) > Open-Meteo (free, default) >
 // FLAT_ELEVATION=1 (synthetic 0m, offline fallback). Usage: npm run build:graph
-import { mkdirSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
+import type { Graph } from "../features/routing/types";
 import { BBOX, MAX_SEGMENT_M } from "./config";
 import { fetchOverpass } from "./overpass";
-import { buildGraph, writeGraph } from "./build-graph";
+import { buildGraph } from "./build-graph";
+
+/** Serialize a graph to JSON on disk (the static artifact the app reads). */
+function writeGraph(graph: Graph, path: string): void {
+  writeFileSync(path, JSON.stringify(graph));
+}
 import { fixtureProvider, googleProvider, openMeteoProvider, type ElevationProvider } from "./elevation";
 
 type Picked = {

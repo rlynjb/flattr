@@ -14,7 +14,9 @@ import { computeZones } from "features/grade/zones";
 import { nearestNode } from "features/routing/nearest";
 import { directedAstar } from "features/routing/astar";
 import { routeSummary, type RouteSummary } from "features/routing/summary";
+import { prefixGraph } from "features/map/tiles";
 import { loadGraph } from "./loadGraph";
+import { useTileGraph } from "./useTileGraph";
 import { GradeSlider } from "./GradeSlider";
 import { RouteSummaryCard } from "./RouteSummaryCard";
 import { Legend } from "./Legend";
@@ -24,13 +26,15 @@ const DEFAULT_USERMAX = 8;
 const GRID_N = 16;
 
 export function MapScreen(): React.JSX.Element {
-  const graph = useMemo(() => {
+  // Bundled area is the base tile; panning loads more tiles and merges them in.
+  const baseGraph = useMemo(() => {
     try {
-      return loadGraph();
+      return prefixGraph(loadGraph(), "base");
     } catch {
       return null;
     }
   }, []);
+  const { graph, loadingKey, onRegionDidChange } = useTileGraph(baseGraph);
 
   const [userMax, setUserMax] = useState(DEFAULT_USERMAX);
   const [startId, setStartId] = useState<string | null>(null);
@@ -110,7 +114,7 @@ export function MapScreen(): React.JSX.Element {
 
   return (
     <View style={styles.root}>
-      <Map style={styles.map} mapStyle={STYLE_URL} onPress={handlePress}>
+      <Map style={styles.map} mapStyle={STYLE_URL} onPress={handlePress} onRegionDidChange={onRegionDidChange}>
         {userLoc ? (
           <Camera center={userLoc} zoom={15} />
         ) : (
@@ -153,6 +157,11 @@ export function MapScreen(): React.JSX.Element {
         ))}
       </View>
 
+      {loadingKey && (
+        <View style={styles.loading}>
+          <Text style={styles.loadingText}>Loading grades…</Text>
+        </View>
+      )}
       <Legend userMax={userMax} />
       {showCard && <RouteSummaryCard found={routed.found} summary={routed.summary} userMax={userMax} />}
       <GradeSlider userMax={userMax} onChange={setUserMax} />
@@ -167,6 +176,16 @@ const styles = StyleSheet.create({
   error: { color: "#d23b2e", textAlign: "center" },
   pin: { width: 16, height: 16, borderRadius: 8, borderWidth: 2, borderColor: "#fff" },
   meDot: { width: 18, height: 18, borderRadius: 9, backgroundColor: "#2979ff", borderWidth: 3, borderColor: "#fff" },
+  loading: {
+    position: "absolute",
+    top: 150,
+    alignSelf: "center",
+    backgroundColor: "rgba(0,0,0,0.75)",
+    borderRadius: 14,
+    paddingVertical: 6,
+    paddingHorizontal: 14,
+  },
+  loadingText: { color: "#fff", fontSize: 12 },
   toggle: {
     position: "absolute",
     top: 196, // below the slider panel (now at the top)

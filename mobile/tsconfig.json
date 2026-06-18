@@ -4,7 +4,8 @@
     "strict": true,
     "paths": {
       "features/*": ["../features/*"],
-      "lib/*": ["../lib/*"]
+      "lib/*": ["../lib/*"],
+      "pipeline/*": ["../pipeline/*"]
     }
   },
   "exclude": ["scripts"]

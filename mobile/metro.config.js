@@ -16,6 +16,7 @@ const repoRoot = path.resolve(projectRoot, "..");
 const aliases = {
   features: path.resolve(projectRoot, ".engine/features"),
   lib: path.resolve(projectRoot, ".engine/lib"),
+  pipeline: path.resolve(projectRoot, ".engine/pipeline"),
 };
 
 const config = getDefaultConfig(projectRoot);
