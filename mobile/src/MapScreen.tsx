@@ -32,7 +32,10 @@ export function MapScreen(): React.JSX.Element {
       return null;
     }
   }, []);
-  const { graph, loadingStep, onRegionDidChange, ensureBbox } = useTileGraph(baseGraph);
+  // Grade display is OFF by default (clean map; the route is still colored by grade).
+  // "edges" = per-street heatmap, "zones" = coarse terrain overview — both load on demand.
+  const [view, setView] = useState<"off" | "edges" | "zones">("off");
+  const { graph, loadingStep, onRegionDidChange, ensureBbox } = useTileGraph(baseGraph, view !== "off");
 
   // Center of the bundled base area — the camera's initial/fallback target so it
   // never opens at world view before the GPS fix lands.
@@ -54,7 +57,6 @@ export function MapScreen(): React.JSX.Element {
   // from the current graph, so endpoints re-snap correctly as route-corridor tiles load.
   const [startPt, setStartPt] = useState<{ lat: number; lng: number } | null>(null);
   const [endPt, setEndPt] = useState<{ lat: number; lng: number } | null>(null);
-  const [view, setView] = useState<"edges" | "zones">("edges");
   const [userLoc, setUserLoc] = useState<[number, number] | null>(null); // [lng, lat]
   const [routeBusy, setRouteBusy] = useState(false);
   const [routeError, setRouteError] = useState<string | null>(null);
@@ -113,11 +115,16 @@ export function MapScreen(): React.JSX.Element {
     locate(true);
   }, [userLoc, locate]);
 
+  // Heatmap/zones are computed only when their view is active (on-demand) — keeps the
+  // map clean by default and avoids needless work when grades aren't shown.
   const heatmap = useMemo(
-    () => (graph ? graphToGeoJSON(graph, bandsForUserMax(userMax)) : null),
-    [graph, userMax]
+    () => (graph && view === "edges" ? graphToGeoJSON(graph, bandsForUserMax(userMax)) : null),
+    [graph, userMax, view]
   );
-  const zoneCells = useMemo(() => (graph ? computeZones(graph, GRID_N) : []), [graph]);
+  const zoneCells = useMemo(
+    () => (graph && view === "zones" ? computeZones(graph, GRID_N) : []),
+    [graph, view]
+  );
   const zonesFC = useMemo(() => zonesToGeoJSON(zoneCells, userMax), [zoneCells, userMax]);
 
   // Re-snap each endpoint coordinate to the nearest node in the CURRENT graph, so the
@@ -153,7 +160,7 @@ export function MapScreen(): React.JSX.Element {
     };
   }, [graph, startId, endId, userMax]);
 
-  if (!graph || !heatmap) {
+  if (!graph) {
     return (
       <View style={styles.center}>
         <Text style={styles.error}>Failed to load graph.</Text>
@@ -262,13 +269,15 @@ export function MapScreen(): React.JSX.Element {
     <View style={styles.root}>
       <Map style={styles.map} mapStyle={STYLE_URL} onPress={handleMapPress} onRegionDidChange={onRegionDidChange}>
         <Camera ref={cameraRef} center={userLoc ?? baseCenter} zoom={userLoc ? 15 : 14} />
-        {/* distinct `key` per branch: MapLibre freezes source/layer `id`, so React must
-            unmount one and mount the other on toggle, not mutate the id in place. */}
-        {view === "edges" ? (
+        {/* On-demand grade display: nothing when "off" (clean map), the per-street heatmap
+            when "edges", the coarse terrain overlay when "zones". Distinct React `key` per
+            branch since MapLibre freezes source/layer `id` and can't mutate it in place. */}
+        {view === "edges" && heatmap && (
           <GeoJSONSource key="src-edges" id="edges" data={heatmap as unknown as GeoJSON.FeatureCollection}>
             <Layer id="edge-lines" type="line" style={{ lineColor: ["get", "color"], lineWidth: 2 }} />
           </GeoJSONSource>
-        ) : (
+        )}
+        {view === "zones" && (
           <GeoJSONSource key="src-zones" id="zones" data={zonesFC as unknown as GeoJSON.FeatureCollection}>
             <Layer id="zone-fill" type="fill" style={{ fillColor: ["get", "color"], fillOpacity: 0.5 }} />
           </GeoJSONSource>
@@ -295,9 +304,13 @@ export function MapScreen(): React.JSX.Element {
       <View style={styles.overlays} pointerEvents="box-none">
         {!searching && (
           <View style={styles.toggle}>
-            {(["edges", "zones"] as const).map((v) => (
+            {([
+              ["off", "Off"],
+              ["edges", "Grades"],
+              ["zones", "Zones"],
+            ] as const).map(([v, label]) => (
               <Pressable key={v} onPress={() => setView(v)} style={[styles.toggleBtn, view === v && styles.toggleOn]}>
-                <Text style={[styles.toggleText, view === v && styles.toggleTextOn]}>{v}</Text>
+                <Text style={[styles.toggleText, view === v && styles.toggleTextOn]}>{label}</Text>
               </Pressable>
             ))}
           </View>
@@ -333,7 +346,7 @@ export function MapScreen(): React.JSX.Element {
           busy={routeBusy}
           error={routeError}
         />
-        {!searching && <Legend userMax={userMax} />}
+        {!searching && view !== "off" && <Legend userMax={userMax} />}
         {!searching && (
           <Pressable style={styles.locate} onPress={recenter} accessibilityLabel="Center on my location">
             <Text style={styles.locateIcon}>◎</Text>

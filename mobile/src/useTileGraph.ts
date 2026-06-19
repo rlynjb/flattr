@@ -5,7 +5,7 @@
 // between two route endpoints. Both are stitched into the merged graph so routing and
 // display cross seams. One network build runs at a time (corridor has priority) to stay
 // under the free Overpass/Open-Meteo rate limits.
-import { useCallback, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { Graph } from "features/routing/types";
 import { prefixGraph, mergeGraphs, stitchGraph } from "features/map/tiles";
 import { fetchOverpass } from "pipeline/overpass";
@@ -89,7 +89,14 @@ function bboxContains(outer: Bbox, inner: Bbox): boolean {
   return outer[0] <= inner[0] && outer[1] <= inner[1] && outer[2] >= inner[2] && outer[3] >= inner[3];
 }
 
-export function useTileGraph(baseGraph: Graph | null): {
+// `gradesOn` gates VIEWPORT grade-loading (the heatmap/zones data). When off, panning
+// loads nothing — the map stays clean and we make no elevation requests. Routing (the
+// corridor via ensureBbox) is independent and always works. Turning it on loads the
+// current view.
+export function useTileGraph(
+  baseGraph: Graph | null,
+  gradesOn: boolean
+): {
   graph: Graph | null;
   loadingStep: string | null;
   onRegionDidChange: (e: RegionEvent) => void;
@@ -109,6 +116,8 @@ export function useTileGraph(baseGraph: Graph | null): {
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const retryRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const retryCountRef = useRef(0);
+  const gradesOnRef = useRef(gradesOn);
+  const lastBoundsRef = useRef<Bbox | null>(null);
 
   const graph = useMemo(
     // stitch coincident boundary nodes so routing crosses base/view/corridor seams.
@@ -190,6 +199,22 @@ export function useTileGraph(baseGraph: Graph | null): {
     })();
   }, []);
 
+  // Fetch grade data for the current viewport (no debounce). Skips if the base graph or
+  // current viewport region already covers it.
+  const queueViewport = useCallback(
+    (bounds: Bbox) => {
+      if (baseGraph && bboxContains(baseGraph.bbox, bounds)) return;
+      if (covers(viewRef.current, bounds)) return;
+      const [w, s, e, n] = bounds;
+      const px = (e - w) * VIEW_PAD;
+      const py = (n - s) * VIEW_PAD;
+      retryCountRef.current = 0; // new area → fresh self-heal budget
+      pendingViewRef.current = { bbox: [w - px, s - py, e + px, n + py], silent: false };
+      pump();
+    },
+    [baseGraph, pump]
+  );
+
   const onRegionDidChange = useCallback(
     (e: RegionEvent) => {
       const { bounds } = e.nativeEvent;
@@ -197,21 +222,19 @@ export function useTileGraph(baseGraph: Graph | null): {
       if (bounds[2] - bounds[0] > MAX_LOAD_SPAN_DEG || bounds[3] - bounds[1] > MAX_LOAD_SPAN_DEG) {
         return; // zoomed out too far (e.g. world view before GPS)
       }
+      lastBoundsRef.current = bounds; // remembered so toggling grades on loads this view
+      if (!gradesOnRef.current) return; // heatmap off → don't load grade data while panning
       if (timerRef.current) clearTimeout(timerRef.current);
-      timerRef.current = setTimeout(() => {
-        // Already fully shown by the base graph or the current viewport fetch? skip.
-        if (baseGraph && bboxContains(baseGraph.bbox, bounds)) return;
-        if (covers(viewRef.current, bounds)) return;
-        const [w, s, e, n] = bounds;
-        const px = (e - w) * VIEW_PAD;
-        const py = (n - s) * VIEW_PAD;
-        retryCountRef.current = 0; // new area → fresh self-heal budget
-        pendingViewRef.current = { bbox: [w - px, s - py, e + px, n + py], silent: false };
-        pump();
-      }, DEBOUNCE_MS);
+      timerRef.current = setTimeout(() => queueViewport(bounds), DEBOUNCE_MS);
     },
-    [baseGraph, pump]
+    [queueViewport]
   );
+
+  // When grades are toggled on, load the current view immediately (no pan needed).
+  useEffect(() => {
+    gradesOnRef.current = gradesOn;
+    if (gradesOn && lastBoundsRef.current) queueViewport(lastBoundsRef.current);
+  }, [gradesOn, queueViewport]);
 
   // Ensure the merged graph covers the bbox spanning both route endpoints, so they sit
   // in one connected component. Skips if the current corridor already contains it.
