@@ -14,13 +14,15 @@ import { openMeteoProvider, type ElevationProvider } from "pipeline/elevation";
 
 // Connectivity/coverage over fidelity: if the elevation API is down/throttled, build
 // with flat (0 m) elevation rather than failing the whole build — the streets still
-// render and routing still connects; grades fill in on a later load when the API recovers.
-function bestEffortElevation(p: ElevationProvider): ElevationProvider {
+// render and routing still connects. `onFallback` flags that the grades are bogus
+// (all flat) so the region can be retried once the API recovers.
+function bestEffortElevation(p: ElevationProvider, onFallback: () => void): ElevationProvider {
   return {
     async sample(points) {
       try {
         return await p.sample(points);
       } catch {
+        onFallback();
         return points.map(() => 0);
       }
     },
@@ -33,17 +35,19 @@ const MAX_SEG_M = 90; // match the ~90m free DEM
 const DEDUPE = 0.0008; // ~90m elevation sample dedup
 const MAX_LOAD_SPAN_DEG = 0.06; // don't load when zoomed further out than ~a few km
 const VIEW_PAD = 0.2; // pad the viewport fetch so small pans don't trigger a refetch
+const RETRY_MS = 8000; // re-fetch a flat-fallback region this often until grades load
 
 type Bbox = [number, number, number, number];
-type Region = { bbox: Bbox; graph: Graph };
+// `degraded` = built with flat fallback elevation (API was throttled); needs a retry.
+type Region = { bbox: Bbox; graph: Graph; degraded: boolean };
 
 export type RegionEvent = {
   nativeEvent: { center: [number, number]; bounds?: Bbox };
 };
 
-/** Does region `r` fully contain `bbox`? */
+/** Does region `r` fully contain `bbox` with real (non-degraded) grades? */
 function covers(r: Region | null, bbox: Bbox): boolean {
-  if (!r) return false;
+  if (!r || r.degraded) return false; // degraded → refetch to upgrade flat grades
   const [w, s, e, n] = bbox;
   return r.bbox[0] <= w && r.bbox[1] <= s && r.bbox[2] >= e && r.bbox[3] >= n;
 }
@@ -68,6 +72,7 @@ export function useTileGraph(baseGraph: Graph | null): {
   const pendingViewRef = useRef<Bbox | null>(null);
   const pendingCorridorRef = useRef<Bbox | null>(null);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const retryRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const graph = useMemo(
     // stitch coincident boundary nodes so routing crosses base/view/corridor seams.
@@ -108,15 +113,29 @@ export function useTileGraph(baseGraph: Graph | null): {
         const osm = await fetchOverpass(bbox);
         // Fail-fast elevation (few retries) so a throttled build degrades to flat quickly
         // instead of stalling the screen on doomed 429 backoffs.
-        const elev = bestEffortElevation(openMeteoProvider(fetch, { delayMs: 400, retries: 1 }));
+        let degraded = false;
+        const elev = bestEffortElevation(openMeteoProvider(fetch, { delayMs: 400, retries: 1 }), () => {
+          degraded = true;
+        });
         const g = await buildGraph(kind, bbox, osm, elev, MAX_SEG_M, { dedupePrecision: DEDUPE }, setLoadingStep);
-        const region: Region = { bbox, graph: prefixGraph(g, kind) };
+        const region: Region = { bbox, graph: prefixGraph(g, kind), degraded };
         if (kind === "corridor") {
           corridorRef.current = region;
           setCorridor(region);
         } else {
           viewRef.current = region;
           setView(region);
+        }
+        // Grades came back flat (API throttled). Re-queue this area until they load for
+        // real, so green-everywhere self-heals once the elevation API recovers (no pan
+        // required). Stops once a rebuild succeeds with non-degraded grades.
+        if (degraded) {
+          if (retryRef.current) clearTimeout(retryRef.current);
+          retryRef.current = setTimeout(() => {
+            if (viewRef.current?.degraded) pendingViewRef.current = viewRef.current.bbox;
+            if (corridorRef.current?.degraded) pendingCorridorRef.current = corridorRef.current.bbox;
+            pump();
+          }, RETRY_MS);
         }
       } catch {
         // Overpass failed (rate-limit/offline) — keep the last region; a later pan retries.
