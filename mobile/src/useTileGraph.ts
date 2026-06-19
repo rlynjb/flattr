@@ -5,7 +5,7 @@
 // the free Overpass/Open-Meteo rate limits; tiles are cached and LRU-capped.
 import { useCallback, useMemo, useRef, useState } from "react";
 import type { Graph } from "features/routing/types";
-import { tileKeyOf, tileBbox, prefixGraph, mergeGraphs, stitchGraph } from "features/map/tiles";
+import { tileKeyOf, tileBbox, prefixGraph, mergeGraphs, stitchGraph, TILE_W, TILE_H } from "features/map/tiles";
 import { fetchOverpass } from "pipeline/overpass";
 import { buildGraph } from "pipeline/build-graph";
 import { openMeteoProvider, type ElevationProvider } from "pipeline/elevation";
@@ -26,7 +26,8 @@ function bestEffortElevation(p: ElevationProvider): ElevationProvider {
 }
 
 const DEBOUNCE_MS = 800;
-const MAX_TILES = 24; // LRU cap on display tiles
+const MAX_TILES = 80; // LRU cap on display tiles — must hold a full screen's worth + margin
+const MAX_VIEW_TILES = 64; // cap tiles enqueued per pan (nearest-to-center wins)
 const MAX_CORRIDOR_SPAN_DEG = 0.12; // ~13 km — refuse routes wider than this (too far)
 const MAX_SEG_M = 90; // match the ~90m free DEM
 const DEDUPE = 0.0008; // ~90m elevation sample dedup
@@ -41,6 +42,29 @@ type QueueItem = { key: string; silent: boolean };
 function neighborKeys(key: string): string[] {
   const [c, r] = key.split(",").map(Number);
   return [`${c + 1},${r}`, `${c - 1},${r}`, `${c},${r + 1}`, `${c},${r - 1}`];
+}
+
+// Every tile key intersecting `bounds`, ordered nearest-to-center first so the middle
+// of the screen fills before the edges. Capped to MAX_VIEW_TILES.
+function tilesInBounds(
+  bounds: [number, number, number, number],
+  center: [number, number]
+): string[] {
+  const [w, s, e, n] = bounds;
+  const c0 = Math.floor(w / TILE_W);
+  const c1 = Math.floor(e / TILE_W);
+  const r0 = Math.floor(s / TILE_H);
+  const r1 = Math.floor(n / TILE_H);
+  const cc = center[0] / TILE_W;
+  const cr = center[1] / TILE_H;
+  const keys: { key: string; d: number }[] = [];
+  for (let c = c0; c <= c1; c++) {
+    for (let r = r0; r <= r1; r++) {
+      keys.push({ key: `${c},${r}`, d: (c + 0.5 - cc) ** 2 + (r + 0.5 - cr) ** 2 });
+    }
+  }
+  keys.sort((a, b) => a.d - b.d);
+  return keys.slice(0, MAX_VIEW_TILES).map((k) => k.key);
 }
 
 export function useTileGraph(baseGraph: Graph | null): {
@@ -97,7 +121,10 @@ export function useTileGraph(baseGraph: Graph | null): {
       try {
         const bbox = tileBbox(item.key);
         const osm = await fetchOverpass(bbox);
-        const g = await buildGraph(item.key, bbox, osm, openMeteoProvider(), MAX_SEG_M, { dedupePrecision: DEDUPE }, item.silent ? undefined : setLoadingStep);
+        // best-effort elevation: a throttled tile still loads (flat) rather than leaving
+        // a blank hole in the screen — grades fill in on a later pan when the API recovers.
+        const elev = bestEffortElevation(openMeteoProvider());
+        const g = await buildGraph(item.key, bbox, osm, elev, MAX_SEG_M, { dedupePrecision: DEDUPE }, item.silent ? undefined : setLoadingStep);
         loadedRef.current.add(item.key);
         setTiles((prev) => {
           const next = [...prev, { key: item.key, graph: prefixGraph(g, item.key) }];
@@ -145,13 +172,15 @@ export function useTileGraph(baseGraph: Graph | null): {
       if (timerRef.current) clearTimeout(timerRef.current);
       timerRef.current = setTimeout(() => {
         // drop not-yet-started SILENT preloads from a previous area (keep primary
-        // items like a route corridor), then queue this view.
+        // items like a route corridor), then queue every tile in the visible screen
+        // so grades cover the whole viewport, not just the center.
         queueRef.current = queueRef.current.filter((it) => {
           if (it.silent) queuedRef.current.delete(it.key);
           return !it.silent;
         });
         enqueue(key, false); // center: primary (shows overlay)
-        for (const nb of neighborKeys(key)) enqueue(nb, true); // neighbors: silent preload
+        const screen = bounds ? tilesInBounds(bounds, center) : neighborKeys(key);
+        for (const k of screen) if (k !== key) enqueue(k, true); // rest: silent, center-out
       }, DEBOUNCE_MS);
     },
     [enqueue]
