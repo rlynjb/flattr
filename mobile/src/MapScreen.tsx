@@ -35,7 +35,8 @@ export function MapScreen(): React.JSX.Element {
   // Grade display is OFF by default (clean map; the route is still colored by grade).
   // "edges" = per-street heatmap, "zones" = coarse terrain overview — both load on demand.
   const [view, setView] = useState<"off" | "edges" | "zones">("off");
-  const { graph, displayGraph, loadingStep, onRegionDidChange, ensureBbox } = useTileGraph(baseGraph, view !== "off");
+  const { graph, displayGraph, loadingStep, corridorDegraded, onRegionDidChange, ensureBbox } =
+    useTileGraph(baseGraph, view !== "off");
 
   // Center of the bundled base area — the camera's initial/fallback target so it
   // never opens at world view before the GPS fix lands.
@@ -364,7 +365,18 @@ export function MapScreen(): React.JSX.Element {
           </Pressable>
         )}
         {!searching && showCard && (routed.found || !loadingStep) && (
-          <RouteSummaryCard found={routed.found} summary={routed.summary} userMax={userMax} />
+          <RouteSummaryCard
+            found={routed.found}
+            summary={routed.summary}
+            userMax={userMax}
+            note={
+              loadingStep
+                ? "Calculating grades…"
+                : corridorDegraded
+                  ? "Grades approximate — elevation unavailable, retrying"
+                  : null
+            }
+          />
         )}
         {!searching && <GradeSlider userMax={userMax} onChange={setUserMax} />}
       </View>

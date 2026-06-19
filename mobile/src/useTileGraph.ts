@@ -100,6 +100,7 @@ export function useTileGraph(
   graph: Graph | null;
   displayGraph: Graph | null;
   loadingStep: string | null;
+  corridorDegraded: boolean;
   onRegionDidChange: (e: RegionEvent) => void;
   ensureBbox: (bbox: Bbox) => boolean;
 } {
@@ -278,5 +279,12 @@ export function useTileGraph(
     [pump]
   );
 
-  return { graph, displayGraph, loadingStep, onRegionDidChange, ensureBbox };
+  return {
+    graph,
+    displayGraph,
+    loadingStep,
+    corridorDegraded: corridor?.degraded ?? false,
+    onRegionDidChange,
+    ensureBbox,
+  };
 }

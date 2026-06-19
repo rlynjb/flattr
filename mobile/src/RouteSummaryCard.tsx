@@ -7,10 +7,12 @@ export function RouteSummaryCard({
   found,
   summary,
   userMax,
+  note,
 }: {
   found: boolean;
   summary: RouteSummary | null;
   userMax: number;
+  note?: string | null;
 }): React.JSX.Element | null {
   if (!found || !summary) {
     if (found) return null; // no endpoints yet -> nothing to show
@@ -37,6 +39,7 @@ export function RouteSummaryCard({
       <Text style={styles.detail}>
         {km} km · +{climb} m climb
       </Text>
+      {note && <Text style={styles.note}>{note}</Text>}
     </View>
   );
 }
@@ -49,5 +52,6 @@ const styles = StyleSheet.create({
   bad: { backgroundColor: "rgba(210,59,46,0.92)" },
   title: { color: "#fff", fontWeight: "700" },
   detail: { color: "#fff" },
+  note: { color: "#fff", fontSize: 11, fontStyle: "italic", marginTop: 4, opacity: 0.95 },
   badText: { color: "#fff", textAlign: "center", fontWeight: "600" },
 });
