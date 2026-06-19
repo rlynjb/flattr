@@ -29,13 +29,46 @@ function bestEffortElevation(p: ElevationProvider, onFallback: () => void): Elev
   };
 }
 
+// Session-wide elevation cache keyed by ~90m DEM cell. Overlapping/revisited areas then
+// need ZERO elevation requests — the main cause of throttling — and reload instantly with
+// real grades. Only real (successfully fetched) values are cached; flat fallbacks aren't.
+const elevCache = new Map<string, number>();
+const cellKey = (lat: number, lng: number) => `${Math.round(lat / DEDUPE)},${Math.round(lng / DEDUPE)}`;
+
+function cachedElevation(p: ElevationProvider): ElevationProvider {
+  return {
+    async sample(points) {
+      const out = new Array<number>(points.length);
+      const missPts: { lat: number; lng: number }[] = [];
+      const missIdx: number[] = [];
+      points.forEach((pt, i) => {
+        const hit = elevCache.get(cellKey(pt.lat, pt.lng));
+        if (hit !== undefined) out[i] = hit;
+        else {
+          missPts.push(pt);
+          missIdx.push(i);
+        }
+      });
+      if (missPts.length) {
+        const got = await p.sample(missPts); // throws when throttled -> caller flattens
+        got.forEach((e, j) => {
+          out[missIdx[j]] = e;
+          elevCache.set(cellKey(missPts[j].lat, missPts[j].lng), e);
+        });
+      }
+      return out;
+    },
+  };
+}
+
 const DEBOUNCE_MS = 600;
+const MAX_RETRIES = 6; // silent flat-fallback retries before giving up (keeps last data)
 const MAX_CORRIDOR_SPAN_DEG = 0.12; // ~13 km — refuse routes wider than this (too far)
 const MAX_SEG_M = 90; // match the ~90m free DEM
 const DEDUPE = 0.0008; // ~90m elevation sample dedup
 const MAX_LOAD_SPAN_DEG = 0.06; // don't load when zoomed further out than ~a few km
 const VIEW_PAD = 0.2; // pad the viewport fetch so small pans don't trigger a refetch
-const RETRY_MS = 8000; // re-fetch a flat-fallback region this often until grades load
+const RETRY_MS = 12000; // re-fetch a flat-fallback region this often until grades load
 
 type Bbox = [number, number, number, number];
 // `degraded` = built with flat fallback elevation (API was throttled); needs a retry.
@@ -69,10 +102,13 @@ export function useTileGraph(baseGraph: Graph | null): {
   const viewRef = useRef<Region | null>(null);
   const corridorRef = useRef<Region | null>(null);
   const busyRef = useRef(false);
-  const pendingViewRef = useRef<Bbox | null>(null);
-  const pendingCorridorRef = useRef<Bbox | null>(null);
+  // pending requests carry `silent` — user pans/routes show the loader; background
+  // self-heal retries don't, so the overlay doesn't flash while grades catch up.
+  const pendingViewRef = useRef<{ bbox: Bbox; silent: boolean } | null>(null);
+  const pendingCorridorRef = useRef<{ bbox: Bbox; silent: boolean } | null>(null);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const retryRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const retryCountRef = useRef(0);
 
   const graph = useMemo(
     // stitch coincident boundary nodes so routing crosses base/view/corridor seams.
@@ -94,30 +130,35 @@ export function useTileGraph(baseGraph: Graph | null): {
   const pump = useCallback(() => {
     if (busyRef.current) return;
     let kind: "corridor" | "view";
-    let bbox: Bbox;
+    let req: { bbox: Bbox; silent: boolean };
     if (pendingCorridorRef.current) {
       kind = "corridor";
-      bbox = pendingCorridorRef.current;
+      req = pendingCorridorRef.current;
       pendingCorridorRef.current = null;
     } else if (pendingViewRef.current) {
       kind = "view";
-      bbox = pendingViewRef.current;
+      req = pendingViewRef.current;
       pendingViewRef.current = null;
     } else {
       return;
     }
+    const { bbox, silent } = req;
     busyRef.current = true;
-    setLoadingStep("Fetching streets");
+    if (!silent) setLoadingStep("Fetching streets");
     (async () => {
       try {
         const osm = await fetchOverpass(bbox);
-        // Fail-fast elevation (few retries) so a throttled build degrades to flat quickly
-        // instead of stalling the screen on doomed 429 backoffs.
+        // Cache first (revisits need no requests), then fail-fast elevation so a throttled
+        // build degrades to flat quickly instead of stalling on doomed 429 backoffs.
         let degraded = false;
-        const elev = bestEffortElevation(openMeteoProvider(fetch, { delayMs: 400, retries: 1 }), () => {
-          degraded = true;
-        });
-        const g = await buildGraph(kind, bbox, osm, elev, MAX_SEG_M, { dedupePrecision: DEDUPE }, setLoadingStep);
+        const elev = bestEffortElevation(
+          cachedElevation(openMeteoProvider(fetch, { delayMs: 400, retries: 1 })),
+          () => {
+            degraded = true;
+          }
+        );
+        const onPhase = silent ? undefined : setLoadingStep;
+        const g = await buildGraph(kind, bbox, osm, elev, MAX_SEG_M, { dedupePrecision: DEDUPE }, onPhase);
         const region: Region = { bbox, graph: prefixGraph(g, kind), degraded };
         if (kind === "corridor") {
           corridorRef.current = region;
@@ -126,14 +167,16 @@ export function useTileGraph(baseGraph: Graph | null): {
           viewRef.current = region;
           setView(region);
         }
-        // Grades came back flat (API throttled). Re-queue this area until they load for
-        // real, so green-everywhere self-heals once the elevation API recovers (no pan
-        // required). Stops once a rebuild succeeds with non-degraded grades.
-        if (degraded) {
+        // Grades came back flat (API throttled). Quietly re-queue this area so green
+        // self-heals once the API recovers — no loader flash, and capped so it doesn't
+        // loop forever during a sustained outage. A real (non-degraded) build stops it.
+        if (degraded && retryCountRef.current < MAX_RETRIES) {
+          retryCountRef.current += 1;
           if (retryRef.current) clearTimeout(retryRef.current);
           retryRef.current = setTimeout(() => {
-            if (viewRef.current?.degraded) pendingViewRef.current = viewRef.current.bbox;
-            if (corridorRef.current?.degraded) pendingCorridorRef.current = corridorRef.current.bbox;
+            if (viewRef.current?.degraded) pendingViewRef.current = { bbox: viewRef.current.bbox, silent: true };
+            if (corridorRef.current?.degraded)
+              pendingCorridorRef.current = { bbox: corridorRef.current.bbox, silent: true };
             pump();
           }, RETRY_MS);
         }
@@ -141,7 +184,7 @@ export function useTileGraph(baseGraph: Graph | null): {
         // Overpass failed (rate-limit/offline) — keep the last region; a later pan retries.
       } finally {
         busyRef.current = false;
-        setLoadingStep(null);
+        if (!silent) setLoadingStep(null);
         pump(); // drain the next pending request (corridor first)
       }
     })();
@@ -162,7 +205,8 @@ export function useTileGraph(baseGraph: Graph | null): {
         const [w, s, e, n] = bounds;
         const px = (e - w) * VIEW_PAD;
         const py = (n - s) * VIEW_PAD;
-        pendingViewRef.current = [w - px, s - py, e + px, n + py];
+        retryCountRef.current = 0; // new area → fresh self-heal budget
+        pendingViewRef.current = { bbox: [w - px, s - py, e + px, n + py], silent: false };
         pump();
       }, DEBOUNCE_MS);
     },
@@ -177,7 +221,8 @@ export function useTileGraph(baseGraph: Graph | null): {
       const [w, s, e, n] = bbox;
       if (e - w > MAX_CORRIDOR_SPAN_DEG || n - s > MAX_CORRIDOR_SPAN_DEG) return false;
       if (covers(corridorRef.current, bbox)) return true;
-      pendingCorridorRef.current = bbox;
+      retryCountRef.current = 0;
+      pendingCorridorRef.current = { bbox, silent: false };
       pump();
       return true;
     },
