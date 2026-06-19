@@ -34,6 +34,7 @@ export function AddressBar({
   onFocusField,
   activeField,
   onUseCurrentLocation,
+  onSwap,
   suggestions,
   suggestField,
   onSelectSuggestion,
@@ -48,6 +49,7 @@ export function AddressBar({
   onFocusField: (f: Field) => void;
   activeField: Field | null;
   onUseCurrentLocation: () => void;
+  onSwap: () => void;
   suggestions: GeocodeResult[];
   suggestField: Field | null;
   onSelectSuggestion: (f: Field, r: GeocodeResult) => void;
@@ -82,17 +84,22 @@ export function AddressBar({
       {suggestField === "from" && suggestions.length > 0 && (
         <Suggestions items={suggestions} onSelect={(r) => onSelectSuggestion("from", r)} />
       )}
-      <TextInput
-        style={[styles.input, styles.toInput, activeField === "to" && styles.inputActive]}
-        placeholder="To — address or place"
-        placeholderTextColor="#888"
-        value={toText}
-        onChangeText={onToChange}
-        onFocus={() => onFocusField("to")}
-        autoCapitalize="none"
-        returnKeyType="go"
-        onSubmitEditing={() => canRoute && onRoute(fromText, toText)}
-      />
+      <View style={styles.fieldRow}>
+        <TextInput
+          style={[styles.input, activeField === "to" && styles.inputActive]}
+          placeholder="To — address or place"
+          placeholderTextColor="#888"
+          value={toText}
+          onChangeText={onToChange}
+          onFocus={() => onFocusField("to")}
+          autoCapitalize="none"
+          returnKeyType="go"
+          onSubmitEditing={() => canRoute && onRoute(fromText, toText)}
+        />
+        <Pressable style={styles.swapBtn} onPress={onSwap} accessibilityLabel="Swap From and To">
+          <Text style={styles.swapIcon}>⇅</Text>
+        </Pressable>
+      </View>
       {suggestField === "to" && suggestions.length > 0 && (
         <Suggestions items={suggestions} onSelect={(r) => onSelectSuggestion("to", r)} />
       )}
@@ -134,7 +141,6 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: "transparent",
   },
-  toInput: { marginBottom: 6 },
   inputActive: { borderColor: "#1565c0", backgroundColor: "#eaf2ff" },
   locBtn: {
     marginLeft: 6,
@@ -146,6 +152,18 @@ const styles = StyleSheet.create({
     justifyContent: "center",
   },
   locIcon: { color: "#fff", fontSize: 18 },
+  swapBtn: {
+    marginLeft: 6,
+    width: 40,
+    height: 39,
+    borderRadius: 8,
+    backgroundColor: "#eef0f2",
+    borderWidth: 1,
+    borderColor: "#1565c0",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  swapIcon: { color: "#1565c0", fontSize: 18, fontWeight: "700" },
   suggest: { maxHeight: 168, backgroundColor: "#fff", borderRadius: 8, marginBottom: 6, borderWidth: 1, borderColor: "#e3e6e8" },
   suggestRow: { paddingHorizontal: 10, paddingVertical: 8, borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: "#eee" },
   suggestText: { fontSize: 13, color: "#222" },

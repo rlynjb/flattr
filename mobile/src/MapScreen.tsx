@@ -205,6 +205,16 @@ export function MapScreen(): React.JSX.Element {
     }
   };
 
+  // Swap From and To (text + endpoints). startId/endId re-derive from the points, and
+  // the route recomputes for the reversed direction (uphill/downhill flips).
+  const handleSwap = () => {
+    setFromText(toText);
+    setToText(fromText);
+    setStartPt(endPt);
+    setEndPt(startPt);
+    setRouteError(null);
+  };
+
   // "Use current location" for the From field: store the GPS point + set text.
   const handleUseCurrentLocation = async () => {
     setRouteError(null);
@@ -339,6 +349,7 @@ export function MapScreen(): React.JSX.Element {
           onFocusField={setActiveField}
           activeField={activeField}
           onUseCurrentLocation={handleUseCurrentLocation}
+          onSwap={handleSwap}
           suggestions={suggestions}
           suggestField={suggestField}
           onSelectSuggestion={onSelectSuggestion}
