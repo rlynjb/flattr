@@ -98,6 +98,7 @@ export function useTileGraph(
   gradesOn: boolean
 ): {
   graph: Graph | null;
+  displayGraph: Graph | null;
   loadingStep: string | null;
   onRegionDidChange: (e: RegionEvent) => void;
   ensureBbox: (bbox: Bbox) => boolean;
@@ -119,6 +120,8 @@ export function useTileGraph(
   const gradesOnRef = useRef(gradesOn);
   const lastBoundsRef = useRef<Bbox | null>(null);
 
+  // Routing graph: includes everything (even flat-fallback regions) — flat grades are
+  // fine for connectivity, and excluding them would break "no route" again.
   const graph = useMemo(
     // stitch coincident boundary nodes so routing crosses base/view/corridor seams.
     () =>
@@ -128,6 +131,23 @@ export function useTileGraph(
               baseGraph,
               ...(corridor ? [corridor.graph] : []),
               ...(view ? [view.graph] : []),
+            ])
+          )
+        : null,
+    [baseGraph, corridor, view]
+  );
+
+  // Display graph (heatmap/zones): EXCLUDES degraded (flat-fallback) regions so their
+  // bogus all-green grades don't paint over the real grades underneath. They reappear
+  // once the self-heal retry lands real elevation.
+  const displayGraph = useMemo(
+    () =>
+      baseGraph
+        ? stitchGraph(
+            mergeGraphs([
+              baseGraph,
+              ...(corridor && !corridor.degraded ? [corridor.graph] : []),
+              ...(view && !view.degraded ? [view.graph] : []),
             ])
           )
         : null,
@@ -252,5 +272,5 @@ export function useTileGraph(
     [pump]
   );
 
-  return { graph, loadingStep, onRegionDidChange, ensureBbox };
+  return { graph, displayGraph, loadingStep, onRegionDidChange, ensureBbox };
 }

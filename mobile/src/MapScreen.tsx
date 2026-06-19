@@ -35,7 +35,7 @@ export function MapScreen(): React.JSX.Element {
   // Grade display is OFF by default (clean map; the route is still colored by grade).
   // "edges" = per-street heatmap, "zones" = coarse terrain overview — both load on demand.
   const [view, setView] = useState<"off" | "edges" | "zones">("off");
-  const { graph, loadingStep, onRegionDidChange, ensureBbox } = useTileGraph(baseGraph, view !== "off");
+  const { graph, displayGraph, loadingStep, onRegionDidChange, ensureBbox } = useTileGraph(baseGraph, view !== "off");
 
   // Center of the bundled base area — the camera's initial/fallback target so it
   // never opens at world view before the GPS fix lands.
@@ -118,12 +118,12 @@ export function MapScreen(): React.JSX.Element {
   // Heatmap/zones are computed only when their view is active (on-demand) — keeps the
   // map clean by default and avoids needless work when grades aren't shown.
   const heatmap = useMemo(
-    () => (graph && view === "edges" ? graphToGeoJSON(graph, bandsForUserMax(userMax)) : null),
-    [graph, userMax, view]
+    () => (displayGraph && view === "edges" ? graphToGeoJSON(displayGraph, bandsForUserMax(userMax)) : null),
+    [displayGraph, userMax, view]
   );
   const zoneCells = useMemo(
-    () => (graph && view === "zones" ? computeZones(graph, GRID_N) : []),
-    [graph, view]
+    () => (displayGraph && view === "zones" ? computeZones(displayGraph, GRID_N) : []),
+    [displayGraph, view]
   );
   const zonesFC = useMemo(() => zonesToGeoJSON(zoneCells, userMax), [zoneCells, userMax]);
 
