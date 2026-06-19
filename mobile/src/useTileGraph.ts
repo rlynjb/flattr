@@ -11,6 +11,7 @@ import { prefixGraph, mergeGraphs, stitchGraph } from "features/map/tiles";
 import { fetchOverpass } from "pipeline/overpass";
 import { buildGraph } from "pipeline/build-graph";
 import { openMeteoProvider, type ElevationProvider } from "pipeline/elevation";
+import { loadElevCache, getElev, putElev } from "./elevCache";
 
 // Connectivity/coverage over fidelity: if the elevation API is down/throttled, build
 // with flat (0 m) elevation rather than failing the whole build — the streets still
@@ -29,10 +30,9 @@ function bestEffortElevation(p: ElevationProvider, onFallback: () => void): Elev
   };
 }
 
-// Session-wide elevation cache keyed by ~90m DEM cell. Overlapping/revisited areas then
-// need ZERO elevation requests — the main cause of throttling — and reload instantly with
-// real grades. Only real (successfully fetched) values are cached; flat fallbacks aren't.
-const elevCache = new Map<string, number>();
+// Elevation cache keyed by ~90m DEM cell, backed by the persistent store in elevCache.ts.
+// Overlapping/revisited areas need ZERO elevation requests — the main cause of throttling
+// — and survive app restarts. Only real (successfully fetched) values are cached.
 const cellKey = (lat: number, lng: number) => `${Math.round(lat / DEDUPE)},${Math.round(lng / DEDUPE)}`;
 
 function cachedElevation(p: ElevationProvider): ElevationProvider {
@@ -42,7 +42,7 @@ function cachedElevation(p: ElevationProvider): ElevationProvider {
       const missPts: { lat: number; lng: number }[] = [];
       const missIdx: number[] = [];
       points.forEach((pt, i) => {
-        const hit = elevCache.get(cellKey(pt.lat, pt.lng));
+        const hit = getElev(cellKey(pt.lat, pt.lng));
         if (hit !== undefined) out[i] = hit;
         else {
           missPts.push(pt);
@@ -53,7 +53,7 @@ function cachedElevation(p: ElevationProvider): ElevationProvider {
         const got = await p.sample(missPts); // throws when throttled -> caller flattens
         got.forEach((e, j) => {
           out[missIdx[j]] = e;
-          elevCache.set(cellKey(missPts[j].lat, missPts[j].lng), e);
+          putElev(cellKey(missPts[j].lat, missPts[j].lng), e);
         });
       }
       return out;
@@ -119,6 +119,12 @@ export function useTileGraph(
   const retryCountRef = useRef(0);
   const gradesOnRef = useRef(gradesOn);
   const lastBoundsRef = useRef<Bbox | null>(null);
+
+  // Load the persisted elevation cache once, so previously-fetched areas have real grades
+  // immediately and don't re-hit the throttled elevation API.
+  useEffect(() => {
+    loadElevCache();
+  }, []);
 
   // Routing graph: includes everything (even flat-fallback regions) — flat grades are
   // fine for connectivity, and excluding them would break "no route" again.
