@@ -1,11 +1,9 @@
-// mobile/src/GradeSlider.tsx — slim vertical Max-grade control: green/flat bottom →
-// red/steep top, with icon preset buttons below (kick scooter / walking / any).
+// mobile/src/GradeSlider.tsx — Max-grade control: three preset buttons
+// (kick scooter / walking / any). Each sets the steepest uphill you'll tolerate.
 import React from "react";
 import { View, Text, Pressable, StyleSheet } from "react-native";
-import Slider from "@react-native-community/slider";
 import { USERMAX_PRESETS } from "features/grade/classify";
 
-const SLIDER_LEN = 130; // visual height of the rotated slider
 const ICONS: Record<string, string> = {
   "Kick scooter": "🛴",
   Walking: "🚶",
@@ -21,21 +19,7 @@ export function GradeSlider({
 }): React.JSX.Element {
   return (
     <View style={styles.panel}>
-      <Text style={styles.label}>Max</Text>
-      <Text style={styles.value}>{userMax.toFixed(0)}%</Text>
-      <View style={styles.sliderBox}>
-        <Slider
-          style={styles.slider}
-          minimumValue={2}
-          maximumValue={15}
-          step={1}
-          value={userMax}
-          onValueChange={onChange}
-          minimumTrackTintColor="#2e9e3f"
-          maximumTrackTintColor="#d23b2e"
-          thumbTintColor="#1565c0"
-        />
-      </View>
+      <Text style={styles.label}>Max grade</Text>
       <View style={styles.chips}>
         {USERMAX_PRESETS.map((p) => (
           <Pressable
@@ -65,11 +49,8 @@ const styles = StyleSheet.create({
     paddingHorizontal: 6,
     alignItems: "center",
   },
-  label: { fontWeight: "600", fontSize: 10, color: "#666" },
-  value: { fontWeight: "700", fontSize: 15, marginBottom: 4 },
-  sliderBox: { width: 40, height: SLIDER_LEN, alignItems: "center", justifyContent: "center" },
-  slider: { width: SLIDER_LEN, height: 40, transform: [{ rotate: "-90deg" }] },
-  chips: { marginTop: 8, alignItems: "center" },
+  label: { fontWeight: "600", fontSize: 10, color: "#666", marginBottom: 2 },
+  chips: { alignItems: "center" },
   chip: {
     width: 50,
     backgroundColor: "#eef0f2",
