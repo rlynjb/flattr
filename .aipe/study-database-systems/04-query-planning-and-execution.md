@@ -1,313 +1,268 @@
 # Query planning and execution
 
-**Industry name(s):** query planner / execution engine / access path · **Type:**
-Industry standard — and **largely `not yet exercised` here** (there is no query
-language and no planner; what exists is hand-coded access paths)
+**Industry name(s):** query optimizer / execution plan / EXPLAIN / scan & join
+operators / N+1 · **Type:** Industry standard.
 
 ## Zoom out, then zoom in
 
-Verdict first: **there is no query planner in this repo, and there can't be —
-there's no query language.** A database planner exists to translate declarative
-SQL into an execution plan, choosing scans, indexes, and join orders. flattr has
-no declarative layer; every read is a hand-written access path. So this file
-teaches the planner concept by its *absence* — what the planner would do, and
-what the hand-coded code does instead.
+A query in flattr isn't SQL — it's a hand-written algorithm. But it still *does*
+everything a query engine does (pick an access path, scan or look up, combine
+records), just with the plan hard-coded by a human instead of chosen by an
+optimizer. That makes flattr a clean place to see what a planner is *for*.
 
 ```
-  Zoom out — where a planner WOULD sit (but doesn't)
+  Zoom out — execution sits above indexes, below the UI
 
-  ┌─ Runtime readers ───────────────────────────────────────────────┐
-  │  A* search        ─┐                                             │
-  │  nearestNode      ─┼─► each reader hand-codes its OWN access path│
-  │  heatmap GeoJSON  ─┘   (no shared planner decides for them)      │
-  └───────────────────────────┬──────────────────────────────────────┘
-        ┌─────────────────────▼─────────────────────┐
-        │  ✗ NO QUERY PLANNER / EXECUTION ENGINE ✗   │  ← the absent box
-        │     (a DB would put one here)              │
-        └─────────────────────┬──────────────────────┘
-  ┌─ Storage (graph.json) ────▼──────────────────────────────────────┐
-  │  nodes (PK index) · edges (heap) · adjacency (secondary index)   │
-  └───────────────────────────────────────────────────────────────────┘
+  ┌─ UI layer (mobile/) ─────────────────────────────────────┐
+  │  tap endpoints → request a route                         │
+  └────────────────────────────┬─────────────────────────────┘
+  ┌─ Execution layer ──────────▼─────────────────────────────┐
+  │  ★ astar.search() — the "query"  ·  nearestNode scan ★    │ ← we are here
+  │  ★ mergeGraphs — the "join"  (useTileGraph) ★             │
+  └────────────────────────────┬─────────────────────────────┘
+  ┌─ Index / storage layer ────▼─────────────────────────────┐
+  │  adjacency · nodes · edges                               │
+  └───────────────────────────────────────────────────────────┘
 ```
 
-Zoom in: the question is *"who decides HOW a read executes — which index, which
-scan?"* In a DB, the planner decides at query time. Here, **the programmer
-decided at write time**, baking the access path into each function. That's the
-control-axis flip worth understanding.
+Zoom in. A query engine takes a *declarative* request ("the cheapest path from A
+to B") and produces an *execution plan* — a tree of physical operators (scans,
+index lookups, joins, sorts) — then runs it. flattr skips the declarative front
+end entirely: the "plan" is the code in `astar.ts`. The lesson is to read that
+hand-rolled plan *as if it were an EXPLAIN output* — because that's the skill
+that lets you read a real one.
 
 ## The structure pass
 
-**Layers.** Two: the *declarative layer* (where SQL would live — empty here) and
-the *physical-access layer* (the hand-coded reads that actually run). In a DB
-these are separated by the planner; here they're collapsed.
+**Layers** (by plan altitude):
+1. **The request** — "route A→B under userMax" / "node nearest this tap."
+2. **The plan** — hard-coded: A* with a chosen cost+heuristic; or a full scan.
+3. **The operators** — index lookup (adjacency), record fetch (byId), priority
+   pop (the heap), distance compute.
 
-**The axis: control — who decides how a read executes?** This is the cleanest
-axis for this file:
+**Axis traced — "who decides the access path: a planner, or the programmer?"**
 
 ```
-  Axis = "who decides the access path?"
+  axis — "who chose this access path?" — across the layers
 
-  In a real DB:                          In flattr:
-  ┌─ SQL (declarative) ───────┐          ┌─ (no declarative layer) ──┐
-  │  "WHAT I want"            │           │   absent                  │
-  └────────────┬──────────────┘          └────────────┬──────────────┘
-        seam: PLANNER decides ═══╪══            seam: PROGRAMMER decided
-  ┌─ execution (physical) ────▼┐          ┌─ access path (physical) ──▼┐
-  │  scan/index/join chosen   │           │  index/scan hard-coded in  │
-  │  AT QUERY TIME            │           │  the function AT WRITE TIME │
-  └───────────────────────────┘          └────────────────────────────┘
+  ┌─ Postgres (reference) ──────────────────┐
+  │  planner decides at runtime              │  CODE declares WHAT, planner picks HOW
+  └────────────────────┬─────────────────────┘
+       seam ═══════════╪═══════  (no planner in flattr)
+  ┌─ flattr routing ───▼─────────────────────┐
+  │  programmer decided, compile-time         │  the HOW is written by hand in astar.ts
+  └────────────────────┬─────────────────────┘
+       seam ═══════════╪═══════  (within flattr, two different hand-plans)
+  ┌─ flattr nearest ───▼─────────────────────┐
+  │  programmer chose a full scan (no index)  │  no plan choice possible — no index exists
+  └───────────────────────────────────────────┘
 ```
 
-**Seams.** The seam that *would* matter — the planner boundary between "what" and
-"how" — doesn't exist. That's the whole point. The consequence: there's no
-`EXPLAIN`, no plan cache, no query optimizer surprising you with a bad plan. You
-read the code to know the access path; you never wonder what the planner chose.
+The axis-answer flips at the planner seam: a real DB picks the access path *at
+runtime* based on statistics (table size, index selectivity); flattr's path is
+fixed in source. That's the whole reason flattr has no `EXPLAIN` — there's nothing
+to explain, the plan is the code. But you can still *write the EXPLAIN by hand*,
+and doing so is the exercise of this file.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You know the difference between `useMemo(() => list.find(...))` (you hand-coded
-the lookup) and a GraphQL resolver where the framework decides how to fetch.
-flattr is entirely the first kind: every read is a `find`, a `map`, or an index
-lookup you wrote by hand. There's no framework choosing for you.
+You know how A* works — `me.md` says you built Dijkstra's animation with your own
+priority queue. Here's the reframe: **A* is a query execution plan.** "Find the
+cheapest path" is the declarative query; the heap + adjacency walk + closed set
+is the physical plan that answers it. Read it that way and every operator maps to
+a database operator.
 
 ```
-  The pattern — hand-coded access paths, no planner
+  the pattern — flattr's "query plan" for a route (read like EXPLAIN)
 
-  A read in a DB:                    A read in flattr:
-  SQL ─► PLANNER ─► PLAN ─► execute  function ─► hard-coded access path ─► run
-        (chooses)                              (you chose, at write time)
+  Route(A→B, userMax)
+   └─ A* Search                          [cost: f = g + h]
+       ├─ Priority Pop      (heap)       → next cheapest frontier node
+       ├─ Index Lookup      (adjacency)  → edges of current node      O(1)
+       │   └─ Record Fetch  (byId)       → resolve edgeId→Edge        O(1)
+       ├─ Cost Eval         (cost.ts)    → grade penalty per edge
+       └─ Relax + Push      (heap)       → enqueue improved neighbors
 ```
 
-### Move 2 — the three access paths, walked
+Each line is a physical operator. The heap is a *sort/top-N* operator. `adjacency`
+is an *index scan*. `byId` is an *index-only fetch*. `cost.ts` is a *projection /
+computed column*. The closed set is *deduplication*. That's a complete plan tree.
 
-There are exactly three read shapes in the runtime. Each is a "query plan" a
-human wrote.
+### Move 2 — reading the plan operators
 
-#### Access path 1 — point lookup via PK (the index-seek)
+**Operator 1 — the heap as Top-N / Sort.** A* always expands the cheapest
+frontier node next. That "give me the current minimum" is a Top-N operator,
+implemented by the binary min-heap (`features/routing/pqueue.ts`). The pop:
 
-`graph.nodes[id]` is a hash-index seek: O(1), the equivalent of
-`SELECT * FROM nodes WHERE id = $1` resolved by a unique index. A* uses it to
-fetch a neighbor node's coords. No planner needed — there's one way to do it and
-it's optimal.
-
-```
-  Point lookup — the index seek
-
-  graph.nodes["n42"]  ─►  {id,lat,lng,elevationM}      O(1)
-  (hash index built into the keyed map; file 03)
+```ts
+// features/routing/astar.ts:49-51 — the Top-N operator
+const current = open.pop()!;            // line 49: pull cheapest frontier node
+pops++;
+if (closed.has(current)) continue;      // line 51: skip stale entries (dedup)
 ```
 
-#### Access path 2 — index scan via the secondary index (the hot path)
+Line 49 is the sort operator producing rows in cost order; line 51 is the
+**lazy-deletion** trick — instead of removing stale heap entries (expensive),
+push duplicates and skip them on pop. A real engine's sort doesn't do this, but
+the closed-set check is the same idea as a `DISTINCT` filter dropping rows already
+seen.
 
-A* expanding a node is "fetch all edges incident to this node" =
-`SELECT edge FROM edges WHERE fromNode=$1 OR toNode=$1`. A DB would *choose*
-between scanning `edges` and using an index on `(fromNode, toNode)`. flattr
-doesn't choose — it always uses `adjacency` (the index), then chains
-`indexEdges()` to resolve ids to objects. Two O(1) hops, hand-wired.
+**Operator 2 — the index scan + record fetch (the join).** The expansion loop is
+a nested-loop join between "the current node" and "its edges," resolved through
+two indexes:
 
-```
-  Index scan — the A* expansion (the hottest "query")
-
-  for edgeId in adjacency[current]:     ← index scan (secondary index)
-    edge = byId.get(edgeId)              ← index seek (transient hash index)
-    next = otherEnd(edge, current)       ← compute the neighbor
-  → equivalent SQL the planner never sees:
-    SELECT e.* FROM edges e WHERE e.fromNode = :n OR e.toNode = :n
+```ts
+// features/routing/astar.ts:64-65 — index scan then record fetch
+for (const edgeId of graph.adjacency[current] ?? []) {  // INDEX SCAN: node→edgeIds, O(1)
+  const edge = byId.get(edgeId)!;                        // RECORD FETCH: edgeId→Edge, O(1)
 ```
 
-#### Access path 3 — full table scan (no index available)
+This is exactly a planner's `Index Scan → Index Lookup` pair. Because both are
+indexed (`03`), this join is O(degree) per node — cheap. If `adjacency` didn't
+exist, the planner's only option would be a `Seq Scan` of all edges per node: the
+N+1 disaster (below).
 
-`nearestNode` is `SELECT id FROM nodes ORDER BY distance(point, node) LIMIT 1` —
-a nearest-neighbor query. With no spatial index, the only access path is a full
-scan of all 1621 nodes computing distance to each. A DB *with* a spatial index
-(PostGIS GiST) would do an index scan; flattr does the scan because the index
-doesn't exist (file `03`).
+**Operator 3 — the projection (computed cost).** `cost.ts`'s `penalty()` is a
+computed column evaluated per edge during the scan:
 
-```
-  Full scan — nearestNode (no spatial index to seek)
-
-  best = ∞
-  for node in ALL nodes:               ← FULL SCAN, O(N)
-    d = haversine(point, node)
-    if d < best: best = d; keep node
-  → SQL: SELECT id FROM nodes ORDER BY ST_Distance(geom, :pt) LIMIT 1
-         (a DB would use a GiST index; here there's no index → scan)
+```ts
+// features/routing/astar.ts:68 — projection / computed column per row
+const tentative = g.get(current)! + costFn(edge, current, userMax);
 ```
 
-#### The N+1 question — and why it doesn't bite here
+`costFn` (one of `distanceCost` / `gradeCostAbs` / `gradeCostDirected`,
+`cost.ts:25-33`) is computed on the fly — flattr never stores routing cost, it
+derives it per query from `userMax`. That's a *computed projection*, the reason
+the same graph answers different route queries for different `userMax` without
+re-indexing. The plan is *parameterized by the query*, just like a prepared
+statement with a bind variable.
 
-The classic execution anti-pattern is N+1: a loop that issues one query per
-iteration. A* *looks* like N+1 — it loops nodes and "queries" edges per node —
-but it isn't, because there's no per-query overhead: the "queries" are in-memory
-index lookups against a single loaded object, not round-trips. The thing that
-makes N+1 painful (network/parse cost per query) is exactly the thing the
-load-once-immutable design eliminates. So the pattern that's a red flag in a
-networked DB is harmless here.
-
-### Move 2.5 — current vs future state
+**Operator 4 — the unplanned full scan.** `nearestNode` is the one query with no
+plan choice, because there's no index to plan around:
 
 ```
-  Phase A (now): hand-coded paths      Phase B (if SQL/SQLite arrived)
+  EXPLAIN (by hand) — nearestNode("tap at lat,lng")
 
-  programmer picks index, at write     planner picks index, at query time
-  no EXPLAIN — read the code           EXPLAIN ANALYZE shows the plan
-  no plan cache, no surprises          plan can change as stats change
-  N+1 harmless (in-memory)             N+1 catastrophic (round-trips)
-  nearest = full scan (no spatial idx) nearest = GiST index scan
+  Limit (1)
+   └─ Sort  (by haversine distance)        ← keeps running min, not a full sort
+       └─ Seq Scan on nodes  (rows=1621)   ← reads EVERY node, no filter
+          (no index available → no Index Scan possible)
 ```
 
-The migration cost: you'd gain a declarative layer and lose the certainty that
-the access path is exactly what you wrote. For an engine where the access paths
-are this simple and this hot, hand-coding them is the *better* choice — you never
-fight the planner.
+`nearest.ts:8` is a `Seq Scan` feeding a top-1. A planner facing this query with
+no spatial index would emit exactly this plan and you'd see `Seq Scan` in the
+output — the universal "you're missing an index" smell. `03` covers the fix.
+
+**The N+1 it avoids.** N+1 is the classic execution anti-pattern: a query per
+row instead of one query for all rows (loop over orders, query each order's
+items). flattr's *avoided* N+1 is the adjacency index: without it, A* would, for
+each of N expanded nodes, scan all E edges to find incident ones — N separate
+O(E) scans, the textbook N+1. The adjacency index collapses that to one O(1)
+lookup per node. **Inference:** the per-search `indexEdges` rebuild (`astar.ts:11`)
+is a *mild* version of the same smell — it does an O(E) pass every query that
+could be done once at load; for the MVP it's cheap, but it's the seed of an N+1 if
+searches get frequent (red-flag #5).
+
+**The "join" in the data layer — mergeGraphs.** There's a second query-shaped
+operation: `useTileGraph.ts:132-145` joins the base graph with viewport and
+corridor sub-graphs into one merged `Graph`, then `stitchGraph` unifies coincident
+boundary nodes. That's a **union + dedup-merge** executed in RAM on every relevant
+state change:
+
+```
+  the merge "query" (useTileGraph.ts:132)
+
+  base graph ──┐
+  corridor ────┼──► mergeGraphs (UNION) ──► stitchGraph (dedup boundary nodes) ──► merged Graph
+  viewport ────┘
+       run on EVERY [baseGraph, corridor, view] change — no memo of the result
+```
+
+It's recomputed from scratch each time (the `useMemo` deps are the three
+sub-graphs, so any change re-runs the whole stitch). That's a *materialized view
+with no caching* — flattr re-executes the join rather than incrementally
+maintaining it. Fine for three small inputs; the place to watch if tiles
+multiply (red-flag #5).
 
 ### Move 3 — the principle
 
-**A query planner is a layer that trades control for convenience.** It lets you
-say "what" and forget "how" — until the plan goes wrong and you must reverse-
-engineer "how" anyway. flattr keeps "how" explicit: there are three access paths,
-all visible in the code, none chosen at runtime. The general lesson: a planner
-earns its keep when queries are many, varied, and data-dependent; when they're
-few, fixed, and hot, hand-coded access paths are simpler and more predictable.
+A query plan is the *separation of "what you want" from "how to get it."* A real
+optimizer makes that choice at runtime from statistics; flattr makes it at
+authoring time in code. Either way the operators are the same — scan, index
+lookup, join, sort, project — and reading any system's data access *as a plan tree*
+is what lets you spot the missing index (a Seq Scan where an Index Scan belongs)
+and the N+1 (a query inside a loop). flattr's A* is a hand-written plan with every
+operator visible; learn to read it and you can read EXPLAIN.
 
 ## Primary diagram
 
-The three access paths, the absent planner, and the indexes each uses.
-
 ```
-  flattr's "query execution" — three hand-coded access paths
+  flattr's two "query plans" side by side
 
-  ┌─ Readers (no planner between them and storage) ──────────────────┐
-  │                                                                   │
-  │  A* point lookup     ─► nodes[id]            ─► PK hash index O(1)│
-  │  A* expansion (hot)  ─► adjacency[id]        ─► secondary idx O(1)│
-  │                          then byId.get(id)   ─► transient idx O(1)│
-  │  nearestNode         ─► loop ALL nodes       ─► FULL SCAN     O(N)│
-  │  heatmap             ─► map ALL edges        ─► FULL SCAN     O(E)│
-  │                                                                   │
-  │  ✗ no planner · no EXPLAIN · no plan cache · no join optimizer    │
-  └───────────────────────────────────────────────────────────────────┘
-```
-
-## Implementation in codebase
-
-**Use cases.** A route request fires all three paths in sequence: `nearestNode`
-twice (snap start + goal, full scans), then A* (index seeks + the hot index scan
-per expansion). The heatmap fires the edge full scan once per region change.
-
-**The hot access path — `features/routing/astar.ts` (lines 64-74):**
-
-```
-  for (const edgeId of graph.adjacency[current] ?? []) {  ← INDEX SCAN: the
-    const edge = byId.get(edgeId)!;                         "query plan" a human
-    const next = otherEnd(edge, current);                   wrote — always uses
-    if (closed.has(next)) continue;                         the adjacency index
-    const tentative = g.get(current)! + costFn(edge, current, userMax);
-    if (tentative < (g.get(next) ?? Infinity)) {            ← the "WHERE" + cost
-      g.set(next, tentative);                                 evaluated inline
-      came.set(next, { edge, prev: current });
-      open.push(next, tentative + heuristicFn(...));
-    }
-  }
-       │
-       └─ no planner decided to use adjacency — the programmer did, by writing
-          this loop. There's no alternative plan to fall back to. This is the
-          access path, full stop.
-```
-
-**The full-scan access path — `features/routing/nearest.ts` (lines 8-15):**
-
-```
-  for (const id of Object.keys(graph.nodes)) {   ← FULL SCAN: the only access
-    const n = graph.nodes[id];                     path, because no spatial index
-    const d = haversine(point, {lat:n.lat, lng:n.lng});
-    if (d < bestDist) { bestDist = d; bestId = id; }
-  }
-       │
-       └─ a DB with PostGIS would EXPLAIN this as an index scan; here EXPLAIN
-          doesn't exist and the access path is visibly a scan. The plan IS the code.
-```
-
-**The edge full scan — `features/map/geojson.ts` (lines 20-21):**
-
-```
-  const features = graph.edges.map((e) => ({ ... }));   ← FULL SCAN of edges,
-                                                           but a full scan is
-                                                           CORRECT here: the
-                                                           heatmap wants every
-                                                           edge. No index would help.
+  ┌─ ROUTE query (well-planned) ──────────┐  ┌─ NEAREST query (unplanned) ──┐
+  │ Route(A→B, userMax)                   │  │ Nearest(tap)                 │
+  │  └ A* Search [f=g+h]                  │  │  └ Limit 1                   │
+  │     ├ Top-N Pop      heap   O(log V)  │  │     └ Sort by distance       │
+  │     ├ Index Scan     adjacency O(1)   │  │        └ Seq Scan nodes      │
+  │     ├ Record Fetch   byId    O(1)     │  │           rows=1621  O(N)    │
+  │     ├ Projection     cost.ts          │  │  ✗ no index → no Index Scan  │
+  │     └ Relax+Push     heap             │  └──────────────────────────────┘
+  └───────────────────────────────────────┘
+       declarative-equiv: "cheapest path"      declarative-equiv: "ORDER BY
+       — every operator indexed                 dist LIMIT 1" — full scan
 ```
 
 ## Elaborate
 
-Query planning is one of the deepest subsystems in a real database — cost-based
-optimizers, statistics, histograms, join-order search. None of it applies to
-flattr, and pretending otherwise would be inventing infrastructure. What's worth
-carrying from the planner world is the *vocabulary of access paths*: point lookup
-(seek), index scan, full scan, nearest-neighbor. Naming flattr's three reads in
-those terms is what lets you reason about their cost and spot the missing index
-(spatial, for path 3).
+The reason real databases have a *cost-based* optimizer is that the right plan
+depends on data the programmer can't know at authoring time: how big the table is
+*today*, how selective a `WHERE` clause is *for these values*, whether an index is
+in cache. The planner re-decides per execution using collected statistics
+(`ANALYZE`). flattr's data is tiny and fixed, so a hand-chosen plan is optimal and
+a planner would be pure overhead — the right call. The skill the planner
+automates (pick access path by selectivity) is the same skill you used by hand
+when you decided to build `adjacency` instead of scanning edges.
 
-The honest framing: flattr is at the far end of a spectrum. One end is "all
-declarative, planner decides everything" (Postgres). The other is "all
-imperative, programmer decides everything" (flattr). The middle (query builders,
-ORMs) is where most apps live. flattr sits at the imperative end *because its
-access patterns are few and fixed* — three of them, all known at write time. A
-planner would add a layer with nothing to optimize.
-
-What to read next: `05` — the write-side topics. Everything from here on is
-`not yet exercised`, and the files explain why and what would change.
+When flattr migrates to Postgres (spec §8), routing likely stays a hand-written
+graph algorithm (it's not expressible as cheap SQL), but `nearestNode` becomes a
+planned spatial query and you'll read its plan in real `EXPLAIN ANALYZE` output —
+where `Seq Scan on nodes` vs `Index Scan using nodes_geom_idx` is the difference
+this file is teaching you to see.
 
 ## Interview defense
 
-**Q: "How does query execution work in this codebase?"**
+**Q: "flattr has no SQL. So what does 'query execution' even mean here?"**
 
-> There's no query language and no planner — that's the honest answer. Every read
-> is a hand-coded access path. There are exactly three: a point lookup via the
-> PK hash index (`nodes[id]`), an index scan via the `adjacency` secondary index
-> (the A* hot path), and a full scan in `nearestNode` because there's no spatial
-> index. The "query plan" is whatever the programmer wrote in the function — no
-> optimizer chooses it at runtime, so there's no `EXPLAIN` and no surprises.
-
-```
-  point lookup (PK seek) · index scan (adjacency) · full scan (no spatial idx)
-                    no planner — the code IS the plan
-```
-
-Anchor: *the code is the plan; no planner means no surprises and no EXPLAIN.*
-
-**Q: "Isn't A* an N+1 query problem?"**
-
-> It has the *shape* — loop over nodes, fetch edges per node — but not the *pain*.
-> N+1 hurts because each query is a round-trip with parse and network cost. Here
-> the "queries" are in-memory index lookups against one loaded object, so per-
-> query overhead is nanoseconds. The load-once-immutable design is exactly what
-> makes the N+1 shape harmless.
+> The query is the algorithm. A* is an execution plan for "cheapest path": the
+> heap is a Top-N/sort operator, `adjacency` is an index scan, `byId` is a record
+> fetch, `cost.ts` is a computed projection, the closed set is dedup. Reading it
+> as a plan tree is exactly how you'd read an EXPLAIN — and it shows the route
+> query is fully indexed while `nearestNode` is a Seq Scan with no index.
 
 ```
-  N+1 over network: 1000× round-trip  ✗     N+1 in-memory: 1000× hash lookup  ✓
+  A* = plan tree:  Sort(heap) → IndexScan(adj) → Fetch(byId) → Project(cost)
 ```
 
-Anchor: *N+1 is a round-trip problem; in-memory there are no round-trips.*
+Anchor: *every data access is a plan tree whether or not a planner wrote it —
+A* is a hand-rolled EXPLAIN.*
 
-## Validate
+**Q: "Is there an N+1 in flattr?"**
 
-1. **Reconstruct:** name the three access paths and the index (or absence) each
-   uses. Which is the hot path?
-2. **Explain:** why is the edge full scan in `geojson.ts:21` *not* a problem,
-   while the node full scan in `nearest.ts:8` *is* a latent one? (The heatmap
-   wants every edge; nearest wants one node but scans all — an index would help
-   only the second.)
-3. **Apply:** you add "show all crossings within the viewport." Write the access
-   path. Is it a scan or a seek, and is there an index for it? (A filtered full
-   scan of edges by `kind`; no index — and at this scale that's fine.)
-4. **Defend:** someone proposes adding SQLite "so we get a real query planner."
-   Argue against it for *this* access pattern, grounded in the three paths above.
+> The big one is *avoided* by design: `adjacency` turns "scan all edges per node"
+> into one O(1) lookup per node. The mild one that remains is `indexEdges`
+> rebuilding the edge index on every search (`astar.ts:11`) — an O(E) pass per
+> query that could be hoisted to load time. Negligible now; the first thing to
+> fix if routing gets called in a tight loop.
+
+Anchor: *N+1 is a query inside a loop; flattr killed the routing N+1 with the
+adjacency index and left a small per-search index rebuild as the residue.*
 
 ## See also
 
-- `03-btree-hash-and-secondary-indexes.md` — the indexes these paths use (and lack)
-- `05-transactions-isolation-and-anomalies.md` — the write side, all not-yet-exercised
-- `.aipe/study-dsa-foundations/` — A* as the algorithm behind the hot access path
+- `03-btree-hash-and-secondary-indexes.md` — the indexes these operators ride
+- `02-records-pages-and-storage-layout.md` — why byId must be built over the array
+- `../study-dsa-foundations/` — A*, the heap, traversal as algorithms
+- `../study-performance-engineering/` — measuring the scan and the merge cost
+- `../study-system-design/` — the merged-graph materialized view in context

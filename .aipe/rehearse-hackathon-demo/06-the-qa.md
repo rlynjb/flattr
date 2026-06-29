@@ -1,88 +1,254 @@
-# Chapter 6 — The Q&A (after the clock)
+# Chapter 6 — The Q&A   (after the clock — prep only)
 
-This chapter runs *after* your timed slot — it never eats the ten minutes. But it's where the demo is won or lost a second time, because judges decide between close demos on the answers. The standard probes are predictable, so prepare them: crisp, honest, anchored to what the code actually does, and never defensive. The rule across all of them: lead with the direct answer, then one sentence of evidence, then stop. Rambling in Q&A undoes a clean demo.
+## Opening hook
 
-```
-  THE FIVE PROBES JUDGES ALWAYS ASK
+The clock stopped. You finished at 9:30, the room voted, and now the judges
+lean in. This chapter never counts against your ten minutes — it's pure prep
+for the questions that come *after*. The good news: judges ask the same five
+questions at every hackathon, so you can rehearse every one cold. The job here
+is crisp, honest, speakable answers anchored to what flattr actually does —
+and the discipline to go one level deeper than the demo without going down a
+rabbit hole.
 
-  "is this actually working?"        ──► yes, you saw it live; tested
-                                          against a reference algorithm
-  "what was the hard part?"          ──► the disconnected-graph bug,
-                                          found by instrumenting first
-  "what's the stack?"                ──► hand-rolled TS engine, Expo/RN,
-                                          MapLibre, OSM + Open-Meteo
-  "did you build this in the window?"──► yes; honest about AI assistance
-  "is there a business / what's next?"─► honest: it's a prototype; the
-                                          real next step is demand discovery
-```
+One answer matters more than the rest in 2026: the AI-honesty question. You
+built this with heavy AI assistance, and the right move is matter-of-fact
+ownership of the architecture and algorithm decisions — not defensiveness.
+Judges assume AI use; candor reads better than dodging. That answer is below
+and it's the one to rehearse hardest.
 
-Each gets a tight answer below, plus a branch for the likely follow-up.
-
-## "Is this actually working, or is it smoke and mirrors?"
-
-> "It's working — you saw it route live. And it's not just plausible, it's *correct*: the router is tested against a slower reference algorithm and has to return the exact same optimal cost, or the test fails. The rough edge I'll own is that the elevation data is coarse and falls back to flat when the free API rate-limits — which I mark as approximate rather than fake."
-
-## "What was the hardest part?"
-
-> "Distant routes returned 'no route' even though both endpoints existed. Instead of guessing, I added a reachability probe — BFS from the start to check if the end was even reachable. It wasn't: the graph was loading in disconnected islands because I only fetched streets near the screen. Fixed by loading the corridor between the two points. The lesson was instrument before guessing."
-
-## "What's the stack?"
-
-> "A hand-rolled routing engine in TypeScript — A\*, the heap, the cost model, all mine, no routing library. The app is Expo/React Native with a MapLibre map. Data's from OpenStreetMap via Overpass and elevation from Open-Meteo, baked into a static graph at build time so routing runs fully on-device, offline."
+## The time-budget bar
 
 ```
-  IF THEY PUSH ON THE STACK
-
-  "hand-rolled TS engine + Expo/RN + MapLibre + OSM/Open-Meteo"
-        │
-        ├─► "Why hand-roll instead of OSRM?"
-        │     "Directional grade cost doesn't fit their cost models,
-        │      and owning the algorithm was the point."
-        │
-        ├─► "Why no backend?"
-        │     "Access is read-only whole-graph traversal — a static
-        │      bundled artifact beats a server for that. Works offline."
-        │
-        └─► "React Native, not web?"
-              "It's a phone-first mobility product — native GPS and
-               offline matter. I've shipped RN before."
+  ┌──────────────────────────────────────────────────────────┐
+  │ ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ │
+  │ 0:00 ──────────────────────────────────────────────── 10:00│
+  │   THE Q&A — PREP ONLY. Runs AFTER the clock. 0 budget.    │
+  └──────────────────────────────────────────────────────────┘
 ```
 
-## "Did you build this during the hackathon? Did you use AI?"
+No clock pressure. But keep each answer to two or three sentences — judges
+have other teams to see.
 
-The 2026 question. Judges assume heavy AI use; defensiveness reads worse than candor.
+## The chapter-opening diagram — the question decision tree
 
-> "Yes, built in the window, and yes — I used AI heavily, Claude Code. The split: the AI wrote a lot of the implementation, but I owned the architecture and designed the algorithm — the directional cost, keeping the heuristic admissible, the honest fallback — and I drove the debugging. I can defend every decision in it, which is the part that matters."
+The five questions that come every time, and where each one can go deeper.
+Know which branch you're on so you give a two-sentence answer, not a lecture.
 
-╔══════════════════════════════════════════════════════╗
-║ IF THEY DRILL THE CODE                                 ║
-║ "Explain this function" → go deep on the engine        ║
-║ (search/heap/cost — your strong tier, read it cold).   ║
-║ On UI or a part you defaulted to: "that's more         ║
-║ standard wiring / an AI default I accepted — happy to   ║
-║ read it with you." Never bluff authorship you can't    ║
-║ back; one caught bluff costs the room's trust.         ║
-╚══════════════════════════════════════════════════════╝
+```
+  THE JUDGE QUESTIONS — five branches, know where each goes
 
-## "Is there a business here? What's next?"
+  ┌─ "Is this actually working?" ────────────────────────────┐
+  │   → YES. live, on-device, real OSM + elevation. (re-demo) │
+  └───────────────────────────────────────────────────────────┘
+  ┌─ "What was the hard part?" ──────────────────────────────┐
+  │   → the "no route" / disconnected-components bug (ch 04)  │
+  │      └─ deeper? → corridor load + stitch (study book 03)  │
+  └───────────────────────────────────────────────────────────┘
+  ┌─ "What's the stack?" ────────────────────────────────────┐
+  │   → Expo/RN + MapLibre; hand-rolled A* in TS; no rt API   │
+  │      └─ deeper? → admissible heuristic, PQueue (defense)  │
+  └───────────────────────────────────────────────────────────┘
+  ┌─ "Did you build this DURING the hackathon?" ─────────────┐
+  │   → yes — and here's exactly how AI fit in (the honesty   │
+  │      answer below; own architecture + algorithm)          │
+  └───────────────────────────────────────────────────────────┘
+  ┌─ "Is there a business / what's next?" ───────────────────┐
+  │   → accessibility routing; cities + profiles next (ch 05) │
+  └───────────────────────────────────────────────────────────┘
+```
 
-> "Honestly, it's a prototype — no users yet, so I won't pretend there's a validated business. The problem is real: grade-aware routing matters for scooters and accessibility. The genuine next step isn't more features, it's demand discovery — talking to real riders about whether they'd switch for a flat-first mode. The engine scales city-wide with a spatial index and contraction hierarchies when that's justified."
+Each branch has a short answer and a deeper one. Give the short one first;
+only descend if they ask.
 
-| WEAK Q&A ANSWER | STRONG Q&A ANSWER |
-|---|---|
-| "Yeah there's a huge market, micromobility is exploding, we'd monetize with premium routes…" | "It's a prototype with no users — I won't fake a business. The problem's real; the honest next step is demand discovery with actual riders." |
-| **Why it's weak:** inventing a market for a userless prototype collapses on one follow-up and torches your credibility. | **Why it works:** candor about the stage, conviction about the problem, a real next step. Judges trust the honest answer. |
+## The body — the answers
 
-▸ In Q&A, lead with the direct answer, add one sentence of evidence, then stop. The ramble is what undoes a clean demo.
+Each answer is in your voice, two to three sentences, ready to say cold.
 
-## One-page run sheet
+### Q1 — "Is this actually working, or is it a mockup?"
 
-- **When:** after the timed slot — never counts against the ten minutes.
-- **"Working?":** yes, live; tested against a reference algorithm for optimality; coarse elevation owned honestly.
-- **"Hard part?":** disconnected-graph bug, found by a reachability probe; instrument-before-guess.
-- **"Stack?":** hand-rolled TS engine, Expo/RN, MapLibre, OSM/Overpass + Open-Meteo, static on-device graph.
-- **"AI / built in window?":** yes and yes — AI wrote much of the code, I owned architecture + algorithm + debugging, can defend every decision.
-- **"Business?":** prototype, no users; problem is real; next step is demand discovery, not features.
-- **Rule:** direct answer → one sentence of evidence → stop. Never bluff code you can't read; never fake a market.
+```
+┃ "Fully working — what you saw was live. It pulls real
+┃  OpenStreetMap streets and real elevation for the corridor
+┃  on-device, builds a graph, and runs the search right there.
+┃  Happy to route any two addresses you give me right now."
+```
 
-┃ "I used AI heavily — and I can defend every decision in it. That's the part that matters."
+The follow-up offer ("give me two addresses") is the strongest possible proof.
+Only make it if your cache is warm for the area they're likely to name — keep
+it to your demo neighborhood.
+
+### Q2 — "What was the hardest part?"
+
+```
+┃ "The 'no route' bug. Two valid addresses would return
+┃  nothing because they landed in two disconnected pieces of
+┃  the graph — I'd only loaded tiles around each endpoint, not
+┃  the gap. Fix was loading the whole corridor between them and
+┃  stitching the seams so the graph actually connects."
+```
+
+**Deeper follow-up — "how do you know it's disconnected vs just steep?":**
+
+```
+┃ "That's the key design choice — BLOCKED is a large finite
+┃  number, not infinity. A too-steep edge stays expensive but
+┃  traversable, so a steep-only route still returns and gets
+┃  flagged. Only a genuinely disconnected graph returns null.
+┃  Two different states, never confused."
+```
+
+→ For the full walk: `.aipe/study-system-design/04-honest-fallback-routing.md`
+and `.aipe/study-system-design/03-tile-merge-stitch.md`.
+
+### Q3 — "What's the stack?"
+
+```
+┃ "Expo and React Native on the front, MapLibre for the map.
+┃  The router is hand-rolled — a generic A* in TypeScript where
+┃  the grade-aware cost and the heuristic are just parameters.
+┃  No Google Maps, no Valhalla, no OSRM — the graph work is the
+┃  whole point, so I wrote it."
+```
+
+**Deeper follow-up — "why hand-roll the router?":**
+
+```
+┃ "Off-the-shelf routers optimize for distance or time — none
+┃  of them take a signed, directional grade penalty. To route
+┃  for flat I needed the cost function to be mine. The A* stays
+┃  optimal because the heuristic is admissible — haversine is a
+┃  true lower bound and the penalty's never negative."
+```
+
+→ For the heuristic admissibility + PQueue depth:
+`.aipe/rehearse-interview-defense/`.
+
+### Q4 — "Did you build this during the hackathon? How much was AI?"  ★ the honesty answer
+
+This is the one to rehearse hardest. Own it, flat and confident. Judges in
+2026 assume heavy AI use — defensiveness reads worse than candor.
+
+```
+┃ "Built in the window, and yes — I used AI heavily, the same
+┃  way I'd use it at work. But the decisions are mine: the
+┃  directional, signed-grade cost function; keeping BLOCKED
+┃  finite so 'too steep' and 'no route' stay distinct; loading
+┃  the corridor to fix the disconnected-graph bug; the
+┃  admissible heuristic so A* stays optimal. AI wrote a lot of
+┃  the lines. I architected the system and I own the algorithm."
+```
+
+The structure that makes this land: name the tool use plainly ("yes, heavily"),
+then list the *decisions* — and they're real, specific, defensible decisions
+you can each explain on demand. That's the proof you drove it. If they push on
+any one of those four decisions, you can go three levels deep on it, which is
+exactly what proves ownership.
+
+**Deeper follow-up — "so what did YOU actually do?":**
+
+```
+┃ "Pick any of those four and I'll walk you through why. Take
+┃  the finite BLOCKED — if I'd used infinity, a steep-only route
+┃  would look identical to a disconnected one, and the app would
+┃  lie to a wheelchair user that there's no way home. That's a
+┃  product decision an autocomplete doesn't make for you."
+```
+
+### Q5 — "Is there a business here? What's next?"
+
+```
+┃ "The wedge is accessibility — mobility-impaired routing is
+┃  genuinely underserved, and cities increasingly have to care
+┃  about it. Next is more map coverage, real accessibility
+┃  profiles beyond the three presets, and turn-by-turn. Today
+┃  it's one city and a clean proof the routing works."
+```
+
+Keep "today vs next" sharp, same as the close — never imply the roadmap
+exists.
+
+### Bonus probe — "your grades look approximate / are they accurate?"
+
+Own it before they have to push.
+
+```
+┃ "Approximate, on purpose, and the app says so. The free
+┃  elevation data is a coarse ~90-meter grid, so grades are
+┃  ballpark — good enough to tell a flat street from a steep
+┃  one, which is the decision that matters. And when the API
+┃  rate-limits me I fall back to flat and label it 'grades
+┃  approximate' rather than crash or fake a number."
+```
+
+→ The fallback + cache mechanics:
+`.aipe/study-system-design/05-elevation-provider-fallback.md`.
+
+### Strong vs weak — the Q&A move
+
+```
+  WEAK Q&A answer                  STRONG Q&A answer
+  ──────────────────────────      ──────────────────────────
+  "How much was AI?" →            "Yes, heavily — but here are
+   "Oh, not that much really,      the four decisions that are
+    I wrote most of it myself"      mine, and I'll defend any of
+  → defensive, sounds like a       them." → matter-of-fact, lists
+    dodge, invites doubt            real architectural calls
+                                   → reads as the engineer who
+  "What's the hard part?" →         drove the build
+   "Um, it was all pretty hard"
+  → vague, no story                 ONE named bug + the fix
+                                   → concrete, only-the-builder
+```
+
+In 2026, the defensive AI answer is the single most common way a strong build
+loses credibility in Q&A. Candor wins. List the decisions.
+
+## The IF-IT-BREAKS box
+
+```
+╔══════════════════════════════════════════════════════════════╗
+║ IF IT BREAKS — a question you don't know the answer to        ║
+║ Don't bluff — judges spot it instantly. Say: "I haven't       ║
+║ measured that — here's how I'd find out," and name the method. ║
+║ "I don't know yet, but my guess is X because Y" beats a        ║
+║ confident wrong answer every time. One honest "I don't know"   ║
+║ buys credibility for everything else you said.                 ║
+╚══════════════════════════════════════════════════════════════╝
+```
+
+## The "tighten it" treatment
+
+Q&A has no clock, so there's nothing to cut — but keep *each answer* tight:
+two to three sentences, then stop and let them ask the follow-up. The failure
+mode here is the opposite of the demo's: not running long on the clock, but
+monologuing a single answer until the judge's eyes glaze. Answer, pause, let
+them drive.
+
+## The one-page run sheet
+
+```
+  ┌─ CH 06 · Q&A · POST-CLOCK · PREP ONLY ───────────────────┐
+  │                                                           │
+  │  Q1 working? → "fully live, on-device, real data —        │
+  │     give me two addresses." (only if cache warm)          │
+  │  Q2 hard part? → "no-route bug: disconnected components;  │
+  │     load + stitch the corridor."                          │
+  │  Q3 stack? → "Expo/RN + MapLibre; hand-rolled A* in TS;   │
+  │     no routing API — graph work is the point."            │
+  │  Q4 ★ AI? → "yes, heavily. Decisions are mine: signed     │
+  │     directional cost · finite BLOCKED · corridor fix ·    │
+  │     admissible heuristic. I own the architecture + algo." │
+  │  Q5 business/next? → "accessibility routing; cities +     │
+  │     profiles + turn-by-turn next. Today: one city, works."│
+  │  Bonus grades? → "approximate on purpose, ~90 m grid,     │
+  │     labeled honestly; flat fallback on throttle."         │
+  │                                                           │
+  │  DON'T KNOW IT: "haven't measured — here's how I'd check."│
+  │                                                           │
+  │  DEEPER: defense book (heuristic, PQueue) ·               │
+  │   study 03/04/05 (stitch, fallback, elevation).           │
+  └───────────────────────────────────────────────────────────┘
+```
+
+That's the book. Pre-warm the cache, open in motion, land the bend at 2:30,
+finish at 9:30, and own the AI answer. Go win it.

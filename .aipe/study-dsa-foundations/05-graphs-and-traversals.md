@@ -1,88 +1,83 @@
-# Graphs & traversals
+# Graphs & Traversals
 
-**Industry names:** weighted directed graph · adjacency list · Dijkstra's
-algorithm · A\* search · informed/best-first search · admissible heuristic ·
-bidirectional search. **Type:** Industry standard. **This is the centerpiece
-of the repo and of this guide.**
-
----
-
-## Zoom out, then zoom in
-
-This is the whole point of `flattr`. A street network is a graph: intersections
-are nodes, blocks are edges, and "find me the flattest comfortable route from A
-to B" is a shortest-path query where "shortest" means *lowest grade-effort*, not
-lowest distance. Everything in the other files exists to make this one work — the
-heap (**03**) is the frontier, the hash maps (**02**) are the adjacency and the
-visited set, the cost model (**01**) is what the path minimizes.
-
-```
-  Zoom out — the search layer is the engine
-
-  ┌─ Input ────────────────────────────────────────────────────────┐
-  │  nearestNode(start), nearestNode(goal)  → snap to node ids       │
-  └─────────────────────────┬────────────────────────────────────────┘
-  ┌─ ★ Search layer (THIS FILE) ───────────▼────────────────────────┐
-  │  search(graph, start, goal, userMax, costFn, heuristicFn)        │
-  │    ONE engine, four stages:                                      │
-  │      dijkstra      = distanceCost + zeroHeuristic                │
-  │      astar         = distanceCost + haversineHeuristic           │
-  │      gradeAstar    = gradeCostAbs + haversineHeuristic           │
-  │      directedAstar = gradeCostDirected + haversineHeuristic      │
-  │    bidirectional() = two frontiers, meet in the middle           │
-  │  features/routing/astar.ts, bidirectional.ts                     │
-  └─────────────────────────┬────────────────────────────────────────┘
-  ┌─ Cost layer ────────────▼────────────────────────────────────────┐
-  │  penalty(directedGrade, userMax)   features/routing/cost.ts       │
-  └────────────────────────────────────────────────────────────────────┘
-```
-
-Zoom in: the verdict first. **Dijkstra, A\*, grade-A\*, and directed-A\* are
-not four algorithms. They're one function, `search()` (`astar.ts:22-78`), called
-with four different `(costFn, heuristicFn)` pairs (`astar.ts:135-163`).** That
-collapse *is* the senior insight: Dijkstra is A\* with a zero heuristic; the
-domain (grade) lives entirely in the cost function, never in the search loop.
-Learn `search()` once and you've learned all four.
+**Industry names:** weighted graph, adjacency list, Dijkstra's algorithm,
+A* search, bidirectional search, best-first traversal, admissible
+heuristic. **Type:** Industry standard.
 
 ---
 
-## The structure pass
+## Zoom out — where this concept lives
 
-**Layers.** The graph machinery nests in three altitudes:
+This is the spine. Everything in the other files — the heap, the hash
+maps, the cost model — exists to serve one function: `search()` in
+`astar.ts`. And the single most important thing to understand about
+flattr is that there is **one** search function, and Dijkstra, A*,
+grade-A*, and directional-A* are all just it, called with different
+`(costFn, heuristicFn)` pairs.
 
 ```
-  One question — "where does direction live?" — down the layers
+  Zoom out — the routing engine in the system
 
-  ┌────────────────────────────────────────────────┐
-  │ STORAGE: undirected edges + adjacency             │ → direction NOT stored
-  │   one Edge, both endpoints in adjacency           │   (graph.ts:22-29)
-  └────────────────────┬───────────────────────────────┘
-       ┌───────────────▼─────────────────────────────┐
-       │ TRAVERSAL: directedGrade(edge, fromNode)      │ → direction DERIVED
-       │   +grade forward, -grade reverse              │   at the moment you step
-       └───────────────┬─────────────────────────────┘   (graph.ts:17-19)
-           ┌───────────▼───────────────────────────┐
-           │ COST: penalty over the directed grade    │ → direction MATTERS
-           │   uphill penalized, downhill free        │   (cost.ts:32-33)
-           └─────────────────────────────────────────┘
-
-  the answer flips: stored undirected → traversed directed → costed asymmetric.
-  THAT progression is the model's cleverness (spec §11-F: derive, don't materialize)
+  ┌─ Mobile UI (mobile/) ───────────────────────────────────────┐
+  │  tap two points → nearestNode() → startId, goalId           │
+  └───────────────────────────┬──────────────────────────────────┘
+                              │  one call into the engine
+  ┌─ Routing engine (features/routing/) ────────────────────────┐
+  │  ★ search(graph, start, goal, userMax, costFn, heuristicFn) ★│ ← we are here
+  │       uses: PQueue (file 03) + g/came/closed (file 02)      │
+  │       over: adjacency list (graph.ts)                       │
+  │       costs: penalty() (cost.ts, file 01)                   │
+  │  wrappers: dijkstra | astar | gradeAstar | directedAstar    │
+  │  variant:  bidirectional (two frontiers)                    │
+  └───────────────────────────┬──────────────────────────────────┘
+                              │  Path { nodes, edges, cost, steepEdges }
+  ┌─ Static graph (mobile/assets/graph.json) ───────────────────┐
+  │  nodes, edges, adjacency — prebuilt, read-only              │
+  └──────────────────────────────────────────────────────────────┘
 ```
 
-**Axis = direction.** This is the axis that makes the repo's graph special. A
-plain graph search doesn't care which way you cross an edge. `flattr` does:
-`directedGrade(edge, fromNodeId)` (`graph.ts:17-19`) returns `+gradePct` if you
-entered from the `fromNode` end, `-gradePct` from the other. One physical edge,
-two costs depending on travel direction. The cost function consumes that
-(`cost.ts:32-33`), so A\* naturally routes downhill-and-flat.
+**Zoom in.** A grade-annotated street graph stored as an undirected
+adjacency list, traversed by a best-first search whose order is set by an
+admissible heuristic and whose preferences are set by a swappable cost
+function. This file builds the search kernel, then shows how four
+algorithms fall out of one engine, then the bidirectional variant.
 
-**Seams.** The load-bearing seam is `otherEnd` + `directedGrade` (`graph.ts:9-19`)
-— the joint where undirected *storage* becomes directed *traversal*. Cross it
-left-to-right and the answer to "what does it cost to cross this edge?" flips from
-symmetric to asymmetric. That single seam is open-decision F-(1) from the spec
-(§11): derive direction at traversal instead of materializing two edges, paying a
-tiny per-step computation to halve the graph size.
+---
+
+## Structure pass — one axis across the search progression
+
+The layers here are the **five search stages** (`bench/` calls them the
+progression: Dijkstra → A* → grade-A* → directional-A* → bidirectional).
+The axis that makes them legible is **what does the priority key
+encode?** — because that one choice is the entire difference between them.
+
+```
+  Axis: "what goes into the heap priority?"  (the f-score)
+
+  ┌─ stage 1  Dijkstra ────────┐  priority = g            (cost so far)
+  │  costFn=distance, h=0       │  → uninformed flood
+  └─────────────────────────────┘
+  ┌─ stage 2  A* ──────────────┐  priority = g + h        (+ haversine)
+  │  costFn=distance, h=havers. │  → aimed at the goal
+  └─────────────────────────────┘
+  ┌─ stage 3  grade-A* ────────┐  priority = g + h, g uses penalty
+  │  costFn=gradeAbs            │  → flattest, symmetric
+  └─────────────────────────────┘
+  ┌─ stage 4  directional-A* ──┐  priority = g + h, g uses SIGNED grade
+  │  costFn=gradeDirected       │  → flattest, A→B ≠ B→A
+  └─────────────────────────────┘
+  ┌─ stage 5  bidirectional ───┐  two heaps, balanced potential
+  │  meet in the middle         │  → fewer expansions vs flood
+  └─────────────────────────────┘
+```
+
+The seams: **stage 1→2** the heuristic flips the search from blind to
+aimed (the `closed`/`g` machinery is identical). **stage 2→3** the cost
+flips from distance to grade-penalized — the search engine doesn't change
+*at all*, only the function plugged into it. **stage 4** the cost becomes
+direction-aware, so the graph's undirected storage has to derive direction
+at traversal time. That last seam — undirected storage, directed cost — is
+the subtle one this file spends the most time on.
 
 ---
 
@@ -90,439 +85,377 @@ tiny per-step computation to halve the graph size.
 
 ### Move 1 — the mental model
 
-You know BFS: a frontier queue, pop a node, push its unvisited neighbors, repeat
-until you find the goal or the queue drains. Dijkstra and A\* are BFS where the
-frontier is a *priority* queue ordered by cost-so-far (plus, for A\*, an estimate
-of cost-remaining). Instead of expanding the nearest-by-hops node, you expand the
-cheapest-by-cost node.
+You already know BFS: a frontier queue, a visited set, dequeue-expand-
+enqueue until you hit the goal. A* is BFS with the FIFO queue replaced by
+a *priority* queue, and the priority is a guess at total trip cost. That's
+the entire idea — pop the most promising node, not the oldest one.
 
 ```
-  Best-first search — the kernel shared by Dijkstra & A*
+  A* — the best-first frontier (the kernel)
 
-       ┌──────────────────────────────────────────┐
-       │  open ← {start}   (a priority queue)        │
-       │  while open not empty:                      │
-       │     current ← open.pop()  (lowest f)        │
-       │     if current == goal → reconstruct, done  │
-       │     close(current)                          │
-       │     for each neighbor via an edge:          │
-       │        if cheaper path found → relax & push │
-       │  open empty → no path                       │
-       └──────────────────────────────────────────┘
-
-  Dijkstra: f = g (cost so far)
-  A*:       f = g + h   (cost so far + admissible estimate to goal)
-  the ONLY difference is h. that's why one function (search) does both.
+       start ●
+            / \
+       g=80●   ● g=80          each frontier node ranked by:
+          /|    \                f = g + h
+   g=160● |      ● g=160          g = real cost from start (so far)
+         ...      ▼               h = admissible estimate to goal
+                ● goal           pop LOWEST f → expand → repeat
+                                 stop when goal is popped
 ```
 
-### Move 2 variant — the load-bearing skeleton
+The "admissible" part is the contract that makes A* *correct*: the
+heuristic `h` must never *over*estimate the remaining cost. flattr uses
+straight-line haversine distance (`astar.ts:9`), which can't overestimate
+because the real road is never shorter than the great-circle line. Honor
+that contract and A* returns the *exact same optimal path* as Dijkstra,
+just by expanding fewer nodes. Break it and A* gets fast but wrong.
 
-`search()` (`astar.ts:22-78`) has an irreducible kernel. Five parts, each named
-by what breaks when it's gone:
+### Move 2 — the search kernel, one moving part at a time
 
-**1. The open set (priority queue) — the frontier.**
-`open = new PQueue<string>()` (`astar.ts:30`), ordered by f-score. *Remove the
-priority ordering* (use a plain queue) and you're back to BFS — correct only when
-all edges cost the same, wrong the instant grades vary. The frontier is what makes
-the search expand the *cheapest* node next.
+#### The kernel — five parts, named by what breaks without each
 
-**2. The `g` map — best-known cost to each node.**
-`g = new Map<string, number>()` (`astar.ts:31`). The relaxation test `tentative <
-(g.get(next) ?? Infinity)` (`astar.ts:69`) is the heart of shortest-path: *only
-update if I found a cheaper way here.* *Remove `g`* and you can't tell a better
-path from a worse one — you'd accept every path and never converge.
-
-**3. The `closed` set — finalized nodes.**
-`closed = new Set<string>()` (`astar.ts:34`). When a node is popped, it's
-finalized (`astar.ts:61`) — with an admissible heuristic, the first time you pop a
-node you have its optimal cost, so you never process it again
-(`astar.ts:51,67`). *Remove `closed`* and you reprocess nodes endlessly; on a
-cyclic graph (every street graph) the search may not terminate. This is the part
-people forget — and the repo has *two* guards: skip if closed at pop
-(`astar.ts:51`, catches stale heap entries) and skip closed neighbors
-(`astar.ts:67`).
-
-**4. The `came` map — path reconstruction.**
-`came = new Map<string, {edge, prev}>()` (`astar.ts:32`). Each relaxation records
-*which edge* and *which predecessor* got you to a node cheaply (`astar.ts:71`).
-*Remove `came`* and the search finds the optimal *cost* but can't tell you the
-*route* — you'd know the trip is 1.2km of gentle grade but not which streets.
-Reconstruction (`astar.ts:86-103`) walks `came` backward from goal to start.
-
-**5. Empty-frontier termination — the "no path" signal.**
-`while (!open.isEmpty())` falling through to `return {path: null}`
-(`astar.ts:48,77`). *Remove it* and a disconnected goal loops forever or crashes
-on `pop()!`. This is how A\* distinguishes "no route exists" (returns `null`,
-`astar.test.ts:21-27`) from "route exists but steep" (returns a path with
-`steepEdges` flagged — see the BLOCKED discussion below).
-
-**Now the execution trace — Dijkstra on the diamond fixture** (`fixtures.ts:46-65`).
-Flat graph, distance cost, find S→G. Edges: sa=100, ag=100, sb=100, bg=150,
-sd=300, dg=300, ac=100, cb=100.
+This is the load-bearing skeleton. Here's the smallest thing that's still
+A*:
 
 ```
-  Dijkstra S→G on diamondGraph (astar.ts:48-75)
-  g = cost so far; open = heap of (node, priority); closed = finalized
+  search() kernel (astar.ts:48-76)
 
-  init:   g{S:0}                       open[(S,0)]
-  pop S:  close S. relax neighbors:
-          A: g 0+100=100 < ∞  → g{A:100}  push(A,100)
-          B: g 0+100=100 < ∞  → g{B:100}  push(B,100)
-          D: g 0+300=300 < ∞  → g{D:300}  push(D,300)
-                                          open[(A,100)(B,100)(D,300)]
-  pop A:  close A. relax:
-          G: g 100+100=200    → g{G:200}  push(G,200)
-          C: g 100+100=200    → g{C:200}  push(C,200)
-                                          open[(B,100)(G,200)(C,200)(D,300)]
-  pop B:  close B. relax:
-          G: 100+150=250  NOT< 200 → skip   (B's route to G is worse)
-          C: 100+100=200  NOT< 200 → skip
-                                          open[(G,200)(C,200)(D,300)]
-  pop G:  current == goal → reconstruct via came{G:(ag,A), A:(sa,S)}
-          path = [S,A,G]  cost 200  ✓ (astar.test.ts:6-12)
+  while open not empty:
+    current = open.pop()                  ── 1. FRONTIER (priority queue)
+    if closed.has(current): continue      ── 2. STALE SKIP (lazy deletion)
+    if current == goal: reconstruct       ── 3. TERMINATION
+    closed.add(current)                   ── 4. VISITED SET
+    for edge in adjacency[current]:       ── 5. RELAXATION
+      tentative = g[current] + cost(edge)
+      if tentative < g[next] ?? Inf:
+        g[next] = tentative
+        came[next] = {edge, current}
+        open.push(next, tentative + h(next))
 ```
 
-Notice D never gets expanded — its priority 300 sat behind the goal at 200. That's
-Dijkstra pruning by cost. A\* prunes *harder* because of the heuristic.
+What breaks if you remove each:
 
-**The heuristic — what turns Dijkstra into A\*.** `haversineHeuristic`
-(`astar.ts:9`) adds an *estimate of remaining cost* to the priority:
-`f = g + h` (`astar.ts:72`). Dijkstra explores in expanding circles (it has no
-idea where the goal is); A\* explores in a *cone* aimed at the goal, because nodes
-pointing away from the goal get a high `h` and sink in the queue.
+- **Drop the frontier (pop min):** without priority ordering it's BFS,
+  which ignores edge weights — it'd return the fewest-*edges* path, not the
+  flattest. Grades would be invisible.
+- **Drop the stale skip:** lazy-deletion duplicates get re-expanded;
+  wasted work, and the `closed` invariant breaks (file 03).
+- **Drop termination on goal-pop:** the search runs the whole graph. Note
+  the subtlety — it terminates when the goal is *popped* (`astar.ts:52`),
+  not when it's first *seen*, because only at pop time is its cost final.
+- **Drop the visited set:** revisits nodes forever on a cyclic graph
+  (every street graph has cycles).
+- **Drop relaxation's `<` test:** you'd overwrite good paths with worse
+  ones; the `tentative < g[next]` is what keeps `g` holding the *best*
+  cost.
 
-```
-  Dijkstra floods vs A* cones (same start ●, goal ★)
+Now walk the live ones.
 
-  DIJKSTRA (h=0)              A* (h=haversine)
-      · · · · ·                       · ·
-    · · · · · · ·                   · · · ★
-  · · · ● · · · ★               · · ● · ·
-    · · · · · · ·                   · ·
-      · · · · ·
-  expands ~everything close    expands a narrow cone toward ★
-  to the start, all directions  → far fewer nodes (bench: ~203 vs ~50)
-```
+#### The relaxation step — the heart of shortest-path
 
-**Admissibility — why A\* still finds the optimal path.** A heuristic is
-*admissible* if it never overestimates the true remaining cost. Then A\* is
-guaranteed optimal. Here's the proof, grounded in the code: every edge cost is
-`length * (1 + penalty)` with `penalty >= 0` (`cost.ts:16-22`), so `cost >=
-length` always. Straight-line haversine distance is `<=` any real path length
-(triangle inequality). Therefore haversine `<=` true remaining cost — it never
-overestimates. The test `astar.test.ts:38-45` is the live proof: A\* returns the
-*exact same cost* as Dijkstra. If it ever didn't, the heuristic would be
-inadmissible.
+"Relaxing" an edge means: is going through `current` a cheaper way to
+reach `next` than anything found so far?
 
-```
-  Why haversine is admissible (the chain, from the code)
-
-  penalty ≥ 0           (cost.ts:16: g≤0 → 0; else positive)
-    ⟹ edgeCost = len*(1+penalty) ≥ len           (cost.ts:29,33)
-    ⟹ true path cost ≥ true path length
-  haversine(n,goal) ≤ true path length            (straight line ≤ any path)
-    ⟹ haversine ≤ true path cost   ← NEVER overestimates = ADMISSIBLE
-    ⟹ A* optimal (astar.test.ts:38-45 proves equal cost to Dijkstra)
+```ts
+// features/routing/astar.ts:64-74
+for (const edgeId of graph.adjacency[current] ?? []) {
+  const edge = byId.get(edgeId)!;
+  const next = otherEnd(edge, current);
+  if (closed.has(next)) continue;
+  const tentative = g.get(current)! + costFn(edge, current, userMax);
+  if (tentative < (g.get(next) ?? Infinity)) {
+    g.set(next, tentative);
+    came.set(next, { edge, prev: current });
+    open.push(next, tentative + heuristicFn(graph.nodes[next], goal));
+    pushes++;
+  }
+}
 ```
 
-**The grade cost — where the domain enters, and ONLY there.** Stage 3 swaps
-`distanceCost` for `gradeCostAbs` (`cost.ts:28-29`), stage 4 for
-`gradeCostDirected` (`cost.ts:32-33`). The search loop never changes — it just
-calls `costFn(edge, current, userMax)` (`astar.ts:68`). `gradeCostDirected` reads
-`directedGrade(edge, fromNodeId)`, so the *same edge* costs more uphill than
-downhill. That asymmetry is what makes A→B ≠ B→A.
+Execution trace — relaxing out of `current=A` (g[A]=80) over two edges:
 
 ```
-  Directed cost asymmetry — directionalGraph (fixtures.ts:88-102)
-  Edge xy: X→Y climbs 8%. userMax=5. Detour X-F-Y is flat.
+  relaxation trace (g[A]=80)
 
-  X→Y (uphill):  directedGrade(xy, X) = +8 > max 5 → penalty BLOCKED (1e9)
-                 cost(xy) = 100*(1+1e9) ≈ 1e11   → A* takes detour X-F-Y
-  Y→X (downhill):directedGrade(xy, Y) = -8 ≤ 0    → penalty 0
-                 cost(xy) = 100*(1+0) = 100        → A* takes direct edge Y-X
+  edge A→C, cost 90:
+    tentative = 80 + 90 = 170
+    g[C] ?? Inf = Inf  →  170 < Inf  → relax: g[C]=170, push(C, 170+h(C))
+  edge A→G, cost 100:
+    tentative = 80 + 100 = 180
+    g[G] ?? Inf = Inf  →  180 < Inf  → relax: g[G]=180, push(G, 180+h(G))
 
-  result: up = [X,F,Y], down = [Y,X]   (astar.test.ts:74-80) — A→B ≠ B→A ✓
+  later, B reaches G cheaper (g[G]=150):
+    tentative = 150 < g[G]=180 → relax: g[G]=150, came[G] rewired to B
+    push(G, 150+h(G))   ← duplicate G in heap; old (G,180+h) now stale
 ```
 
-**BLOCKED is large-finite, not Infinity — the honest-fallback design.**
-`BLOCKED = 1e9` (`cost.ts:5`). When *every* route crosses a too-steep edge, A\*
-still returns one (the cost is huge but finite and comparable), and
-`summarizePath` flags the offending edges in `path.steepEdges`
-(`astar.ts:126-128`). `null` is reserved for a *genuinely disconnected* graph —
-the open set drains without ever reaching the goal. This distinguishes two real
-graph states: "no flat way" (steep, flagged) vs "no way at all" (disconnected).
-`astar.test.ts:82-96` pins both.
+The priority pushed is `tentative + h(next)` — that's the f-score. `g` is
+known cost; `h` is the estimate. The duplicate push is exactly the lazy
+deletion from file 03: G is now in the heap twice, and the stale `(G,180)`
+copy gets skipped when it pops.
 
-```
-  Three outcomes A* distinguishes (the honest fallback)
+#### costFn — the parameter that makes one engine into four
 
-  clean route exists   → path, steepEdges=[]        (normal)
-  only-steep route     → path, steepEdges=[xy]      BLOCKED finite, flagged
-                         (astar.test.ts:82-89)        — "no flat way"
-  disconnected         → path = null                open drained, goal unseen
-                         (astar.test.ts:91-96)        — "no way"
+Here's the design move that defines flattr. The search engine never
+mentions grades. It calls `costFn(edge, current, userMax)` and that's it.
+The four wrappers just pick the function:
 
-  if BLOCKED were Infinity, only-steep and disconnected would BOTH look like
-  "no path" — the honesty distinction collapses. (See 01 for the arithmetic.)
+```ts
+// features/routing/astar.ts:135-163 — four algorithms, one engine
+export function dijkstra(g, s, go)       { return search(g,s,go, Infinity, distanceCost,        zeroHeuristic); }
+export function astar(g, s, go)          { return search(g,s,go, Infinity, distanceCost,        haversineHeuristic); }
+export function gradeAstar(g,s,go,uMax)  { return search(g,s,go, uMax,     gradeCostAbs,         haversineHeuristic); }
+export function directedAstar(g,s,go,uMax){ return search(g,s,go, uMax,    gradeCostDirected,    haversineHeuristic); }
 ```
 
-**Reconstruction uses the exact relaxed edge — the parallel-edge trap.**
-`reconstruct` (`astar.ts:86-103`) walks `came` and reports the *exact edge the
-search relaxed* (`entry.edge`), not a re-resolution by node pair. Why it matters:
-two parallel edges can connect A→B (a short-steep one and a long-flat one). The
-grade router picks long-flat; a naive reconstruction that re-looks-up "an A→B
-edge" might report the short-steep one, lying about the route. `astar.test.ts:102-128`
-locks this: the path must report `long-flat`, not `short-steep`.
-
-**Bidirectional A\* — two frontiers, meet in the middle.** `bidirectional()`
-(`bidirectional.ts:8-151`) runs a forward search from start *and* a backward
-search from goal, and stops when they meet. The provable win is *meeting in the
-middle*: two small cones instead of one big one (`bidirectional.test.ts:26-38`:
-~43 expansions vs Dijkstra's ~203).
-
 ```
-  Bidirectional A* — two cones meet (bidirectional.ts:49-115)
+  One engine, four (costFn, heuristicFn) pairs
 
-  forward from S ──►cone     cone◄── backward from G
-                    ●  meet  ●
-  S ────────────────●━━━━━━━━●──────────────── G
-                    └─ meet point: reconstruct
-                       front S→meet (cameF) + back meet→G (cameR)
-
-  stopping rule (bidirectional.ts:52): topF + topR ≥ mu → stop
-    mu = best total cost found so far; when the two frontier tops can't
-    possibly beat it, you're done. This is the part that's easy to get WRONG.
+  search(...) ◄─── costFn ───┬─ distanceCost      → "shortest"
+                             ├─ gradeCostAbs      → "flattest, symmetric"
+                             └─ gradeCostDirected → "flattest, directional"
+              ◄─── heuristicFn ─┬─ zeroHeuristic     → Dijkstra (blind)
+                                └─ haversineHeuristic → A* (aimed)
 ```
 
-The subtle correctness piece is the **balanced consistent potential**
-(`bidirectional.ts:30-32`): `pf(n) = (h(n,goal) - h(n,start)) / 2`, with `pr = -pf`.
-A naive bidirectional A\* using plain haversine on each side isn't *consistent*
-across the two searches, and the meeting rule can return a non-optimal path. The
-balanced potential keeps both sides consistent so the stopping rule is sound.
-*Remove the balance* and you can get a wrong answer that still looks plausible —
-the hardest bug class in the repo. `bidirectional.test.ts:16-24` verifies it
-matches directed-A\*'s optimal cost.
+This is dependency injection at the algorithm level. The *correctness*
+proof is in the test suite: `astar.test.ts:38-45` asserts A*'s path cost
+equals Dijkstra's on a 12×12 grid — the **optimality oracle**. Same
+optimum, fewer expansions (`astar.test.ts:47-52`: A* expands `<=`
+Dijkstra). If a refactor ever broke admissibility, that oracle would catch
+it.
 
-### Move 2.5 — current state vs future state
+#### Undirected storage, directed cost — the subtle seam
 
-Stages 1–5 are shipped and tested. Stage 6 (contraction hierarchies / ALT
-landmarks) and k-alternative routes are spec stretch goals, not built.
+The graph stores each edge **once**, listed under both endpoints
+(`buildAdjacency`, `graph.ts:22-29`). There are no reversed edges. So how
+does directional routing — where uphill A→B costs more than downhill
+B→A — work?
+
+Direction is **derived at traversal time**, not stored:
+
+```ts
+// features/routing/graph.ts:10-19
+export function otherEnd(edge: Edge, nodeId: string): string {
+  if (nodeId === edge.fromNode) return edge.toNode;
+  if (nodeId === edge.toNode) return edge.fromNode;
+  throw new Error(...);
+}
+export function directedGrade(edge: Edge, fromNodeId: string): number {
+  return fromNodeId === edge.fromNode ? edge.gradePct : -edge.gradePct;
+}
+```
 
 ```
-  Phase A (shipped)              Phase B (spec §14.5 stretch, not built)
-  ┌──────────────────────┐       ┌──────────────────────────────────────┐
-  │ Dijkstra              │       │ contraction hierarchies — preprocess  │
-  │ A* (haversine)        │  ───► │   shortcuts for O(query) ≪ current    │
-  │ grade-A*, directed-A* │       │ k-alternatives — penalty method:      │
-  │ bidirectional A*      │       │   inflate used edges, re-run (touches  │
-  └──────────────────────┘       │   DP ideas — see 07)                   │
-  what DOESN'T change: the graph model, the cost function, the heap.
-  CH/ALT add a PREPROCESSING layer; the query-time search stays recognizable.
+  One stored edge, two travel directions (graph.ts)
+
+  stored:   A ──[gradePct = +8%]── B     (signed from→to)
+
+  traverse A→B:  directedGrade(edge, "A") = +8   → uphill → penalized
+  traverse B→A:  directedGrade(edge, "B") = -8   → downhill → free (penalty 0)
+                 otherEnd(edge, "B") = "A"
+
+  same edge object; the FROM node decides the sign
+```
+
+`gradeCostDirected` (`cost.ts:32-33`) feeds `directedGrade(edge, fromNode)`
+into `penalty()`, so the *same edge* is expensive one way and free the
+other. The test proves it: `directedAstar(X,Y)` detours uphill via F, but
+`directedAstar(Y,X)` takes the direct edge downhill
+(`astar.test.ts:73-80`). **Why store undirected?** Half the memory, and a
+single source of truth per street — you can't have the A→B and B→A grades
+drift out of sync because there's only one number. The cost of that choice
+is the `fromNodeId` parameter threaded through every cost function. That's
+the seam: storage is undirected, cost is directional, and the bridge is a
+function argument.
+
+#### Bidirectional A* — two frontiers meeting in the middle
+
+The stage-5 variant runs two searches at once: forward from start,
+backward from goal, stopping when they meet. The win is geometric — two
+small explored circles instead of one big one.
+
+```
+  Bidirectional — two frontiers (bidirectional.ts)
+
+      start ●───►  ◄───● goal
+            forward    backward
+            frontier   frontier
+                  \   /
+                   meet         total = gf[meet] + gr[meet]
+                                stop when topF + topR >= mu (best found)
+```
+
+The hard part of bidirectional A* is keeping it *correct* — a naive
+"stop when they touch" returns suboptimal paths. flattr uses a **balanced
+consistent potential**:
+
+```ts
+// features/routing/bidirectional.ts:30-32
+const pf = (id) => (haversine(nodes[id], goal) - haversine(nodes[id], start)) / 2;
+const pr = (id) => -pf(id);
+```
+
+```
+  Balanced potential — keeps both frontiers consistent
+
+  pf(node) = (h_goal(node) - h_start(node)) / 2     forward potential
+  pr(node) = -pf(node)                              reverse potential
+
+  stopping rule: topF + topR >= mu  → break  (bidirectional.ts:52)
+    where mu = best meeting-point total cost found so far
+```
+
+The `/2` is what makes the forward and reverse potentials *consistent*
+with each other — without it the two searches use mismatched estimates and
+the meeting point isn't guaranteed optimal. The stopping rule
+`topF + topR >= mu` (`bidirectional.ts:52`) says: once the two frontiers'
+best remaining estimates sum to at least the best path already found, no
+better meeting is possible — stop. The correctness gate is again an
+oracle: `bidirectional.test.ts:16-24` asserts bidirectional's cost matches
+directional-A*'s on the grid. And the test is honest about the limits —
+`bidirectional.test.ts:26-38` notes bidirectional beats *uninformed
+Dijkstra's* flood, but a tight unidirectional A* cone on a Euclidean grid
+can legitimately expand *fewer* nodes. The win is "vs flood," not "always
+fewest."
+
+#### Reconstruction — the exact-edge subtlety
+
+Once the goal pops, walk `came` backward to rebuild the path. The detail
+that matters: it stores the **exact edge relaxed**, not the node pair, so
+parallel edges stay correct (full walk in file 07).
+
+```ts
+// features/routing/astar.ts:93-99 — walk back via the exact edge
+while (cur !== startId) {
+  const entry = came.get(cur)!;
+  edges.push(entry.edge);        // the EXACT edge, not re-resolved by pair
+  cur = entry.prev;
+  nodes.push(cur);
+}
 ```
 
 ### Move 3 — the principle
 
-**The search is generic; the intelligence is the cost function.** `flattr` proves
-this structurally — one `search()` function, four behaviors, swapped purely by
-arguments. This is the same machine Google Maps and Uber run (spec §15.1): a
-weighted graph + shortest-path, where the product differentiation is the *weights*
-(directional grade-effort here, traffic/ETA there), not the search. Learn to
-separate the two — generic traversal vs domain cost — and you can build any
-routing engine.
+A shortest-path search is four parts you can mix independently: a graph
+(adjacency list), a frontier ordered by some key (the heap), a cost
+function (what "shortest" means), and a heuristic (how to aim). flattr's
+insight is that the *first two never change* — Dijkstra and A* and
+grade-A* share one engine — and only the *last two* are parameters. Once
+you see a search engine that way, "add a new routing mode" stops being "write
+a new algorithm" and becomes "write a new `costFn`." That's the whole
+reason the file is called `astar.ts` and not `dijkstra.ts` and
+`grade-router.ts`.
 
 ---
 
 ## Primary diagram
 
-The full search engine: model, the one function, the four stages, and
-bidirectional, with every structure labelled.
+The complete search: graph, frontier, relaxation, the cost/heuristic
+parameters, and reconstruction — one frame.
 
 ```
-  flattr's graph search — the complete picture
+  search() — the full A* engine (astar.ts:22-103)
 
-  ┌─ MODEL (types.ts, graph.ts) ──────────────────────────────────┐
-  │  nodes: Record<id,Node>   edges: Edge[]                        │
-  │  adjacency: Record<id,id[]>  (undirected storage)              │
-  │  directedGrade(edge, from) → signed by travel dir (graph.ts:17)│
-  └─────────────────────────┬──────────────────────────────────────┘
-  ┌─ search() — ONE engine (astar.ts:22-78) ──────────────────────┐
-  │  open:PQueue  g:Map  came:Map  closed:Set   (the 5 kernel parts)│
-  │  loop: pop lowest f → if goal reconstruct → close → relax nbrs  │
-  │        relax: tentative<g(next)? → update g,came, push(f=g+h)   │
-  │  costFn ──┬─ distanceCost ──────────► stage 1 dijkstra (h=0)    │
-  │           ├─ distanceCost + haversine► stage 2 astar            │
-  │           ├─ gradeCostAbs ───────────► stage 3 gradeAstar       │
-  │           └─ gradeCostDirected ──────► stage 4 directedAstar    │
-  └─────────────────────────┬──────────────────────────────────────┘
-  ┌─ bidirectional() (bidirectional.ts) ──────────▼───────────────┐
-  │  openF + openR (two heaps) · pf/pr balanced potential          │
-  │  stop: topF+topR ≥ mu · reconstruct front(cameF)+back(cameR)   │
-  └──────────────────────────────────────────────────────────────────┘
-       outputs: Path {nodes, edges, cost, lengthM, steepEdges}
-                + SearchResult metrics {nodesExpanded, pushes, pops}
-```
-
----
-
-## Implementation in codebase
-
-**Use cases.** The search runs on every route request: snap start/goal with
-`nearestNode`, pick a stage by `userMax` and preset, run `search()` or
-`bidirectional()`, draw the path and color its segments by directed grade. The
-bench harness (`bench/run.ts`) runs all five stages over fixed pairs to prove the
-progression. The four stage wrappers are the same function with different args.
-
-```
-  features/routing/astar.ts  (lines 64-75)  — the relaxation hot loop
-
-  for (const edgeId of graph.adjacency[current] ?? []) {  ← all incident edges
-    const edge = byId.get(edgeId)!;                       ← O(1) (see 02)
-    const next = otherEnd(edge, current);                 ← the directed step
-    if (closed.has(next)) continue;                       ← skip finalized (guard 2)
-    const tentative = g.get(current)! + costFn(edge, current, userMax);
-                                                          ← cost-so-far + edge cost
-    if (tentative < (g.get(next) ?? Infinity)) {          ← RELAX: found cheaper?
-      g.set(next, tentative);                             ← record best cost
-      came.set(next, { edge, prev: current });            ← record HOW (for path)
-      open.push(next, tentative + heuristicFn(graph.nodes[next], goal));
-      pushes++;                                           ← f = g + h into the heap
-    }
-  }
-       │
-       └─ this loop IS the algorithm. costFn is the only thing that changes
-          between stages — direction enters via costFn reading directedGrade,
-          NOT via the loop. The `?? Infinity` makes an unseen node always relax.
-```
-
-```
-  features/routing/astar.ts  (lines 48-61)  — pop, goal-check, close
-
-  const current = open.pop()!; pops++;
-  if (closed.has(current)) continue;     ← STALE entry from lazy deletion (see 03)
-  if (current === goalId) { ...reconstruct, return... }  ← first pop of goal = optimal
-  closed.add(current); nodesExpanded++;  ← finalize: never process again
-       │
-       └─ the `closed.has(current)` skip is the lazy-deletion seam with the heap:
-          a node relaxed twice has two heap entries; the better pops first and
-          closes the node, the worse pops later and is skipped here. Without
-          this line the search reprocesses nodes and may not terminate on cycles.
-```
-
-```
-  features/routing/bidirectional.ts  (lines 30-32, 49-52)  — potential + stop
-
-  const pf = (id) => (haversine(nodes[id], goal) - haversine(nodes[id], start))/2;
-  const pr = (id) => -pf(id);                            ← balanced, consistent
-  ...
-  const topF = openF.peekPriority()!; const topR = openR.peekPriority()!;
-  if (topF + topR >= mu) break;                          ← standard stopping rule
-       │
-       └─ the /2 balance is what keeps BOTH frontiers consistent so the
-          topF+topR≥mu rule is correct. Use raw haversine per side and the
-          meeting point can be non-optimal — the subtlest correctness bug here.
-          Verified equal-cost to directed-A* in bidirectional.test.ts:16-24.
+  ┌─ Graph (undirected adjacency, graph.ts) ────────────────────┐
+  │  adjacency[nodeId] → edgeIds   |  otherEnd/directedGrade     │
+  └───────────────────────────┬──────────────────────────────────┘
+                              │ expand
+  ┌─ Search loop ───────────────────────────────────────────────┐
+  │  open: PQueue ──pop min-f──► current                        │
+  │     closed.has? skip stale (lazy deletion, file 03)         │
+  │     current==goal? ──► reconstruct via came (exact edges)   │
+  │     closed.add(current)                                      │
+  │     for edge in adjacency[current]:                         │
+  │        tentative = g[current] + costFn(edge, current, uMax) │ ◄─ cost.ts
+  │        if tentative < g[next]?:                             │
+  │           g[next]=tentative; came[next]={edge,current}      │
+  │           open.push(next, tentative + h(next))              │ ◄─ haversine
+  └───────────────────────────┬──────────────────────────────────┘
+                              │ Path
+  ┌─ Output ────────────────────────────────────────────────────┐
+  │  {nodes, edges, cost, lengthM, steepEdges}                  │
+  │  wrappers pick (costFn,h): dijkstra/astar/gradeAstar/dir.   │
+  │  variant: bidirectional (two frontiers, balanced potential) │
+  └──────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
 ## Elaborate
 
-Dijkstra (1959) is the foundation: single-source shortest path on non-negative
-weights. A\* (Hart, Nilsson, Raphael, 1968) added the admissible heuristic to
-make it goal-directed — the same idea behind every game-AI pathfinder and map
-router. Bidirectional search and its consistent-heuristic correctness is 1970s
-work; contraction hierarchies (Geisberger et al., 2008) are what make
-continent-scale routing answer in microseconds and are the spec's stage-6 stretch.
-`flattr`'s contribution isn't a new algorithm — it's the *directional cost
-function*, which makes it a genuinely directed-graph problem (A→B ≠ B→A), the
-thing most toy routers skip. You've built the pieces before: `reincodes/Graph.ts`
-(adjacency, BFS/DFS, connected components), `reincodes/Graph2.ts` (weighted edges,
-Dijkstra), `reincodes/PG.ts` (BFS over an implicit state-space graph). This repo
-is the applied, directional, heuristic-guided version. Next reads: **03** (the
-heap that makes it tractable), **01** (the `O((V+E) log V)` cost), **06** (the
-`nearestNode` snap that feeds it). The connected-component gap below points at
-**union-find**.
-
-**`not yet exercised` — union-find (DSU).** The repo answers "is the goal
-reachable?" *implicitly* — A\* returns `null` when the open set drains. A
-union-find structure would answer "are A and B in the same connected component?"
-in near-`O(1)` *without running a search at all* — useful to fail fast before
-even snapping nodes, or to validate the graph at build time (catch the
-disconnected-corner mesh bug the spec warns about, §14.3 node identity).
-Rein's `reincodes/Graph.ts` has `numberOfConnectedComponents` (a DFS-based
-version); the DSU version with path compression + union by rank is the
-near-constant-time upgrade. Not built here.
-
-**`not yet exercised` — DFS / BFS as standalone traversals.** The repo only ever
-does *priority-first* search (Dijkstra/A\*). Plain BFS (unweighted shortest path,
-FIFO frontier) and DFS (cycle detection, topological sort) aren't used — they'd
-matter for graph *validation* at build time rather than routing at query time.
+Dijkstra (1959) is uninformed best-first; A* (Hart, Nilsson, Raphael,
+1968) adds the admissible heuristic to aim it — A* *is* Dijkstra when
+`h=0`, which is literally how `astar.ts` implements Dijkstra
+(`zeroHeuristic`, line 137). Bidirectional A* with consistent potentials
+is from Ikeda et al. / Goldberg's work on the topic; the balanced
+`(h_goal - h_start)/2` potential is the standard trick to make the two
+directions agree. You've built the unweighted half of this in reincodes —
+`Graph.ts` BFS/DFS, `Graph2.ts` with weighted edges supporting Dijkstra,
+`PG.ts` BFS over an implicit state-space graph. flattr is the weighted,
+heuristic-guided continuation: your Dijkstra animation's `PriorityQueue`
+is the same frontier, now ranked by `g + h` instead of just `g`. The
+biggest *missing* graph foundation is **union-find** for a connectivity
+preflight (file 08) — right now "is the goal reachable?" is answered by
+running the whole search and getting `null`. Read file 03 for the frontier,
+file 07 for reconstruction.
 
 ---
 
 ## Interview defense
 
-**Q: "Are Dijkstra and A\* different algorithms in this codebase?"**
-
-No — they're one function, `search()` (`astar.ts:22-78`), with different
-arguments. Dijkstra is `distanceCost + zeroHeuristic`; A\* is `distanceCost +
-haversineHeuristic`. Dijkstra is A\* with `h=0`. The grade stages just swap the
-cost function. That collapse is the design.
+**Q: Are Dijkstra and A* different algorithms here, or the same?**
 
 ```
-  search(graph, s, g, userMax, COSTFN, HEURISTICFN)
-    dijkstra      = distanceCost,      zeroHeuristic       (h=0 → floods)
-    astar         = distanceCost,      haversineHeuristic  (h>0 → cones)
-    directedAstar = gradeCostDirected, haversineHeuristic  (A→B≠B→A)
-  anchor: astar.ts:135-163 — four wrappers, one engine
+  one search() ── h=0 ───────► Dijkstra (blind flood)
+              └─ h=haversine ─► A* (aimed cone)
+  same g/came/closed/heap machinery; only the priority key changes
 ```
 
-**Q: "Prove your A\* is optimal."**
+*Model answer:* "Same engine. `search()` takes a `(costFn, heuristicFn)`
+pair. Dijkstra is `search` with `zeroHeuristic`; A* is `search` with the
+haversine heuristic. The grade modes just swap the cost function. The
+correctness gate is an oracle test: A*'s path cost must equal Dijkstra's
+on a 12×12 grid — same optimum, fewer expansions. The heuristic only
+changes the *order* nodes come off the heap, never the answer, as long as
+it stays admissible."
 
-The heuristic is admissible: every edge cost is `length*(1+penalty)` with
-`penalty≥0`, so cost≥length, and straight-line haversine ≤ any real path length,
-so haversine never overestimates true remaining cost. Admissible heuristic ⟹
-A\* optimal. The live proof is `astar.test.ts:38-45`: A\* returns the *exact same
-cost* as Dijkstra.
+*Anchor:* one parametric engine; Dijkstra is A* with `h=0`.
 
-**Q: "What's the load-bearing part people forget in A\*?"**
+**Q: The graph is undirected but routing is directional. How?**
 
-The closed set and empty-frontier termination. Without `closed` you reprocess
-nodes and may never terminate on a cyclic graph — and every street graph is
-cyclic. Without the empty-frontier check you can't signal "no path." `flattr`
-has both, plus a *second* closed-check at pop (`astar.ts:51`) to skip stale
-lazy-deletion entries.
+*Model answer:* "Each edge is stored once with a signed `gradePct`
+from→to, listed under both endpoints in the adjacency list. Direction is
+derived at traversal: `directedGrade(edge, fromNode)` returns `+gradePct`
+if you entered from the `from` node, `-gradePct` otherwise, and `otherEnd`
+gives the opposite endpoint. So the same edge object is uphill (penalized)
+one way and downhill (free) the other. The bridge is the `fromNodeId`
+argument threaded through every cost function. Storing undirected halves
+memory and keeps one source of truth per street so the two-way grades
+can't drift."
 
-**Q: "Why is BLOCKED `1e9` and not `Infinity`?"**
+*Anchor:* undirected storage + `directedGrade`-derived direction; the
+`fromNode` is the bridge.
 
-So an only-steep path stays a finite, comparable, returnable answer — flagged in
-`steepEdges` — distinct from a genuinely disconnected graph that returns `null`.
-Infinity would collapse "no flat way" and "no way" into the same outcome, and
-`Infinity-Infinity=NaN` would break the heap (which rejects NaN, `pqueue.ts:24`).
+**Q: Why does A* terminate when the goal is *popped*, not when it's first
+seen?**
 
----
+*Model answer:* "Because a node's `g` cost isn't final until it comes off
+the heap. The first time you *see* the goal you might have a suboptimal
+path to it; a cheaper one could still be sitting in the frontier. Only
+when the goal is the minimum-f node popped do you know nothing cheaper
+remains. Terminating on first-sight would return a valid but possibly
+non-optimal route."
 
-## Validate
-
-1. **Reconstruct:** From memory, write the five kernel parts of `search()`
-   (`astar.ts:30-34`) and name what breaks if each is removed.
-2. **Explain:** Walk the admissibility chain from `cost.ts:16-22` to "A\* is
-   optimal," and name the test that proves it (`astar.test.ts:38-45`).
-3. **Apply:** Trace `directedAstar` on `directionalGraph` (`fixtures.ts:88-102`)
-   for X→Y and Y→X; show why one detours and one takes the direct edge
-   (`astar.test.ts:74-80`).
-4. **Defend:** Explain the balanced potential `pf=(h_goal-h_start)/2`
-   (`bidirectional.ts:30-32`) and why raw per-side haversine would break the
-   `topF+topR≥mu` stopping rule (`bidirectional.ts:52`).
+*Anchor:* `astar.ts:52` — pop-time termination is what makes A* optimal.
 
 ---
 
 ## See also
 
-- **03-stacks-queues-deques-and-heaps.md** — the PQueue frontier this depends on.
-- **01-complexity-and-cost-models.md** — the `O((V+E) log V)` cost and `nodesExpanded`.
-- **02-arrays-strings-and-hash-maps.md** — adjacency, `g`/`came`/`closed`.
-- **06-sorting-searching-and-selection.md** — `nearestNode` snapping the endpoints.
-- **04-trees-tries-and-balanced-indexes.md** — union-find for connectivity (gap).
-- `.aipe/study-performance-engineering/` — the bench harness proving the progression.
-- `.aipe/study-system-design/` — graph-as-artifact, client vs server A\*, tiling.
+- `03-stacks-queues-deques-and-heaps.md` — the frontier this drives.
+- `02-arrays-strings-and-hash-maps.md` — `g`/`came`/`closed`/`adjacency`.
+- `01-complexity-and-cost-models.md` — `O(E log V)` and `BLOCKED`.
+- `07-recursion-backtracking-and-dynamic-programming.md` — reconstruction.
+- `08-dsa-foundations-practice-map.md` — union-find connectivity gap.
+- sibling **system-design** — owns the static-graph artifact architecture.

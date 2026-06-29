@@ -1,225 +1,188 @@
-# Idempotency, de-duplication, and delivery semantics
-### why retrying is safe, and how duplicate work is collapsed
-**Industry name:** idempotency, request de-duplication, at-least-once / effectively-once · **Type:** Industry standard
+# Idempotency, Deduplication & Delivery Semantics
+
+**Industry name(s):** idempotency keys / at-least-once vs exactly-once / safe retries · *Industry standard*
 
 ## Zoom out, then zoom in
 
-`02` left a loose end: it retries remote calls freely. That's only safe if a retry can't do damage — if calling twice equals calling once. This file is about *why* flattr's retries are safe (idempotency by construction) and where it actively *collapses* duplicate work (de-duplication and batching) to stay under rate limits.
+This concept *is* exercised — but as an absence you can justify, which is the more interesting version. flattr retries remote calls (see `02`), and retries normally raise a terrifying question: *what if the call actually succeeded and only the response got lost? Did I just do the thing twice?* flattr never has to answer that, and the reason is structural.
 
 ```
-  Zoom out — where idempotency & dedup live
+  Zoom out — where delivery semantics would live (and why they don't)
 
-  ┌─ Coordination layer (yours) ────────────────────────────────┐
-  │  retry loops (02) ──► call remote                           │
-  │  ┌──────────────────────────────────────────────────────┐  │
-  │  │ ★ sampleElevations: dedup to 1 query per DEM cell ★    │  │ ← we are here
-  │  │ ★ providers: batch N points per request ★             │  │
-  │  └──────────────────────────────────────────────────────┘  │
-  └───────────────────────────┬─────────────────────────────────┘
-                              │  ═══ NETWORK ═══ (every hop is a READ)
-  ┌─ Provider layer ──────────▼──────────────────────────────────┐
-  │  Overpass / Open-Meteo / Nominatim — pure GET/POST, no       │
-  │  server-side state you mutate → retry can't double-apply     │
+  ┌─ Coordination layer ─────────────────────────────────────────┐
+  │  pump → fetchOverpass(bbox)   ─┐                              │
+  │  pump → sample(points)        ─┤ ALL of these are pure READs  │ ← we are here
+  │  UI   → geocode(query)        ─┘ keyed by geography           │
+  │                                                               │
+  │  ★ idempotency keys would live HERE — if any call WROTE ★     │
+  │    none do → the slot is correctly empty                     │
+  └────────────────────────┬──────────────────────────────────────┘
+                           │ HTTP GET/POST, but semantically READ-ONLY
+  ┌─ Provider layer ───────▼──────────────────────────────────────┐
+  │  Overpass · Open-Meteo · Nominatim                           │
   └───────────────────────────────────────────────────────────────┘
 ```
 
-Zoom in: two questions. *Delivery semantics* — "if my retry means the request actually ran twice, is that a problem?" Answer for flattr: no, because every call is a read keyed only by its inputs. *De-duplication* — "am I sending the same expensive request more than I need to?" Answer: flattr collapses near-duplicate elevation queries to one per DEM cell, then batches. The first is why retries are *correct*; the second is why they're *cheap*.
+**Zoom in.** Delivery semantics ask: when a message might be delivered zero, one, or many times, how many times does the *effect* happen? The three answers are at-most-once (might be lost), at-least-once (might duplicate), and exactly-once (the hard one). flattr gets exactly-once *effects* for free — not by building dedup, but because every call is a read with no effect to duplicate. Retrying a read twice and getting the same streets back isn't "doing it twice," it's just reading twice.
 
 ## Structure pass
 
-**Layers.** Caller → dedup/batch shaping (`sampleElevations`, the batch loops) → retry loop (`02`) → remote read.
+**Layers.** Caller (pump/UI) → call (HTTP) → provider. Same three as always.
 
-**The axis: guarantees — "what's promised about how many times work happens?"** Trace it:
+**The axis: `guarantees` — exactly-once *what*, and bought how?** This is the axis that exposes the whole concept. Trace it:
 
 ```
-  One question — "how many times does the work actually run?" — traced
+  The guarantees axis — "exactly-once" means different things
 
-  ┌──────────────────────────────────────┐
-  │ retry loop (02)                       │  → AT-LEAST-once: a retry may
-  └──────────────────────────────────────┘    re-send a request that succeeded
-      ▲ but the operation is...
-  ┌──────────────────────────────────────┐
-  │ the remote operation                  │  → IDEMPOTENT (pure read): running
-  └──────────────────────────────────────┘    it N times == running it once
-      ▲ so the observable effect is...
-  ┌──────────────────────────────────────┐
-  │ caller's result                       │  → EFFECTIVELY-once: same answer
-  └──────────────────────────────────────┘    regardless of how many sends
+  what's guaranteed exactly-once?  │ how it's bought
+  ─────────────────────────────────┼─────────────────────────────
+  exactly-once DELIVERY            │ impossible (FLP / two generals)
+  exactly-once PROCESSING          │ at-least-once delivery + dedup
+  exactly-once EFFECT              │ idempotent operation (no dedup needed)
+                                   │  ← flattr is HERE
 ```
 
-**The seam.** The seam is the operation's *nature*: read vs. write. at-least-once delivery (which any retry gives you) becomes effectively-once *for free* the moment the operation is idempotent. flattr never crosses that seam into mutation, so it never needs idempotency keys or de-dup tokens. That absence is a *design property*, not a gap.
+**The seam.** The load-bearing boundary is *read vs write*. A read is naturally idempotent: GET the bbox `[-122.33, 47.61, ...]` once or five times, the answer and the world-state are identical. A write is not: "create one route record" run five times makes five records unless you stop it. flattr's boundary never flips from read to write — so the seam where idempotency keys become mandatory is never crossed. Naming that the boundary is read-only is the entire finding.
 
 ## How it works
 
-#### Move 1 — the mental model
+### Move 1 — the mental model
 
-You know idempotency from HTTP already: `GET` and `PUT` are idempotent, `POST` generally isn't. The mental model is a function whose output depends only on its inputs — call it again, get the same answer, change nothing.
-
-```
-  Idempotency — same input, same result, no side effect to double
-
-   f(bbox)  ──► streets          f(bbox)  ──► streets   (identical)
-   f(bbox)  ──► streets          ───────────────────────
-                                 calling twice == calling once
-   contrast — a NON-idempotent op:
-   charge($5) ──► balance -5     charge($5) ──► balance -10  (BAD on retry)
-```
-
-flattr lives entirely in the top row. There is no `charge($5)` anywhere — no remote call mutates state you'd double-apply.
-
-#### Move 2 — walk the parts
-
-**Part 1 — idempotency by construction.** Bridge from a pure function. Every remote call flattr makes is a read keyed only by its arguments: `fetchOverpass(bbox)` returns the streets in a box, `sample(points)` returns elevations for points, `geocode(query)` returns matches for a string. None writes anything server-side. *Consequence:* the `02` retry loops can re-send blindly. If a 504 actually arrived *after* Overpass processed the request, re-sending just re-reads the same streets — no harm. This is why flattr needs **no idempotency key**: the inputs *are* the key, and the operation has no effect to de-duplicate.
+You know this from HTTP itself: `GET` is safe and idempotent, `POST` usually isn't. Retrying a `GET /streets?bbox=...` is harmless; retrying a `POST /routes` might duplicate. flattr's calls are all in the first category — even the Overpass call, which is *technically* an HTTP POST, is *semantically* a GET (it sends a query in the body and reads back data; it changes nothing on the server).
 
 ```
-  At-least-once delivery + idempotent op = effectively-once result
+  Idempotency = same key, same input → same effect, any # of times
 
-  send #1 ──► [ maybe processed, response lost ] ──► (timeout)
-  send #2 ──► [ processed again, same answer    ] ──► 200 streets
-                        │
-                        └─ second processing is harmless: it's a read.
-                           caller sees one consistent result. no key needed.
+  retry #1:  read(bbox=K) → streets(K)  ┐
+  retry #2:  read(bbox=K) → streets(K)  ├─ effect happens 0 extra times
+  retry #3:  read(bbox=K) → streets(K)  ┘   the KEY is the bbox itself
+
+  contrast — a WRITE without an idempotency key:
+  retry #1:  POST /route → record_A  ┐
+  retry #2:  POST /route → record_B  ├─ effect happens 3 times = BUG
+  retry #3:  POST /route → record_C  ┘   needs a client-supplied key to dedup
 ```
 
-**Part 2 — de-duplication (one query per DEM cell).** Bridge from a `Set` dropping duplicates before a `.map()`. Many graph nodes fall inside the same ~90m elevation cell; sampling each individually is wasted work *and* burns rate-limit budget. `sampleElevations` with `dedupePrecision` snaps each node's lat/lng to a cell key, picks one representative per cell, queries only representatives, then maps the answer back to every node in that cell.
+### Move 2 — the walkthrough
 
-```
-  De-duplication — collapse N nodes → 1 query per cell, fan back out
+**Part 1 — the natural key is geography.** Look at what each call is keyed on. There's no `id` field generated, no nonce, no idempotency header — the key *is the input*:
 
-  nodes:   a(47.6000)  b(47.6003)  c(47.6100)
-              │            │            │
-   keyOf:  "59500,..."  "59500,..."  "59512,..."   ← a,b same cell
-              └─────┬──────┘            │
-                    ▼                   ▼
-   queries:   [ rep(a) ]          [ rep(c) ]        ← 2 queries, not 3
-                    │                   │
-   map back:  a=e0, b=e0            c=e1            ← b reuses a's answer
+```ts
+// pipeline/overpass.ts:7-9 — the bbox IS the key
+export function buildOverpassQuery(bbox: [number, number, number, number]): string {
+  const [minLng, minLat, maxLng, maxLat] = bbox;
+  const b = `${minLat},${minLng},${maxLat},${maxLng}`;   // deterministic from bbox
 ```
 
-*What breaks if removed:* without dedup you sample finer than the 90m DEM resolution — wasteful, and worse, you'd compute grades over sub-DEM baselines that spike wildly at cell steps (`run-build.ts:33-37`). So dedup here is simultaneously a *correctness* fix and a *rate-limit* fix. That double-duty is the elegant part.
-
-**Part 3 — batching.** Bridge from `Promise.all` vs. a loop, except here it's the opposite — fewer requests, not more parallelism. Open-Meteo accepts 100 points/request, Google 256. The provider loops over the point list in chunks and packs each chunk into one request. *Consequence:* 150 points become 2 requests, not 150 — fewer round-trips, fewer 429 opportunities, with a throttle `sleep(delayMs)` between batches to stay polite.
-
-```
-  Batching — pack the point list into the largest legal request
-
-  150 points ──► [ 0..99 ] ──► one GET ──► 100 elevations
-              ──► [100..149] ──► one GET ──► 50 elevations
-                                  (throttle sleep between)
-   2 requests instead of 150. tested at elevation.test.ts:52-64
+```ts
+// pipeline/geocode.ts:14 — the query string IS the key
+const params = new URLSearchParams({ q: query, format: "jsonv2", limit: "1" });
 ```
 
-#### Move 2.5 — the runtime single-flight (a different kind of dedup)
+Same query in → same result out. There's no server-side state that the second call could collide with, because flattr never writes server-side state. The retry loop in `overpass.ts:32` can fire three times against the same bbox and the worst case is three identical responses, of which it keeps one.
 
-There's a *second* de-duplication mechanism at runtime, and it's worth distinguishing. `useTileGraph`'s `busyRef` (`06`) ensures only one graph build runs at a time, and `covers()` (`:45-49`) skips a fetch entirely if the current region already contains the requested bbox. That's **request-level** single-flight de-dup — "don't fetch what I already have, and don't fetch twice concurrently" — whereas Part 2 is **point-level** dedup *within* one build. Same instinct (don't do duplicate work), two altitudes.
+**Part 2 — the only dedup in the system is local and request-eliminating, not effect-deduping.** flattr *does* dedup — but it's a different kind. It dedups *which points it bothers to ask about*, not *how many times an effect fires*:
 
-#### Move 3 — the principle
+```ts
+// mobile/src/useTileGraph.ts:42-51 — cache lookup splits hits from misses
+points.forEach((pt, i) => {
+  const hit = getElev(cellKey(pt.lat, pt.lng));   // already known?
+  if (hit !== undefined) out[i] = hit;            // skip the network entirely
+  else { missPts.push(pt); missIdx.push(i); }     // only misses get sampled
+});
+```
 
-Idempotency is what makes naive retries safe; de-duplication is what makes them cheap. The deepest version of the lesson: if you keep every remote operation a *pure read keyed by its inputs*, you get effectively-once semantics with zero machinery — no keys, no dedup tables, no transaction log. flattr gets exactly-once-observable behavior for free because it never earns the right to need it. The moment a call mutates remote state, all of that machinery becomes mandatory.
+And in `elevation.ts:42-50`, the build-time dedup collapses many nodes in one ~90m DEM cell to a single sample. Both are *deduplication*, but of **requests**, not of **effects** — they exist to stay under the rate limit (a performance/backpressure concern, see `06`), not to make a non-idempotent operation safe. It's worth being precise about that distinction in an interview: flattr has request dedup, not delivery dedup, because it has no delivery effect to dedup.
+
+**Part 3 — what flips this on.** The moment flattr writes anything across a boundary, the free ride ends:
+
+```
+  The trigger that introduces idempotency keys
+
+  TODAY (read-only)              FUTURE (a write appears)
+  ─────────────────             ────────────────────────────
+  read(bbox) — safe to retry    POST /save-route — NOT safe to retry
+                                 retry after a lost ACK → duplicate route
+                                 FIX: client sends Idempotency-Key: <uuid>
+                                      server dedups on that key (at-least-once
+                                      delivery + dedup = exactly-once effect)
+
+  concrete triggers in flattr's roadmap:
+   • "save this route to my account"  (write to a backend)
+   • "share route" / analytics events (write)
+   • multi-device sync of saved routes (write + ordering)
+```
+
+### Move 2.5 — current vs future
+
+```
+  Phase A (now): read-only           Phase B: first write crosses the boundary
+  ─────────────────────────          ───────────────────────────────────────
+  retries safe by construction       retries can duplicate
+  no idempotency key                 client-generated Idempotency-Key required
+  no dedup table                     server dedup table keyed on that key
+  exactly-once EFFECT (free)         exactly-once EFFECT (engineered)
+```
+
+The cost of Phase B isn't huge, but it's real: a key generated client-side *before* the first attempt (so all retries of one logical op share it), and a server-side store that remembers seen keys long enough to cover the retry window. flattr has none of that infrastructure, and correctly needs none — until a write appears.
+
+### Move 3 — the principle
+
+The strongest delivery-semantics design is the one that doesn't need a mechanism. "Exactly-once delivery" is provably impossible over an unreliable network (the two-generals problem); the industry workaround is always at-least-once delivery plus an idempotent operation or a dedup key. flattr lands on the easy side of that: by keeping the boundary read-only, every retry is automatically safe, and the hard problem never arises. Knowing *why* you don't need idempotency keys is a stronger signal than reflexively adding them.
 
 ## Primary diagram
 
-The full picture — delivery semantics on top, the two dedup mechanisms below.
-
 ```
-  Idempotency + dedup + batching — recap
+  Delivery semantics in flattr — recap
 
-  ┌─ caller ─────────────────────────────────────────────────┐
-  │  buildGraph(...)                                          │
-  │      │                                                    │
-  │      ▼                                                    │
-  │  sampleElevations(nodes, provider, {dedupePrecision})     │
-  │      │  POINT-LEVEL dedup: N nodes → unique cells         │
-  │      ▼                                                    │
-  │  provider.sample(uniquePoints)                            │
-  │      │  BATCH: chunk into 100/256 per request             │
-  │      ▼                                                    │
-  │  retry loop (02): AT-LEAST-once send                      │
-  └──────┼────────────────────────────────────────────────────┘
-         │ ═══ NETWORK ═══
-  ┌──────▼─────────────────────────────────────────────────────┐
-  │  remote: PURE READ, idempotent → re-send harmless           │
-  │  ⇒ caller observes EFFECTIVELY-once. no idempotency key.    │
-  └──────────────────────────────────────────────────────────────┘
-
-  (runtime: useTileGraph busyRef + covers() = REQUEST-level single-flight)
-```
-
-## Implementation in codebase
-
-**Use cases.** Dedup + batch fire on every build that samples real elevation. Build-time uses `dedupePrecision: 0.0008` (`run-build.ts:37`); the phone uses `DEDUPE = 0.0008` (`useTileGraph.ts:34`) for the same reason. The dedup behavior is directly tested at `pipeline/elevation.test.ts:73-92`.
-
-The de-duplication core:
-
-```
-  pipeline/elevation.ts  (lines 42–59, sampleElevations dedup branch)
-
-  const keyOf = (lat, lng) => `${Math.round(lat/prec)},${Math.round(lng/prec)}`; ← cell key
-  const repByKey = new Map();
-  for (const id of ids) {
-    const k = keyOf(n.lat, n.lng);
-    if (!repByKey.has(k)) repByKey.set(k, { lat, lng });   ← keep ONE rep per cell
-  }
-  const elevs = await provider.sample([...rep points]);    ← query reps only
-  ...
-  out[id] = { ...n, elevationM: elevByKey.get(keyOf(...)) };← fan the answer back to all
-       │
-       └─ the Map IS the dedup: first node in a cell wins, rest reuse its elevation.
-          Remove it and you'd issue one query per node — same answer, far more
-          requests, guaranteed free-tier 429 on a real city.
-```
-
-The batching loop (idempotent reads, packed):
-
-```
-  pipeline/elevation.ts  (lines 100–124, openMeteoProvider.sample)
-
-  for (let i = 0; i < points.length; i += OPEN_METEO_BATCH) {  ← chunk by 100
-    const batch = points.slice(i, i + OPEN_METEO_BATCH);
-    const url = `...?latitude=${lats}&longitude=${lngs}`;       ← all 100 in one URL
-    ... fetch + retry ...
-    if (delayMs && i + OPEN_METEO_BATCH < points.length)
-      await sleep(delayMs);                                     ← throttle between batches
-  }
-       │
-       └─ each request is keyed purely by its point list (idempotent). a retried
-          batch re-reads the same elevations. the inter-batch sleep is the
-          politeness that keeps at-least-once from becoming a flood.
+  ┌─ Coordination layer ────────────────────────────────────────┐
+  │  retry loop (from 02) fires call up to N times               │
+  │     │                                                        │
+  │     ▼   key = bbox / query / coord  (input == key)           │
+  │  ┌──────────────────────────────────────────────┐           │
+  │  │  request dedup (local):                       │           │
+  │  │   • cache hit → no network (elevCache)        │  ← dedups │
+  │  │   • DEM-cell collapse (elevation.ts)          │  REQUESTS │
+  │  └──────────────────────────────────────────────┘           │
+  └────────────────────────────┬─────────────────────────────────┘
+            ════ HTTP boundary ╪═══════════════════
+                              ▼
+   ┌──────────────────────────────────────────────────┐
+   │  Provider: pure READ, no server-side write         │
+   │  → retry N times = identical effect = exactly-once │
+   │  → NO idempotency key needed (slot correctly empty)│
+   └──────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-Idempotency keys exist precisely for the case flattr avoids: a *mutation* you might retry (Stripe's `Idempotency-Key` header on charge creation is the canonical example — it lets the server recognize "I've already processed this exact charge" and return the original result instead of charging twice). flattr needs none of that because it never mutates a remote. The lesson generalizes: **the cheapest way to handle duplicate delivery is to make the operation idempotent so duplicates don't matter** — far cheaper than building a dedup table keyed on request IDs.
-
-The dedup-as-correctness insight (Part 2) is the non-obvious one. Sampling at sub-DEM resolution isn't just wasteful, it's *wrong* — it manufactures grade spikes at cell boundaries. Snapping to the cell grid is the same move as quantizing to your data's true resolution. That's a data-modeling instinct (`.aipe/study-data-modeling/`) doing double duty as a rate-limit defense.
-
-What would force real delivery-semantics machinery: a server-side build farm (§11 E2) where a job queue delivers tile-build tasks at-least-once and a *write* (persisting the built tile) could be double-applied. Then you'd need an idempotency key on the persist, or an upsert keyed by tile bbox — see `06` and `08`.
+The canonical idempotency-key design is Stripe's: the client generates a key per logical operation, sends it on every retry, and the server stores `(key → result)` so a replayed request returns the original result instead of re-charging the card. The whole apparatus exists because payments are writes you absolutely cannot duplicate. flattr's reads are the opposite end of the spectrum. The interesting middle ground — at-least-once message processing with a dedup window — shows up the moment you add a queue (`06`) carrying *commands* rather than today's read requests. Sibling `study-database-systems` covers the storage side of a dedup table; `study-system-design` covers where the key gets generated in a request flow.
 
 ## Interview defense
 
-**Q: "Your retries can re-send a request that already succeeded. Isn't that a bug?"**
-No — and that's the whole point. Every remote call I make is a pure read keyed by its inputs: streets-in-a-bbox, elevation-for-points, geocode-of-a-string. Re-sending re-reads the same answer with no side effect. So at-least-once delivery (which any retry gives you) collapses to effectively-once *observable* behavior, with zero machinery — no idempotency key, no dedup table. I get exactly-once semantics for free because I never made a remote call that mutates state.
+**Q: "Your code retries network calls. How do you prevent duplicate side effects?"**
+Verdict first: there are none to prevent.
 
 ```
-   retry ──► at-least-once send ──► [idempotent read] ──► same answer
-                                          │
-                                          └─ no effect to double ⇒ no key needed
+  read-only boundary → retry is free
+
+  call(K) ──retry──► call(K) ──retry──► call(K)
+     same K, same result, ZERO side effects
+  no Idempotency-Key because no write to dedup
 ```
-*Anchor: at-least-once + idempotent = effectively-once, for free.*
 
-**Q: "Where do you de-duplicate, and why does it matter beyond performance?"**
-Two places. Point-level: I snap elevation samples to one query per ~90m DEM cell — that's not just fewer requests, it's *correctness*, because sampling finer than the DEM creates fake grade spikes at cell steps. Request-level: at runtime `busyRef` + `covers()` skip a fetch I already have or one already in flight. The point-level dedup doing double duty as both a rate-limit defense and a correctness fix is the part I'd highlight. *Anchor: dedup to the data's true resolution — cheaper AND more correct.*
+"Every cross-boundary call is a pure read keyed by geography — a bbox, a query string, a coordinate. The input *is* the idempotency key. Retrying a read returns the same streets or the same elevation and changes nothing on the provider, so the effect is exactly-once for free. I deliberately didn't add idempotency keys or a dedup table because there's no write to make safe. The moment I add 'save route to account,' that changes — I'd generate a client-side key before the first attempt, share it across retries, and dedup on it server-side, turning at-least-once delivery into exactly-once effect."
 
-## Validate
+**Anchor:** *The input is the key — reads are idempotent by construction, so the dedup slot is correctly empty.*
 
-1. **Reconstruct:** explain why flattr needs no idempotency key. What property of every remote call makes a blind retry safe?
-2. **Explain:** in `pipeline/elevation.ts:42-59`, what is the cell key and why does collapsing to one query per cell improve *correctness*, not just cost?
-3. **Apply:** a build samples 1,000 nodes that fall in 120 distinct 90m cells, batched 100/request. How many HTTP requests? (2 — 120 unique points, ceil(120/100).) Walk it through `sampleElevations` → `openMeteoProvider.sample`.
-4. **Defend:** the spec adds server-side tile persistence (§11 E2) behind an at-least-once queue. Argue what new delivery-semantics machinery becomes mandatory and why none of it is needed today.
+**Q: "But you do have deduplication in the code — isn't that the same thing?"**
+"Different axis. The cache and the DEM-cell collapse dedup *requests* to stay under the rate limit — a performance concern. Delivery dedup would dedup *effects* to make a write safe — a correctness concern. I have the first, not the second, because I have no write effects."
+
+**Anchor:** *Request dedup ≠ delivery dedup — one saves quota, the other saves correctness.*
 
 ## See also
 
-- `02-partial-failure-timeouts-and-retries.md` — the retries this file proves safe.
-- `06-queues-streams-ordering-and-backpressure.md` — request-level single-flight dedup via `busyRef`.
-- `04-consistency-models-and-staleness.md` — the stale-but-converging copies these reads produce.
-- `.aipe/study-data-modeling/` — the DEM-resolution quantization as a modeling decision.
+- `02-partial-failure-timeouts-and-retries.md` — the retries that make this question arise.
+- `04-consistency-models-and-staleness.md` — the cache's *staleness* story (this file is its *safety* story).
+- `06-queues-streams-ordering-and-backpressure.md` — where at-least-once delivery would appear (queues).
+- `08-sagas-outbox-and-cross-boundary-workflows.md` — multi-step writes where idempotency compounds.

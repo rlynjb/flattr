@@ -1,83 +1,172 @@
-# Chapter 1 — The cold open (0:00–1:00)
+# Chapter 1 — The Cold Open   (0:00–1:00, 1 minute)
 
-You have sixty seconds before the room decides whether to look up from their laptops. Do not spend them on a title slide, your name, or "so, the problem we're solving is…" Open in motion: a sentence that stings, then the one-liner, then straight into the app. The single most common way to lose a hackathon slot is burning the first ninety seconds on setup the room doesn't need yet — you don't have ninety seconds to spare, you have one minute total here.
+## Opening hook
+
+You have sixty seconds, and the room decides inside the first ten whether
+this is real or another slide deck. So don't open on a slide. Don't say your
+name. Don't explain what a routing app is. Open with the map already on
+screen and the problem said out loud in one breath — then drop the one-liner.
+The whole job of this minute is to make the room *want* the demo you're about
+to give. Nothing else.
+
+The failure mode I've watched kill more cold opens than any other: the
+ninety-second wind-up. "Hi, I'm — so, a lot of people don't realize that
+urban mobility is — let me pull up some slides." By the time the app appears,
+the room has decided you're boring. Skip all of it. The app is your opening
+line.
+
+## The time-budget bar
 
 ```
-  ┌──────────────────────────────────────────────────────┐
-  │ ▓▓▓▓▓░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ │
-  │ 0:00 ──── 1:00 ───────────────────────────────── 10:00│
-  │        COLD OPEN — you own 0:00 to 1:00 (1 min)        │
-  └──────────────────────────────────────────────────────┘
+  ┌──────────────────────────────────────────────────────────┐
+  │ ▓▓▓▓▓░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ │
+  │ 0:00 ──────────────────────────────────────────────── 10:00│
+  │        THE COLD OPEN — you own 0:00 to 1:00 (1 min)        │
+  └──────────────────────────────────────────────────────────┘
 ```
 
-In this minute you land one painful truth and one sentence that says what flattr is — then your hands are already on the app.
+One minute. Hook + one-liner, then you're typing addresses. If you're still
+talking at 1:00, you're already behind.
+
+## The chapter-opening diagram — the room's attention curve
+
+This is what you're managing in this minute: attention is highest the second
+you start and decays fast unless you give it something to hold. The cold open
+spends that opening spike on the hook, not on setup.
 
 ```
-  THE ATTENTION CURVE — where the room's focus goes
+  THE ATTENTION CURVE — spend the opening spike, don't waste it
 
   attention
-    high │            ╭── money shot (≈3:00)
-         │           ╱
-         │   ╭──────╯   ← you must KEEP it here from 0:00
-         │  ╱
-     low │_╱____________________________________________
-         0:00   1:00        3:00                    10:00
-              ▲ the cold open's job: get the line UP and
-                keep it up — never let it dip into setup
+    high │●                                    ★ money shot
+         │ \                                   re-spikes here
+         │  \         ┌─ one-liner lands       (chapter 02, ~2:30)
+         │   ●────────┘    ↑                        ●
+         │    \            keeps it up          ___/ \___
+         │     \___                            /         
+    low  │         ●─── (this is where a       
+         │           slide-deck open dies)     
+         └────┬─────┬─────┬─────┬─────┬─────┬─────┬──── time
+            0:00  0:15  0:30  0:45  1:00  ...  2:30
+
+   weak open:  ●→low  by 0:30  (slides, intro, problem essay)
+   strong open: ●→held by 0:30  (app on screen + one-liner)
+                then re-spiked at the money shot
 ```
 
-The curve says it all: the cold open's job isn't to inform, it's to *lift attention and hand it to the demo without a dip.* The fastest way to do that is to not talk about flattr — show the sting, say the one line, start clicking.
+You cannot create a second opening spike — but you *can* avoid wasting the
+first one and set up the re-spike at 2:30. The cold open is entirely about not
+flattening that curve before the demo even starts.
 
-## The hook
+## The body — the two beats
 
-┃ "The shortest route and the best route are the same thing — until you're pushing a scooter up a hill."
+### Beat 1 — the hook (0:00–0:30): open on the thing, not the title
 
-Say that line, and you've framed the entire product in one breath. Everyone in the room has felt a hill. You've made grade *matter* before you've shown a single feature.
-
-| WEAK OPEN | STRONG OPEN |
-|---|---|
-| "Hi, I'm Rein, and today I'm going to show you flattr, a routing app I built. Let me start with the problem…" | "The shortest route and the best route are the same thing — until you're pushing a scooter up a hill. *[app already open]* This is flattr." |
-| **Why it's weak:** three sentences of throat-clearing. The room's attention dips before you've shown anything. | **Why it works:** the first sentence is the problem *and* the hook; by the second you're on the app. No dip. |
-
-## The one-liner
-
-Right after the hook, the "X is a Y that does Z for W" line:
-
-┃ "flattr is a router that finds the flattest comfortable way from A to B — for anyone on foot or a scooter who'd rather not climb."
+The app is on screen, centered on your pre-warmed demo neighborhood, before
+you say a word. Your first sentence is the problem that stings — said while
+the room is looking at a real map.
 
 ```
-  SAY (out loud)                    SHOW (on screen)
-  ──────────────────────────        ──────────────────────────
-  "The shortest route and the       flattr already open, map
-   best route are the same —          visible, NOT a title slide
-   until you're pushing a scooter
-   up a hill."
-  "This is flattr — it finds the    your finger moving to the
-   flattest comfortable way from      To field, about to type
-   A to B."                           (you're already starting the demo)
+  SHOW (on screen)              SAY (out loud)
+  ──────────────────────        ─────────────────────────────
+  the map, already open,        "Maps will get you there
+  centered on the demo           fast. None of them care
+  neighborhood (warm cache)      whether you're pushing a
+                                 stroller up a 12% hill."
+  ──────────────────────        ─────────────────────────────
+  your finger traces the        "If you're on a scooter, a
+  steep area on the map          wheelchair, a bike, a bad
+  (no clicks yet)                knee — fast isn't flat. And
+                                 nobody routes for flat."
 ```
 
-Notice the SAY track never says "I'm going to show you" — it shows. By the end of the one-liner your hands are in the To field and the demo has already begun.
+That's the sting. Everyone in the room has pushed something heavy uphill. You
+named the gap and you did it over a live map, not a bullet point.
 
-╔══════════════════════════════════════════════════════╗
-║ IF IT BREAKS                                           ║
-║ The app won't launch / screen won't mirror → say the  ║
-║ hook and one-liner anyway (they need no screen), and   ║
-║ go straight to the 20-second recorded demo clip. Line: ║
-║ "Let me show you a run from a minute ago." Never open   ║
-║ with an apology for the tech — say the hook first,     ║
-║ fix the screen second.                                 ║
-╚══════════════════════════════════════════════════════╝
+### Beat 2 — the one-liner (0:30–1:00): X is a Y that does Z for W
 
-## Tighten it
+Now name the thing. One sentence, said clean, the line you've rehearsed until
+it's automatic.
 
-If the slot is shorter than ten minutes, the cold open compresses to a single sentence: just the hook line, then straight into typing. Drop the separate one-liner and let the demo's first action carry it. **Floor:** you must say the hook — it's the frame for everything after.
+```
+┃ "flattr is a router that optimizes for flat, not fast —
+┃  type two addresses and it finds you the least-uphill way
+┃  there, not the shortest."
+```
 
-## One-page run sheet
+Then the bridge straight into the demo — no pause, no "so let me show you the
+architecture first."
 
-- **Budget:** 0:00–1:00. No money shot here; it's at ~3:00 in the demo.
-- **SAY, in order:** (1) the hook — "shortest = best, until you're pushing a scooter up a hill"; (2) one-liner — "flattr finds the flattest comfortable way from A to B."
-- **Nail this line:** ┃ "The shortest route and the best route are the same thing — until you're pushing a scooter up a hill."
-- **SHOW:** app already open on the map; hands moving to the To field by the end of the minute. Never a title slide.
-- **If it breaks:** say hook + one-liner (no screen needed), cut to the recorded clip.
-- **Tighten:** drop the one-liner, keep the hook, start typing.
+```
+┃ "Let me just show you. Watch the route."
+```
+
+That last line is the handoff. The moment it leaves your mouth, your hands are
+already in the address bar. Chapter 02 starts mid-motion.
+
+### Strong vs weak — the cold open move
+
+The contrast that matters most in this minute:
+
+```
+  WEAK open                        STRONG open
+  ───────────────────────────      ───────────────────────────
+  "Hi, I'm Rein, this is           App already on screen.
+   flattr, a project about         "Maps don't care if you're
+   accessible urban mobility,       pushing a stroller uphill."
+   let me give you some context"   → problem stings in 1 sentence
+  → 40 words before anything
+    happens; attention gone        "flattr finds the flattest
+                                     way, not the shortest."
+  "First, the problem space..."    → one-liner, then straight
+  → essay, not a demo                into the demo. 0 wasted words.
+```
+
+Weak open explains. Strong open *shows*, then names. You are in the second
+column.
+
+## The IF-IT-BREAKS box
+
+```
+╔══════════════════════════════════════════════════════════════╗
+║ IF IT BREAKS — the app won't open / map is blank              ║
+║ Don't restart it live (that's 30 dead seconds). Switch to the ║
+║ screenshot of the routed map (slide 1) and say:               ║
+║ "Here's flattr with a route already drawn — let me walk you   ║
+║  through what you're seeing." Then narrate the money shot from ║
+║ the screenshot while a teammate quietly relaunches the app.    ║
+║ Never apologize twice. Keep the energy where it was.           ║
+╚══════════════════════════════════════════════════════════════╝
+```
+
+## The "tighten it" treatment
+
+**Cut:** the second hook line (the scooter/wheelchair/bad-knee list). Go
+straight from "none of them care about the hill" to the one-liner.
+**Floor:** you must say the one-liner. The room cannot watch the demo without
+the frame "flat, not fast." That sentence survives any cut.
+
+## The one-page run sheet
+
+```
+  ┌─ CH 01 · COLD OPEN · 0:00–1:00 ──────────────────────────┐
+  │                                                           │
+  │  BEFORE YOU SPEAK: app open, centered on warm neighborhood│
+  │                                                           │
+  │  SAY, in order:                                           │
+  │   • "Maps get you there fast — none care about the hill." │
+  │   • (one-liner) "flattr routes for FLAT, not fast —       │
+  │      least-uphill way, not shortest."                     │
+  │   • "Let me show you. Watch the route." → start typing    │
+  │                                                           │
+  │  NAIL THIS LINE:                                          │
+  │   ┃ "flattr routes for flat, not fast."                   │
+  │                                                           │
+  │  IF IT BREAKS: screenshot slide 1, narrate from it,       │
+  │                teammate relaunches.                       │
+  │                                                           │
+  │  TIGHTEN: drop the 2nd hook line; one-liner is the floor. │
+  └───────────────────────────────────────────────────────────┘
+```
+
+Go to chapter 02 — your hands are already typing.

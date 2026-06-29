@@ -1,140 +1,316 @@
 # Chapter 6 — The hard parts
 
-This chapter is reflection, and reflection is where candidates either show range or show fragility. "What was the hardest bug?" "What are you proudest of?" "What's the part you're least sure about?" — these aren't softball questions. They test whether you can be specific under no pressure, whether you can praise your own work without inflating it, and — the one most people get wrong — whether you can name a weakness without collapsing into apology. "The part I'm least confident defending" is a *strong-signal* answer when you handle it right: it tells the interviewer you know exactly where your understanding ends, which is the most senior thing you can demonstrate.
+This chapter is about three reflection questions that show up in nearly every
+senior loop: the hardest bug you fixed, the part you're proudest of, and the
+part you're least confident defending. They feel softer than the architecture
+questions, but they're not — they're testing self-awareness and honesty under a
+microscope. The candidate who says "honestly nothing was that hard" fails this
+chapter. The candidate who can name a real bug, a real source of pride, and a
+real soft spot — and talk about all three without collapsing — passes it.
 
-The trick across all three is the same: anchor to something real and specific. A vague "I had some tricky bugs" teaches the interviewer nothing. "Distant routes returned 'no route' even though both endpoints existed, and I traced it to disconnected graph components with a reachability probe" — that's a story, and you have it, because you lived it.
+The counterintuitive lesson: **the least-confident answer is a strong-signal
+answer when handled right.** Interviewers aren't looking for someone with no
+weak spots. They're looking for someone who knows where their weak spots are.
+This chapter gives you all three answers grounded in flattr's real code.
+
+---
+
+## The chapter-opening diagram — the confidence map
+
+Here's flattr's codebase annotated by how confidently you can defend each
+region. The bright regions are where you go deep; the dim region is where the
+"I don't know" honesty lives.
 
 ```
-  CONFIDENCE MAP OF THE CODEBASE — defend accordingly
+  flattr — confidence map of the codebase
 
-  HIGH CONFIDENCE (lead here, go deep)
-  ┌──────────────────────────────────────────────┐
-  │ ★ A* / search() — one engine, four variants   │  proudest
-  │ ★ admissibility proof (A* == Dijkstra cost)    │
-  │ ★ directional cost (A→B ≠ B→A)                 │
-  │ ★ lazy-deletion heap + invariant tests        │
-  │ ★ honest degradation (elevation, BLOCKED)     │  hardest bug lived here
-  └──────────────────────────────────────────────┘
+  ████████████ ROCK SOLID — defend to any depth ████████████
+  ┌──────────────────────────────────────────────────────────┐
+  │  cost.ts          directional penalty, finite BLOCKED      │
+  │  astar.ts         one parametric search(), admissible h    │
+  │  graph.ts         directedGrade, adjacency, otherEnd       │
+  │  pqueue.ts        hand-rolled lazy-deletion binary heap    │
+  │  PROUDEST: one search() that is Dijkstra/A*/grade/directed │
+  │            + provable admissibility → A* == Dijkstra       │
+  └──────────────────────────────────────────────────────────┘
 
-  MEDIUM CONFIDENCE (can defend, name the edges)
-  ┌──────────────────────────────────────────────┐
-  │ ~ bidirectional A* balanced potential          │  subtle, least confident
-  │ ~ tile merge/stitch correctness                │
-  │ ~ on-device pipeline re-run                     │
-  └──────────────────────────────────────────────┘
+  ▓▓▓▓▓▓▓▓▓▓ SOLID — defend the what + why ▓▓▓▓▓▓▓▓▓▓
+  ┌──────────────────────────────────────────────────────────┐
+  │  useTileGraph.ts  degrade-honestly, tile merge/stitch      │
+  │  elevation.ts     provider interface, retry/backoff        │
+  │  HARDEST BUG: "no route" — disconnected components, found  │
+  │               via a reachability probe                     │
+  └──────────────────────────────────────────────────────────┘
 
-  LOWER CONFIDENCE (own the gap, don't bluff)
-  ┌──────────────────────────────────────────────┐
-  │ · RN/Hermes runtime internals                  │
-  │ · MapLibre native render pipeline              │
-  │ · distributed / multi-user scale (no server)   │
-  └──────────────────────────────────────────────┘
+  ░░░░░░░░░░ LEAST CONFIDENT — know the shape, not the proof ░░
+  ┌──────────────────────────────────────────────────────────┐
+  │  bidirectional.ts balanced potential pf = (h_goal -        │
+  │                   h_start)/2; the CONSISTENCY proof and     │
+  │                   the meeting-point stopping rule are the   │
+  │                   part I'd flag as least-confident          │
+  └──────────────────────────────────────────────────────────┘
 ```
 
-Know which tier a question lands in *before* you answer. Go deep in the top tier; name the edges in the middle; own the boundary in the bottom.
+You walk left to right: proudest (bright), hardest bug (solid), least confident
+(dim). Honest about all three.
 
-## "What was the hardest bug?"
+---
 
-┌─────────────────────────────────────────────────┐
-│ THEY ASK                                          │
-│   "Tell me about a hard bug you debugged."         │
-│                                                   │
-│ WHAT THEY'RE TESTING                              │
-│   Do you debug systematically — evidence, root    │
-│   cause, fix — or flail? The METHOD matters more  │
-│   than the bug.                                   │
-└─────────────────────────────────────────────────┘
+## "What's the hardest bug you fixed?"
 
-> "Routing between distant points returned 'no route,' even though both the start and the end clearly existed on the map. The tempting fix was to mess with the search, but I didn't want to guess, so I instrumented instead — I added a reachability probe: from the start node, BFS the whole merged graph and count how many nodes are reachable, and check whether the end node is in that set. The probe said: both endpoints exist, but the end is *not reachable* from the start. That was the root cause — they were in two disconnected components. The tile loader only fetched tiles near the viewport, so a start and a destination far apart became two separate islands with no loaded corridor between them. The fix was to load the bounding-box corridor between the two endpoints and stitch it in, so they share one connected component. What I'd underline is the method: I added evidence before I touched the fix, and the evidence pointed straight at the cause."
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ THEY ASK                                                          │
+│   "What's the hardest bug you've fixed on this project?"         │
+│                                                                   │
+│ WHAT THEY'RE TESTING                                              │
+│   Can you debug systematically, or do you flail? Do you reason   │
+│   from symptom to root cause? Is the "hard" bug actually hard,   │
+│   or just a typo you're dressing up? Do you understand WHY the   │
+│   fix worked?                                                     │
+└─────────────────────────────────────────────────────────────────┘
+```
 
-This is a textbook systematic-debugging story and it's *yours*. The method — instrument, find root cause, then fix — is exactly what senior interviewers want to hear, and the reachability probe is a concrete, memorable detail.
+> "The hardest one was 'no route' between two points that visibly *should* have
+> connected. You'd tap two nearby spots and get nothing back — `path: null` —
+> even though there was obviously a walkable path between them on the map.
+>
+> My first instinct was the search was wrong. But the search was fine — I
+> confirmed that by running it on a tiny fixture where I knew the answer. The
+> real cause was the *graph*, not the algorithm: the two points were landing in
+> *disconnected components*. When I load tiles separately and merge them, two
+> tiles that share a street boundary have coincident nodes — the same physical
+> corner represented as two different node ids, one per tile. The adjacency never
+> linked them, so the search couldn't cross the seam.
+>
+> The way I found it was a reachability probe — a BFS/flood from the start node
+> to see which nodes were actually reachable, and the end node simply wasn't in
+> that set even though it was meters away. That told me it was a connectivity
+> problem, not a search problem. The fix is `stitchGraph` (`tiles.ts`), which
+> merges coincident boundary nodes so routing crosses seams. It's the classic
+> mesh-construction bug the spec even warns about (§14.3, 'node identity') — two
+> 'same' corners that don't share a node."
 
-┃ "I added evidence before I touched the fix — the reachability probe pointed straight at 'disconnected components.'"
+```
+┃ "The search was fine. The bug was in the graph —
+┃  disconnected components from coincident nodes that
+┃  weren't stitched. I found it with a reachability probe."
+```
 
-| WEAK ANSWER | STRONG ANSWER |
-|---|---|
-| "There was a bug where routes didn't work sometimes, and I tried a few things and eventually figured out it was a graph issue and fixed it." | "Distant routes returned 'no route' though both endpoints existed. I added a reachability probe — BFS from start, is end in the set? It wasn't: disconnected components, because tiling only loaded the viewport. Fix: load and stitch the corridor between endpoints." |
-| **Why it's weak:** "tried a few things and eventually figured out" is the opposite of method. It describes flailing and getting lucky. | **Why it works:** names the symptom precisely, shows instrumentation-before-fix, names the root cause and the mechanism behind it. Method visible throughout. |
+Why this lands: you separated algorithm from data (a real debugging discipline),
+you used a *graph technique* (reachability flood) to diagnose a *graph bug*, and
+the root cause is a named classic. That's the opposite of "I added a console.log
+and eventually it worked."
+
+---
 
 ## "What are you proudest of?"
 
-┌─────────────────────────────────────────────────┐
-│ THEY ASK                                          │
-│   "What part of this are you most proud of?"      │
-│                                                   │
-│ WHAT THEY'RE TESTING                              │
-│   Do you know what's actually hard vs what just   │
-│   took time? Pride in the right thing signals     │
-│   taste.                                          │
-└─────────────────────────────────────────────────┘
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ THEY ASK                                                          │
+│   "What part of this are you most proud of?"                     │
+│                                                                   │
+│ WHAT THEY'RE TESTING                                              │
+│   What do you think 'good engineering' is? Do you point at        │
+│   something that took effort, or something that's actually        │
+│   elegant? Can you articulate WHY it's good, not just that you   │
+│   like it?                                                        │
+└─────────────────────────────────────────────────────────────────┘
+```
 
-> "The search engine — specifically that it's *one* `search()` function that's Dijkstra, A\*, grade-A\*, and directed-A\* depending on the cost and heuristic you pass it. Dijkstra is literally A\* with a zero heuristic. I'm proud of that because it's the senior version of the algorithm: the generic traversal and the domain intelligence are cleanly separated — the search loop never mentions grade, the cost function never mentions search. And I can *prove* it's correct, not just claim it: the heuristic is admissible because every edge cost is at least its length and straight-line distance never overestimates, so A\* returns the exact same cost as Dijkstra — which I test against directly. That proof-backed correctness is the part I'd put my name on."
+> "Two things, and they're related. First: there's exactly *one* search
+> function. `search()` in `astar.ts:22` is Dijkstra, A*, grade-aware routing, and
+> directional routing — all of them — depending only on which `(costFn,
+> heuristicFn)` you pass in. Dijkstra is `search` with a zero heuristic and pure
+> distance cost. A* swaps in the haversine heuristic. Grade routing swaps in the
+> penalty cost. Directional routing swaps in the *signed* penalty cost. The four
+> 'stages' of the progression are four three-line wrappers (`astar.ts:136-163`)
+> around the same engine. Collapsing what looks like four algorithms into one
+> parametric function is the thing I'm happiest with.
+>
+> Second, and this is what makes the first one trustworthy: the A* heuristic is
+> *provably admissible*, so A* returns the exact same optimal path as Dijkstra —
+> just faster. The proof is short. Cost is `length * (1 + penalty)` and penalty
+> is always ≥ 0 (`cost.ts:16`), so cost is always ≥ length. The heuristic is
+> straight-line haversine distance, which is always ≤ the true path length. So
+> the heuristic never *overestimates* remaining cost — that's the definition of
+> admissible — which means A* can't return a worse path than Dijkstra. I can test
+> that invariant directly: same path, fewer nodes expanded. That's what the
+> benchmark confirms."
 
-Pride in the *separation of concerns* and the *provable correctness*, not "I used A\*," is what shows taste. You're proud of the design, not the feature.
+```
+        ▸ One parametric search() is four algorithms.
+          A provable admissibility bound makes A* == Dijkstra.
+          Elegance you can prove beats cleverness you can't.
+```
 
-▸ Be proud of the design decision, not the feature. "I separated traversal from cost and can prove the heuristic admissible" beats "I implemented A\*."
+The proof is your power move. Most candidates *use* A* and assume it's optimal.
+You can derive *why* — penalty ≥ 0 → cost ≥ length, haversine ≤ true length →
+admissible → optimal. That's the senior signal the spec names: you can reason
+about invariants, not just run the algorithm (§15.1).
 
-## "What's the part you're least confident defending?"
+Deeper on the admissibility proof, lazy-deletion heaps, and the algorithm
+progression → `.aipe/study-dsa-foundations/`.
 
-┌─────────────────────────────────────────────────┐
-│ THEY ASK                                          │
-│   "What part would you be least comfortable if I   │
-│    drilled into it?"                               │
-│                                                   │
-│ WHAT THEY'RE TESTING                              │
-│   Self-awareness. Can you name a real weak spot    │
-│   without either hiding it or falling apart? This  │
-│   answer is a senior signal when handled right.   │
-└─────────────────────────────────────────────────┘
+---
 
-> "The balanced potential in bidirectional A\*. The forward and backward searches each need a heuristic, and you can't just use plain straight-line distance on both sides — they won't be *consistent* with each other, and the rule for when the two frontiers meet can then return a non-optimal path. The fix is a balanced potential — each side uses half the difference of the two heuristics — and I have it implemented and tested against the optimal cost. But if you asked me to re-derive *why* that specific formula keeps both sides consistent from first principles, I'd have to think carefully and might not get the proof airtight on the spot. I know it's correct because the test pins it to directed-A\*'s cost, and I know the shape of why — but the formal consistency argument is the edge of my understanding here."
+## "What are you least confident defending?"
 
-This is the answer that *gains* you credibility. You named a genuinely subtle thing, showed you understand it operationally (it's tested, you know the failure mode), and drew the exact line where your knowledge gets shaky. That's senior.
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ THEY ASK                                                          │
+│   "What part of this are you least confident about?"            │
+│                                                                   │
+│ WHAT THEY'RE TESTING                                              │
+│   Self-awareness. Will you claim everything is solid (a lie      │
+│   they'll catch) or name a real soft spot? Can you describe      │
+│   what you DON'T fully understand precisely — which itself        │
+│   shows you understand it better than someone who'd bluff?       │
+└─────────────────────────────────────────────────────────────────┘
+```
 
-╔═══════════════════════════════════════════════════╗
-║ WHEN YOU DON'T KNOW                                ║
-║                                                   ║
-║   They take the bidirectional answer as an         ║
-║   invitation and ask you to prove the              ║
-║   consistency of the balanced potential on the     ║
-║   whiteboard, right now.                          ║
-║                                                   ║
-║   Say:                                            ║
-║   "Let me set it up and you tell me if I drift.    ║
-║    The potential on the forward side is            ║
-║    (h_goal − h_start)/2, the reverse is its        ║
-║    negation, so an edge's reduced cost is          ║
-║    consistent across both searches — that's what   ║
-║    makes the topF+topR ≥ mu stopping rule sound.   ║
-║    The full proof that reduced costs stay          ║
-║    non-negative I'd want to work through carefully  ║
-║    rather than wave at — can we do it together?"   ║
-║                                                   ║
-║   What this signals: you'll attempt the hard       ║
-║   thing, you know where the rigor gets shaky, and  ║
-║   you invite collaboration instead of bluffing.   ║
-║                                                   ║
-║   Do NOT say:                                      ║
-║   "It just balances the two sides so it works" —   ║
-║   restating the name as if it were an explanation  ║
-║   is the collapse. Either attempt the mechanism    ║
-║   or cleanly say where the proof exceeds you.      ║
-╚═══════════════════════════════════════════════════╝
+This is the question where the weak instinct is to say "nothing, really." Don't.
+Name the real one.
 
-## What you'd change
+> "The bidirectional A* — specifically its correctness proof. It works and it's
+> tested, but I'm less sure I could *defend the proof* than I am for the
+> single-direction search. The forward and backward searches use a balanced
+> potential, `pf = (haversine-to-goal − haversine-to-start) / 2`, with the
+> reverse potential being `−pf` (`bidirectional.ts:30`). I can tell you *why*
+> that form is used — you need the two potentials to be consistent with each
+> other so the meeting-point cost is correct, and the balanced form makes the
+> forward and reverse heuristics symmetric. And I implemented the standard
+> stopping rule — stop when the top of both frontiers sums to ≥ the best path
+> found (`bidirectional.ts:52`).
+>
+> But if you pushed me to *prove* that the meeting-point reconstruction is
+> guaranteed optimal under that potential — versus me having matched it to the
+> textbook formulation and confirmed it against my Dijkstra oracle on fixtures —
+> I'd be reconstructing the proof live, not reciting it. The forward search I can
+> prove cold. The bidirectional consistency argument I'd want to walk through
+> carefully rather than claim from memory."
 
-The hard-parts reflection I'd carry forward isn't about a line of code — it's about *when* I reached for instrumentation. The "no route" bug got solved fast because I probed before fixing, but the all-green elevation problem took several rounds because at first I *assumed* it was throttling and guessed at fixes, instead of immediately checking the API with a curl and adding the degraded-region diagnostic. Both bugs had the same right method available; I only used it cleanly on one. What I'd change is making "instrument first, always" the reflex from the first symptom, not the third — the times I followed it, the root cause fell out in one step.
+```
+┃ "The forward search I can prove cold. The bidirectional
+┃  consistency argument I'd reconstruct live, not recite."
+```
 
-## One-page summary
+That is a *strong* answer. You named the exact thing (consistency of the
+balanced potential + meeting-point optimality), showed you understand it well
+enough to know where your certainty ends, and you have a fallback (the Dijkstra
+oracle on fixtures confirms correctness empirically). Knowing precisely where
+your confidence runs out is more senior than false certainty everywhere.
 
-**Core claim:** Anchor every reflection to a specific, real story, and treat "least confident" as a strength — naming exactly where your understanding ends is the most senior signal you can give.
+---
 
-- **Hardest bug:** distant routes returned "no route"; a reachability probe (BFS from start) showed the endpoints were in disconnected components from viewport-only tiling; fixed by loading+stitching the corridor. Method: evidence before fix.
-- **Proudest:** one `search()` for Dijkstra/A\*/directed — clean separation of traversal from cost — with a *provable* admissible heuristic (A\* == Dijkstra cost in tests).
-- **Least confident:** the bidirectional balanced-potential consistency proof — implemented and tested, but the formal derivation is the edge of my understanding. (Named honestly, attempted collaboratively.)
-- **Confidence tiers:** deep on A\*/heap/degradation; name edges on bidirectional/tiling; own the gap on RN runtime internals and multi-user scale.
+## The "I don't know" box — when they push the bidirectional proof
 
-┃ "I added evidence before I touched the fix."
-┃ "I'm proud of the design — traversal separated from cost, with a provable heuristic — not just that I used A\*."
+This is the natural place the least-confident answer gets tested. Have the
+recovery ready.
 
-**What you'd change:** Make "instrument first" the reflex from the first symptom, not the third — the bugs I probed immediately resolved in one step.
+```
+╔═══════════════════════════════════════════════════════════════╗
+║ WHEN YOU DON'T KNOW                                            ║
+║                                                               ║
+║   They take your least-confident answer and push: "OK, prove  ║
+║   the bidirectional search returns the optimal path. Why is    ║
+║   the stopping rule correct?"                                  ║
+║                                                               ║
+║   You flagged this yourself as the proof you'd reconstruct,   ║
+║   not recite. Now they're making you do it. Don't bluff a     ║
+║   proof you're unsure of — reason out loud and mark your       ║
+║   confidence as you go.                                        ║
+║                                                               ║
+║   Say:                                                         ║
+║   "Let me reason through it rather than recite it. The         ║
+║    stopping rule is: stop when topF + topR ≥ mu, the best     ║
+║    meeting cost found so far. The intuition is that topF       ║
+║    and topR are lower bounds on any remaining path through     ║
+║    each frontier, so once their sum can't beat mu, no          ║
+║    unexplored path can either. That relies on the potentials   ║
+║    being consistent — the balanced form gives me that. The     ║
+║    part I'd want to verify carefully is the edge case where    ║
+║    the optimal meeting node is closed on one side before the   ║
+║    other reaches it — I handle that by re-checking total cost  ║
+║    when a node is found closed on the opposite side            ║
+║    (bidirectional.ts:61). I'm fairly confident in the          ║
+║    structure; if we're proving it rigorously I'd want to       ║
+║    write out the consistency inequality, not eyeball it."      ║
+║                                                               ║
+║   What this signals: you can REASON through a proof you        ║
+║   don't have memorized, you flag your confidence honestly at  ║
+║   each step, and you point at the actual code handling the     ║
+║   edge case. Reasoning + calibrated confidence beats a         ║
+║   confident hand-wave every time.                             ║
+║                                                               ║
+║   Do NOT say:                                                  ║
+║   "It's optimal because it's bidirectional A* and that's       ║
+║    proven in the literature." Appeal to authority on a proof   ║
+║   you just admitted you can't reconstruct is the worst         ║
+║   possible move.                                               ║
+╚═══════════════════════════════════════════════════════════════╝
+```
+
+---
+
+## Where the hard-parts conversation goes next
+
+```
+  You named the "no route" disconnected-components bug.
+        │
+        ├─► IF THEY ASK "how do you prevent it now?"
+        │     "stitchGraph merges coincident boundary nodes on
+        │      every tile merge (tiles.ts). And endpoints are
+        │      stored as coordinates, re-snapped to the current
+        │      graph as tiles load (MapScreen.tsx:133) so they
+        │      track the merged graph, not a stale one."
+        │
+        ├─► IF THEY ASK "how did you know it was the graph and
+        │   │   not the search?"
+        │     "I ran the search on a known-answer fixture — it
+        │      was correct there. That isolated it to the data.
+        │      Then the reachability flood confirmed the end
+        │      node wasn't reachable from the start."
+        │
+        └─► IF THEY ASK "could the proudest part be simpler?"
+              "The parametric search is already the simple
+               version — one function, four wrappers. If
+               anything I'd resist adding more cleverness; the
+               readability of `search(g,s,e,max,costFn,hFn)` is
+               the win."
+```
+
+---
+
+## What you'd change about the hard parts
+
+I'd close the loop on the least-confident one: write out the bidirectional
+consistency proof formally and add a property test that fuzzes random
+start/goal pairs and asserts `bidirectional` returns the *same cost* as
+`directedAstar` (which I can already prove optimal). Right now my confidence in
+bidirectional is empirical — it matches the oracle on fixed fixtures. Turning
+that into a fuzzed invariant would move it from "solid" to "rock solid" on the
+confidence map, and then I could prove it cold like the forward search. The
+proudest and hardest-bug parts I wouldn't change — they're the strongest things
+in the repo.
+
+---
+
+## One-page summary — Chapter 6
+
+**Core claim:** Name a real bug, a real source of pride, and a real soft spot —
+and handle all three honestly. The least-confident answer is a strength when
+calibrated.
+
+**The three answers:**
+- **Hardest bug** → "no route" from disconnected components (coincident tile-boundary nodes); found via a reachability flood; fixed with `stitchGraph` (tiles.ts). Separated algorithm from data.
+- **Proudest** → one parametric `search()` is Dijkstra/A*/grade/directed via `(costFn, heuristicFn)` (astar.ts:22); plus provable admissibility (penalty ≥ 0 → cost ≥ length; haversine ≤ true length → A* == Dijkstra).
+- **Least confident** → bidirectional A* consistency proof + meeting-point stopping rule (bidirectional.ts:30,52). Forward search provable cold; bidirectional reconstructed live, with a Dijkstra oracle as the empirical backstop.
+
+**Pull quotes:**
+- ┃ "The search was fine. The bug was in the graph — disconnected components, found with a reachability probe."
+- ▸ One parametric search() is four algorithms; provable admissibility makes A* == Dijkstra.
+- ┃ "The forward search I can prove cold. The bidirectional argument I'd reconstruct live, not recite."
+
+**What you'd change:** Add a fuzzed property test asserting `bidirectional` cost == `directedAstar` cost over random pairs, and write the consistency proof formally — move bidirectional from empirically-solid to provably-solid.

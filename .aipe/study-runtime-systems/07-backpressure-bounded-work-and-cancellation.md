@@ -1,373 +1,288 @@
-# Backpressure, bounded work, and cancellation
+# Backpressure, Bounded Work & Cancellation
 
-*Bounded concurrency, queues, overload, cancellation, deadlines, shutdown.*
-**Type:** Industry standard (single-flight + debounce; cancellation absent).
+**Industry name(s):** bounded concurrency · debounce/throttle · rate-limit
+backoff · stale-work supersession (vs cancellation) · capped retry. **Type:**
+Industry standard.
 
 ## Zoom out, then zoom in
 
-This is where the runtime story has the most tension. flattr has a real
-backpressure mechanism (the `pump()` single-flight gate from `04-`), real
-bounded work (debounce, batch sizes, span caps), and **no cancellation at
-all**. Those three together define how the app behaves under overload:
-it sheds load by collapsing bursts and refusing too-big requests, but it
-never *stops* work it's already started — a superseded build runs to
-completion, wasted, before the next one begins.
+flattr's whole concurrency strategy is about *bounding* — keeping the amount of
+network and CPU work small enough to stay under free-tier limits and a phone's
+budget. It does this with debounce, single-flight, batch size, backoff, and span
+limits. What it deliberately does **not** do is *cancel* in-flight work — stale
+work runs to completion and gets superseded, not aborted.
 
 ```
-  Zoom out — load control on the runtime map
+  Zoom out — where work gets bounded across the pipeline
 
-  ┌─ RUN process ────────────────────────────────────────────┐
-  │  ★ debounce (collapse bursts) ★                           │ ← bounded
-  │  ★ pump() single-flight (one build at a time) ★           │ ← backpressure
-  │  ★ span caps (refuse too-wide routes/views) ★             │ ← admission control
-  │  ✗ NO AbortController / no cancellation ✗                 │ ← the gap
+  ┌─ UI events ─────────────────────────────────────────────┐
+  │  pan/type → DEBOUNCE (600ms / 400ms) → collapse to 1     │ ← bound #1
+  └───────────────────────┬───────────────────────────────────┘
+  ┌─ Scheduler ───────────▼─────────────────────────────────┐
+  │  pump() SINGLE-FLIGHT → 1 build at a time                │ ← bound #2
+  │  span limits → refuse too-wide loads/corridors           │ ← bound #3
+  └───────────────────────┬───────────────────────────────────┘
+  ┌─ Network ─────────────▼─────────────────────────────────┐
+  │  BATCH (100/256) + delayMs throttle + EXP BACKOFF on 429 │ ← bound #4
+  │  CAPPED retries (1-6) → give up gracefully               │ ← bound #5
   └──────────────────────────────────────────────────────────┘
-
-  ┌─ BUILD process ──────────────────────────────────────────┐
-  │  batch sizes (100/256) + inter-batch sleep                │ ← bounded I/O
-  │  ✗ no SIGTERM handler / no graceful drain ✗               │ ← `not yet exercised`
-  └──────────────────────────────────────────────────────────┘
+  ✗ MISSING: cancellation — no AbortController, no A* abort   ← we are here
 ```
 
-Zoom in: the question is *what happens when more work arrives than flattr
-can do, and can it stop work it no longer needs?* The answer: it caps and
-collapses the incoming work well, and it cannot cancel in-flight work at
-all.
+Zoom in: the question is **how does flattr avoid drowning under bursts and
+overload, and what happens to work that's no longer needed?** The answer is five
+layered bounds and zero cancellation — a deliberate, mostly-fine tradeoff with one
+sharp edge (the unbounded A*).
 
 ## Structure pass
 
-**Layers.** Load control nests from "don't accept it" to "don't finish it":
+**Layers.** Two concerns stacked: *throttling the inflow* (debounce + single-flight
++ span limits decide how much work even starts) and *surviving the work that does
+start* (batch + backoff + capped retries keep each build from hammering the API).
+Cancellation would be a third layer — *stopping work mid-flight* — and it's absent.
+
+**Axis traced — "what bounds this, and what happens at the limit (failure)?"**
 
 ```
-  Layered decomposition — "how is excess work handled?" at each layer
+  One axis — "what's the bound / what at the limit?" — per stage
 
-  ┌───────────────────────────────────────────────┐
-  │ outer: admission (span caps)                   │ → REJECT (return false/skip)
-  └───────────────────────────────────────────────┘
-      ┌─────────────────────────────────────────┐
-      │ middle: debounce (collapse a burst)       │ → COALESCE (one timer)
-      └─────────────────────────────────────────┘
-          ┌─────────────────────────────────────┐
-          │ inner: single-flight (one at a time)  │ → SERIALIZE (busyRef)
-          └─────────────────────────────────────┘
-              ┌─────────────────────────────────┐
-              │ innermost: in-flight work        │ → CANNOT STOP (no cancel) ✗
-              └─────────────────────────────────┘
-
-  excess handled differently per layer — until the innermost, where
-  the answer is "it runs to completion no matter what" (the gap)
+  pan burst        → debounce 600ms; collapses N pans → 1     (drop extras)
+  concurrent builds→ busyRef; hard cap of 1                   (defer, never parallel)
+  load/route span  → MAX_LOAD_SPAN / MAX_CORRIDOR_SPAN deg    (refuse, return false)
+  elevation reqs   → batch 100 + delayMs + exp backoff on 429 (slow down)
+  retries          → capped: Overpass 3, Open-Meteo 1, heal 6 (give up, keep last)
+  in-flight build  → NO bound on duration; NO abort           ✗ runs to completion
+  A* search        → NO bound on expansions; NO abort          ✗ blocks till done
 ```
 
-**Axis — failure/overload containment.** Trace "where does excess work get
-absorbed?" At admission, a too-wide request is rejected outright
-(`ensureBbox` returns `false`). At debounce, a burst of pans becomes one
-fetch. At single-flight, concurrent builds become sequential. But once a
-build *starts*, there's no layer that contains it — it consumes its full
-network + CPU cost even if the user already moved on.
-
-**Seam.** The load-bearing boundary is **queued ↔ in-flight**. Everything
-*before* a build starts is controllable (reject, coalesce, stash). Once it
-crosses into "running," it's uninterruptible. That seam is exactly where
-cancellation would live, and it's empty.
+**Seam — the debounce-then-single-flight boundary.** Upstream of it, events arrive
+unbounded (drag the map = dozens of `onRegionDidChange`). Downstream, exactly one
+build runs. The flip from "unbounded inflow" to "one unit of work" happens across
+two collapses: the debounce timer (many events → one queued request) and the
+`busyRef` slot (many queued → one running). That double-collapse *is* flattr's
+backpressure. → `02-processes-threads-and-tasks.md`.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You know backpressure from a saturated queue: when the consumer can't keep
-up, you stop accepting (drop), slow the producer (throttle), or buffer
-(queue) — but you never let unbounded work pile up. flattr does all three
-of the "before it runs" moves and skips the "stop it running" move
-(cancellation) entirely.
+You've bounded inflow before with a search-as-you-type debounce: wait until the
+user stops typing, then fire one request instead of one per keystroke. flattr
+stacks that idea five deep. And the cancellation gap is the same one most React
+apps have: when a debounced fetch finally fires and the inputs already changed,
+the old fetch isn't aborted — its result just gets ignored on the next render.
+Supersession, not cancellation.
 
 ```
-  Pattern — the four load-control moves, three present + one absent
+  Pattern — bound the inflow, survive the work, supersede the stale
 
-   incoming work
-        │
-        ▼
-   [ admission ]  too big? ──► REJECT          ✓ span caps
-        │ ok
-        ▼
-   [ debounce ]   burst? ────► COALESCE to one  ✓ setTimeout
-        │ one
-        ▼
-   [ single-flight ] busy? ──► STASH (1 slot)   ✓ busyRef
-        │ free
-        ▼
-   [ run build ]  ──► (started) ──► CANNOT CANCEL  ✗ no AbortController
-        │
-        ▼  result or wasted work
+   inflow            running work           stale work
+   ┌──────────┐      ┌────────────┐         ┌──────────────┐
+   │ N events │─bound│ 1 build     │         │ old result   │
+   │ collapse │─────►│ batch+back- │         │ arrives late │
+   │ to 1     │      │ off+capped  │         │ → IGNORED by │
+   └──────────┘      └────────────┘         │ next render  │
+        debounce       throttle/retry        └──────────────┘
+                                              (not aborted)
 ```
 
-### Move 2 — walk the mechanisms
+### Move 2 — the load-bearing skeleton
 
-**Admission control: span caps reject too-big work before it starts.**
-`ensureBbox` returns `false` if the route's bounding box is wider than
-~13 km — too far to route, refuse it. `onRegionDidChange` skips entirely
-if the viewport is zoomed out past ~a few km. These are the cheapest
-possible load shedding: the work never enters the system.
+The kernel of bounded work here is: **debounce + single-flight + span-limit +
+backoff + capped-retry.** Name each by what breaks without it.
 
-```
-  Execution trace — admission decisions
+**Part 1 — debounce (collapse the burst).** Drop it and every pixel of a pan drag
+queues a build:
 
-  request                          span check          outcome
-  ───────────────────────────────  ──────────────────  ──────────────
-  route across 5 km                 < 0.12° → ok         build corridor
-  route across 20 km                > 0.12° → REJECT     return false (no route)
-  pan at city zoom (0.1° span)      > 0.06° → REJECT     skip, no fetch
-  pan at street zoom (0.01° span)   < 0.06° → ok         schedule build
+```ts
+// mobile/src/useTileGraph.ts:253-255
+if (timerRef.current) clearTimeout(timerRef.current);  // cancel the pending one
+timerRef.current = setTimeout(() => queueViewport(bounds), DEBOUNCE_MS); // 600ms
 ```
 
-**Bounded work: debounce caps the *rate* of build attempts.** A pan fires
-dozens of `onRegionDidChange` events; the 600ms debounce ensures only the
-*last* one (after the user stops) actually schedules a build. The
-autocomplete has the same 400ms cap. This bounds how often the gate is
-even engaged. (Mechanism detail: `03-`.)
+What breaks if removed: a 2-second drag fires ~60 region events → 60 build
+attempts. Debounce collapses them to the one viewport the user landed on.
 
-**Backpressure: single-flight serializes builds to one at a time.** This
-is the `pump()` gate from `04-` — `busyRef` ensures one network build runs
-at a time, and a request that arrives while busy is stashed in a one-deep,
-last-write-wins slot. This is the core backpressure: no matter how fast
-requests arrive, they're throttled down to a serial stream, and only the
-latest of each kind survives.
+**Part 2 — single-flight (cap concurrency at 1).** Covered in depth in file 02 —
+`busyRef` ensures one build runs at a time. What breaks if removed: parallel
+Overpass POSTs → instant 429.
 
-```
-  Pattern — single-flight as backpressure (one server, bounded queue)
+**Part 3 — span limits (refuse work that's too big to be worth doing).** Two hard
+geographic ceilings:
 
-   fast arrivals ──► [ busyRef: one in-flight ] ──► slow consumer (network)
-                     [ pending: 1 slot, LWW   ]
-                          │
-                          └─ overflow policy: overwrite (keep latest),
-                             NOT grow the queue → bounded by construction
+```ts
+// mobile/src/useTileGraph.ts:249-251 (viewport)
+if (bounds[2]-bounds[0] > MAX_LOAD_SPAN_DEG || ...) return; // zoomed out → load nothing
+// mobile/src/useTileGraph.ts:272 (corridor)
+if (e-w > MAX_CORRIDOR_SPAN_DEG || n-s > MAX_CORRIDOR_SPAN_DEG) return false; // too far → refuse route
 ```
 
-**Bounded I/O: batch sizes and span caps bound the build's own size.**
-Inside a build, elevation requests go out in batches of 100
-(`OPEN_METEO_BATCH`), Google in 256, with an inter-batch sleep. The
-segment-split granularity and bbox are capped so a single build's node
-count stays phone-friendly. The work *per build* is bounded, not just the
-*rate* of builds.
+What breaks if removed: a world-view pan or a cross-state route would try to fetch
+a gigantic bbox — minutes of Overpass, a graph too big for the phone, and an A*
+that blocks for ages. The span limit is the bound that keeps the *unbounded* A*
+(Part 6) from ever getting a pathologically large graph. That's the quiet
+load-bearing connection: flattr bounds A*'s *input size* upstream because it can't
+bound A*'s *runtime* directly.
 
-**The gap: nothing is cancellable.** Here's the missing layer. When a
-build is in flight and the user pans away or picks a different route, that
-build keeps running — full Overpass fetch, full elevation sampling, full
-CPU — and only *then* does `pump()` drain the now-stale next request.
-There's no `AbortController` threaded into `fetch`, no abort signal, no
-"this build is obsolete, stop." The work isn't killed; its *result* is
-just superseded when a newer request was queued behind it.
+**Part 4 — batch + throttle (rate-limit-friendly network).** Elevation requests
+are chunked and spaced:
 
-```
-  Comparison — what flattr does vs cancellation
-
-  flattr (no cancel):  build A starts ──── runs to completion ────► result A
-                       (user moved on)     wasted network + CPU      (stale, but
-                                                                      then pump
-                                                                      drains B)
-
-  with AbortController: build A starts ──X abort ──► fetch rejects ──► free thread
-                        (user moved on)              immediately       for build B
+```ts
+// pipeline/elevation.ts:102-121
+for (let i = 0; i < points.length; i += OPEN_METEO_BATCH) {  // 100 per request
+  ...
+  if (delayMs && i + OPEN_METEO_BATCH < points.length) await sleep(delayMs); // throttle between batches
+}
 ```
 
-**No graceful shutdown either.** The build process has no `SIGTERM`
-handler and no drain — on error it sets `process.exitCode = 1` and lets
-the loop empty (`run-build.ts:54-57`). There's no deadline on any fetch
-(beyond Overpass's server-side `timeout:60`). These are `not yet
-exercised` — fine for a manual CLI and a single-user app, relevant the
-moment flattr runs unattended or serves concurrent users.
+What breaks if removed: one request per point → hundreds of calls → throttled.
+Batching is the primary rate-limit defense; the elevCache (file 05) makes most
+batches empty on revisit.
+
+**Part 5 — exponential backoff + capped retry (survive a 429, then give up).**
+
+```ts
+// pipeline/elevation.ts:114-118
+if (res.status === 429 && attempt < retries) {
+  await sleep(delayMs * 2 ** (attempt + 1));  // 800ms, 1600ms, ... exponential
+  continue;
+}
+throw new Error(...);  // out of retries → fail this build
+```
+
+What breaks if removed without the cap: an infinite retry loop hammering a downed
+API. The cap (`retries`, default 3 but set to **1** in the mobile hot path,
+`useTileGraph.ts:191`) is the "give up fast and degrade to flat" decision — pair it
+with `bestEffortElevation` (line 20-31), which catches the throw and returns
+zeros so the build still produces connected streets. The capped self-heal retry
+(`MAX_RETRIES = 6`, lines 65, 209-218) then re-queues the degraded region quietly
+until grades come back.
+
+```
+  Execution trace — Open-Meteo throttled, mobile hot path (retries:1)
+
+  attempt 0 → 429 → sleep 800ms → retry          (attempt < 1)
+  attempt 1 → 429 → throw "elevation: 429"        (attempt == retries)
+  → bestEffortElevation catches → returns all-0   (degraded = true)
+  → build completes with FLAT grades, streets connected
+  → schedule self-heal retry in 12s (capped at 6 tries)
+  result: no stall, no crash, grades self-heal later
+```
+
+**Part 6 — the missing layer: cancellation.** Here's what flattr does *not* do.
+Once a build is in flight or A* is running, nothing stops it:
+
+- **No `AbortController` on any `fetch`.** `fetchOverpass` (`overpass.ts:33`) and
+  the elevation fetch take no abort signal. Pan away mid-build and the build
+  finishes, writes its region, *then* the next pan's build starts.
+- **No A\* abort.** `directedAstar` (`MapScreen.tsx:151`) runs to completion in a
+  `useMemo`. Change `userMax` or an endpoint mid-search and the old search still
+  finishes blocking the thread before the new one starts — React just discards the
+  stale `useMemo` result.
+- **Supersession instead.** The defense is that stale work is *cheap to ignore*:
+  the `useMemo` recomputes from the new inputs, the old region is overwritten in
+  its single slot. The work isn't stopped; its output is dropped.
+
+```
+  Comparison — cancellation vs flattr's supersession
+
+  CANCELLATION (not built)        SUPERSESSION (what flattr does)
+  ─────────────────────────       ──────────────────────────────
+  inputs change → abort fetch     inputs change → fetch runs to completion
+  → free the thread NOW           → result lands → next render ignores it
+  → A* AbortSignal stops loop     → A* finishes, useMemo discards stale value
+  costs: plumbing an abort path   costs: wasted work + thread blocked till done
+```
+
+The bet: bounds 1-5 keep stale work small and infrequent enough that not
+cancelling it is cheap. That holds for `fetch` (the thread is free during I/O
+anyway) but is *weakest* for A*, because A* blocks the thread — a superseded A* on
+a large graph still janks a frame before its result is thrown away. That's the one
+place the no-cancellation choice has teeth.
 
 ### Move 3 — the principle
 
-Load control is a stack of cheaper-to-more-expensive moves: **reject
-before you queue, coalesce before you run, serialize before you saturate —
-and cancel what you no longer need.** flattr nails the first three and
-skips the fourth. Skipping cancellation is acceptable when work is cheap
-and short (today's tiny graph), and it becomes the dominant cost the moment
-builds are slow and users change their minds mid-flight. The discipline
-that transfers: every layer of admission/throttling you add only controls
-work *before* it starts — controlling work *after* it starts is a separate
-mechanism (cancellation), and you have to build it on purpose.
+Bounded work and cancellation are two different tools for two different problems.
+Bounding controls how much work *starts*; cancellation reclaims work already
+*running*. flattr invests entirely in the first — five stacked bounds — and skips
+the second, betting that the bounds keep stale work cheap. The bet is sound for
+yielding I/O (a stale fetch costs nothing while it's parked) and risky for
+non-yielding CPU (a stale A* costs a frame). The general lesson: cancellation
+earns its complexity exactly when stale work is *expensive and non-yielding* —
+which is precisely flattr's A*, and precisely where it's missing.
 
 ## Primary diagram
 
-The full load-control stack — three present layers, one absent, the seam
-between controllable and uninterruptible.
-
 ```
-  flattr load control — the full stack, the gap marked
+  The full bounded-work stack + the cancellation gap
 
-  INCOMING (pans, routes, keystrokes)
-        │
-  ┌─────▼──────────────────────────────────────────────┐
-  │ ADMISSION   span caps: ensureBbox<0.12°, view<0.06° │ REJECT
-  ├─────────────────────────────────────────────────────┤
-  │ DEBOUNCE    600ms pan, 400ms suggest                │ COALESCE
-  ├─────────────────────────────────────────────────────┤
-  │ SINGLE-FLIGHT  busyRef + 1-deep LWW slots (corridor> │ SERIALIZE
-  │                view priority)                         │
-  ├═════════════════ SEAM: queued ↔ in-flight ═══════════┤
-  │ IN-FLIGHT BUILD  Overpass + elevation + buildGraph    │ ✗ CANNOT
-  │                  (full cost even if superseded)       │   CANCEL
-  └───────────────────────────────────────────────────────┘
-        │
-        ▼  result (used, or stale-then-discarded)
-
-  controllable above the seam; uninterruptible below it
-```
-
-## Implementation in codebase
-
-**Use cases.** This stack runs on every interaction: panning (debounce →
-single-flight), routing (admission → single-flight, corridor priority),
-typing (debounce). The cancellation gap shows up whenever a user changes
-their mind faster than a build completes.
-
-Admission control — reject a too-wide route outright:
-
-```
-  mobile/src/useTileGraph.ts  (lines 156-166)
-
-  const ensureBbox = useCallback((bbox: Bbox): boolean => {
-    const [w, s, e, n] = bbox;
-    if (e - w > MAX_CORRIDOR_SPAN_DEG || n - s > MAX_CORRIDOR_SPAN_DEG) return false;  ← REJECT
-    if (covers(corridorRef.current, bbox)) return true;        ← already covered: no work
-    pendingCorridorRef.current = bbox;                          ← else stash for the gate
-    pump();
-    return true;
-  }, [pump]);
-        │
-        └─ MAX_CORRIDOR_SPAN_DEG (~13km) is admission control: a route too wide
-           to serve is refused BEFORE any build — the cheapest load shed there is.
-```
-
-The debounce — collapse a burst of pan events into one scheduled build:
-
-```
-  mobile/src/useTileGraph.ts  (lines 138-148)
-
-  if (timerRef.current) clearTimeout(timerRef.current);   ← cancel the prior timer
-  timerRef.current = setTimeout(() => {
-    if (baseGraph && bboxContains(baseGraph.bbox, bounds)) return;  ← skip: covered
-    if (covers(viewRef.current, bounds)) return;                    ← skip: covered
-    ...
-    pendingViewRef.current = [...];                          ← stash latest viewport
-    pump();
-  }, DEBOUNCE_MS);
-        │
-        └─ clearing+resetting the timer per event is the coalesce: only the pan
-           AFTER the user stops moving survives to schedule a build.
-```
-
-The in-flight build with the missing cancellation — note the `finally`
-drains the *next* request only after the current one fully finishes:
-
-```
-  mobile/src/useTileGraph.ts  (lines 106-128, condensed)
-
-  (async () => {
-    try {
-      const osm = await fetchOverpass(bbox);          ← NO abort signal passed
-      const elev = bestEffortElevation(openMeteoProvider(...));
-      const g = await buildGraph(kind, bbox, osm, elev, ...);  ← runs fully, always
-      ... setView/setCorridor ...
-    } catch { /* keep last region */ }
-    finally {
-      busyRef.current = false;
-      pump();                                          ← only NOW drain the next
-    }
-  })();
-        │
-        └─ if the user panned away during `await fetchOverpass`, this build still
-           runs to completion — full network + CPU — before pump() services the
-           stale-superseding next request. An AbortController on fetchOverpass
-           would let an obsolete build bail early. That's the gap. (audit 08-)
+  EVENTS ──────────────────────────────────────────────────────►
+   │ debounce 600/400ms ─ collapse burst → 1            [bound 1]
+   ▼
+  pump() ─ busyRef ─ 1 build at a time                  [bound 2]
+   │ span limits ─ refuse too-wide bbox → false         [bound 3]
+   ▼
+  fetch ─ batch 100/256 + delayMs throttle              [bound 4]
+   │ 429 → exp backoff → CAPPED retry → degrade flat     [bound 5]
+   ▼
+  build region → setState → useMemo rebuilds graph
+   │
+   ✗ in-flight build: NOT abortable (no AbortController)
+   ✗ A* in useMemo:   NOT abortable (blocks frame, then discarded)
+   → stale work SUPERSEDED, not cancelled
 ```
 
 ## Elaborate
 
-The reject→coalesce→serialize→cancel ladder is the standard vocabulary of
-overload handling — it's what a rate limiter, a debounced search box, a
-`singleflight` cache, and an `AbortController`-wired fetch each contribute.
-flattr's omission of the last rung is the most common one in real apps,
-because cancellation is genuinely harder: you have to thread an abort
-signal through every async boundary (`fetch`, the elevation loop, even a
-chunked CPU search) and decide what partial state to discard. The
-canonical fix is `AbortController` — create one per build, pass
-`signal` into `fetchOverpass`/`fetchImpl`, abort it when a newer request
-supersedes the current one, and check `signal.aborted` between elevation
-batches. For the synchronous CPU search, "cancellation" means chunking the
-loop (`02-`/`03-`) and checking an abort flag between chunks. Read `04-`
-for the gate this builds on, and
-[`.aipe/study-networking/`](../study-networking/) for where the abort
-signal threads through the fetch layer.
+The bounding toolkit here is the standard one: debounce (Lodash-era UI), bounded
+concurrency (semaphores, p-limit), exponential backoff with cap (AWS SDK, every
+robust HTTP client). The supersession-over-cancellation choice is also extremely
+common in React land — most apps ignore stale fetch results rather than abort
+them, and it's usually fine. The reason it's worth flagging *here* specifically is
+the synchronous A*: in a typical app the superseded work is a yielding fetch, so
+"don't cancel" is free; in flattr the superseded work can be a thread-blocking
+search, so "don't cancel" can cost a visible frame. The fix vocabulary —
+`AbortController` for fetch, an iteration-budget check inside the A* `while` loop
+that bails when inputs change — is small and well-known; it's just not earned yet
+at the current graph size. Cross-link `.aipe/study-performance-engineering/` for
+the budget angle and `.aipe/study-networking/` for the retry/backoff angle.
 
 ## Interview defense
 
-**Q: "How does the app handle a burst of pan events without hammering the
-API?"**
+**Q: How does flattr handle a burst of pan events without melting the rate
+limits?**
 
-Three layers. Admission: pans at too-far zoom are skipped
-(`useTileGraph.ts:135`). Debounce: a 600ms timer collapses the burst to
-one scheduled build (`:138-148`). Single-flight: `busyRef` serializes
-builds to one at a time, with a one-deep last-write-wins slot so only the
-latest viewport survives (`:90-104`). So N rapid pans become at most one
-build.
+Five stacked bounds: debounce collapses the burst to one request
+(`useTileGraph.ts:254`), single-flight `busyRef` caps builds at one, span limits
+refuse too-wide loads, batching + throttle space the elevation calls, and capped
+exponential backoff survives a 429 then degrades to flat grades.
 
 ```
-  N pans ──► [reject far] ──► [debounce: 1] ──► [busyRef: serial] ──► 1 build
+  the bound stack, one line each
+
+  many pans → [debounce] → 1 → [single-flight] → 1 build →
+  [span limit] sane size → [batch+throttle] → [backoff+cap] → done-or-degrade
 ```
 
-Anchor: *"Reject, coalesce, serialize — three rungs before any work
-starts."*
+Anchor: *"The clever connection is bound #3 — the span limit caps A*'s **input**
+because flattr can't cap A*'s **runtime**. There's no abort inside the search, so
+the only way to keep it from blocking the thread is to never feed it a giant
+graph."*
 
-**Q: "What happens to a build if the user changes their mind mid-flight?"**
+**Q: What happens to a build or a route search that's no longer needed?**
 
-It runs to completion anyway — that's the gap. There's no
-`AbortController`; `fetchOverpass` and the elevation loop get no abort
-signal (`useTileGraph.ts:108-112`). The stale build finishes, then
-`pump()` drains the newer request. So obsolete work isn't cancelled, just
-superseded — wasted network and CPU. The fix is an `AbortController` per
-build, aborted when a newer request arrives.
-
-```
-  user moves on ──► build keeps running (full cost) ──► result discarded
-                    (no abort) ──► THEN next build starts
-```
-
-Anchor: *"Everything above the queued↔in-flight seam is controllable;
-below it there's no cancellation, so started work always finishes."*
-
-## Validate
-
-**Reconstruct.** Draw the four-rung load-control ladder (reject /
-coalesce / serialize / cancel) and mark which three flattr has and which
-it lacks, with the file:line for each present one.
-(`useTileGraph.ts:159` reject, `:138` debounce, `:90` single-flight;
-cancel absent.)
-
-**Explain.** Why does panning around quickly never fire more than one
-build at a time, even though each pan calls `pump()`? (Debounce collapses
-the events to one, and `busyRef` rejects a second concurrent build —
-`:138`, `:90`.)
-
-**Apply.** Add cancellation to the viewport build. Name the API and the
-exact call sites. (Create an `AbortController` in `pump()`; pass
-`controller.signal` into `fetchOverpass`'s `fetchImpl` and the elevation
-`fetchImpl`; store the controller in a ref; call `controller.abort()` at
-the top of `pump()` when superseding an in-flight view build —
-`useTileGraph.ts:104-112`.)
-
-**Defend.** Argue that the missing cancellation is acceptable *today* and
-name the trigger that flips it. (Builds over the tiny bbox are fast and
-cheap, so a wasted one costs little; it flips the moment builds are slow —
-big merged graph or slow network — and users change routes mid-build, at
-which point wasted full-cost builds dominate latency. `config.ts:10`,
-`useTileGraph.ts:106`.)
+It's superseded, not cancelled — that's the deliberate gap. No `AbortController`
+on any `fetch`, no abort inside `directedAstar`. Stale work runs to completion and
+its result gets ignored on the next render. Anchor: *"That's free for a fetch
+because the thread is parked during I/O anyway, but it has teeth for A* — a
+superseded search on a large graph still blocks a frame before React throws the
+result away. That's the one spot I'd add cancellation first: an
+iteration-budget bail inside the `while` loop in `astar.ts:48`."*
 
 ## See also
 
-- `04-shared-state-races-and-synchronization.md` — the single-flight gate
-- `03-event-loop-and-async-io.md` — debounce + backoff mechanics
-- `02-processes-threads-and-tasks.md` — chunking the sync search to cancel it
-- `08-runtime-systems-red-flags-audit.md` — the cancellation gap ranked
-- [`.aipe/study-networking/`](../study-networking/) — threading abort through fetch
+- `02-processes-threads-and-tasks.md` — single-flight, bound #2.
+- `03-event-loop-and-async-io.md` — why a superseded A* blocks but a fetch doesn't.
+- `08-runtime-systems-red-flags-audit.md` — the no-cancellation risk, ranked.
+- `.aipe/study-networking/` — batch/backoff/retry from the protocol side.
+- `.aipe/study-performance-engineering/` — the A* frame budget.

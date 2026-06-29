@@ -1,121 +1,174 @@
-# Skeptical reviewer questions
+# Skeptical Reviewer Questions — flattr
 
-This is the file to rehearse out loud, because the questions a skeptical reviewer throws at a problem proposal are the same whether the problem is flattr or a feature at work: who asked for this, why now, why you, what does success look like, and what happens if you're wrong. The skill is answering each with conviction where you have evidence and candor where you don't — never bluffing a number you don't have.
+> The review-room questions, the answer that holds, the trap, and a one-line
+> anchor for each. Coach posture: "say this, not that." The recurring move is
+> the same one this whole book is built on — own the EVIDENCE/INFERENCE split
+> before the reviewer forces it. Never fake demand.
+
+## The discovery questions to answer before investing
+
+Before the Q&A, here are the open questions this book cannot answer from the repo
+— the things the discovery slice exists to resolve. A reviewer respects you more
+for listing these than for pretending they're settled.
 
 ```
-  THE REVIEW ROOM — the five probes, and where each lands
+  open discovery questions — unanswered by the repo
 
-  "who actually wants this?"  ──► honesty: demand is inferred,
-                                   here are the discovery questions
-  "why not use OSRM?"         ──► the goal is owning the algorithm,
-                                   and grade-as-directional fights libs
-  "isn't this a toy?"         ──► yes at city scale, no at the premise:
-                                   the engine is real and provably correct
-  "how do you know it works?" ──► A* == Dijkstra (oracle), bench numbers
-  "what if you're wrong?"     ──► cheap to be wrong: one neighborhood,
-                                   free data, no sunk infra
+  1. Does any real self-powered traveler feel grade-pain
+     strongly enough to change tools?              ← the whole premise
+  2. Shown both routes, do they CHOOSE the flat one
+     for the grade (not for distance/familiarity)? ← the switching test
+  3. Is free Open-Meteo elevation accurate enough
+     that the colors don't lie?                    ← spec §11.A / §12 crux
+  4. Is the differentiator (personalized userMax)
+     actually felt vs. AccessMap's fixed bands?    ← spec §12 overlap risk
+  5. Which neighborhoods do validated users actually
+     travel — i.e. where would coverage pay off?   ← answer AFTER Q1-2
 ```
 
-The pattern across all five: lead with the honest verdict, then the evidence. Don't defend; answer.
+Now the pressure test.
 
-## "Who actually wants this? Show me the demand."
+---
 
-┌─────────────────────────────────────────────────┐
-│ THEY ASK                                          │
-│   "Is there real demand, or did you build         │
-│    something you thought was cool?"               │
-│                                                   │
-│ WHAT THEY'RE TESTING                              │
-│   Will you fake market evidence, or own that      │
-│   demand is unproven and name how you'd find out? │
-└─────────────────────────────────────────────────┘
+## Q1. "Isn't this a solution looking for a problem? Defend the demand."
 
-> "I'll be straight: this repo proves the problem is *technically* solvable, not that it's *wanted*. There's no usage data — it's a prototype. The demand case is inference: scooter riders, wheelchair users, and stroller commuters have a real reason to avoid grade, and no mainstream router offers a flat-first mode. But before I'd spend real resources, I'd run discovery — interview target users on whether they actively avoid hills today and whether they'd switch apps for it. I'm not going to hand you a fake adoption number."
+**The honest answer holds; a faked one collapses.**
 
-That answer *wins trust* precisely because it refuses to overclaim. A fabricated "studies show 40% of riders…" would collapse on the first follow-up.
+> "Yes — and I'll name it before you do. The repo proves the problem is
+> *technically solvable*: oracle-checked optimal routing, a measured algorithm
+> progression, honest fallback, all on free data, on device. It proves *nothing*
+> about demand — there are no users, no interviews, no analytics. The §3 user
+> table in the spec is a hypothesis I wrote, not a finding. So the correct next
+> investment isn't another feature — it's the cheapest experiment that turns that
+> hypothesis into evidence: one neighborhood, five real travelers, A→B in flattr
+> vs. Google Maps, measure which they pick and why."
 
-## "Why not just use OSRM or Valhalla?"
+```
+  the answer's shape — own both columns
 
-┌─────────────────────────────────────────────────┐
-│ THEY ASK                                          │
-│   "Production routers exist. Why reinvent this?"  │
-│                                                   │
-│ WHAT THEY'RE TESTING                              │
-│   Build-vs-buy judgment. Did you reinvent for ego │
-│   or for a reason?                                 │
-└─────────────────────────────────────────────────┘
+  "it WORKS"  ──┐
+  (evidence,    ├──►  "...and demand is UNMEASURED.
+   point at      │      here's the experiment that measures it."
+   astar.test)  ─┘            ▲
+                              └── this sentence is what reads as senior
+```
 
-> "Two reasons. The directional grade cost — uphill penalized, downhill free, so A→B ≠ B→A — doesn't fit those engines' distance/time cost models cleanly. And the explicit goal of this project is to own the graph algorithm, not call a library: I built the search, the heap, and proved the heuristic optimal. If this were a funded product on a deadline, I'd reach for OSRM and accept that it can't do directional grade naturally. For a project whose point is the algorithm, hand-rolling was right — and I know the cost, which is no city-scale machinery."
+- **Trap:** inventing a user count or "lots of people hate hills." The moment
+  you assert demand you can't source, you've lost.
+- **Anchor:** *"Proven solvable, unproven wanted — discovery is the next dollar."*
 
-## "Isn't this just a toy? It only covers one neighborhood."
+## Q2. "Why build the engine before validating the problem?"
 
-┌─────────────────────────────────────────────────┐
-│ THEY ASK                                          │
-│   "This doesn't even cover a city. Is it real?"   │
-│                                                   │
-│ WHAT THEY'RE TESTING                              │
-│   Can you distinguish 'scoped' from 'unserious'?  │
-└─────────────────────────────────────────────────┘
+> "Honestly, the build order was backwards for a *product* — and right for a
+> *portfolio piece*. The engine is the DSA artifact: hand-rolled A*, admissible
+> heuristic, the Dijkstra-oracle gate. If flattr's goal is to show I can build
+> routing from the graph up, it's done. If the goal is a product, then I'm now at
+> the point where the next move is discovery, not more code — which is exactly
+> what `03` Option B recommends."
 
-> "At city scale, yes, it's a prototype — no spatial index, no contraction hierarchies. At the level of the premise, no: the engine is real and provably correct — A\* returns the exact same cost as Dijkstra in the tests, with a genuine directional cost model and an honest fallback that distinguishes 'too steep' from 'no route.' The neighborhood scope is deliberate sequencing: it validates flat-first routing without spending months on coverage that would teach me nothing about whether anyone wants it. Toy implies it doesn't work. It works — on one neighborhood, on purpose."
+- **Trap:** pretending the build order was demand-driven. It wasn't; the spec is
+  engineering-first (§14, §15). Own it.
+- **Anchor:** *"Engine-first was right for the portfolio, and now discovery is
+  the next move."*
 
-| WEAK ANSWER | STRONG ANSWER |
-|---|---|
-| "It's just an MVP, I'd scale it later." | "City scale is a prototype; the premise is proven — provably-optimal routing with directional grade. The neighborhood scope is sequencing: validate demand before spending months on coverage." |
-| **Why it's weak:** "just an MVP" is a shrug that concedes the point. | **Why it works:** separates the scaling gap from the working core, and frames the scope as a *decision* with a reason. |
+## Q3. "Google Maps and AccessMap exist. Why does flattr get to exist?"
 
-## "How do you know the routing is even correct?"
+> "Google Maps optimizes distance/time and hides per-block grade in a smoothed
+> curve — verifiable. AccessMap shows grade but with fixed pedestrian thresholds.
+> flattr's claimed wedge is personalization: the route and the colors both key
+> off one user-set ceiling, so a kick scooter's 'red' starts far below a hiker's.
+> But — and this is the honest part — I have *not* validated that this
+> personalization is a felt difference. Spec §12 already flags the AccessMap
+> overlap as a risk. Whether the wedge matters to a real user is discovery
+> question 4."
 
-┌─────────────────────────────────────────────────┐
-│ THEY ASK                                          │
-│   "How do you know the paths are right?"          │
-│                                                   │
-│ WHAT THEY'RE TESTING                              │
-│   Evidence or vibes?                               │
-└─────────────────────────────────────────────────┘
+- **Trap:** overclaiming the differentiator as proven value. It's a plausible
+  wedge, not a measured one.
+- **Anchor:** *"The wedge is personalized grade; whether it's felt is unproven —
+  it's a discovery question."*
 
-> "An optimality oracle. A\* is tested against Dijkstra on the same graph and must return the *exact same cost* — if they diverge, the heuristic is inadmissible and the test fails. That's a provable correctness signal, not a vibe. The bench harness also measures that A\* expands four to six times fewer nodes than Dijkstra, so the optimization is real and re-runnable, not claimed."
+## Q4. "What if elevation data is too coarse and the map lies?"
 
-╔═══════════════════════════════════════════════════╗
-║ WHEN YOU DON'T KNOW                                ║
-║                                                   ║
-║   They ask for the thing you genuinely don't have: ║
-║   "What's your retention? CAC? Conversion?" — real ║
-║   product metrics for a project with no users.    ║
-║                                                   ║
-║   Say:                                            ║
-║   "I don't have those — there are no users, it's   ║
-║    a prototype. I'm not going to invent them. What  ║
-║    I can give you is the technical evidence the     ║
-║    engine works and the discovery plan I'd run to   ║
-║    get real demand numbers before investing."      ║
-║                                                   ║
-║   What this signals: you know which numbers are    ║
-║   real and you won't manufacture the ones that     ║
-║   aren't — the exact trait a reviewer is testing  ║
-║   for when they ask.                              ║
-║                                                   ║
-║   Do NOT say:                                      ║
-║   "Early signs are promising and we project…" —    ║
-║   projecting metrics for a userless prototype is   ║
-║   the fastest way to lose the room's trust.       ║
-╚═══════════════════════════════════════════════════╝
+> "That's the load-bearing risk, and the spec names it first — §11.A calls
+> elevation accuracy make-or-break, §12 says coarse data makes a map 'worse than
+> nothing.' The pipeline runs on free Open-Meteo, which 429s under load and is
+> resolution-limited. So route plausibility (metric 1c) is only as good as that
+> data. The mitigation is in the slice: validate on *known-hilly* blocks where I
+> can ground-truth the grade — if the colors disagree with reality there, I learn
+> it before I scale."
 
-## "What if you're wrong about the demand?"
+- **Trap:** claiming accuracy is solved. It isn't; it's gated by the free-tier
+  constraint.
+- **Anchor:** *"Accuracy gates everything; I validate it on ground-truthable
+  blocks first."*
 
-> "Then I've spent a bounded amount of time on one neighborhood with free data and no infrastructure to unwind — there's no server, no database, no sunk cost beyond my time. Being wrong here is cheap, which is exactly why a neighborhood prototype is the right way to test an inferred premise before betting more."
+## Q5. "Why not just add bidirectional A* / k-routes / city coverage next?"
 
-▸ Being cheap to be wrong is a feature of the scope, not an apology for it.
+> "Because all of those spend hours on the column that's already full. The engine
+> works; demand is zero. `03` lays this out — Options C and D improve proven
+> things and leave demand exactly as unknown. The only option that buys
+> information about the unknown is the discovery slice. The senior move is to
+> invest against the uncertainty, and the uncertainty is entirely on the demand
+> side."
 
-## One-page summary
+- **Trap:** treating more engine as obviously the next step because it's the fun,
+  comfortable side.
+- **Anchor:** *"Spend hours where the uncertainty is — that's demand, not the
+  engine."*
 
-**Core claim:** Answer every skeptical probe with the honest verdict first, then the evidence — own that demand is unproven, that city scale is a gap, and that the engine is provably correct.
+## Q6. "What does success even look like here? Give me a number."
 
-- **"Who wants this?":** demand is inferred, not measured; here's the discovery plan. (Don't fake a market number.)
-- **"Why not OSRM?":** directional grade fights their cost model + the goal is owning the algorithm; I'd buy if it were a funded product.
-- **"Isn't it a toy?":** city scale is prototype; the premise is proven — provably-optimal routing, real directional cost. Scope is sequencing.
-- **"How do you know it works?":** A\* == Dijkstra oracle + bench harness numbers.
-- **"What if you're wrong?":** cheap to be wrong — one neighborhood, free data, no sunk infra.
+> "Two buckets. Available now, from the repo: A* equals Dijkstra on cost,
+> expands fewer nodes, returns plausibly flatter routes on hilly pairs, and
+> distinguishes 'no flat way' from 'no way.' Those prove the engine. The demand
+> numbers — adoption, switching, trust — I deliberately won't fake; there's no
+> product live, so there's no funnel. The first real number comes from the slice:
+> of five travelers shown both routes, how many choose flattr *for the grade*.
+> Three of five is my bar to consider investing further."
 
-┃ "I'm not going to hand you a fake adoption number."
-┃ "Toy implies it doesn't work. It works — on one neighborhood, on purpose."
+- **Trap:** producing a DAU/retention/market-size number. There's no product —
+  any such number is fabricated.
+- **Anchor:** *"Engine metrics now; demand metrics only after the five-traveler
+  slice — and I won't invent the rest."*
+
+## Q7. "When is the right call to just stop?"
+
+> "If the slice comes back negative — travelers shrug, or pick the default route,
+> or don't trust the colors — that's a *successful* experiment that says stop or
+> pivot. And `03` Option A is legitimate even now: if flattr is explicitly a
+> portfolio artifact, it's already done its job and there's nothing left to
+> validate. The failure mode isn't stopping; it's pouring more solo-dev hours into
+> a product premise no one tested."
+
+- **Trap:** treating "stop" as failure. A cheap negative result is a win.
+- **Anchor:** *"A cheap 'no' is a successful experiment; the real failure is
+  building past an untested premise."*
+
+## The meta-move under every answer
+
+```
+  the recovery pattern when pressed on demand
+
+  reviewer pushes on "who wants this?"
+            │
+            ▼
+  DON'T invent a user / number / market   ← instant credibility loss
+            │
+            ▼
+  DO: "I don't have that evidence. Here's
+       the experiment that would produce it,
+       and the bar I'd hold it to."        ← reads as senior judgment
+```
+
+"I don't know yet — here's how I'd find out" beats a confident fabrication every
+single time in a senior review.
+
+## See also
+
+- `00-overview.md` — the EVIDENCE/INFERENCE split every answer leans on.
+- `03-options-and-opportunity-cost.md` — the `do nothing` / discovery reasoning
+  behind Q5 and Q7.
+- `04-success-metrics-and-feedback-loop.md` — the two-bucket metric story behind
+  Q6.
+- `docs/flattr-spec.md` §12, §15.1 — the spec's own honest-caveat framing this
+  book extends from scale to demand.

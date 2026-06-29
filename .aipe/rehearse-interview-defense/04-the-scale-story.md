@@ -1,160 +1,326 @@
 # Chapter 4 — The scale story
 
-This chapter is where a distributed-systems interviewer will try to find your ceiling, and you need to be honest about where it is. flattr is a client-side app with no server, so the usual scale story — more users, more QPS, more replicas — *doesn't directly apply*, and pretending it does is the fastest way to get caught. The senior move here is to redirect to the scale axes that are actually real for this system: the **graph size**, the **elevation API quota**, and the **per-query work on the device**. Name those, walk the bottlenecks in order, and when they push into multi-region-load-balancer territory, own that it's outside what this system — and your portfolio — has done.
+"What breaks first at 10x?" is the question where most candidates either freeze
+or bluff. They reach for the answer they think the interviewer wants — load
+balancers, sharding, Redis — and walk straight into territory they haven't
+built. You're not going to do that. flattr's scale story is unusual and *that's
+the strength*: there's no server, so the scale axes aren't users. They're graph
+size, elevation quota, and per-query work. This chapter teaches you to redirect
+the scale conversation onto the axes you can actually defend with code.
 
-The thing to internalize before this chapter: "what breaks first" is a sequence, not a single answer. For each scale axis, there's a first bottleneck, then a second one that the fix for the first exposes. Walking that sequence is the skill.
+The single most important move in this chapter: when someone says "scale,"
+**clarify which axis** before you answer. flattr has no users-axis to break,
+because it has no server. Saying that out loud — and then naming the axes that
+*do* exist — is the senior move.
 
-```
-  SCALE AXES FOR A CLIENT-SIDE ROUTER — what breaks, in order
+---
 
-  AXIS 1: GRAPH SIZE  (neighborhood → city → region)
-    now: ~1621 nodes, in-memory, fine
-     │ 10x  ── nearestNode O(N) linear scan starts to bite
-     │ 100x ── whole graph in memory + search latency on JS thread
-     ▼ fix order: k-d tree for snapping → off-thread search →
-                  tiling + don't hold the whole graph at once
+## The chapter-opening diagram — the real scale axes
 
-  AXIS 2: ELEVATION API QUOTA  (the real production wall)
-    now: free Open-Meteo, dedup + cache
-     │ more area ── 429 throttling (already hit this in testing)
-     ▼ fix order: persistent cache (done) → paid provider →
-                  precompute elevation at build time for whole cities
-
-  AXIS 3: PER-QUERY WORK  (latency-sensitive: live reroute)
-    now: search in a useMemo, single-digit ms, debounced
-     │ bigger graph ── search blocks the render thread
-     ▼ fix order: bidirectional A* (built) → contraction
-                  hierarchies (preprocess) → worker thread
-
-  AXIS 4: CONCURRENT USERS  ◄── DOESN'T APPLY. No server.
-    "this is an offline client; there's nothing to load-balance."
-```
-
-That fourth row is the most important line in the chapter. Say it out loud: flattr has no concurrency axis because it has no server. Don't invent one.
-
-## "What breaks first as the graph grows to a whole city?"
-
-┌─────────────────────────────────────────────────┐
-│ THEY ASK                                          │
-│   "Right now it's a neighborhood. What breaks      │
-│    when you scale to a city or a region?"          │
-│                                                   │
-│ WHAT THEY'RE TESTING                              │
-│   Can you find the FIRST bottleneck specifically, │
-│   and the second one behind it? Or do you just    │
-│   say 'I'd add caching'?                           │
-└─────────────────────────────────────────────────┘
-
-> "The first thing that breaks is node snapping. `nearestNode` is a linear O(N) scan over every node to find the closest one to a coordinate — fine at 1600 nodes, a real cost at a million. So the first fix is a spatial index, a k-d tree, to make snapping O(log N). The second bottleneck the fix exposes is the search itself and memory: holding a whole city's graph in memory and running A\* on the render thread starts to show up as latency. That's where two things I already have help — bidirectional A\* cuts the explored area, and the tiling system means I don't have to hold the entire region at once. Past that, the real answer is contraction hierarchies — a preprocessing layer that adds shortcut edges so query-time search skips most of the graph. That's the documented stretch goal, not built."
-
-The structure is the win: first bottleneck (snapping → k-d tree), second bottleneck (search/memory → bidirectional + tiling), then the real scale tool (CH). You named the sequence and which pieces already exist.
-
-┃ "What breaks first is node snapping — `nearestNode` is an O(N) scan. The fix is a k-d tree."
-
-| WEAK ANSWER | STRONG ANSWER |
-|---|---|
-| "I'd add caching and optimize the algorithm, and maybe shard the graph if needed." | "First bottleneck is `nearestNode`'s O(N) scan — fix with a k-d tree. Second is search latency and memory on a big graph — bidirectional A\* and tiling help, then contraction hierarchies as the real preprocessing answer." |
-| **Why it's weak:** "add caching and optimize" is what people say when they haven't located the actual bottleneck. Caching doesn't help a cold shortest-path query. | **Why it works:** names a *specific* first bottleneck with a *specific* fix, then the second one the fix reveals. Shows you can profile in your head. |
-
-## "How do you measure to know what to fix?"
-
-┌─────────────────────────────────────────────────┐
-│ THEY ASK                                          │
-│   "How would you know which bottleneck to attack?"│
-│                                                   │
-│ WHAT THEY'RE TESTING                              │
-│   Do you measure or guess? Senior engineers       │
-│   instrument before optimizing.                   │
-└─────────────────────────────────────────────────┘
-
-> "I already have the instrumentation for the search itself — the bench harness counts nodes expanded, heap pushes, and pops per query, and I compare A\* against Dijkstra on fixed node pairs. That's how I know A\* expands roughly four to six times fewer nodes than Dijkstra here, not a guess. So for the search axis I'd extend that — measure expansions and wall-time as the graph grows, and watch the ratio of heap pops to nodes expanded, which tells me when lazy-deletion staleness starts to hurt and decrease-key becomes worth it. For snapping and memory I'd add timing around `nearestNode` and the graph load. The principle is: the bench is the source of truth, not my intuition."
-
-This answer is strong because the measurement already exists in your repo (`bench/run.ts`). You're not promising to measure — you already do.
+The usual scale chart has "users" on one axis. flattr's doesn't. Here are the
+three axes that actually exist, with what breaks first on each.
 
 ```
-  IF THEY PUSH ON MEASUREMENT
+  flattr scale — three axes, NONE of them is "users"
 
-  "I'd extend the existing bench harness."
+  AXIS 1: GRAPH SIZE (N nodes)        current: 1,621 nodes
+  ────────────────────────────────────────────────────────────
+   1k ──── 10k ──── 100k ──── 1M nodes
+    │        │         │          │
+    fine   fine    nearestNode  A* working set
+                   O(N) scan    grows; whole
+                   hurts ◄──    graph in memory
+                   1st BREAK    2nd BREAK
+
+  AXIS 2: ELEVATION QUOTA (build time only)
+  ────────────────────────────────────────────────────────────
+   small area ──── city ──── metro
+       │             │          │
+      fine        429s from   build can't
+                  Open-Meteo  finish in one
+                  free tier   quota window
+                  ◄── BREAK   (paid provider)
+
+  AXIS 3: PER-QUERY WORK (runtime, per tap)
+  ────────────────────────────────────────────────────────────
+   nearestNode O(N)  +  A* search
+        │                  │
+        scan EVERY node    expands a cone
+        on every tap       toward goal
+        ◄── dominates as N grows; k-d tree first
+
+  ┌────────────────────────────────────────────────────────┐
+  │  THE FIRST BOTTLENECK, ranked:                          │
+  │   1. nearestNode O(N) linear scan   → k-d tree          │
+  │   2. whole-graph-in-memory          → spatial tiling    │
+  │   3. elevation 429 at build         → paid provider     │
+  │  Users are NOT on this list. There is no server.        │
+  └────────────────────────────────────────────────────────┘
+```
+
+That box is the whole chapter. Three axes, ranked bottlenecks, and the explicit
+absence of a users-axis.
+
+---
+
+## "What breaks first as this scales?"
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ THEY ASK                                                          │
+│   "What breaks first as this scales up?"                         │
+│                                                                   │
+│ WHAT THEY'RE TESTING                                              │
+│   Do you know YOUR system's actual bottlenecks, or do you        │
+│   recite generic ones? Can you reason about Big-O in your own    │
+│   hot path? Do you measure, or guess? And — do you notice that   │
+│   "scale" usually means users, and that your system doesn't      │
+│   have that axis?                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+Step one is the redirect. Then the ranked answer.
+
+> "First I'd clarify what's scaling, because flattr doesn't have the usual
+> users-axis — there's no server. Routing runs on-device over a static graph, so
+> 'more users' just means more phones each doing their own local search. Nothing
+> shared breaks.
+>
+> The axes that *do* scale are graph size and per-query work. So: what breaks
+> first is `nearestNode` (nearest.ts). When you tap, I snap the tap to the
+> closest graph node with a linear scan over every node — O(N), haversine
+> distance, keep the minimum. At 1,621 nodes that's instant. At 100k or a
+> million nodes, that scan runs on *every tap and every endpoint re-snap*, and
+> it starts to dominate. The fix is a spatial index — a k-d tree — to make
+> nearest-neighbor O(log N) instead of O(N). That's the first thing I'd add.
+>
+> Second bottleneck is memory. The whole graph is in memory at once. A* itself
+> scales fine — it expands a cone toward the goal, not the whole graph — but
+> holding a metro-scale graph resident becomes the limit. The fix is the spatial
+> tiling I already have at runtime (`useTileGraph.ts`): load only the bbox
+> around the route corridor, not the whole city.
+>
+> And I'd measure, not guess — I have a benchmark harness (`bench/run.ts`) that
+> records nodes-expanded, heap push/pop counts, and wall-clock per algorithm.
+> That's how I'd confirm where the time actually goes before optimizing."
+
+```
+┃ "flattr doesn't have a users-axis — there's no server.
+┃  More users just means more phones doing their own
+┃  local search."
+```
+
+The `nearestNode` O(N) → k-d tree answer is the centerpiece. It's specific
+(real file, real complexity), it's correct, and it names the exact data
+structure that fixes it. That's what "I understand my hot path" sounds like.
+
+---
+
+## The bottleneck, traced — why nearestNode is first
+
+Here's the per-tap work, so you can see why the linear scan dominates before A*
+does.
+
+```
+  Per-tap work — what runs on every route request
+
+  tap coordinate
+       │
+       ▼
+  ┌─ nearestNode(graph, point) ──────────── nearest.ts:5 ─┐
+  │  for EVERY node in graph.nodes:                       │
+  │     d = haversine(point, node)                        │   O(N)
+  │     if d < best: best = d                             │   ← scans
+  │  → runs for BOTH endpoints, re-runs as tiles load     │     all N
+  └──────────────────────┬─────────────────────────────────┘
+                         │ startId, endId
+                         ▼
+  ┌─ directedAstar(graph, startId, endId, userMax) ── astar.ts:156
+  │  expands a CONE toward the goal (heuristic prunes)     │  O(E log N)
+  │  does NOT touch every node — that's the whole point    │  but only
+  │  of the heuristic                                      │  the cone
+  └─────────────────────────────────────────────────────────┘
+
+  As N grows, the O(N) scan that touches EVERY node beats the
+  A* cone that touches only the relevant ones. So the snap,
+  not the search, breaks first.
+```
+
+The non-obvious insight — and a great one to volunteer — is that the *search*
+isn't the first thing to break. The heuristic already keeps A* from touching
+every node. It's the *snap* that still touches every node. Naming that
+ordering correctly is a strong signal.
+
+---
+
+## Weak vs strong — the scale answer
+
+```
+┌──────────────────────────────┬──────────────────────────────┐
+│ WEAK ANSWER                   │ STRONG ANSWER                 │
+├──────────────────────────────┼──────────────────────────────┤
+│ "At scale I'd add a load      │ "There's no server, so 'more  │
+│ balancer and shard the data   │ users' isn't an axis. What    │
+│ and probably cache hot routes │ breaks first is nearestNode — │
+│ in Redis, and use a CDN for   │ an O(N) scan on every tap. At │
+│ the static assets..."         │ 100k nodes I'd add a k-d tree │
+│                               │ for O(log N) snapping. Then   │
+│                               │ memory — I'd lean on the tile │
+│                               │ loading I already have. And   │
+│                               │ I'd measure with my bench     │
+│                               │ harness first."               │
+├──────────────────────────────┼──────────────────────────────┤
+│ Why it's weak:                │ Why it works:                  │
+│ Generic distributed-systems   │ Reasons about THIS system's    │
+│ shopping list. None of it     │ actual hot path, in Big-O,     │
+│ applies — there's no server   │ names the real file and the    │
+│ to load-balance. Invites a    │ exact fix (k-d tree), and      │
+│ follow-up that exposes the    │ leads with measurement. No     │
+│ hand-wave instantly.          │ generic terms that don't fit.  │
+└──────────────────────────────┴──────────────────────────────┘
+```
+
+```
+        ▸ When they say "scale," clarify the axis before
+          you answer. Half the wrong answers come from
+          solving the wrong axis.
+```
+
+---
+
+## Where the scale conversation goes next
+
+```
+  You named nearestNode O(N) as the first bottleneck.
         │
-        ├─► "What does the bench measure today?"
-        │     "nodesExpanded, pushes, pops per stage, over fixed
-        │      interior node pairs — so A* vs Dijkstra is a real
-        │      table, not a claim."
+        ├─► IF THEY ASK "how does a k-d tree fix it?"
+        │     "It partitions space so nearest-neighbor
+        │      queries skip most of the tree — O(log N)
+        │      average instead of O(N). I'd build it once at
+        │      load over graph.nodes, query it per tap. I've
+        │      built BSTs and heaps from scratch, so the tree
+        │      mechanics are familiar."
         │
-        ├─► "When would decrease-key beat lazy deletion?"
-        │     "When pops ≫ nodesExpanded — that ratio is the
-        │      staleness overhead. I'd port the decrease-key PQueue
-        │      I already built in reincodes only when the bench says so."
+        ├─► IF THEY ASK "what about the elevation build?"
+        │     "That's the build-time axis. Open-Meteo's free
+        │      tier 429s on a big area — I've hit it. I handle
+        │      it with caching + dedup by DEM cell + retry
+        │      backoff (elevation.ts). At metro scale you need
+        │      the paid provider to finish in one window."
         │
-        └─► "How do you measure on-device, not just in the bench?"
-              "Honestly, I haven't — the on-device timing is the gap.
-               I'd add timing spans around the search and graph load."
+        ├─► IF THEY ASK "does A* itself scale?"
+        │     "Better than the snap. The heuristic keeps it
+        │      to a cone toward the goal — it doesn't touch
+        │      every node. The benchmark shows A* expanding
+        │      far fewer nodes than Dijkstra for the same
+        │      path. Memory is the real A*-side limit, fixed
+        │      by tiling."
+        │
+        └─► IF THEY ASK "what about 10x latency-sensitive
+            │   requests / real-time?"
+            "Each route is independent and local, so there's
+             no shared contention — it parallelizes trivially
+             across devices. The per-device limit is the snap
+             + search, which I just covered."
 ```
 
-## "Could you serve this for a whole city, many users at once?"
+---
 
-┌─────────────────────────────────────────────────┐
-│ THEY ASK                                          │
-│   "How would you run this as a service for        │
-│    thousands of concurrent users?"                │
-│                                                   │
-│ WHAT THEY'RE TESTING                              │
-│   This is the trap. They want to see if you'll    │
-│   fake distributed-systems experience or own the  │
-│   boundary of what you've built.                  │
-└─────────────────────────────────────────────────┘
+## The "I don't know" box — the distributed-systems push
 
-This is the one to *not* bluff. flattr is offline-client by design; you have no server-scale war stories, and `me.md` is honest that horizontal-scale distributed systems is the gap in your portfolio. Redirect to what you can defend.
+This chapter is exactly where an interviewer will try to drag you into
+horizontal-scale distributed systems. This is your single biggest gap (`me.md`
+is explicit about it). Lean into it.
 
-╔═══════════════════════════════════════════════════╗
-║ WHEN YOU DON'T KNOW                                ║
-║                                                   ║
-║   They push into multi-region, load balancing      ║
-║   under sustained traffic, hot-path queues,        ║
-║   replica consistency. This is genuinely outside   ║
-║   what flattr is and what you've built.           ║
-║                                                   ║
-║   Say:                                            ║
-║   "flattr is an offline client — there's no        ║
-║    server to scale, so I want to be straight that  ║
-║    I haven't run this as a multi-user service.     ║
-║    If I had to, the shape I'd reach for is:        ║
-║    precompute the graph and elevation per city at  ║
-║    build time, serve the routing as a stateless    ║
-║    function so it scales horizontally behind a     ║
-║    load balancer, and the heavy work — contraction ║
-║    hierarchies — happens offline, not per request. ║
-║    But running that under real sustained traffic   ║
-║    is the part I haven't done, and I'd be learning ║
-║    the failure modes on the job."                  ║
-║                                                   ║
-║   What this signals: you can reason about the      ║
-║   shape, you're honest about the experience gap,   ║
-║   and you don't fake scars you don't have.        ║
-║                                                   ║
-║   Do NOT say:                                      ║
-║   "I'd just put it behind Kubernetes with          ║
-║    auto-scaling and Redis…" — buzzword stacking    ║
-║   over a system you've never operated is the       ║
-║   clearest tell of faked seniority.               ║
-╚═══════════════════════════════════════════════════╝
+```
+╔═══════════════════════════════════════════════════════════════╗
+║ WHEN YOU DON'T KNOW                                            ║
+║                                                               ║
+║   They ask: "OK, say you DID make this a server — how would   ║
+║   you horizontally scale the routing service? Sharding        ║
+║   strategy, load balancing under sustained traffic,           ║
+║   multi-region, the works."                                   ║
+║                                                               ║
+║   This is the gap. You have shipped five system shapes, but   ║
+║   NONE of them is distributed systems at horizontal scale,    ║
+║   hot-path queue infra, multi-region replication, or load     ║
+║   balancing under sustained traffic. Do not fake it.          ║
+║                                                               ║
+║   Say:                                                         ║
+║   "I'm going to be straight with you: horizontal-scale        ║
+║    distributed serving is the part of system design I         ║
+║    haven't built. My projects are local-first and             ║
+║    single-node by design. I can reason about the shape — a    ║
+║    routing service is mostly stateless per query, so it       ║
+║    fans out cleanly; I'd probably shard the graph             ║
+║    geographically since most routes are local; cross-shard    ║
+║    routes are the hard case. But sharding strategy and load   ║
+║    balancing under sustained real traffic is something I'd    ║
+║    be designing for the first time, not recalling from        ║
+║    something I shipped. I'd want to pair with someone who's    ║
+║    operated it, or build a small version and measure."        ║
+║                                                               ║
+║   What this signals: you know the shape (stateless fan-out,   ║
+║   geographic sharding, cross-shard as the hard case) AND      ║
+║   you're honest that you haven't operated it. That            ║
+║   combination — informed, not bluffing — is a stronger        ║
+║   senior signal than a confident wrong answer.                ║
+║                                                               ║
+║   Do NOT say:                                                  ║
+║   "Sure — consistent hashing, three replicas per shard,       ║
+║    leader election with Raft..." reciting terms you can't     ║
+║   defend on the second follow-up. The interviewer WILL ask    ║
+║   the second follow-up.                                        ║
+╚═══════════════════════════════════════════════════════════════╝
+```
 
-▸ The strongest scale answer for a client-side app is naming the axis that doesn't apply — "there's no concurrency axis, there's no server" — instead of inventing one.
+Deeper on horizontal scale, sharding, and the patterns you'd study to close
+this gap → `.aipe/study-distributed-systems/` and
+`.aipe/study-system-design/`. The k-d tree and spatial-index mechanics →
+`.aipe/study-dsa-foundations/`.
 
-## What you'd change
+```
+┃ "Horizontal-scale distributed serving is the part of
+┃  system design I haven't built. I can reason about the
+┃  shape; I can't claim I've operated it."
+```
 
-The scaling decision I'd revisit earliest is the O(N) `nearestNode` scan, because it's the cheapest fix with the highest ceiling — a k-d tree turns the first bottleneck into a non-issue and it's a self-contained change that doesn't touch the search at all. I deliberately left it linear because at 1621 nodes it's invisible, and a spatial index I don't need is just complexity — but I'd want it in before the graph crossed even a few tens of thousands of nodes. The broader thing I'd change in how I *think* about scale here: I treated "scale" as a someday concern because there's no server, but the elevation quota wall is a *today* concern that already bit me. The real first scale problem wasn't users — it was a free API's rate limit, and I should have planned the persistent cache before I hit the 429s, not after.
+---
 
-## One-page summary
+## What you'd change for scale
 
-**Core claim:** flattr's scale axes are graph size, elevation quota, and per-query work — not users, because there's no server. Walk each as a sequence of bottlenecks, and own that horizontal multi-user scale is outside what you've built.
+The one concrete thing I'd add before any scale push is the k-d tree for
+`nearestNode`. It's the first real bottleneck, it's a self-contained change
+(build once at load, query per tap), and I've already built the tree primitives
+it needs. Everything else on the scale path — tiling, paid elevation — is either
+already partly there or a build-time concern. The honest bigger picture: flattr
+is built to be single-node and local, so the "real" scale story (distributed
+serving) is a *different project*, and I'd say that rather than pretend this one
+grows into it.
 
-- **Graph to a city:** first bottleneck is `nearestNode` O(N) → k-d tree; second is search latency/memory → bidirectional A\* + tiling; then contraction hierarchies as the real preprocessing answer.
-- **How to measure:** the bench already counts expansions/pushes/pops and proves A\* beats Dijkstra; extend it, watch pops≫expanded for the decrease-key trigger.
-- **Many concurrent users:** doesn't apply — it's an offline client. If forced: precompute per city, stateless routing function, CH offline. Honest that operating it under traffic is the gap.
-- **The real today-scale wall:** the free elevation API's rate limit, which already bit during testing.
+---
 
-┃ "There's no concurrency axis, because there's no server."
-┃ "First bottleneck is node snapping — and I can prove A\* beats Dijkstra, I don't guess it."
+## One-page summary — Chapter 4
 
-**What you'd change:** Add the k-d tree before the graph grows (cheapest fix, highest ceiling), and plan the elevation cache *before* hitting rate limits — the first real scale problem was a free API's quota, not users.
+**Core claim:** flattr's scale axes are graph size, elevation quota, and
+per-query work — *not* users, because there's no server. Clarify the axis before
+answering.
+
+**The ranked bottlenecks:**
+1. `nearestNode` O(N) linear scan (nearest.ts) — runs every tap → **k-d tree** for O(log N).
+2. Whole graph in memory — A* itself is fine (cone, not flood) → **spatial tiling** (already in `useTileGraph.ts`).
+3. Elevation 429 at build time — Open-Meteo free-tier → **paid provider** at metro scale.
+
+**Key insight:** the *snap* breaks before the *search*, because the heuristic already keeps A* off most nodes.
+
+**Questions covered:**
+- "What breaks first?" → redirect to axes; nearestNode O(N) → k-d tree.
+- "Does A* scale?" → yes, cone not flood; memory is the A*-side limit.
+- "Horizontal scale / sharding?" → name the gap; reason about shape; don't bluff distributed systems.
+
+**Pull quotes:**
+- ┃ "flattr doesn't have a users-axis — there's no server."
+- ▸ When they say "scale," clarify the axis before you answer.
+- ┃ "Distributed serving is the part of system design I haven't built."
+
+**What you'd change:** Add the k-d tree for `nearestNode` — first real bottleneck, self-contained, and you already have the tree primitives. And say plainly that distributed scale is a different project, not a growth path for this one.

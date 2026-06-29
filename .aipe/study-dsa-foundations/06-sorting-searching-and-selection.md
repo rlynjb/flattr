@@ -1,67 +1,60 @@
-# Sorting, searching & selection
+# Sorting, Searching & Selection
 
-**Industry names:** comparison sort · binary search · linear search · order
-statistics / selection · quickselect · percentile / quantile. **Type:**
-Industry standard. The repo sorts (in `percentile`) and linearly searches (in
-`nearestNode`); binary search and quickselect are `not yet exercised` and are
-the documented upgrades.
+**Industry names:** comparison sort, binary search, quickselect, order
+statistics, percentile / quantile, linear scan. **Type:** Industry
+standard.
 
 ---
 
-## Zoom out, then zoom in
+## Zoom out — where this concept lives
 
-Two places in `flattr` need to find or order things outside the graph search:
-snapping a tapped coordinate to the nearest node, and rolling per-cell grades up
-to a representative value for the heatmap. The first is a *search* (find the
-min-distance node); the second is *sort + select* (the p85 of a cell's grades).
+flattr sorts in exactly one place — the grade heatmap's percentile
+calculation — and it does it the expensive way: a full sort to find one
+order statistic. Everywhere else it scans linearly. So this file has a
+clear shape: one real sort to walk, and two pointed gaps (binary search,
+quickselect) named where they'd belong.
 
 ```
-  Zoom out — where sorting/searching live
+  Zoom out — sorting/searching across flattr
 
-  ┌─ Input layer ──────────────────────────────────────────────────┐
-  │  nearestNode(point) → linear search O(V)   ← ★ SEARCH            │
-  │  features/routing/nearest.ts:5-18             (binary search gap)│
-  └─────────────────────────┬────────────────────────────────────────┘
-  ┌─ Aggregation layer ─────▼────────────────────────────────────────┐
-  │  percentile(values, 0.85) → sort O(n log n) + interpolate         │
-  │  features/grade/zones.ts:5-14              ← ★ SORT + SELECT       │
-  │                                               (quickselect gap)   │
-  └────────────────────────────────────────────────────────────────────┘
+  ┌─ Aggregate layer (build-time) ──────────────────────────────┐
+  │  zones.ts  percentile()  → full sort, index out p85    ★   │ ← we are here
+  └──────────────────────────────────────────────────────────────┘
+  ┌─ Search/snap layer (runtime) ───────────────────────────────┐
+  │  nearest.ts  linear scan (no binary search — unsorted data) │
+  │  astar.ts    heap-ordered, not sorted (file 03)             │
+  └──────────────────────────────────────────────────────────────┘
+  ┌─ not yet exercised ─────────────────────────────────────────┐
+  │  binary search   → would need sorted arrays (none kept)     │
+  │  quickselect     → would replace zones.ts full sort         │
+  └──────────────────────────────────────────────────────────────┘
 ```
 
-Zoom in: the question is *do you need everything in order, or just one element?*
-`percentile` sorts the whole array to read one rank — correct, but it does more
-work than the question requires. `nearestNode` scans every node — correct for a
-small graph, but a sorted structure plus binary search would prune it. Both are
-right *today* and have a named cheaper form for *later*.
+**Zoom in.** The one sort is `percentile()` in `zones.ts`: sort the
+grades, interpolate at rank `p·(n-1)`. Correct and readable. Then the two
+selection/search techniques the repo doesn't reach for, and exactly when
+each would pay off.
 
 ---
 
-## The structure pass
+## Structure pass — one axis across ordering operations
 
-**Layers.** Three operations stack by *how much order they need*:
+The axis is **how much order do you actually need, and how much do you
+pay for?**
 
 ```
-  One question — "how much ordering work?" — across the operations
+  Axis: "how much ordering does the task need vs what it buys?"
 
-  ┌──────────────────────────────────────────────┐
-  │ FULL SORT     → all n elements in order         │  O(n log n)  percentile (zones.ts)
-  └────────────────────┬───────────────────────────┘
-       ┌───────────────▼─────────────────────────┐
-       │ SELECTION     → just the k-th element      │  O(n) avg   quickselect (GAP)
-       └───────────────┬─────────────────────────┘
-           ┌───────────▼───────────────────────┐
-           │ SEARCH        → just "is it / where"  │  O(log n) sorted / O(n) unsorted
-           └─────────────────────────────────────┘   nearestNode = O(n) (no sort)
+  full sort      O(n log n)  → total order   zones.ts: needs only ONE value
+  selection      O(n) avg    → kth element   what p85 actually needs
+  binary search  O(log n)    → needs sorted input first
+  linear scan    O(n)        → no order needed  nearest.ts, fine for unsorted
 ```
 
-**Axis = work vs question.** Hold "how much do I actually need to know?"
-constant. To find the median you need *selection*, not a full sort — but
-`percentile` does a full sort anyway because it's simpler and `n` (edges per
-grid cell) is small. To find the nearest node you need a *search*, and on
-unsorted data that's linear; sort the coordinates once and it's `O(log n)`. The
-seam in both cases: *is the data sorted?* If yes, search/select gets cheap; if no,
-you either sort (amortize over many queries) or scan (one-off).
+The seam: `zones.ts` buys a *total order* (`O(n log n)`) when it only
+needs *one order statistic* — the 85th percentile. That's the gap between
+sorting and selection, and it's the cleanest "you paid for more order than
+you needed" example in the repo.
 
 ---
 
@@ -69,216 +62,226 @@ you either sort (amortize over many queries) or scan (one-off).
 
 ### Move 1 — the mental model
 
-You've called `.sort()` and `.indexOf()`. The lesson here is that those are the
-*expensive* defaults, and the cheaper specialized versions — binary search,
-quickselect — exist for when you don't need the full ordering they imply.
+Sorting and selection are different questions that get confused. "Sort
+these grades" gives you all of them in order. "What's the 85th percentile
+grade" needs only *one* of them — the value at a specific rank. You can
+answer the second without doing the first, and selection is the algorithm
+that does.
 
 ```
-  The work/question ladder
+  Sort vs select — same data, different question
 
-  question                cheapest tool          cost
-  ─────────────────────────────────────────────────────────
-  "everything in order"   comparison sort        O(n log n)
-  "the k-th element"      quickselect            O(n) average
-  "where is x?" (sorted)  binary search          O(log n)
-  "where is x?" (unsorted)linear scan            O(n)
-  "the min" (one-off)     linear scan            O(n)   ← nearestNode does this
+  grades: [4, 1, 9, 2, 7, 3]
 
-  doing MORE than the question needs is the waste this file teaches you to spot
+  full sort → [1, 2, 3, 4, 7, 9]   ← all ordered (O(n log n))
+                       ▲
+  selection → just find the rank-k element, O(n) avg
+              (partition around pivots, recurse into one side only)
 ```
 
-### Move 2 — the moving parts
+flattr asks the *selection* question ("p85") but uses the *sort* answer.
+For a build-time heatmap over a handful of edges per cell, that's a fine
+call — but knowing it's a sort-where-select-would-do is the literacy.
 
-**Linear search — `nearestNode`.** `nearest.ts:7-15` walks every node, computes
-haversine distance, tracks the running minimum. It's the find-the-min pattern:
-`O(V)`, one pass, no preprocessing. Correct and *right* for a one-off query over a
-small graph. The boundary where it breaks: a city-sized graph run twice per route
-request — then you want a spatial structure (**04**) or sorted coordinates +
-binary search.
+### Move 2 — the one sort, then the two gaps
 
-```
-  Linear min-search (nearest.ts:7-15)
+#### `percentile()` — full sort + linear interpolation
 
-  bestDist = ∞
-  for each node:                         ← O(V), every node
-     d = haversine(point, node)
-     if d < bestDist: bestDist=d; best=node   ← keep the running winner
-  return best
+The grade heatmap rolls each grid cell's edges up to a single number: the
+85th percentile of their `absGradePct`. Here's how it's computed:
 
-  no sort, no index — pays O(V) but pays it only once, zero setup
-```
-
-**Full comparison sort — inside `percentile`.** `zones.ts:7` does `[...values].sort((a,b)=>a-b)`
-— a defensive *copy* then an ascending numeric sort. The copy matters: it
-avoids mutating the caller's array (the cell's grade list). It's `O(n log n)`;
-JS engines use an introsort/Timsort hybrid under the hood.
-
-**Linear-interpolation selection — the rest of `percentile`.** Once sorted,
-finding the p85 is index arithmetic (`zones.ts:8-13`): the rank `p*(n-1)` usually
-lands *between* two indices, so it linearly interpolates between them. The
-edge-case guards are the lesson — single element returns itself
-(`zones.ts:10`), exact-integer rank skips interpolation (`zones.ts:12`). The test
-`zones.test.ts:14` pins p85 of 1..10 = 8.65.
-
-```
-  percentile([1..10], 0.85)  (zones.ts:8-13)
-
-  sorted = [1,2,3,4,5,6,7,8,9,10]   n=10
-  rank   = 0.85*(10-1) = 7.65       ← lands between index 7 and 8
-  lo=7 (val 8)  hi=8 (val 9)
-  result = 8 + (9-8)*(7.65-7) = 8 + 0.65 = 8.65   ✓ (zones.test.ts:14)
-
-  the interpolation IS the "linear-interpolation percentile" — without it you'd
-  snap to 8 or 9 and lose precision on small samples
+```ts
+// features/grade/zones.ts:5-14
+export function percentile(values: number[], p: number): number {
+  if (values.length === 0) throw new Error("percentile: empty input");
+  const sorted = [...values].sort((a, b) => a - b);   // ← FULL O(n log n) sort
+  if (sorted.length === 1) return sorted[0];
+  const rank = p * (sorted.length - 1);               // fractional rank
+  const lo = Math.floor(rank);
+  const hi = Math.ceil(rank);
+  if (lo === hi) return sorted[lo];                   // exact integer rank
+  return sorted[lo] + (sorted[hi] - sorted[lo]) * (rank - lo); // interpolate
+}
 ```
 
-**Why this could be `O(n)` instead of `O(n log n)` — the selection gap.**
-`percentile` only ever reads *one or two* elements of the sorted array (the
-ranks around `p`). Sorting all `n` to read 2 is overkill. **Quickselect**
-(partition like quicksort, but recurse into only the side containing your rank)
-finds the k-th element in `O(n)` average without sorting the rest. The repo
-doesn't use it because cell grade-lists are tiny — the `O(n log n)` sort is
-faster in practice than quickselect's overhead at small `n`. That's the honest
-call: the asymptotic win is real but doesn't pay off at this scale.
+Execution trace — `percentile([4,1,9,2,7,3], 0.85)`:
+
+```
+  percentile trace (p=0.85, n=6)
+
+  sort:   [1, 2, 3, 4, 7, 9]                      O(n log n)
+  rank:   0.85 * (6-1) = 4.25                     fractional position
+  lo=4, hi=5  (lo != hi → interpolate)
+  result: sorted[4] + (sorted[5]-sorted[4])*(4.25-4)
+        = 7 + (9 - 7)*0.25
+        = 7.5                                     the p85 grade
+```
+
+The interpolation matters: a percentile rarely lands on an exact array
+index (`4.25` here), so it linearly blends the two straddling values. This
+is the standard "linear interpolation between closest ranks" percentile
+definition. It's correct. The `.sort((a,b)=>a-b)` is the part to flag —
+it's `O(n log n)` to extract one value.
+
+```
+  Comparison — full sort (actual) vs quickselect (the lean version)
+
+  ┌─ zones.ts now: full sort ───────┐  ┌─ quickselect: select rank k ────┐
+  │ sort ALL grades  O(n log n)     │  │ partition around pivot           │
+  │ then index [4] and [5]          │  │ recurse into the side with rank k│
+  │ produces total order, uses 2    │  │ O(n) average, O(n²) worst        │
+  │ values of it                    │  │ finds the straddling values only │
+  └─────────────────────────────────┘  └──────────────────────────────────┘
+```
+
+**Is it worth fixing?** Honestly, no — not here. `zones.ts` runs at
+*build time* over a small number of edges per cell, and the sort is dwarfed
+by the OSM/elevation pipeline around it. The readability of `.sort()` beats
+a hand-rolled quickselect for a non-hot path. But it's the textbook
+"sort-to-select" pattern, and recognizing it is the point — if this ran in
+a runtime hot loop over thousands of values, quickselect would be the move.
+
+#### not yet exercised — binary search
+
+No binary search anywhere in the repo. Binary search needs **sorted input**
+that stays sorted, and flattr keeps no such structure: `graph.nodes` is a
+hash map (unordered), `graph.edges` is an insertion-ordered array, and
+`percentile` sorts a throwaway copy it never reuses.
+
+```
+  Where binary search WOULD belong (if data were kept sorted)
+
+  nearest.ts    if nodes were sorted by one coordinate, binary-search
+                the lng band, then scan a narrow strip → faster than O(N)
+                (but a grid/k-d index is the better fix — file 04)
+
+  percentile    the sort is already done; the index lookup IS the
+                "binary search result" — you compute the rank directly
+```
+
+The honest verdict: binary search isn't missing because of an oversight —
+it's missing because **nothing in the repo maintains sorted order to
+search over.** It becomes relevant the moment you keep a sorted index
+(e.g., nodes sorted by latitude for a strip-based nearest-neighbor).
+
+#### not yet exercised — quickselect
+
+Quickselect is the selection algorithm `zones.ts` *should* use if the
+percentile ever moved to a hot path. It's quicksort that only recurses
+into the side containing the target rank:
+
+```
+  Quickselect — the partition skeleton (NOT in repo)
+
+  select(arr, k):
+    pivot = pick one
+    partition arr → [< pivot] [pivot] [> pivot]
+    if k in left:   recurse left      ── only ONE side, not both
+    if k == pivot:  return pivot
+    if k in right:  recurse right
+  → O(n) average (each step halves the work), O(n²) worst-case
+```
+
+You've already built the partition logic — it's the heart of quicksort in
+your reincodes sorting visualizers (`utils/notes/Sorting/`). Quickselect is
+quicksort with one recursive call deleted. That's the "you've already built
+X" anchor: you have the partition; selection is half of the sort you
+animated.
 
 ### Move 3 — the principle
 
-**Don't sort to answer a question that selection or search can answer.** A full
-sort is the reflexive default and usually more work than the question requires.
-`flattr` sorts in `percentile` (justified — small `n`, simpler code) and scans in
-`nearestNode` (justified — one-off, small graph). Knowing *why each is justified
-at this scale* and *what the cheaper form is at larger scale* is the whole lesson.
+Match the algorithm to the *question*, not the data. "Give me the 85th
+percentile" is a selection question; answering it with a full sort works
+but pays `O(n log n)` for an `O(n)` job. The discipline is to notice when
+you're computing a total order and only using a sliver of it — sometimes
+the sort is fine (build-time, small n, readability wins, like `zones.ts`),
+and sometimes it's the bottleneck (hot path, large n). Knowing which is
+which is the skill; the algorithms (sort, quickselect, binary search) are
+just the tools you pick *after* you've named the question.
 
 ---
 
 ## Primary diagram
 
-The two operations, what they cost now, and their named cheaper forms.
+The one sort and the two gaps, with the rank math, in one frame.
 
 ```
-  flattr's sort/search sites and their upgrade paths
+  Sorting / searching / selection in flattr
 
-  ┌─ nearestNode (nearest.ts:5-18) ────────────────────────────────┐
-  │  linear scan O(V)  ──[V grows]──►  k-d tree O(log V)   (see 04)  │
-  │                    ──[sorted axis]►  binary search O(log V)      │
-  └──────────────────────────────────────────────────────────────────┘
-  ┌─ percentile (zones.ts:5-14) ───────────────────────────────────┐
-  │  sort O(n log n) ──[large n]──►  quickselect O(n) avg            │
-  │  + linear interpolation (the SELECT step, kept either way)       │
-  └──────────────────────────────────────────────────────────────────┘
-  both correct NOW (small inputs); the arrows are the documented upgrades
-```
-
----
-
-## Implementation in codebase
-
-**Use cases.** Sorting happens once per grid cell when building the heatmap
-(`zones.ts` → the choropleth in spec §7). Linear search happens twice per route
-request (snap start, snap goal — `nearest.ts`). Neither is in a tight inner loop,
-which is why the simpler forms are the right call.
-
-```
-  features/grade/zones.ts  (lines 5-14)  — percentile
-
-  if (values.length === 0) throw new Error("percentile: empty input");
-  const sorted = [...values].sort((a, b) => a - b);   ← COPY then sort O(n log n)
-  if (sorted.length === 1) return sorted[0];          ← single-element guard
-  const rank = p * (sorted.length - 1);               ← fractional rank
-  const lo = Math.floor(rank); const hi = Math.ceil(rank);
-  if (lo === hi) return sorted[lo];                   ← exact-index guard
-  return sorted[lo] + (sorted[hi]-sorted[lo])*(rank-lo);  ← interpolate
-       │
-       └─ the spread copy [...values] is load-bearing: .sort() mutates in place,
-          and the caller (computeZones, zones.ts:53) passes the cell's live grade
-          array. Without the copy, computing one cell's percentile would scramble
-          the data. The throw on empty is why computeZones omits empty cells
-          (zones.ts:44-57) — never calls percentile on []. (zones.test.ts:17-19)
-```
-
-```
-  features/routing/nearest.ts  (lines 7-15)  — linear min-search
-
-  let bestDist = Infinity;
-  for (const id of Object.keys(graph.nodes)) {  ← O(V) scan
-    const d = haversine(point, {lat:n.lat, lng:n.lng});
-    if (d < bestDist) { bestDist = d; bestId = id; }   ← running minimum
-  }
-       │
-       └─ the find-the-min idiom: init to Infinity, keep the running winner.
-          O(V) with zero setup beats a sorted index for a one-shot query on a
-          small graph. The throw on no nodes (nearest.ts:16) mirrors percentile's
-          empty guard. (nearest.test.ts:17-28)
+  ┌─ zones.ts percentile() — the one real sort ─────────────────┐
+  │  sorted = values.sort((a,b)=>a-b)        O(n log n)         │
+  │  rank   = p * (n-1)                       fractional         │
+  │  result = interpolate(sorted[lo], sorted[hi], rank-lo)      │
+  │  → returns ONE order statistic from a TOTAL order   ★ slack │
+  └──────────────────────────────────────────────────────────────┘
+  ┌─ not yet exercised ─────────────────────────────────────────┐
+  │  quickselect   → would give the p85 in O(n) avg (partition) │
+  │  binary search → needs a sorted index the repo doesn't keep │
+  │  (linear scans in nearest.ts/astar.ts are over unordered    │
+  │   data — correct; the fix there is indexing, not searching) │
+  └──────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
 ## Elaborate
 
-Comparison sorting has a proven `O(n log n)` lower bound (you can't beat it with
-comparisons alone), which is why "just sort it" tops out there. Binary search
-(documented by Knuth as famously hard to implement correctly — off-by-one bugs)
-is `O(log n)` but *requires sorted input*, so it pairs with a one-time sort
-amortized over many queries. Selection — finding the k-th element without sorting
-— was solved by Hoare's quickselect (1961, `O(n)` average) and the
-median-of-medians guarantee (Blum et al., 1973, `O(n)` worst case); percentiles
-and medians are its canonical use. `flattr`'s `percentile` reaches for the
-simpler full-sort because its inputs are small; the principle (don't over-order)
-still holds. The spatial-search upgrade for `nearestNode` is **04** (k-d tree);
-the connection to the graph is **05** (the snapped nodes are the search's
-endpoints). Rein's `reincodes/utils/notes/Sorting/` already implements selection,
-bubble, insertion, merge, quick, and heap sort from scratch — this repo is where
-sorting shows up *applied*, in service of a percentile.
+Quickselect is Hoare's (1961), the selection sibling of his quicksort —
+same partition, one fewer recursion. Median-of-medians (Blum et al., 1973)
+makes it `O(n)` worst-case. The "linear interpolation between closest
+ranks" percentile in `zones.ts` is one of the nine standard quantile
+definitions (it's NumPy's default, `linear`). You've built all five
+elementary sorts plus the partition logic in reincodes
+(`utils/notes/Sorting/`) with animated visualizers — so quickselect is the
+shortest hop from what you've already done: take quicksort, recurse one
+way. Binary search is the other half of the "search a sorted thing" coin,
+and the reason it's absent is genuinely structural — flattr keeps nothing
+sorted to search. Read file 04 for the spatial index that fixes
+`nearest.ts` more directly than binary search would, file 08 for the
+ranked practice plan.
 
 ---
 
 ## Interview defense
 
-**Q: "`percentile` sorts the whole array to read one rank. Wasteful?"**
-
-Asymptotically, yes — quickselect finds the k-th element in `O(n)` average
-without sorting the rest. But the inputs are tiny (grades per grid cell), where
-the full sort's simplicity and small constant beat quickselect's overhead. The
-right call at this scale; the upgrade is named for when cells get large.
+**Q: `zones.ts` sorts to get one percentile. Is that the right call?**
 
 ```
-  read 2 elements ← sort all n?   O(n log n)   ← what zones.ts does
-  read 2 elements ← quickselect   O(n) avg     ← the upgrade at large n
-  anchor: zones.ts:7 (sort) — justified by small n, not asymptotics
+  full sort O(n log n) → total order → use 2 values  (actual)
+  quickselect O(n) avg → just rank k → use 2 values  (leaner)
 ```
 
-**Q: "Why is `nearestNode` a linear scan and not binary search?"**
+*Model answer:* "It's sort-to-select — `O(n log n)` for what's really an
+`O(n)` selection problem, since p85 only needs the values straddling
+rank `0.85·(n-1)`. Quickselect would do it in linear average time. But
+here it's the right call: `zones.ts` runs at build time over a small
+number of edges per cell, dwarfed by the elevation pipeline, and `.sort()`
+is far more readable than a hand-rolled quickselect. I'd only switch if it
+moved to a runtime hot path over large arrays."
 
-Binary search needs sorted data; node coordinates are 2-D and unsorted. Sorting
-costs `O(V log V)` up front, amortized only over many queries. For a one-off snap
-on a small bbox graph, the `O(V)` scan with zero setup wins. When the graph grows,
-a spatial index (k-d tree, **04**) — not 1-D binary search — is the real fix.
+*Anchor:* it's the textbook sort-to-select pattern; fine at build time,
+wrong in a hot loop.
 
-**Q: "Why the `[...values]` copy in `percentile`?"**
+**Q: Why no binary search anywhere?**
 
-`.sort()` mutates in place, and the caller passes the cell's live grade array
-(`zones.ts:53`). Sorting it in place would corrupt the source data for any later
-read. The copy is the boundary that keeps `percentile` a pure function.
+*Model answer:* "Binary search needs maintained sorted order, and the repo
+keeps none — nodes are in a hash map, edges in an insertion-ordered array,
+and `percentile` sorts a throwaway copy. The nearest-node lookup that
+*looks* like it wants binary search is better served by a spatial index
+(grid or k-d tree), because the data is 2D — binary search is 1D. So
+binary search isn't an oversight; there's just no sorted structure for it
+to run on yet."
 
----
-
-## Validate
-
-1. **Reconstruct:** Write the find-the-min idiom from `nearest.ts:7-15` from
-   memory; state its complexity in terms of `V`.
-2. **Explain:** Why does `percentile` copy with `[...values]` before sorting
-   (`zones.ts:7`)? What corrupts without it?
-3. **Apply:** Compute `percentile([1,2,3,4], 0.5)` by hand using the interpolation
-   in `zones.ts:8-13`. Check against `zones.test.ts:11-13`.
-4. **Defend:** Argue when `percentile`'s full sort should become quickselect, and
-   when `nearestNode`'s scan should become a spatial index — citing input size as
-   the deciding factor.
+*Anchor:* binary search is absent because nothing is kept sorted; the 2D
+lookup wants a spatial index, not binary search.
 
 ---
 
 ## See also
 
-- **04-trees-tries-and-balanced-indexes.md** — the spatial-index upgrade for `nearestNode`.
-- **05-graphs-and-traversals.md** — the snapped nodes are the search endpoints.
-- **01-complexity-and-cost-models.md** — `O(n log n)` vs `O(n)` vs `O(log n)`.
-- **03-stacks-queues-deques-and-heaps.md** — a heap also answers "k smallest."
+- `04-trees-tries-and-balanced-indexes.md` — the spatial index that fixes
+  `nearest.ts` (the better answer than binary search).
+- `01-complexity-and-cost-models.md` — the `O(n log n)` vs `O(n)` framing.
+- `08-dsa-foundations-practice-map.md` — quickselect as a practice build.
+- sibling **performance-engineering** — when build-time vs hot-path
+  matters.

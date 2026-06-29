@@ -1,114 +1,138 @@
-# Database Systems — overview
+# Database Systems — flattr (overview)
 
-> Study guide for `flattr`, generated 2026-06-19. Mode: CREATE.
-> Honest framing up front: **this repo has no database.** No SQL server, no
-> query engine, no transactions, no WAL, no replicas. The canonical store is a
-> single prebuilt JSON file (`mobile/assets/graph.json`) that the app reads
-> once at startup. Most classic DB-engine topics are therefore `not yet
-> exercised` — and this guide says so plainly instead of inventing machinery
-> that isn't here. What *is* here is a real storage-and-index story worth
-> studying: an immutable read-only artifact, a hand-built in-memory index, and
-> a bbox partitioning scheme. We teach those honestly and name what would
-> change the day a real DB shows up.
+> Curriculum-style guide. flattr has **no database server** — no Postgres, no
+> SQLite, no Mongo, no client to a remote store. So this guide teaches the
+> storage-engine and consistency mechanisms a working engineer needs to reason
+> about, and *anchors each one to what flattr actually does instead*. Where a
+> mechanism is genuinely absent, it's marked `not yet exercised` with the
+> concrete trigger that would force it in.
 
-## The one-diagram map
+## The verdict first
 
-The whole storage surface fits in one picture. The thing a real app would call
-"the database" is the box marked `graph.json`.
+flattr's "database" is **one immutable, read-only static artifact**:
+`mobile/assets/graph.json` (544 KB, 1621 nodes, 1879 edges, 1621 adjacency
+entries). It's bundled into the app, loaded once at startup
+(`mobile/src/loadGraph.ts:9`), cast to a typed `Graph`, and held in memory for
+the process lifetime. There is no write path back to it.
+
+That single choice cascades into every concept in this guide:
 
 ```
-  flattr storage surface — where data lives and who reads it
+  flattr's storage shape — one diagram
 
-  ┌─ BUILD TIME (offline ETL, pipeline/) ───────────────────────────┐
-  │  Overpass (OSM) ─► parse ─► split ─► elevation ─► grade ─►       │
-  │  buildAdjacency()  ───────────────────────────────────►  graph  │
-  │                                          JSON.stringify ─► FILE  │
-  └───────────────────────────────────────┬─────────────────────────┘
-                                           │  graph.json (544 KB,
-                                           │  bundled into the app)
-  ┌─ RUN TIME (Expo / React Native) ───────▼─────────────────────────┐
-  │  import graph from "./graph.json"   ◄── the "database": immutable │
-  │           │                              read-only artifact       │
-  │           ▼                                                       │
-  │  loadGraph(): Graph   ──►  { nodes: Record<id,Node>,  ← PK lookup │
-  │                              edges: Edge[],           ← heap file │
-  │                              adjacency: Record<id,[]> }← index    │
-  │           │                                                       │
-  │           ▼                                                       │
-  │  A* search reads adjacency[current]  ──►  O(1) neighbor fetch     │
-  └───────────────────────────────────────────────────────────────────┘
+  ┌─ BUILD TIME (pipeline/, offline) ───────────────────────┐
+  │  OSM + Open-Meteo elevation                              │
+  │      → split → grade → build-graph → graph.json (artifact)│
+  └────────────────────────────┬─────────────────────────────┘
+                               │  bundled into the app
+  ┌─ RUNTIME (mobile/, on device) ▼──────────────────────────┐
+  │  loadGraph() ── reads graph.json once ──► Graph in memory │
+  │     nodes: Record<id,Node>   (primary-key map, O(1))      │
+  │     adjacency: id→edgeId[]    (hand-built secondary index)│
+  │     edges: Edge[]            (array, scanned by nearest)  │
+  │                                                           │
+  │  elevCache  ── AsyncStorage KV store ──► debounced writes │
+  │     the ONLY persistent write path in the whole app       │
+  └───────────────────────────────────────────────────────────┘
 ```
 
-## The verdict — what this repo exercises vs. what it doesn't
+So flattr is two storage stories, not one:
 
-**Exercised (real, worth studying):**
+1. **The graph** — a read-only, in-memory artifact. This is where the
+   *index-vs-scan* and *storage-layout* lessons live: `nodes` is a primary-key
+   hash map, `adjacency` is a hand-built secondary index that makes A* expansion
+   O(1) (`features/routing/astar.ts:64`), and `nearestNode` is an **unindexed
+   O(N) full scan** (`features/routing/nearest.ts:8`) — the spatial-index gap.
 
-| DB concept | flattr analog | Where |
-|---|---|---|
-| Immutable read-only store | `graph.json`, loaded once | `mobile/assets/graph.json`, `mobile/src/loadGraph.ts:9` |
-| Primary-key lookup | `nodes: Record<id, Node>` | `features/routing/types.ts:25` |
-| Heap file (unordered rows) | `edges: Edge[]` array | `features/routing/types.ts:26` |
-| Hand-built secondary index | `adjacency: Record<id, edgeIds[]>` | `features/routing/graph.ts:22-29` |
-| In-memory hash index | `indexEdges()` Map per search | `features/routing/astar.ts:12-16` |
-| Full table scan | `nearestNode` loops all nodes | `features/routing/nearest.ts:8-15` |
-| Bulk-load / ETL | the `pipeline/` build | `pipeline/build-graph.ts`, `pipeline/run-build.ts` |
-| Partitioning / sharding by key | fixed-grid bbox tiles | `features/map/tiles.ts` |
-| Read-through cache / lazy load | viewport+corridor tile fetch | `mobile/src/useTileGraph.ts` |
+2. **The elevation cache** — `mobile/src/elevCache.ts` uses AsyncStorage as a
+   key/value store with **debounced, batched writes**. This is the one place
+   flattr touches durability, write batching, and a (very weak) recovery story.
 
-**`not yet exercised` (the DB machinery this repo deliberately does without):**
+Everything else — transactions, isolation levels, locks, MVCC, WAL, query
+planners, replication — is `not yet exercised`. That's not a failing; flattr's
+workload doesn't need them. The job of this guide is to teach them anyway, so
+that the day flattr grows a real datastore (the spec's Next.js + Postgres
+target, `docs/flattr-spec.md` §8), you reach for the right mechanism.
 
-1. **Query planning & execution** — no query language, no planner, no joins, no
-   `EXPLAIN`. Access is direct map/array reads. → `04`
-2. **Transactions / atomicity / isolation** — nothing is written at runtime, so
-   there's nothing to make atomic or isolate. → `05`
-3. **Locks / MVCC / concurrency control** — single reader, immutable data, no
-   writers to coordinate. → `06`
-4. **WAL / durability / recovery** — the artifact is a static file; "recovery"
-   is `npm run build:graph` again. → `07`
-5. **Replication / read consistency / failover** — one bundled copy per app;
-   no replicas, no lag, no stale-read window. → `08`
+## Ranked findings — what's worth your attention
 
-## Ranked findings (most consequential first)
+```
+  ranked by consequence — read top-down
 
-1. **The store is immutable and the whole engine is built around that.** No
-   write path means the five hardest DB topics collapse to "not applicable."
-   This is the single most important fact about the repo's data layer — and
-   it's a *strength*, not a gap, for a read-only routing app. (`loadGraph.ts:9`)
-2. **`adjacency` is the load-bearing index.** Drop it and A* falls back to
-   scanning all 1879 edges per node expansion — O(E) instead of O(1). It's a
-   hand-built secondary index, materialized once at build time. (`graph.ts:22-29`)
-3. **`nearestNode` is an un-indexed full scan** — O(N) over 1621 nodes on every
-   tap-to-snap. Fine at this scale; the first thing a spatial index (k-d tree /
-   R-tree) would fix if the graph grew. (`nearest.ts:8-15`)
-4. **Tiling is partitioning-by-bbox done by hand**, with a real distributed-data
-   problem solved at the seams: independently-built tiles get prefixed ids and
-   stitched at coincident coordinates. (`tiles.ts:21-86`)
-5. **`indexEdges()` rebuilds a hash index on every search call** — re-paying
-   O(E) index-build cost per route. A persistent index would amortize it; at
-   MVP scale it's negligible. (`astar.ts:12-16`)
+  ┌────────────────────────────────────────────────────────────────┐
+  │ #1  nearestNode is an O(N) full scan — no spatial index         │ HIGH
+  │     features/routing/nearest.ts:8                                │
+  │     every tap scans all 1621 nodes. Fine at city-MVP size;      │
+  │     the spatial-index gap that bites at metro scale.            │
+  ├────────────────────────────────────────────────────────────────┤
+  │ #2  graph.json has NO schema version field                      │ HIGH
+  │     top-level keys: city, bbox, nodes, edges, adjacency         │
+  │     a real gap: a bundled artifact + an app reading it with no  │
+  │     handshake. Shape drift = silent breakage on next build.     │
+  ├────────────────────────────────────────────────────────────────┤
+  │ #3  elevCache write path has no atomicity / no real recovery    │ MED
+  │     mobile/src/elevCache.ts:42  single setItem, last-write-wins │
+  │     debounced 4s window; a crash inside the window loses writes.│
+  ├────────────────────────────────────────────────────────────────┤
+  │ #4  adjacency is a derived index with no integrity enforcement  │ MED
+  │     features/routing/graph.ts:22  build-time only; if graph.json│
+  │     and adjacency disagree, routing silently drops edges.       │
+  ├────────────────────────────────────────────────────────────────┤
+  │ #5  in-memory merged graph rebuilt per state change (no caching │ LOW
+  │     of the join) — useTileGraph.ts:132 stitch on every change.  │
+  └────────────────────────────────────────────────────────────────┘
+```
+
+The full ranked audit with evidence per verdict is in
+`09-database-systems-red-flags-audit.md`.
 
 ## Reading order
 
 ```
-  00-overview.md ........... you are here
-  01-database-systems-map .. the store, the access paths, the durability boundary
-  02-records-pages-...... ... how a Node/Edge is laid out; JSON as the page format
-  03-btree-hash-and-...... .. adjacency + indexEdges as indexes; the missing spatial index
-  04-query-planning-...... .. there's no planner — what the access paths look like instead
-  05-transactions-...... .... not yet exercised — what a write path would need
-  06-locks-mvcc-...... ...... not yet exercised — single immutable reader
-  07-wal-durability-...... .. the rebuild IS the recovery story
-  08-replication-...... ..... not yet exercised — one bundled copy
-  09-...red-flags-audit ..... ranked risks + the not-yet-exercised ledger
+  00-overview.md ......... you are here
+  01-database-systems-map ........ the datastore map: artifacts, engines, query
+                                   paths, durability boundaries
+  02-records-pages-and-storage-layout .. records, pages, locality, the cost of
+                                   persistence — flattr's JSON-as-storage choice
+  03-btree-hash-and-secondary-indexes .. the nodes hash map, the adjacency
+                                   secondary index, and the missing spatial index
+  04-query-planning-and-execution ...... what a "query" is in flattr (A* + scan),
+                                   plans, N+1, EXPLAIN
+  05-transactions-isolation-and-anomalies .. ACID, isolation levels, anomalies —
+                                   all not-yet-exercised, taught + triggered
+  06-locks-mvcc-and-concurrency-control .. locks, MVCC, optimistic vs pessimistic
+                                   — flattr's single-writer in-process model
+  07-wal-durability-and-recovery ....... write-ahead logs, fsync, recovery — the
+                                   elevCache debounce as the only durability seam
+  08-replication-and-read-consistency .. replicas, lag, stale reads — not
+                                   exercised; the bundled-artifact analog
+  09-database-systems-red-flags-audit .. ranked risks, evidence per verdict
 ```
 
-## Cross-links
+## not yet exercised — the honest list
 
-- `.aipe/study-data-modeling/` — the *shape* of the graph schema (Node/Edge
-  fields, normalization, the signed-grade choice). This guide owns the
-  *mechanisms*; that guide owns the *shape*.
-- `.aipe/study-dsa-foundations/` — `adjacency` as an adjacency list, the binary
-  heap behind `PQueue`, A* itself. The index here is a DSA structure there.
-- `.aipe/study-system-design/` — *why* the store is a build-time artifact and
-  how tiling scales. This guide owns "how reads/writes are preserved"; that one
-  owns "which store and how it scales."
+- **Transactions / ACID** — no multi-statement atomic unit anywhere. `→ 05`
+- **Isolation levels** — no concurrent readers/writers over shared durable
+  state; the elevCache is single-process. `→ 05`
+- **Locks / MVCC** — no lock manager, no version chains. `→ 06`
+- **WAL** — no write-ahead log; the durability boundary is AsyncStorage's own
+  `setItem`. `→ 07`
+- **Query planner / optimizer** — A* is a hand-written algorithm, not a planned
+  query; there's no cost-based plan selection. `→ 04`
+- **Replication / failover** — single device, single artifact. `→ 08`
+
+## Partition (don't look here for these)
+
+```
+  study-data-modeling      the SHAPE of the graph schema, normalization, whether
+                           Edge[] vs Record matches access — the modeling call.
+  study-database-systems   (this) the MECHANISMS that execute & preserve reads
+                           and writes — indexes, scans, durability, isolation.
+  study-system-design      WHICH datastore is chosen and how it scales.
+  study-dsa-foundations    the heap, the graph traversal, Big-O of the algorithms.
+  study-performance-engineering  measuring the O(N) scan, profiling the build.
+```
+
+Cross-links: `../study-data-modeling/`, `../study-dsa-foundations/`,
+`../study-system-design/`, `../study-performance-engineering/`,
+`../study-runtime-systems/`.

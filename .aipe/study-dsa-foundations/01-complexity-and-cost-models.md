@@ -1,81 +1,66 @@
-# Complexity & cost models
+# Complexity & Cost Models
 
-**Industry names:** asymptotic analysis · Big-O / Big-Θ · amortized analysis ·
-the cost model. **Type:** Language-agnostic.
-
----
-
-## Zoom out, then zoom in
-
-Every other file in this guide makes a *speed* or *space* claim — "A\* expands
-fewer nodes than Dijkstra," "the heap pops in `O(log n)`," "`percentile` sorts in
-`O(n log n)`." This file is the ruler those claims are measured against. It sits
-underneath all of them.
-
-```
-  Zoom out — where cost analysis lives
-
-  ┌─ The claims every other file makes ───────────────────────────┐
-  │  03 heap: push/pop O(log n)                                    │
-  │  05 A*:   fewer nodes expanded than Dijkstra                   │
-  │  06 sort: percentile() is O(n log n)                           │
-  │  06 scan: nearestNode() is O(V)                                │
-  └─────────────────────────┬──────────────────────────────────────┘
-                            │ all measured against...
-  ┌─ ★ THIS FILE ───────────▼──────────────────────────────────────┐
-  │  the cost model: what counts as "one unit of work"?            │
-  │  input size n · time vs space · worst vs amortized · constants  │
-  └──────────────────────────────────────────────────────────────────┘
-                            │ the repo's own measuring stick:
-  ┌─ bench/run.ts ──────────▼──────────────────────────────────────┐
-  │  nodesExpanded · pushes · pops · wall-clock ms                  │
-  └──────────────────────────────────────────────────────────────────┘
-```
-
-Zoom in: a cost model is the answer to one question — *what do you count, and as
-a function of what?* Pick the wrong unit and your analysis is fiction. `flattr`
-is unusually disciplined here because it ships its own cost model: the
-`SearchResult` type (`features/routing/types.ts:46-51`) counts `nodesExpanded`,
-`pushes`, and `pops` — the engine *reports its own complexity* every time it runs.
+**Industry names:** asymptotic analysis (Big-O), amortized analysis, cost
+functions. **Type:** Industry standard.
 
 ---
 
-## The structure pass
+## Zoom out — where this concept lives
 
-**Layers.** Three altitudes of "cost" stack up in this repo, and they get
-confused with each other constantly:
+Complexity isn't a file — it's the lens you hold over every other file.
+But flattr has one place where a *cost model decision* is written into the
+code as a constant, and that's the thing to anchor on.
 
 ```
-  One question — "what does cost mean here?" — down the layers
+  Zoom out — cost models across the routing stack
 
-  ┌──────────────────────────────────────────────┐
-  │ outer: ROUTING cost (cost.ts)                  │  → a domain weight:
-  │   path.cost = Σ length*(1+penalty)             │     "how much effort?"
-  └────────────────────┬───────────────────────────┘
-       ┌───────────────▼─────────────────────────┐
-       │ middle: ALGORITHMIC cost                  │  → operations:
-       │   nodesExpanded, pushes, pops             │     "how much work?"
-       └───────────────┬─────────────────────────┘
-           ┌───────────▼───────────────────────┐
-           │ inner: WALL-CLOCK cost (bench)      │  → time/space:
-           │   ms, memory                        │     "how long / how big?"
-           └─────────────────────────────────────┘
-
-  the word "cost" means three different things — the lesson is keeping them apart
+  ┌─ Snap layer ────────────────────────────────────────────────┐
+  │  nearest.ts   nearestNode()      → O(N) per snap            │
+  └───────────────────────────┬──────────────────────────────────┘
+                              │
+  ┌─ Search layer ──────────────────────────────────────────────┐
+  │  astar.ts     search()           → O(E log V)              │
+  │  pqueue.ts    push/pop           → O(log n) amortized       │
+  │  cost.ts      ★ BLOCKED = 1e9 ★  → a finite-cost decision   │ ← we are here
+  └───────────────────────────┬──────────────────────────────────┘
+                              │
+  ┌─ Aggregate layer ───────────────────────────────────────────┐
+  │  zones.ts     percentile()       → O(N log N) full sort     │
+  └──────────────────────────────────────────────────────────────┘
 ```
 
-**Axis = cost.** Hold the question "what's expensive?" constant and the answer
-flips at every layer. At the outer layer the expensive thing is *climbing a hill*
-(`penalty()` inflates it). At the middle layer the expensive thing is *expanding a
-node* (popping it and relaxing its neighbors). At the inner layer it's
-*milliseconds*. A reviewer who conflates these — "A\* is faster because it has a
-lower path cost" — has mixed two layers. Path cost is identical for Dijkstra and
-A\* (`astar.test.ts:38-45`); only the *work* differs.
+**Zoom in.** Two questions this file answers. First: what does each
+operation in flattr actually *cost*, in Big-O, and where's the slack?
+Second — the one that's specific to this repo — why is "blocked" encoded
+as `1e9` and not `Infinity`? That second one is a *cost-model* decision,
+and it's the most interesting thing in the file.
 
-**Seams.** The load-bearing seam is between the middle and inner layers:
-`nodesExpanded` is a *machine-independent* proxy for `ms`. That's why the bench
-harness records it — `ms` varies with your laptop, `nodesExpanded` doesn't. The
-seam is where a portable complexity claim becomes a wall-clock measurement.
+---
+
+## Structure pass — one axis across the layers
+
+Layers: **snap → search → aggregate**. The axis worth tracing is **cost
+per unit of work** — and specifically *what dominates as the graph grows*.
+
+```
+  Axis: "what dominates as N (nodes) and E (edges) grow?"
+
+  ┌─ snap ──────────┐   N grows → linear scan dominates
+  │  O(N)           │   the seam: no spatial index
+  └─────────────────┘
+  ┌─ search ────────┐   E grows → heap ops dominate
+  │  O(E log V)     │   the seam: lazy deletion vs decrease-key
+  └─────────────────┘
+  ┌─ aggregate ─────┐   N grows → full sort dominates
+  │  O(N log N)     │   the seam: sort vs selection
+  └─────────────────┘
+```
+
+The seam at each layer is the same shape: **a linear or log-linear
+operation sitting where a smarter structure would cut the exponent or
+the log.** That's the through-line of this whole guide — flattr's
+algorithms are *correct* everywhere; the slack is in the *cost model
+choices*, not in bugs.
 
 ---
 
@@ -83,200 +68,214 @@ seam is where a portable complexity claim becomes a wall-clock measurement.
 
 ### Move 1 — the mental model
 
-You already do this every time you reason about a `.map()` over an array: "this
-is `O(n)` because it touches each element once." Big-O is just that habit made
-formal — **strip the constants, keep the growth shape, express it as a function
-of the input size.** The only hard part is naming *n* correctly.
+You already do this every time you pick `.find()` vs a `Map`. Big-O is
+just "how does the work grow when the input doubles?" The picture is a
+curve, and the only curves that matter for flattr are these four:
 
 ```
-  The shape of asymptotic growth (n = input size)
+  The cost curves that appear in flattr
 
-  cost
-   ▲                                        O(n²)  ← double n → 4× cost
-   │                                  ●
-   │                            ●
-   │                      ●                 O(n log n) ← sort
-   │                ●                ○
-   │           ●            ○                O(n)   ← linear scan
-   │       ●         ○            ╌╌╌╌       O(log n) ← heap op, binary search
-   │   ● ○      ╌╌╌╌╌╌╌╌╌╌╌                  O(1)   ← hash lookup
-   └───────────────────────────────────────► n
-       the curve you're on matters more than the constant in front
+  work
+   │                                    O(N²)  ← never (would be naive A*)
+   │                               .
+   │                          .
+   │                     .          O(N log N) ← zones.ts sort
+   │                .  ___------    O(N)        ← nearest.ts scan
+   │           . _--
+   │       ._--      ____________   O(log N)    ← one heap op
+   │    .--______----
+   │ .-‾                            O(1)        ← one Map lookup
+   └────────────────────────────────────► input size N
 ```
 
-### Move 2 — the moving parts
+flattr lives almost entirely in the bottom three curves. The `O(N²)`
+curve is the one A* *avoids* — and it avoids it precisely because of the
+heap (`O(log N)` pops) and the hash maps (`O(1)` lookups). Drop either
+and the whole search slides up to `O(N²)`.
 
-**Naming the input size `n`.** This is the whole game and the most common
-mistake. For a graph algorithm there is no single `n` — there's `V` (vertices)
-and `E` (edges), and they grow differently. Dijkstra/A\* over a binary heap is
-`O((V + E) log V)`: every vertex gets popped once (`V log V` for the pops), every
-edge gets relaxed and may trigger a push (`E log V` for the pushes). Say "`O(n
-log n)`" for a graph search and you've already lost — *which* n?
+### Move 2 — the cost model that's actually written into the code
 
-```
-  Trace the cost of one node expansion (astar.ts:48-75)
+#### The `BLOCKED` constant — a cost model, not an error code
 
-  pop current ............... O(log V)   sift-down restores heap
-  for each incident edge .... deg(current) iterations
-     otherEnd, cost ......... O(1) each
-     maybe push ............. O(log V)   sift-up
+Here's the one that trips people up. A too-steep edge isn't *forbidden* —
+it's *expensive*. And the difference between "expensive" and "impossible"
+is the whole reason this is a finite number.
 
-  total over the whole run: Σ deg = 2E relaxations, V pops
-  = O(E log V + V log V) = O((V + E) log V)
+```ts
+// features/routing/cost.ts:5
+/** Large but FINITE, so an only-steep path is still returned and flagged. */
+export const BLOCKED = 1e9;
 ```
 
-**Worst case vs the case you actually hit.** Worst case for A\* is "no better
-than Dijkstra" — when the heuristic gives no information, A\* expands every node.
-That's not a bug; it's the corner case `bench/run.ts:17-21` deliberately avoids
-by using *interior* pairs. Corner-to-corner, the goal is the farthest node, so
-nothing can be pruned and A\* degenerates to the Dijkstra flood. Naming the worst
-case *and* the case you designed for is the senior move.
+```ts
+// features/routing/cost.ts:16-22
+export function penalty(g: number, max: number, k1 = DEFAULT_K1, k2 = DEFAULT_K2): number {
+  if (g <= 0) return 0;          // downhill/flat: free
+  if (g > max) return BLOCKED;   // over userMax: 1e9, NOT Infinity
+  const half = 0.5 * max;
+  if (g <= half) return k1 * g;  // moderate: linear
+  return k2 * (g - half) ** 2 + k1 * half; // steep: quadratic
+}
+```
 
-**Amortized cost — why `push` is `O(log n)` "on average".** A single `push`
-might sift all the way up (`O(log n)`); most pushes sift up one level or none.
-Amortized analysis says: across a sequence of operations, the *average* cost per
-op is what matters, even if one op is occasionally expensive. The PQueue's array
-backing (`pqueue.ts:1`) is the classic example — a dynamic array's `push` is
-`O(1)` amortized even though an occasional resize copies everything.
+Trace what `Infinity` would do versus `1e9`:
 
-**Space cost is a separate axis — don't forget it.** A\* holds four structures
-in memory simultaneously (`astar.ts:31-34`): `open` (the heap), `g` (best-known
-cost per node), `came` (the came-from map), `closed` (the finalized set). That's
-`O(V)` space — and on a city-sized graph that's the constraint that bites first,
-which is exactly why the spec (§12) talks about *tiling* the graph rather than
-loading all of Seattle.
+```
+  Comparison — BLOCKED as Infinity vs 1e9
+
+  ┌─ if BLOCKED were Infinity ──────────┐  ┌─ BLOCKED = 1e9 (actual) ──────────┐
+  │ steep edge cost = Infinity          │  │ steep edge cost = ~1e9 * length    │
+  │ tentative = g + Infinity = Infinity │  │ tentative = g + 1e9 = large finite │
+  │ Infinity < Infinity → false         │  │ 1e9 < Infinity → true: edge relaxed│
+  │ edge NEVER relaxed                  │  │ edge IS relaxed, path found        │
+  │ → "all routes steep" == "no route"  │  │ → "all steep" path returned +      │
+  │   (user can't tell them apart)      │  │    flagged in steepEdges (honesty) │
+  └─────────────────────────────────────┘  └────────────────────────────────────┘
+```
+
+This is the product's "honesty" requirement encoded as a number. The
+relaxation test in `astar.ts:69` is `tentative < (g.get(next) ?? Infinity)`.
+A finite `1e9` *passes* that test; an `Infinity` cost would tie with the
+`Infinity` default and fail it. So a city where every route to the goal
+crosses one steep block still returns a route — with that block listed in
+`steepEdges` — instead of returning `null` ("no route"). `null` is
+reserved for *genuinely disconnected* (`astar.test.ts:91-96`).
+
+**What breaks if you remove the finiteness:** the user can no longer
+distinguish "there's a path but it's steep" from "there's no path." Two
+very different answers collapse into one.
+
+#### Amortized analysis — why one heap push is "O(log n)"
+
+A single `siftUp` can climb the whole tree height — `log n` swaps. But
+most pushes don't. Amortized analysis says: average the expensive
+operations over the cheap ones across a whole sequence.
+
+```
+  Amortized: cost spread over a sequence of pushes
+
+  push 1:  ●                    0 swaps
+  push 2:  ●─┐                  1 swap
+  push 3:  ● ●                  0 swaps
+  push 4:  ●─┐                  1 swap
+  ...
+  push n:  rare full climb      log n swaps  ← the worst case
+           ────────────────────────────────
+           total over n pushes ≈ O(n), so   O(1) amortized per push
+           (worst single push still O(log n))
+```
+
+For flattr's purposes the honest bound is **O(log n) per push and per
+pop**, because A* can push the same node many times (lazy deletion — see
+file 03). The amortized framing matters when you reason about the *whole
+search*: `O(E log V)` total, because each edge can trigger at most one
+push.
+
+#### Choosing the right cost model — distance vs grade
+
+flattr has *four* cost functions, and the choice of which to plug in
+changes what "optimal" even means:
+
+```
+  cost.ts — the cost model IS a parameter
+
+  distanceCost        → cost = lengthM           (shortest path)
+  gradeCostAbs        → cost = lengthM*(1+pen)   (flattest, symmetric)
+  gradeCostDirected   → cost = lengthM*(1+pen)   (flattest, A→B ≠ B→A)
+                                    ▲
+                              penalty(grade, userMax)
+```
+
+The complexity is identical across all four — same `O(E log V)`. What
+changes is the *number that gets minimized*. This is the cleanest example
+in the repo of "the algorithm and the cost model are separable": you swap
+the cost model and reuse the entire search engine (file 05 walks this).
 
 ### Move 3 — the principle
 
-**Complexity analysis is choosing what to count.** The number falls out once
-you've named the unit and the input size. `flattr`'s discipline — counting
-`nodesExpanded` rather than trusting `ms` — is the lesson generalized: pick a
-machine-independent unit, measure growth against the right `n`, and your claim
-survives a change of laptop, language, or compiler.
+Cost models are decisions, not facts. `BLOCKED = 1e9` looks like a magic
+number; it's actually a product requirement ("always show a route, flag
+the steep parts") expressed in the only language the algorithm
+understands — a finite, large cost. When you see a constant that *could*
+be `Infinity` but isn't, ask what distinction the finiteness is
+preserving.
 
 ---
 
 ## Primary diagram
 
-The three cost layers and the single seam that makes complexity portable.
+The full cost picture: where each operation sits, and where the slack is.
 
 ```
-  flattr's three cost models and the portability seam
+  flattr — complexity at every layer (★ = optimization slack)
 
-  ROUTING cost          ALGORITHMIC cost           WALL-CLOCK cost
-  (domain weight)       (machine-independent)      (machine-dependent)
-  ┌──────────────┐      ┌──────────────────┐       ┌──────────────┐
-  │ Σ len*(1+pen)│      │ nodesExpanded     │  seam │ ms           │
-  │ cost.ts:16   │      │ pushes / pops     │ ════► │ bench/run.ts │
-  │              │      │ types.ts:46-51    │       │ :23-27       │
-  └──────────────┘      └──────────────────┘       └──────────────┘
-   "how much effort      "how much work"            "how long"
-    to climb?"            O((V+E) log V)             varies by host
-        │                                                 ▲
-        └─── does NOT change between Dijkstra & A* ───────┘
-             (only the middle layer does — that's the win)
-```
-
----
-
-## Implementation in codebase
-
-**Use cases.** The repo reaches for cost analysis in three concrete places:
-(1) the `SearchResult` metrics that every search returns, (2) the bench harness
-that compares stages, and (3) the `BLOCKED = 1e9` constant, which is a
-*numeric-precision* cost decision.
-
-```
-  features/routing/types.ts  (lines 46-51)
-
-  export type SearchResult = {
-    path: Path | null;
-    nodesExpanded: number;  ← V-term proxy: nodes finalized (closed)
-    pushes: number;         ← E-term proxy: heap insertions
-    pops: number;           ← includes STALE pops (lazy-deletion overhead)
-  };
-       │
-       └─ pops > pushes is impossible; pops can exceed nodesExpanded because
-          stale duplicates are popped and skipped (astar.ts:51). The gap
-          between pops and nodesExpanded IS the measured cost of choosing
-          lazy deletion over decrease-key.
-```
-
-The `BLOCKED` constant is a cost-model decision hiding in plain sight:
-
-```
-  features/routing/cost.ts  (line 5)
-
-  export const BLOCKED = 1e9;   ← large but FINITE
-       │
-       └─ why not Infinity? Because path.cost sums these (astar.ts:124).
-          Σ of a few 1e9 stays a finite, comparable number, so the heap can
-          still ORDER an all-steep path behind a clean one (pqueue.test.ts:101-106)
-          instead of producing NaN/Infinity arithmetic. The cost model has to
-          stay a total order — that's the constraint 1e9 satisfies and
-          Infinity breaks (Infinity - Infinity = NaN, and push() rejects NaN,
-          pqueue.ts:24).
+  ┌─ Snap (nearest.ts) ─────────────────────────────────────────┐
+  │  nearestNode: scan all N nodes, haversine each   → O(N)  ★  │
+  └───────────────────────────┬──────────────────────────────────┘
+                              │ startId, goalId
+  ┌─ Search (astar.ts + pqueue.ts) ─────────────────────────────┐
+  │  per pop:   heap pop          → O(log V)                    │
+  │  per edge:  g/closed lookup   → O(1)                        │
+  │             heap push         → O(log V)                    │
+  │  total:     O(E log V)                                       │
+  │  cost.ts:   penalty()         → O(1), BLOCKED=1e9 finite    │
+  └───────────────────────────┬──────────────────────────────────┘
+                              │ Path
+  ┌─ Aggregate (zones.ts) ──────────────────────────────────────┐
+  │  percentile: full sort then index  → O(N log N)         ★  │
+  └──────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
 ## Elaborate
 
-Big-O came from number theory (Bachmann, Landau, 1890s) and was imported into
-algorithm analysis by Knuth in the 1960s precisely to make claims portable
-across the wildly different machines of the era — the same reason `flattr` counts
-`nodesExpanded` instead of trusting `ms`. Amortized analysis (Tarjan, 1985) is
-the tool that justifies the dynamic-array and lazy-deletion-heap choices here:
-both are "occasionally expensive, cheap on average." The natural next read is
-**03** (where `O(log n)` heap ops are derived) and **05** (where `O((V+E) log
-V)` is the search cost that everything else hangs on). For the wall-clock end of
-the seam, go to `.aipe/study-performance-engineering/` — the bench harness is a
-performance artifact built on this file's vocabulary.
+Big-O comes from Bachmann/Landau (1890s number theory), pulled into CS by
+Knuth. Amortized analysis is Tarjan's (1985) — the same Tarjan behind
+union-find (a gap noted in file 05/08). The `1e9`-not-`Infinity` trick is
+folklore in routing engines: OSRM and Valhalla both use large finite
+"blocked" weights for exactly flattr's reason — distinguishing
+*penalized* from *impossible*. flattr can't use those engines (the spec
+forbids it — `docs/flattr-spec.md` §14), so it re-derives the trick. Read
+file 03 next for the heap that the `O(log V)` claim rests on.
 
 ---
 
 ## Interview defense
 
-**Q: "Why does the benchmark count `nodesExpanded` instead of milliseconds?"**
-
-Because `ms` is machine-dependent and `nodesExpanded` is the portable proxy for
-the algorithmic cost. A\* and Dijkstra return the *same* path cost — the win is
-purely fewer expansions, and that win survives a change of laptop. Milliseconds
-would muddy the comparison with JIT warmup and host noise.
+**Q: Why is `BLOCKED` `1e9` and not `Infinity`?**
 
 ```
-  Dijkstra ●●●●●●●●●●●●●●●●  expanded ~203  (floods)
-  A*       ●●●●●            expanded  ~50   (cones to goal)
-  same cost, different WORK — that's the only axis that matters here
-  anchor: types.ts:46-51 reports it; bench/run.ts:51-53 tabulates it
+  Infinity → relaxation test fails → edge unreachable → null
+  1e9      → relaxation test passes → path returned + flagged
 ```
 
-**Q: "What's the time complexity of `search()` and what's `n`?"**
+*Model answer:* "Because `null` means disconnected and a steep path means
+'expensive but possible' — two different answers the product must keep
+distinct. The relaxation test is `tentative < (g ?? Infinity)`. A finite
+`1e9` passes it, so an all-steep route is still found and its bad edges
+land in `steepEdges`. `Infinity` would tie with the default and fail the
+test, collapsing 'steep' into 'no route.'"
 
-`O((V + E) log V)`. Not "`O(n log n)`" — a graph has two sizes. Every vertex is
-popped once (`V log V`), every edge relaxed at most a constant number of times
-(`E log V`). The `log V` factor is the heap. Anchor: `astar.ts:48-75`, the pop +
-neighbor-relax loop.
+*Anchor:* `cost.ts:5` — large-finite is honesty, not a hack.
 
----
+**Q: What's the time complexity of one route query end to end?**
 
-## Validate
+*Model answer:* "`O(N)` to snap the endpoints — that's the linear scan in
+`nearest.ts`, the weakest link — plus `O(E log V)` for the A* itself: each
+edge relaxes at most once, each push/pop is `O(log V)` against the binary
+heap. On a city graph `E ≈ 2-3·V`, so the search is effectively
+`O(V log V)`. The snap can dominate on a big graph, which is why a spatial
+index is the first thing I'd add."
 
-1. **Reconstruct:** State the time and space complexity of `search()` in
-   `astar.ts:22-78` in terms of `V` and `E`, and name the data structure
-   responsible for the `log V` factor.
-2. **Explain:** Why can `pops` exceed `nodesExpanded` in a `SearchResult`
-   (`types.ts:49`)? What design choice does that gap measure?
-3. **Apply:** `bench/run.ts:17-21` uses interior pairs. Walk the worst case for
-   A\* and explain why corner-to-corner triggers it.
-4. **Defend:** Argue why `BLOCKED = 1e9` (`cost.ts:5`) rather than `Infinity`,
-   in terms of keeping the cost model a total order the heap can sort.
+*Anchor:* snap is `O(N)`, search is `O(E log V)` — the snap is the gap.
 
 ---
 
 ## See also
 
-- **03-stacks-queues-deques-and-heaps.md** — where `O(log n)` heap ops are derived.
-- **05-graphs-and-traversals.md** — the `O((V+E) log V)` search this all measures.
-- **06-sorting-searching-and-selection.md** — `O(n log n)` sort in `percentile`.
-- `.aipe/study-performance-engineering/` — the wall-clock end of the seam.
+- `03-stacks-queues-deques-and-heaps.md` — the `O(log n)` heap ops.
+- `05-graphs-and-traversals.md` — the `O(E log V)` search this all serves.
+- `06-sorting-searching-and-selection.md` — the `O(N log N)` zones sort.
+- sibling **performance-engineering** — the `bench/` harness that measures
+  these bounds empirically.

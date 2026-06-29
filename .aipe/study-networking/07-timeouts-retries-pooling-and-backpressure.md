@@ -1,335 +1,232 @@
-# 07 — Timeouts, retries, pooling, and backpressure
-### timeouts, retries, jitter, connection pools, request collapse, and overload
-**Industry name:** resilience / overload control — *Industry standard*
+# 07 — Timeouts, Retries, Pooling, and Backpressure
 
-═════════════════════════════════════════════════
-ZOOM OUT, THEN ZOOM IN
-═════════════════════════════════════════════════
+**Resilience under load and failure** · *Industry standard*
 
-This is the load-bearing networking file in the repo. Everything flattr does to survive flaky, rate-limited free APIs lives here: retry-with-backoff, request collapsing (dedup), batching, the single-in-flight busy-lock, and the best-effort degrade-to-flat fallback. It's also where the biggest gap lives — *there is no client-side request timeout anywhere.* Verdict first: the retry/backoff and concurrency control are real and thoughtful; jitter and timeouts are missing; and the retry policy is inconsistent across providers.
+## Zoom out, then zoom in
+
+This is where flattr's networking gets interesting, because it's where the free-tier rate limits force real design. Three retry curves, a single-flight gate, a same-cell dedup, a persistent cache, and a self-heal loop — all aimed at one goal: *don't get 429'd by APIs you don't pay for.* And one conspicuous hole: no request timeout anywhere.
 
 ```
-  Zoom out — where resilience sits
+  Zoom out — the resilience machinery sits around every fetch
 
-  ┌─ App / Build layer ──────────────────────────────┐
-  │  ★ retries · backoff · dedup · busy-lock ·        │ ← we are here
-  │    best-effort fallback — the resilience logic ★  │
-  │  fetch(url)  (no timeout / AbortSignal)            │
-  └─────────────────────────┬─────────────────────────┘
-  ┌─ Provider layer (free tier, rate-limited) ──────▼┐
-  │  Overpass · Open-Meteo · Nominatim — 429 under load│
+  ┌─ UI / pump scheduler ────────────────────────────────────┐
+  │  debounce · single-flight gate · corridor priority        │
+  └────────────────────────┬──────────────────────────────────┘
+                           │
+  ┌─ ★ resilience band ★ ───▼─────────────────────────────────┐
+  │  retry+backoff (per API) · dedup · cache · best-effort     │ ← we are here
+  │  self-heal retry         · [NO timeout]                    │
+  └────────────────────────┬──────────────────────────────────┘
+                           │
+  ┌─ providers (free-tier, rate-limited) ───▼─────────────────┐
+  │  429 when over quota · 5xx under load                      │
+  └────────────────────────────────────────────────────────────┘
+```
+
+Zoom in: the question is *"when an API is slow, throttled, or down, what does flattr do?"* The answer is layered — first avoid the request (cache/dedup), then space it out (debounce/single-flight), then retry it (backoff), then give up gracefully (best-effort flat + self-heal). The missing layer is the *first* line of defense in most systems: a timeout to bound how long a single request can hang.
+
+## Structure pass
+
+**Layers.** Avoid → space → retry → degrade. Four layers of defense, applied in that order to every request.
+
+```
+  Layers — four defenses, applied in order
+
+  ┌─ 1. AVOID ───────────────────────────────────────┐
+  │  cache hit / dedup → no request at all            │
+  └────────────────────────┬──────────────────────────┘
+  ┌─ 2. SPACE ──────────────▼─────────────────────────┐
+  │  debounce (600/400ms) · single-flight · throttle  │
+  └────────────────────────┬──────────────────────────┘
+  ┌─ 3. RETRY ──────────────▼─────────────────────────┐
+  │  per-API backoff on retryable status              │
+  └────────────────────────┬──────────────────────────┘
+  ┌─ 4. DEGRADE ────────────▼─────────────────────────┐
+  │  best-effort flat elevation + self-heal retry     │
   └────────────────────────────────────────────────────┘
 ```
 
-Zoom in: this layer answers "what does flattr do when the provider is slow, overloaded, or rate-limiting?" The free-tier 429 is the real, documented enemy (`.aipe/project/context.md`), and every mechanism here exists to stay under the limit or recover when it's hit.
+**Axis = failure (where does an overloaded provider get absorbed?).** Trace it down the layers: layer 1 absorbs it by never asking; layer 2 by asking less often; layer 3 by asking again later; layer 4 by accepting a degraded answer. The failure is contained at whichever layer catches it first — and almost everything is caught before it reaches the user.
 
-═════════════════════════════════════════════════
-THE STRUCTURE PASS
-═════════════════════════════════════════════════
+**Seam.** The retry/give-up boundary is the seam, and it's drawn three ways (the per-module status sets from `05`) plus a *count* boundary: Overpass `retries=3` linear (`overpass.ts:27`), Open-Meteo `retries=3` exponential (`elevation.ts:97`), runtime elevation `retries=1` fail-fast (`useTileGraph.ts:191`), geocode `retries=0`. Where the retry budget runs out, control flips from "try again" to "degrade or throw."
 
-**Layers.** Pre-request (collapse + batch + throttle to *avoid* overload) → In-request (retry + backoff to *recover* from a transient failure) → Cross-request (busy-lock to *cap concurrency*) → Whole-build (best-effort fallback to *degrade* instead of fail).
+## How it works
 
-**Axis — failure (where does overload originate, propagate, get contained?).**
+### Move 1 — the mental model
 
-```
-  Axis "how is overload contained?" — across the resilience layers
-
-  ┌──────────────────────────────────────────────────┐
-  │ Pre-request: dedup + batch + throttle             │ → AVOID hitting limit
-  └──────────────────────────────────────────────────┘
-      ┌──────────────────────────────────────────────┐
-      │ In-request: retry + backoff on 429/5xx        │ → RECOVER if hit
-      └──────────────────────────────────────────────┘
-          ┌──────────────────────────────────────────┐
-          │ Cross-request: 1-at-a-time busy-lock      │ → CAP concurrency
-          └──────────────────────────────────────────┘
-              ┌──────────────────────────────────────┐
-              │ Whole-build: degrade to flat (0m)     │ → CONTAIN failure
-              └──────────────────────────────────────┘
-
-  four layers, four distinct overload-containment moves
-```
-
-**Seams.** Two load-bearing seams. First, `busyRef` in `useTileGraph` — the boundary between "a build is running" and "a build is queued"; concurrency flips from N-possible to exactly-1 here. Second, `bestEffortElevation` — the boundary between "elevation succeeded" and "elevation failed but the build continues with zeros"; failure-containment flips from propagate to swallow here.
-
-═════════════════════════════════════════════════
-HOW IT WORKS
-═════════════════════════════════════════════════
-
-#### Move 1 — the mental model
-
-You know the standard retry shape: try, if it fails transiently wait a bit and try again, give up after N attempts? flattr has that — twice, with two different wait curves. But the more interesting shape is the *overload-avoidance* layered on top: collapse duplicate requests, batch many points into one call, throttle between calls, and only ever run one build at a time. Retry recovers from a 429; the avoidance layer tries to never earn one.
+You've written a `fetch` with a `try/catch`. flattr's resilience is that, scaled up: every request is wrapped in retry-with-backoff, but *before* it even gets there, a cache and a dedup try to skip the request, and a debounce + single-flight gate make sure too many don't fire at once. Think of it as concentric rings — the request only escapes to the network if it gets past the inner rings.
 
 ```
-  Pattern — avoid, then recover, then cap, then degrade
+  Pattern — concentric defenses; a request escapes only if it must
 
-  AVOID:    dedup ──► batch 100 ──► throttle 300ms between batches
-                │
-  RECOVER:  on 429/5xx: sleep(backoff) ──► retry ──► give up after N
-                │
-  CAP:      busy? ──► queue (corridor preempts view) ──► one at a time
-                │
-  DEGRADE:  elevation failed? ──► return 0m, keep building
+   ┌─────────────────────────────────────────┐
+   │ debounce (wait for pan/typing to settle) │
+   │  ┌────────────────────────────────────┐  │
+   │  │ single-flight (one build at a time)│  │
+   │  │  ┌──────────────────────────────┐  │  │
+   │  │  │ cache + dedup (skip request) │  │  │
+   │  │  │   ┌────────────────────────┐ │  │  │
+   │  │  │   │ retry + backoff        │ │  │  │
+   │  │  │   │   → the actual fetch   │ │  │  │
+   │  │  │   └────────────────────────┘ │  │  │
+   │  │  └──────────────────────────────┘  │  │
+   │  └────────────────────────────────────┘  │
+   └───────────────────────────────────────────┘
 ```
 
-#### Move 2 — walking each mechanism (the load-bearing skeleton)
+### Move 2 — walk each mechanism
 
-The retry kernel is the irreducible core. Strip it to the minimum that's still "retry with backoff":
+**Mechanism 1 — the three retry curves (the load-bearing skeleton).** This is the kernel: a loop that retries a retryable status with a growing delay, up to a budget. Here's the irreducible shape:
 
 ```
-  The retry kernel — smallest thing that's still the pattern
+  Kernel — retry-with-backoff (what every API call shares)
 
   for attempt = 0, 1, 2, ...:
-      res = fetch(url)
-      if res.ok: return body              ← success exit
-      if retryable(res.status) and attempt < N:
-          sleep(backoff(attempt))         ← WAIT before retry
-          continue
-      throw                               ← give-up exit
+     res = fetch(...)
+     if res.ok:          return parse(res)        // success
+     if retryable(res) and attempt < budget:
+        sleep(delay(attempt))                      // back off
+        continue
+     throw                                          // give up
 ```
 
-**Part 1 — the retryable-status set (what breaks if missing: you'd retry 4xx forever or give up on transient blips).** Overpass retries `{429, 502, 503, 504}` (`pipeline/overpass.ts:18`). Open-Meteo retries *only* `429` (`pipeline/elevation.ts:114`). The set encodes "which failures are worth retrying" — 5xx and 429 yes (server/rate, transient), 4xx no (your request is wrong). Drop this check and you'd either hammer on a permanent 400 or treat a 503 as fatal.
+Name each part by what breaks if removed: drop the `attempt < budget` check and a sustained outage retries *forever*; drop the `sleep` and you hammer a throttled server, guaranteeing more 429s; drop the `retryable()` filter and you retry a 400 that will never succeed. All three are load-bearing. Now the three real curves, side by side:
 
-**Part 2 — the backoff curve (what breaks if missing: instant retries = a tight loop that makes the overload worse).** Here's the inconsistency, drawn out:
-
-```
-  Execution trace — two different backoff curves
-
-  Overpass (LINEAR):  delayMs * (attempt + 1)
-    attempt 0 fails → sleep 2000ms  → attempt 1
-    attempt 1 fails → sleep 4000ms  → attempt 2
-    attempt 2 fails → sleep 6000ms  → attempt 3 → give up
-    waits: 2s, 4s, 6s
-
-  Open-Meteo (EXPONENTIAL):  delayMs * 2 ** (attempt + 1)
-    attempt 0 fails → sleep 600ms   → attempt 1   (300 * 2^1)
-    attempt 1 fails → sleep 1200ms  → attempt 2   (300 * 2^2)
-    attempt 2 fails → sleep 2400ms  → attempt 3 → give up
-    waits: 600ms, 1.2s, 2.4s
+```ts
+// overpass.ts:42-45 — LINEAR backoff: delayMs × (attempt+1) = 2s, 4s, 6s
+if (RETRYABLE.has(res.status) && attempt < retries) {
+  await sleep(delayMs * (attempt + 1));   // delayMs=2000, retries=3
+  continue;
+}
 ```
 
-Two modules in one codebase, two curves. Exponential (Open-Meteo) is the textbook-correct choice — it backs off harder the longer the provider stays unhappy. Linear (Overpass) is gentler and caps lower. Neither is wrong, but the *inconsistency* is a smell: a reader can't predict the behavior without reading each module.
-
-**Part 3 — the missing jitter (what breaks if missing: synchronized retries — the thundering herd).** Neither curve adds randomness. If flattr ever fired many requests that got 429'd together, they'd all back off by the *same* amount and retry at the *same* instant, re-colliding. flattr mostly dodges this by being single-threaded and sequential (Part 5), so the herd is small — but jitter is the standard hardening and it's `not yet exercised`.
-
-```
-  with jitter (NOT in flattr):  sleep(backoff(attempt) + random(0, spread))
-  without (flattr):             sleep(backoff(attempt))  ← retries align
-```
-
-**Part 4 — request collapse via dedup (what breaks if missing: you'd sample elevation finer than the DEM and blow the rate limit).** Before any elevation request, `sampleElevations` collapses nodes that fall in the same `dedupePrecision`-sized cell to a single representative point (`pipeline/elevation.ts:42-50`). Many nodes → one query. This is request-collapsing: it cuts request count *before* the network, which is the cheapest possible rate-limit defense.
-
-```
-  Pattern — dedup collapses N points to 1 request
-
-   node A (47.618, -122.328) ┐
-   node B (47.618, -122.328) ┼─ same ~90m cell ─► ONE Open-Meteo query
-   node C (47.618, -122.328) ┘                     result fanned back to A,B,C
+```ts
+// elevation.ts:114-117 — EXPONENTIAL backoff: delayMs × 2^(attempt+1) = 600ms, 1.2s, 2.4s
+if (res.status === 429 && attempt < retries) {
+  await sleep(delayMs * 2 ** (attempt + 1));   // delayMs=300, retries=3
+  continue;
+}
 ```
 
-**Part 5 — the single-in-flight busy-lock (what breaks if missing: a pan storm fires 10 parallel builds and instantly rate-limits you).** This is the most interesting mechanism in the file. `useTileGraph` runs *exactly one* graph build at a time, guarded by `busyRef`. Requests don't queue infinitely — there are exactly two pending slots (one corridor, one view), and the corridor *preempts* the view so a pending route isn't starved by panning.
+Geocode has *no* loop — `if (!res.ok) throw` (`geocode.ts:24`). Three different curves because the failure modes differ (the `05` analysis), and the *delays* differ too: Overpass waits seconds (heavy build queries, infrequent), Open-Meteo starts sub-second (many small batches, quota-driven). The curve is tuned to the request's size and frequency.
 
-```
-  State machine — the busy-lock + 2-slot priority queue
+**The hardening vs skeleton split:** the retry *loop* is the skeleton. The *specific* curve (linear vs exponential), the delay constants, and the retry budget are hardening tuned per API. Saying which is which is the lesson — the loop is universal; the numbers are flattr-specific knobs.
 
-   idle ──pan──► [pending view set]
-        ──route─► [pending corridor set]
-                       │ pump()
-                       ▼
-   busy (1 build running) ──new pan──► overwrites pending view
-                          ──new route─► overwrites pending corridor
-                       │ build done
-                       ▼
-   pump() drains: corridor FIRST, then view ──► back to idle
-```
+**Mechanism 2 — single-flight gate (backpressure at the scheduler).** `pump()` allows exactly one build in flight via `busyRef`, and corridor (route) requests preempt viewport (pan) requests:
 
-The "overwrite, don't append" design is deliberate: if you pan five times while a build runs, only the *last* viewport matters, so the pending slot is overwritten, not queued. This collapses a burst of pans into one follow-up build. Concurrency is capped at 1 specifically to stay under the free rate limits — the comment says so (`mobile/src/useTileGraph.ts:6-7`).
-
-**Part 6 — best-effort degrade (what breaks if missing: a throttled elevation API fails the whole build and the screen stays empty).** `bestEffortElevation` wraps the provider so a thrown error yields `0 m` for every point instead of propagating (`mobile/src/useTileGraph.ts:18-28`). Streets still render, routing still connects (flat grades), and real grades fill in on a later load when the API recovers. This is failure containment: the elevation dependency is downgraded from "required" to "best-effort."
-
-```
-  Layers-and-hops — degrade contains the elevation failure
-
-  ┌─ buildGraph ─┐  sample(points)   ┌─ Open-Meteo ──┐
-  │              │ ────────────────► │ 429 / down    │
-  │ bestEffort   │ ◄── throws ────── └───────────────┘
-  │ catch → 0m   │                      │
-  │ build continues with flat elevation │
-  └──────────────┘  streets render, route connects, grades = 0 (for now)
+```ts
+// useTileGraph.ts:166-180 — one in-flight, corridor first
+const pump = useCallback(() => {
+  if (busyRef.current) return;            // already building → drop through, will drain later
+  if (pendingCorridorRef.current) { kind = "corridor"; ... }   // priority
+  else if (pendingViewRef.current) { kind = "view"; ... }
+  else return;
+  busyRef.current = true;
+  // ... build ... finally { busyRef.current = false; pump(); }  // drain next
+});
 ```
 
-**Part 7 — the missing timeout (what breaks if missing: a hung connection blocks forever).** No `fetch` in the repo passes an `AbortSignal` or any deadline. The Overpass QL carries a *server-side* `[timeout:60]` (`pipeline/overpass.ts:10`) — that's Overpass promising to abort its own query after 60s, not flattr aborting the connection. If a provider accepts the TCP connection but never responds (a half-open connection, a black-hole), flattr's `await fetch` hangs until the OS default kicks in (minutes), and the busy-lock means *the whole build pipeline is stuck* behind it. This is the top red flag (`08`).
-
-#### Move 2.5 — the runtime tuning vs build tuning
-
-The same retry code is tuned differently in the two phases:
+This is backpressure: when builds arrive faster than they complete (rapid panning), the gate collapses them — only the latest pending viewport survives (each `queueViewport` overwrites `pendingViewRef`), so flattr never queues a backlog of stale builds. Drop this gate and rapid panning fires concurrent Overpass+elevation builds, blowing the rate limit instantly.
 
 ```
-  Comparison — same module, two tunings
+  Execution trace — rapid pan, single-flight collapses the backlog
 
-  BUILD (run-build.ts)              RUNTIME (useTileGraph.ts:111)
+  t0  pan A → pendingView=A, pump() → busy, building A
+  t1  pan B → pendingView=B           (A still building)
+  t2  pan C → pendingView=C           (overwrites B — B never runs)
+  t3  A done → busy=false → pump() → builds C   (B was collapsed)
+  result: 2 builds (A, C), not 3 — backlog absorbed
+```
+
+**Mechanism 3 — cache + dedup (request collapse, the avoid layer).** Covered in depth in `05`, recapped here as resilience: the persistent AsyncStorage cache (`elevCache.ts`) means revisited areas issue *zero* elevation requests, and the same-cell dedup (`elevation.ts:42`) collapses many nearby coordinates into one query. This is the single biggest lever against throttling — far more than retry tuning. The comment says it outright: cache hits are "the main cause of throttling" eliminated (`useTileGraph.ts:34`).
+
+**Mechanism 4 — best-effort degradation + self-heal (the give-up-gracefully layer).** When elevation fails despite retries, `bestEffortElevation` catches it and returns flat `0`m elevation rather than failing the whole build (`useTileGraph.ts:20-31`). The region is marked `degraded`, excluded from the heatmap, and *quietly re-queued* on a 12s timer up to 6 times (`useTileGraph.ts:209-218`, `RETRY_MS`, `MAX_RETRIES`):
+
+```
+  Layers-and-hops — elevation fails → degrade → self-heal
+
+  ┌─ cachedElevation ─┐ miss → fetch throws (429, no budget left)
+  └─────────┬──────────┘
+            ▼ caught by
+  ┌─ bestEffortElevation (useTileGraph:20) ─┐ return 0m, onFallback()
+  └─────────┬───────────────────────────────┘
+            ▼ build completes with degraded=true
+  ┌─ region marked degraded ────────────────┐ excluded from displayGraph
+  └─────────┬───────────────────────────────┘
+            ▼ 12s timer (RETRY_MS), silent, ≤6×
+  ┌─ re-queue same bbox ────────────────────┐ pump() → fresh attempt
+  └──────────────────────────────────────────┘ real grades → stops retrying
+```
+
+This is the runtime's "reconnect" equivalent — not a stream reconnect (there's no stream, per `06`), but a re-issue of a fresh one-shot build until the API recovers.
+
+**Mechanism 5 — pooling: NOT EXERCISED.** flattr sets no connection-pool size, no max-sockets, no keep-alive header, no HTTP/2 multiplexing knob. The platform pools by default (the `03` analysis), but flattr controls none of it. *(Inference from platform defaults; flattr-side fact: no pool config exists.)*
+
+**The hole — NO TIMEOUT, anywhere.** Not one `fetch` is wrapped in `AbortController`/`AbortSignal`. Confirmed by repo-wide search: zero abort usage. The consequence is concrete: if Overpass accepts the TCP connection but never responds (a half-open connection, a hung server), the `await fetch` hangs until the *OS* TCP timeout fires — which can be minutes. At build time, the build stalls. At runtime, `busyRef` stays `true`, so the single-flight gate is *jammed* — no further builds run, panning loads nothing, and the user sees a stuck "Fetching streets" loader with no recovery. The retry budget never even engages, because retries only trigger on a *returned status*, not on a hang. This is the #1 red flag (`08`).
+
+```
+  Comparison — what a timeout would change
+
+  now (no timeout):                 with AbortController (5s):
   ──────────────────────            ───────────────────────────
-  openMeteoProvider()               openMeteoProvider(fetch,
-   → delayMs 300, retries 3           { delayMs: 400, retries: 1 })
-  "take your time, get it right"    "fail fast → degrade to flat quickly
-                                      instead of stalling on doomed 429s"
+  hung fetch → await blocks         hung fetch → abort at 5s
+  busyRef stuck true (runtime)      → throws → catch → busyRef freed
+  gate jammed, loader stuck         → self-heal retry can run
+  recovers only at OS TCP timeout   recovers in 5s
+  (minutes)
 ```
 
-At build time you want fidelity, so retry hard. At runtime you want the screen to stay responsive, so retry *once* and fall back to flat fast. Same code, opposite priorities — a genuinely good use of the injectable options.
+### Move 3 — the principle
 
-#### Move 3 — the principle
+The cheapest request is the one you never send — flattr's resilience is *avoid → space → retry → degrade*, in that order, and the inner two rings (cache, dedup, single-flight) carry far more weight than the retry curves everyone fixates on. But retry-and-backoff is necessary, not sufficient: a retry loop only handles requests that *return*. A request that *hangs* needs a timeout, and that's the one defense flattr is missing. The principle: pair every retry budget with a timeout, because backoff handles errors and the timeout handles silence.
 
-Resilience is layered: avoid the failure (collapse, batch, throttle, cap concurrency), recover from it (retry with backoff), and contain it (degrade gracefully). flattr does all three — the gap isn't the *shape*, it's the *hardening*: no timeout (a hung connection is unbounded), no jitter (retries align), and an inconsistent retry policy across providers. The single highest-leverage fix is a timeout, because without one no other resilience mechanism can bound how long a stuck call holds the pipeline.
+## Primary diagram
 
-═════════════════════════════════════════════════
-PRIMARY DIAGRAM
-═════════════════════════════════════════════════
-
-The complete resilience picture — all four layers and the two gaps.
+The complete resilience machine — four layers, three curves, the gate, and the hole.
 
 ```
-  flattr resilience — avoid → recover → cap → degrade (+ 2 gaps)
+  flattr resilience — complete
 
-  ┌─ AVOID overload (pre-request) ─────────────────────────────┐
-  │  dedup (collapse same-cell pts) · batch 100 · throttle 300ms│
-  └────────────────────────────┬───────────────────────────────┘
-  ┌─ RECOVER (in-request) ──────▼──────────────────────────────┐
-  │  retryable set {429,5xx} · backoff (LINEAR vs EXP — incons.)│
-  │  ✗ NO JITTER (retries align)   ✗ NO TIMEOUT (hang = forever)│
-  └────────────────────────────┬───────────────────────────────┘
-  ┌─ CAP concurrency (cross-request) ─▼────────────────────────┐
-  │  busyRef: 1 build at a time · 2 pending slots ·            │
-  │  corridor PREEMPTS view · overwrite-not-append             │
-  └────────────────────────────┬───────────────────────────────┘
-  ┌─ DEGRADE (whole-build) ─────▼──────────────────────────────┐
-  │  bestEffortElevation: elevation fails → 0m, build continues│
+  ┌─ scheduler (backpressure) ─────────────────────────────────┐
+  │  debounce 600/400ms → single-flight gate (busyRef) →        │
+  │  corridor preempts viewport · backlog collapses to latest   │
+  └────────────────────────┬────────────────────────────────────┘
+                           ▼
+  ┌─ avoid ────────────────────────────────────────────────────┐
+  │  persistent cache (AsyncStorage) + same-cell dedup → skip   │
+  └────────────────────────┬────────────────────────────────────┘
+                           ▼  only misses reach here
+  ┌─ retry + backoff (per API) ────────────────────────────────┐
+  │  Overpass  linear  2/4/6s   {429,502,503,504} ×3            │
+  │  Open-Meteo expo    .6/1.2/2.4s  {429} ×3 (runtime ×1)      │
+  │  Geocode   none     throw immediately                       │
+  │  ⚠ NO TIMEOUT — a hang blocks here forever (jams the gate)  │
+  └────────────────────────┬────────────────────────────────────┘
+                           ▼  budget exhausted
+  ┌─ degrade ──────────────────────────────────────────────────┐
+  │  best-effort flat 0m + self-heal re-queue (12s ×6)          │
   └─────────────────────────────────────────────────────────────┘
+     not exercised: jitter · Retry-After · connection-pool config
 ```
 
-═════════════════════════════════════════════════
-IMPLEMENTATION IN CODEBASE
-═════════════════════════════════════════════════
+## Elaborate
 
-**Use cases.** Reached on every provider call. Most visible in three places: the two retry loops (Overpass, Open-Meteo), the busy-lock pump, and the best-effort wrapper.
+The thing flattr gets right that most juniors miss: retry without jitter causes a *thundering herd* — if many clients (or many batches) back off on the same fixed schedule, they retry in sync and re-overload the server. flattr's curves have no jitter (a gap — see `08`), but its *single-flight gate* accidentally mitigates it at runtime by ensuring only one build retries at a time. At build time, the sequential batch loop does the same. So the herd is small by construction. The proper fix is still jitter on the backoff (`delay * (1 + random())`), cheap to add. For the AI pivot: LLM provider calls have the exact same shape — rate limits, 429s, the need for backoff-with-jitter and a timeout — so this machinery transfers directly.
 
-**The exponential-backoff retry loop** — `pipeline/elevation.ts` (lines 108-119):
+## Interview defense
 
-```
-  pipeline/elevation.ts  (lines 108-119)
+**Q: What's the single biggest weakness in flattr's networking?**
+No request timeout. Every `fetch` can hang indefinitely — confirmed, zero `AbortController` usage. At runtime a hung Overpass request leaves `busyRef` stuck true, jamming the single-flight gate so the whole map stops loading until the OS TCP timeout fires (minutes). The retry budget doesn't help because retries trigger on returned statuses, not on silence. The fix is a 5–10s `AbortController` on each fetch. Anchor: *backoff handles errors; a timeout handles silence — flattr has the first, not the second.*
 
-  for (let attempt = 0; ; attempt++) {
-    const res = await fetchImpl(url);            ← NO timeout — can hang here
-    if (res.ok) { json = await res.json(); break; } ← success exit
-    if (res.status === 429 && attempt < retries) {  ← ONLY 429 retried
-      await sleep(delayMs * 2 ** (attempt + 1));    ← EXPONENTIAL backoff
-      continue;
-    }
-    throw new Error(`Open-Meteo elevation: ${res.status}`); ← give up
-  }
-        │
-        └─ note: retries ONLY 429 (not 5xx, unlike Overpass). No jitter.
-           The await fetchImpl has no AbortSignal → unbounded on a hang
-```
+**Q: Why do Overpass and Open-Meteo use different backoff curves?**
+The curve is tuned to request size and frequency. Overpass uses linear 2/4/6s — heavy queries, infrequent, can afford to wait (`overpass.ts:44`). Open-Meteo uses exponential starting at 600ms — many small batches, quota-driven, wants to recover fast (`elevation.ts:114`). Geocode retries nothing because it's UI-debounced and a dropped suggestion is harmless. Anchor: *retry curve matches the request's size, frequency, and failure mode.*
 
-**The busy-lock pump with corridor priority** — `mobile/src/useTileGraph.ts` (lines 89-129):
+**Q: What stops rapid panning from blowing the rate limit?**
+The single-flight gate in `pump()` — one build in flight, and the pending viewport slot is overwritten by each new pan, so a backlog of stale builds collapses to just the latest (`useTileGraph.ts:166`). Combined with the persistent elevation cache, revisited areas issue zero requests. Anchor: *single-flight + cache; the cheapest request is the one never sent.*
 
-```
-  mobile/src/useTileGraph.ts  (lines 89-129)
+## See also
 
-  const pump = useCallback(() => {
-    if (busyRef.current) return;                 ← LOCK: one build at a time
-    let kind, bbox;
-    if (pendingCorridorRef.current) {            ← corridor wins (priority)
-      kind = "corridor"; bbox = pendingCorridorRef.current;
-      pendingCorridorRef.current = null;
-    } else if (pendingViewRef.current) {         ← else viewport
-      kind = "view"; bbox = pendingViewRef.current;
-      pendingViewRef.current = null;
-    } else return;                               ← nothing pending → idle
-    busyRef.current = true;
-    (async () => {
-      try { ... await fetchOverpass(bbox) ... }
-      catch { /* keep last region */ }           ← Overpass fail → no crash
-      finally { busyRef.current = false; pump(); } ← unlock + DRAIN next
-    })();
-  }, []);
-        │
-        └─ the finally-pump is load-bearing: it drains the next pending
-           request (corridor first). Without it, a queued pan/route after a
-           build would never fire. busyRef caps concurrency at 1 for rate limits
-```
-
-**The best-effort degrade** — `mobile/src/useTileGraph.ts` (lines 18-28):
-
-```
-  mobile/src/useTileGraph.ts  (lines 18-28)
-
-  function bestEffortElevation(p: ElevationProvider): ElevationProvider {
-    return {
-      async sample(points) {
-        try { return await p.sample(points); }   ← try real elevation
-        catch { return points.map(() => 0); }     ← FAIL → flat 0m, no throw
-      },
-    };
-  }
-        │
-        └─ converts a hard elevation dependency into a soft one: a 429 storm
-           degrades grades to 0 rather than failing the build. Coverage > fidelity
-```
-
-═════════════════════════════════════════════════
-ELABORATE
-═════════════════════════════════════════════════
-
-The canonical resilience stack is: timeout → retry → backoff → jitter → circuit breaker → bulkhead. flattr implements retry + backoff and a crude bulkhead (the single-in-flight lock isolates the build from a request storm), but skips timeout, jitter, and circuit breaking. For a hobby-scale app against free APIs that's a defensible subset — except the timeout, which is the one omission that can actually wedge the app (a hung connection holds the busy-lock forever, and no later pan can recover because `busyRef` never clears). The standard fix is `AbortSignal.timeout(ms)` passed to every `fetch`, with the timeout itself being a retryable condition. The free-tier 429 reality documented in `.aipe/project/context.md` is the concrete proof that this layer matters: it's not theoretical resilience, it's the difference between a working build and a quota-exhausted dead one. The general theory of overload, backpressure, and circuit breaking lives in `.aipe/study-distributed-systems/`; the async/event-loop mechanics that `sleep`-via-`setTimeout` and the `await`-in-loop ride on live in `.aipe/study-runtime-systems/`.
-
-═════════════════════════════════════════════════
-INTERVIEW DEFENSE
-═════════════════════════════════════════════════
-
-**Q: "Walk me through your retry strategy."**
-
-Answer: "Retry-with-backoff on transient statuses, with a give-up after N. Overpass retries 429 plus 502/503/504 with linear backoff; Open-Meteo retries only 429 with exponential backoff. I don't retry 4xx because a client error won't fix itself. The honest weaknesses: the two backoff curves are inconsistent, there's no jitter so retries can align, and Nominatim has no retry at all. And the biggest one — no client timeout, so a hung connection blocks the pipeline indefinitely."
-
-```
-  retryable set {429,5xx} · backoff (linear OR exp) · give up after N
-  gaps: no jitter · no timeout · inconsistent policy across providers
-```
-
-Anchor: *the retryable-status set is the load-bearing part — it's what stops you retrying a permanent 4xx forever.*
-
-**Q: "How do you avoid getting rate-limited in the first place?"**
-
-Answer: "Three pre-request moves. Dedup collapses points in the same ~90m DEM cell to one elevation query. Batching packs 100 points per request. And at runtime I cap concurrency at exactly one in-flight build with a busy-lock, with a two-slot pending queue where a route corridor preempts a viewport pan — so a burst of pans collapses into a single follow-up build instead of a storm. The free-tier 429 is a real, documented problem here, so all of this is load-bearing, not premature."
-
-```
-  dedup (collapse) → batch 100 → throttle → 1-in-flight busy-lock
-  burst of pans → overwrite pending slot → ONE follow-up build
-```
-
-Anchor: *the single-in-flight busy-lock is the part people forget — capping concurrency at 1 is the cheapest backpressure against a rate limit.*
-
-**Q: "What's the worst networking bug waiting in this code?"**
-
-Answer: "A hung provider connection. No `fetch` has a timeout, so if Overpass accepts the TCP connection but never responds, `await fetch` hangs. At runtime that's worse than a crash: the busy-lock stays held, `busyRef` never clears, and every subsequent pan or route silently does nothing because `pump` early-returns on the lock. The fix is `AbortSignal.timeout` on every fetch, treating the abort as a retryable failure."
-
-Anchor: *no timeout + a concurrency lock = one stuck call wedges the whole pipeline.*
-
-═════════════════════════════════════════════════
-VALIDATE
-═════════════════════════════════════════════════
-
-1. **Reconstruct:** Write the retry kernel from memory, then name the four overload-containment layers (avoid/recover/cap/degrade) and one mechanism each.
-2. **Explain:** Why does runtime use `retries: 1` while build uses `retries: 3`? (`mobile/src/useTileGraph.ts:111` vs `pipeline/run-build.ts:37`)
-3. **Apply:** A user pans the map 8 times in 2 seconds. Trace what `pump` does (`mobile/src/useTileGraph.ts:89-129`) and how many builds actually fire.
-4. **Defend:** Pick the single highest-leverage resilience fix for this repo and justify it over the alternatives (timeout vs jitter vs unifying backoff vs circuit breaker).
-
-═════════════════════════════════════════════════
-SEE ALSO
-═════════════════════════════════════════════════
-
-- `05-http-semantics-caching-and-cors.md` — the status codes the retry set is built on.
-- `03-tcp-udp-connections-and-sockets.md` — why no timeout means a TCP hang is unbounded.
-- `08-networking-red-flags-audit.md` — the no-timeout and retry-inconsistency findings, ranked.
-- `.aipe/study-distributed-systems/` — backpressure, circuit breaking, overload theory.
-- `.aipe/study-runtime-systems/` — the async/event-loop model `sleep` and `await`-in-loop ride on.
+- `05-http-semantics-caching-and-cors.md` — the status sets behind each retry curve, and the cache in depth
+- `08-networking-red-flags-audit.md` — the missing timeout and jitter, ranked
+- `03-tcp-udp-connections-and-sockets.md` — why pooling is the platform's, not flattr's
+- `.aipe/study-performance-engineering/` — the cache/dedup/debounce as throughput levers

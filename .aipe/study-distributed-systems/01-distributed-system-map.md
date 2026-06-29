@@ -1,199 +1,168 @@
-# Distributed system map
-### the coordination map: nodes, boundaries, messages, ownership, failure domains
-**Industry name:** system/coordination map, failure-domain diagram · **Type:** Language-agnostic
+# The Distributed-System Map
+
+**Industry name(s):** system context / coordination map / failure-domain diagram · *Industry standard*
 
 ## Zoom out, then zoom in
 
-Before any mechanism, look at the whole thing and ask the one question that defines a distributed system: *where do two machines have to coordinate, and which of them can fail independently?* For flattr the answer is small and sharp — there's exactly one kind of boundary, and you cross it the same way every time.
+Before any concept, you need the map: who talks to whom, where a message can be lost, and which boxes can fail independently. In a big system this is a fan-out of services. In flattr it's almost embarrassingly small — and that smallness *is* the first lesson. Most of "distributed systems" doesn't apply here because there's only one node. The discipline is finding the *one* boundary that does.
 
 ```
-  Zoom out — every layer of flattr, with the one boundary that matters marked
+  Zoom out — the whole system as failure domains
 
-  ┌─ UI layer (the phone, RN/Expo) ─────────────────────────────┐
-  │  MapScreen.tsx · AddressBar.tsx · GradeSlider.tsx            │
-  └───────────────────────────┬─────────────────────────────────┘
-                              │  in-process calls (no network)
-  ┌─ Coordination layer ──────▼─────────────────────────────────┐
-  │  ★ useTileGraph.ts — single-flight pump(), corridor>view ★   │ ← we are here
-  └───────────────────────────┬─────────────────────────────────┘
-                              │  ═══ NETWORK BOUNDARY (the only one) ═══
-  ┌─ Provider layer (NOT yours) ──▼──────────────────────────────┐
-  │  Overpass API   ·   Open-Meteo   ·   Nominatim               │
-  │  (separate failure domains — each can 429/time out alone)    │
-  └──────────────────────────────────────────────────────────────┘
+  ┌─ FAILURE DOMAIN 1: your client process (one node) ──────────────┐
+  │  ┌──────────────┐   ┌─────────────────┐   ┌──────────────────┐  │
+  │  │ MapScreen    │──►│ useTileGraph    │──►│ A* router        │  │
+  │  │ (UI)         │   │ (pump, debounce)│   │ (in-memory graph)│  │
+  │  └──────────────┘   └────────┬────────┘   └──────────────────┘  │
+  │   ┌─ local state ─┐          │  ┌─ local persistence ─┐         │
+  │   │ graph.json    │          │  │ elevCache (Async-   │         │
+  │   │ (bundled)     │          │  │ Storage)            │         │
+  │   └───────────────┘          │  └─────────────────────┘         │
+  └──────────────────────────────┼──────────────────────────────────┘
+                                 │  ★ THE ONLY BOUNDARY ★  ← we are here
+            ════════════ HTTP over the public internet ════════════
+                                 │
+  ┌─ FAILURE DOMAIN 2 ─┐ ┌─ DOMAIN 3 ─┐ ┌─ FAILURE DOMAIN 4 ────────┐
+  │ Overpass (OSM)     │ │ Open-Meteo │ │ Nominatim (geocode)       │
+  │ not yours          │ │ not yours  │ │ not yours                 │
+  └────────────────────┘ └────────────┘ └───────────────────────────┘
 ```
 
-Zoom in: the "distributed system" here is not your boxes talking to each other — you only have one box live at a time. It's your box talking to *their* boxes. The coordination map is therefore almost entirely a **failure-domain map**: where does your process end and a machine you can't control begin, and what happens at that seam when the other side misbehaves. That seam — and only that seam — is what this whole guide studies.
+**Zoom in.** A *failure domain* is a set of components that fail together. Inside domain 1, if the router throws, the UI throws — same process, same crash, no network in between, so it's not a *distributed* failure, it's an ordinary exception. The interesting thing happens only when a message crosses into domains 2–4: those can be slow, throttled, or down *while your process keeps running*. That asymmetry — one side alive, the other unreachable — is the entire definition of partial failure, and it only exists across that one double line.
 
 ## Structure pass
 
-**Layers.** Three, top to bottom: UI (the React Native screens), a thin coordination layer (`useTileGraph` at build/runtime, `run-build.ts` at build time), and a provider layer of public APIs you don't own.
-
-**The axis: failure domain — "if this stops responding, who notices and who keeps working?"** Trace it down the stack:
+**Layers.** Three, stacked:
 
 ```
-  One question — "what's an independent failure domain?" — traced down
-
-  ┌──────────────────────────────────────┐
-  │ UI screens                            │  → NOT independent: same process,
-  └──────────────────────────────────────┘    crash together
-      ┌──────────────────────────────────┐
-      │ useTileGraph / run-build          │  → NOT independent: same process
-      └──────────────────────────────────┘
-          ═══ network boundary ═══           ← the answer FLIPS here
-          ┌──────────────────────────────┐
-          │ Overpass                      │  → INDEPENDENT domain (can be down
-          ├──────────────────────────────┤    while Open-Meteo is up, and v.v.)
-          │ Open-Meteo                    │  → INDEPENDENT domain
-          ├──────────────────────────────┤
-          │ Nominatim                     │  → INDEPENDENT domain
-          └──────────────────────────────┘
+  UI / interaction   — MapScreen.tsx
+  Coordination       — useTileGraph.ts (the pump), build pipeline
+  External providers  — Overpass · Open-Meteo · Nominatim (HTTP)
 ```
 
-**The seam.** There's one load-bearing seam: the network boundary. Above it, everything shares fate — a thrown error unwinds the whole call stack, one process, one device. Below it, each provider is its own failure domain that can be slow, throttled, or down *independently of the others*. That's why Overpass and Open-Meteo get **separate** retry policies (`02`) and why the elevation call gets degraded while the streets call still hard-fails — they're different domains with different consequences.
+**The axis to trace: `failure` — where does it originate, and where does it get contained?**
+
+```
+  One axis (failure) traced down the layers
+
+  ┌─ UI layer ────────────────┐  failure here = a render bug
+  │ MapScreen                 │  (in-process, deterministic)
+  └───────────┬───────────────┘
+              │
+  ┌─ Coordination layer ──────▼┐  failure here = a throttle / hang /
+  │ useTileGraph pump          │  network drop — NON-deterministic,
+  │  try/catch contains it     │  ARRIVES from below, contained here
+  └───────────┬───────────────┘
+              │
+  ┌─ Provider layer ──────────▼┐  failure ORIGINATES here:
+  │ Overpass / Open-Meteo /    │  429, 503, timeout, DNS fail —
+  │ Nominatim                  │  outside your control entirely
+  └────────────────────────────┘
+
+  the answer flips at the boundary: above it failure is a bug you
+  fix; below it failure is a fact you absorb. That flip is the seam.
+```
+
+**The seam.** It's the HTTP call itself — `fetchOverpass`, `provider.sample`, `geocode`. That's where the contract between "code I control" and "service I don't" lives, where every retry/timeout/fallback decision has to be made, and where every bug in this guide originates. Map the seam first; the mechanics in `02`–`04` all hang off it.
 
 ## How it works
 
-#### Move 1 — the mental model
+### Move 1 — the mental model
 
-You already know the shape from any frontend app: a component calls `fetch()`, and the server it hits is somebody else's. The mental model for flattr's "distributed system" is just that, drawn honestly — a fan of independent remotes hanging off one client.
-
-```
-  The shape — one client, a fan of independent remotes
-
-                    ┌────────────► Overpass    (domain A)
-                    │
-   [ your process ] ┼────────────► Open-Meteo  (domain B)
-   one failure      │
-   domain           └────────────► Nominatim   (domain C)
-
-  A, B, C fail independently. Your process is the only point
-  that sees all three. There is no coordination BETWEEN A/B/C
-  and none between two copies of "your process" — there's one.
-```
-
-#### Move 2 — walk the map one boundary at a time
-
-**The node inventory.** Name every participant. *Yours:* the build CLI (`pipeline/run-build.ts`) and the phone app (`mobile/`), never both live at once on the same data. *Not yours:* Overpass, Open-Meteo (or Google Elevation), Nominatim. That's the entire node set. The diagram below is a layers-and-hops view of who sends what to whom.
+You already know the shape from any frontend app: a component calls `fetch()` and has to handle loading / success / error. A distributed-system map is just that picture drawn for *every* external call at once, with one extra column — *can this call fail independently of the rest of my app?* If yes, it crosses a failure-domain boundary and earns a place on the map. If no (same process), it's just a function call.
 
 ```
-  Layers-and-hops — messages across the only boundary
+  The map kernel — one row per external dependency
 
-  ┌─ Client (yours) ─┐  hop 1: POST bbox query     ┌─ Overpass ─────┐
-  │  run-build /     │ ──────────────────────────► │  OSM ways      │
-  │  useTileGraph    │  hop 2: JSON elements ◄───── └────────────────┘
-  │                  │
-  │                  │  hop 3: GET lat,lng list    ┌─ Open-Meteo ───┐
-  │                  │ ──────────────────────────► │  DEM elevation │
-  │                  │  hop 4: JSON elevations ◄─── └────────────────┘
-  │                  │
-  │                  │  hop 5: GET ?q=address      ┌─ Nominatim ────┐
-  │                  │ ──────────────────────────► │  geocode rows  │
-  └──────────────────┘  hop 6: JSON rows ◄──────── └────────────────┘
+  caller        │ boundary    │ provider    │ failure modes you must absorb
+  ──────────────┼─────────────┼─────────────┼──────────────────────────────
+  pump/build    │ HTTP POST   │ Overpass    │ 429 502 503 504, hang, offline
+  pump/build    │ HTTP GET    │ Open-Meteo  │ 429, hang, offline
+  geocode UI    │ HTTP GET    │ Nominatim   │ 5xx, hang, offline (1 req/s cap)
 ```
 
-**Ownership.** Who owns state? *You* own the merged graph (`graph.json` at build, the React state in `useTileGraph` at runtime). The providers own the source-of-truth OSM/DEM data; you hold copies. Crucially, no piece of state is *shared* across a boundary that both sides mutate — every hop is a read. That single fact (state is owned, not shared) is why most of the hard distributed problems don't appear here.
+That three-row table *is* flattr's distributed system. Everything else is one node.
 
-**Failure domains.** Each provider is its own. The map's job is to make you ask, per boundary, "what if this one is down?" — and the answers differ: Overpass down ⇒ this build is skipped, retry on next pan (`useTileGraph.ts:121-122`); Open-Meteo down ⇒ degrade to flat, keep going (`:111`); Nominatim down ⇒ the geocode throws and the search box shows nothing. Same boundary type, three different blast radii.
+### Move 2 — walking the map
 
-#### Move 3 — the principle
+**The caller side — who initiates, and from where.** There are two distinct callers hitting the same three providers, at two different lifecycle moments.
 
-A distributed system is defined by its **failure domains**, not its boxes. The map you draw first is always "what fails independently of what," because every later decision — retry here, degrade there, don't bother with a queue — falls out of where the domains split. flattr has exactly one split (your process | their APIs), which is why it gets to skip 80% of the distributed-systems playbook honestly.
+```
+  Two callers, two lifecycles, same providers
+
+  BUILD TIME (once, on a dev laptop)        RUN TIME (on the user's phone)
+  ┌────────────────────────┐                ┌────────────────────────┐
+  │ pipeline/run-build.ts  │                │ useTileGraph.ts pump   │
+  │  → fetchOverpass(BBOX) │                │  → fetchOverpass(bbox) │
+  │  → provider.sample()   │                │  → openMeteoProvider() │
+  └───────────┬────────────┘                └───────────┬────────────┘
+              │ writes data/graph.json                   │ merges into live graph
+              ▼                                          ▼
+        bundled into app  ───────── shipped ──────► read by loadGraph.ts
+```
+
+The build-time caller is in `pipeline/run-build.ts:43-46`: `fetchOverpass(BBOX)` then `buildGraph(...)`. It runs on your machine, writes `data/graph.json`, and that file gets copied into `mobile/assets/graph.json` (per `loadGraph.ts:2-4`). The run-time caller is the pump in `useTileGraph.ts:186-197`, which fetches *additional* viewport/corridor tiles on top of the bundled base.
+
+The lifecycle split matters: a build-time failure is a developer staring at a stack trace who can just re-run; a run-time failure is a user mid-pan whose elevation API just 429'd. **Same provider, completely different blast radius** — the build-time path can crash loudly (`run-build.ts:54-57` sets `exitCode = 1`), the run-time path must degrade silently (`02`, `04`).
+
+**The provider side — what you don't control.** All three are free public endpoints with rate limits and no SLA to you. Open-Meteo's 429 is a documented hazard (the project context literally warns "check `curl` before debugging the pipeline"). Nominatim asks for ~1 req/sec and a `User-Agent` (set in `geocode.ts:22`). You can't make these faster or more reliable — you can only decide what your side does when they misbehave.
+
+**The message side — what crosses, and the key it carries.** Every message across the seam is a read keyed by geography: a bbox (Overpass, Open-Meteo) or a query string / coordinate (Nominatim). No message carries a write. That single fact — *the boundary is read-only* — is what makes delivery semantics trivial (`03`) and retries safe.
+
+### Move 3 — the principle
+
+Drawing the map is the move that tells you which 90% of "distributed systems" to *skip*. flattr has one boundary, so it needs partial-failure handling and graceful degradation — and needs nothing about consensus, replication, or sagas. The map is how you earn the right to say `not yet exercised` instead of cargo-culting infrastructure you don't have a second node to justify.
 
 ## Primary diagram
 
-The full recap — every node, every boundary, every owned-vs-borrowed piece of state in one frame.
-
 ```
-  flattr coordination map — the whole thing
+  flattr distributed-system map — final recap
 
-  ┌─ YOUR FAILURE DOMAIN ───────────────────────────────────────┐
-  │                                                             │
-  │  BUILD TIME                        RUN TIME                  │
-  │  run-build.ts                      useTileGraph.ts          │
-  │    owns: data/graph.json           owns: merged Graph state  │
-  │    pickElevation() chain           pump() single-flight      │
-  │         │                                │                   │
-  └─────────┼────────────────────────────────┼──────────────────┘
-            │        ═══ NETWORK ═══          │
-   ┌────────┼────────┐  ┌──────────────┐  ┌──┼──────────┐
-   ▼        ▼        ▼  ▼              ▼  ▼  ▼          ▼
-  ┌──────────┐  ┌──────────────┐  ┌──────────┐  ┌────────────┐
-  │ Overpass │  │ Open-Meteo / │  │ Nominatim│  │ (OpenFree- │
-  │  streets │  │ Google elev. │  │  geocode │  │  Map tiles)│
-  │  domain A│  │  domain B    │  │  domain C│  │  domain D  │
-  └──────────┘  └──────────────┘  └──────────┘  └────────────┘
-   retry+throw   degrade-to-flat   throw to UI    handled by
-   (overpass.ts) (useTileGraph)    (geocode.ts)   MapLibre
-```
-
-## Implementation in codebase
-
-**Use cases.** The map isn't a file — it's the union of where boundaries are crossed. Two concrete triggers: (1) `npm run build:graph` builds the static artifact by crossing the Overpass + Open-Meteo boundaries once each; (2) panning the map or routing on the phone crosses the same two boundaries again, live, through `useTileGraph`.
-
-The clearest single place the *whole* failure-domain decision is encoded is the elevation-source fallthrough at build time:
-
-```
-  pipeline/run-build.ts  (lines 22–38, pickElevation)
-
-  const key = process.env.GOOGLE_ELEVATION_KEY;
-  if (key) return { provider: googleProvider(key), ... }   ← domain B = Google (paid)
-  if (process.env.FLAT_ELEVATION === "1")
-    return { provider: fixtureProvider(() => 0), ... }      ← NO domain B: synthetic, offline
-  return { provider: openMeteoProvider(), ... }             ← domain B = Open-Meteo (free)
-       │
-       └─ this IS the failure-domain map as code: which remote (if any)
-          owns elevation is chosen here. Drop the fixture branch and an
-          offline build is impossible — that branch is the "boundary B
-          can be removed entirely" escape hatch.
-```
-
-And the runtime edge of the same boundary, where one build crosses two domains in sequence:
-
-```
-  mobile/src/useTileGraph.ts  (lines 106–120, inside pump)
-
-  const osm = await fetchOverpass(bbox);                    ← cross boundary A
-  const elev = bestEffortElevation(openMeteoProvider(...)); ← wrap boundary B
-  const g = await buildGraph(kind, bbox, osm, elev, ...);   ← B crossed inside here
-       │
-       └─ boundary A failing throws and is caught at :121 (skip build);
-          boundary B failing is swallowed INSIDE bestEffortElevation and
-          never reaches here. Two domains, two different fates, same hop.
+  ┌─ NODE (single process: client + build) ─────────────────────────┐
+  │  UI ──► coordination (pump / build) ──► in-memory graph + router │
+  │         local state: graph.json (stale-by-design)                │
+  │         local persistence: elevCache (eventual, self-healing)    │
+  └───────────────────────┬──────────────────────────────────────────┘
+                          │ keyed READ messages (bbox / coord)
+       ═══════════════════╪═══════ the ONE coordination boundary ═════
+                          │ partial failure lives here, nowhere else
+        ┌─────────────────┼──────────────────┐
+        ▼                 ▼                  ▼
+   ┌──────────┐     ┌──────────┐       ┌───────────┐
+   │ Overpass │     │Open-Meteo│       │ Nominatim │   ← failure domains
+   │ retry ✓  │     │ retry ✓  │       │ retry ✗   │     you don't own
+   │ timeout ✗│     │ timeout ✗│       │ timeout ✗ │
+   └──────────┘     └──────────┘       └───────────┘
 ```
 
 ## Elaborate
 
-The "draw the failure domains first" move comes straight from production distributed-systems practice — it's the first thing an SRE does in an incident review and the first thing a design doc draws. The insight flattr makes vivid is the *degenerate* case: when you have exactly one of your own nodes, the map collapses to "me vs. the internet," and the entire discipline reduces to *client-side resilience against remotes you don't control*. That's not a lesser version of distributed systems — it's the base case every larger system is built out of. The retry loop you write against Overpass is the same retry loop a service mesh sidecar writes against a downstream service; there's just one of it instead of thousands.
-
-What would grow the map: spec §11 D(2)/E(2) — a server-side A* over a served multi-city graph. The instant there are two server instances, you gain a *new* boundary type (your-node ↔ your-node) and with it the topics this guide currently marks `not yet exercised`: replication (`05`), leadership (`07`), and cross-boundary workflows (`08`).
+The "system context diagram" is the outermost ring of the C4 model — the picture you draw before any other. In distributed systems the same diagram doubles as a *failure-domain* diagram: each external box is a thing that can fail without taking you down. flattr's version is small enough to teach the discipline cleanly: the whole map is three rows, and only those three rows need any of the machinery in this guide. When this app grows a backend (the trigger discussed in `05`/`07`/`08`), the map grows new boxes inside *your* failure domain — and that's the moment the rest of distributed systems stops being `not yet exercised`.
 
 ## Interview defense
 
-**Q: "Is this a distributed system? Walk me through the architecture."**
-Verdict first: no — it's a single-process engine plus a single-device app over a static artifact. The only distributed surface is the client-to-third-party-API boundary. Sketch the fan diagram: one client, three independent remote failure domains (Overpass, Open-Meteo, Nominatim), no coordination between them and no second copy of my own node. The skill I'd show is recognizing that this is the *base case* of distributed systems — client resilience against uncontrolled remotes — not pretending it's something bigger.
+**Q: "Is flattr a distributed system?"**
+Lead with the verdict, then the nuance.
 
 ```
-   [ my one process ] ──► Overpass   (down? skip+retry)
-                     ──► Open-Meteo (down? degrade to flat)
-                     ──► Nominatim  (down? empty search)
-   no node↔node coordination anywhere. one failure domain on my side.
+  one node + three external deps it doesn't own
+
+  [ your process ] ──HTTP──► [ Overpass / Open-Meteo / Nominatim ]
+        controlled                    not controlled
 ```
-*Anchor: one failure domain on my side; three independent ones on theirs.*
 
-**Q: "What's the most load-bearing part of this map people miss?"**
-That the three providers are *separate* failure domains, so they earn *separate* failure policies. Overpass down kills the build (retry later); Open-Meteo down only kills fidelity (degrade to flat); Nominatim down only kills search. Treating them as one "the network" would force one policy and lose that nuance. *Anchor: separate domains, separate blast radii, separate policies.*
+"Strictly, no — it's a single client with no server, replicas, or workers, so there's nothing to coordinate *internally*. But it has one genuine distributed boundary: it calls three third-party HTTP APIs it doesn't own, and those can be slow, throttled, or down while my process keeps running. That's partial failure, and it's where I put retries, backoff, and graceful degradation. I'd resist calling the whole thing 'distributed' because that word implies coordination between nodes I control — there are none yet."
 
-## Validate
+**Anchor:** *One boundary, three read-only deps — the map tells you what to skip.*
 
-1. **Reconstruct:** draw flattr's failure-domain map from memory. How many of *your* nodes are live at once? (One.) How many independent remote domains? (Three: Overpass, Open-Meteo, Nominatim — four with OpenFreeMap tiles.)
-2. **Explain:** why does `pipeline/run-build.ts:22-38` count as "the failure-domain map encoded as code"?
-3. **Apply:** Nominatim starts returning 503s. Trace the blast radius using `pipeline/geocode.ts:24`. Whose screen breaks, and does routing still work?
-4. **Defend:** someone says "add a retry queue so all three providers share one resilience layer." Argue why the *separate* policies at `pipeline/overpass.ts:18` vs `pipeline/elevation.ts:114` vs `useTileGraph.ts:18-28` are correct given the different blast radii.
+**Q: "Where would partial failure actually hurt you here?"**
+The run-time pump path, not the build path. Build-time failures crash loudly and you re-run; run-time failures hit a user mid-interaction, so they have to degrade. Point at `useTileGraph.ts:186` vs `run-build.ts:43`.
+
+**Anchor:** *Same provider, different blast radius — lifecycle decides the failure policy.*
 
 ## See also
 
-- `02-partial-failure-timeouts-and-retries.md` — what happens at each boundary when the remote misbehaves.
-- `04-consistency-models-and-staleness.md` — the owned-copy-vs-source-of-truth split this map exposes.
-- `.aipe/study-system-design/` — the same boundary at the architecture/scale altitude.
-- `.aipe/study-networking/` — the transport mechanics of each hop drawn here.
+- `02-partial-failure-timeouts-and-retries.md` — the seam's failure handling in detail.
+- `04-consistency-models-and-staleness.md` — why graph.json is stale and how the cache converges.
+- `09-distributed-systems-red-flags-audit.md` — the ranked risks on this map.
+- sibling `study-system-design` — the same map read for architecture/scale instead of failure.

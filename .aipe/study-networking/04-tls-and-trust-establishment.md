@@ -1,206 +1,156 @@
-# 04 — TLS and trust establishment
-### encryption in transit, certificates, trust establishment, and termination points
-**Industry name:** TLS / transport security — *Industry standard*
+# 04 — TLS and Trust Establishment
 
-═════════════════════════════════════════════════
-ZOOM OUT, THEN ZOOM IN
-═════════════════════════════════════════════════
+**Encryption in transit, certificates, termination** · *Industry standard*
 
-Every `https://` URL in flattr means a TLS handshake happened before any HTTP byte moved — certificate exchange, key agreement, an encrypted channel. flattr does none of this explicitly; it writes `https://` and the platform does the rest. The lesson is short and sharp: flattr terminates no TLS, pins no certificates, and trusts whatever the OS trust store trusts.
+## Zoom out, then zoom in
+
+Every flattr URL is `https://`. That single character `s` is the whole TLS story: it tells `fetch` to do a TLS handshake before sending any HTTP, so the bytes are encrypted and the server's identity is verified against the OS trust store. flattr writes the `s` and trusts the platform for everything after it.
 
 ```
-  Zoom out — where TLS sits
+  Zoom out — where TLS sits in the request
 
-  ┌─ App / Build layer ──────────────────────────────┐
-  │  fetch("https://...")   ← the `s` is the whole    │
-  │                            decision flattr makes   │
-  └─────────────────────────┬─────────────────────────┘
-  ┌─ ★ TLS layer (platform: handshake + verify) ★ ───┐
-  │  cert chain check vs OS trust store · key exchange│ ← we are here
-  │  · encrypt/decrypt the byte stream                │
-  └─────────────────────────┬─────────────────────────┘
-  ┌─ Transport (TCP) ────────▼────────────────────────┐
-  │  the connection TLS rides on                      │
+  ┌─ App ──────────────────────────────────────────────┐
+  │  fetch("https://...")   ← the "s" requests TLS      │ ← we are here
+  └────────────────────────┬───────────────────────────┘
+                           │
+  ┌─ TCP (from 03) ────────▼───────────────────────────┐
+  │  socket open on port 443                            │
+  └────────────────────────┬───────────────────────────┘
+                           │
+  ┌─ ★ TLS (OS / platform) ★ ──────────────────────────┐
+  │  handshake · cert verify vs OS trust store · cipher │
+  └────────────────────────┬───────────────────────────┘
+                           │ encrypted channel
+  ┌─ HTTP ─────────────────▼───────────────────────────┐
+  │  request/response, now confidential + authenticated │
   └────────────────────────────────────────────────────┘
 ```
 
-Zoom in: TLS is "is this channel encrypted and am I talking to who I think I'm talking to?" In flattr the answer is "yes, because every URL is `https://`, and trust is delegated to the platform's trust store." flattr verifies nothing itself.
+Zoom in: flattr's only TLS decision is *use HTTPS for all four hosts* — which it does, with zero exceptions. There is no certificate pinning, no custom CA, no `rejectUnauthorized: false`, no mutual TLS. The handshake, the cert chain validation, and the termination all happen below flattr's floor, in the platform.
 
-═════════════════════════════════════════════════
-THE STRUCTURE PASS
-═════════════════════════════════════════════════
+## Structure pass
 
-**Layers.** URL scheme (`https://`, flattr's only TLS decision) → TLS session (platform: handshake, cert verification, encryption) → TCP (the connection underneath).
+**Layers.** Scheme choice (flattr) → handshake + cert verify (platform) → trust store (OS). flattr lives only in the top layer.
 
-**Axis — trust (who do you trust, and who can tamper?).**
+**Axis = trust (who verifies the server is who it claims?).** The OS does, against its built-in CA store. flattr neither supplies a CA nor overrides verification. Trace the axis and it's flat across flattr's code — flattr makes *one* trust decision (HTTPS, so verify) and then trusts the platform to enforce it.
 
 ```
-  Axis "who establishes trust?" — across the TLS boundary
+  axis traced: who verifies the server's certificate?
 
-  ┌─ flattr ───────────┐  TLS handshake  ┌─ provider ───────────┐
-  │ writes "https://"  │ ════╪══════════►│ presents a cert chain│
-  │ verifies NOTHING   │  (trust est.)   │ signed by a CA       │
-  └────────────────────┘                 └──────────────────────┘
-            │                                      │
-            └─ the OS trust store decides if that ─┘
-               cert chain is valid. flattr inherits that decision.
-
-  trust is ESTABLISHED at the handshake, DELEGATED to the platform
+  ┌─ flattr ───────────────┐  seam  ┌─ OS / platform ───────────┐
+  │ decides: use HTTPS      │ ══╪══► │ verifies cert vs CA store │
+  │ (implies verification)  │ flips  │ rejects bad/expired certs │
+  └────────────────────────┘        └───────────────────────────┘
 ```
 
-**Seams.** The seam is the `https://` scheme string. On flattr's side, the only TLS-relevant act is choosing `https` over `http`. Everything past that — which CAs are trusted, whether the cert is expired, whether the hostname matches — flips to the platform trust store. flattr never sees the certificate, never pins it, never overrides verification.
+**Seam.** The `https://` scheme in the URL is the trust seam. Above it, flattr's decision to encrypt-and-verify. Below it, the platform's enforcement. flattr cannot weaken or strengthen what's below — there's no pinning code and no verification bypass, which is the correct default.
 
-═════════════════════════════════════════════════
-HOW IT WORKS
-═════════════════════════════════════════════════
+## How it works
 
-#### Move 1 — the mental model
+### Move 1 — the mental model
 
-You know how a browser shows a padlock and you never think about *why* you trust the site? It's because the cert chains up to a CA the browser already trusts. flattr is the non-browser version: the platform (Node at build, the device at runtime) carries a trust store of CAs, and the TLS handshake either chains to one of them or fails the connection. flattr's whole TLS posture is "use `https`, trust the store."
+You've seen the lock icon in a browser. That lock is a completed TLS handshake: the client and server agreed on a cipher, and the client verified the server's certificate chains up to a CA it trusts. flattr gets the same lock on every API call for free, because `https://` plus a platform `fetch` runs that handshake automatically. flattr's job is just to never *opt out* of it — and it never does.
 
 ```
-  Pattern — TLS handshake, then encrypted HTTP
+  Pattern — the TLS handshake, run by the platform per host
 
-   fetch("https://overpass-api.de/...")
-        │
-        │  TCP connect (port 443)
-        │  ── ClientHello ──►
-        │  ◄── ServerHello + CERT CHAIN ──
-        │  verify chain vs OS trust store   ← platform does this
-        │  ── key exchange ──►
-        │  ═══ encrypted channel up ═══
-        │  send the HTTP request (now encrypted)
-        ▼
-   Response (decrypted by the platform, handed to flattr as plaintext)
+  flattr: fetch("https://api.open-meteo.com/...")
+                │
+                ▼  (platform, once per fresh connection)
+   ClientHello ──────────────────────────────► server
+   server cert + ServerHello ◄────────────────
+   verify cert vs OS CA store ──┐
+        │ valid                  │ invalid → fetch REJECTS (throws)
+        ▼                        ▼
+   key exchange ──► encrypted    flattr's catch{} handles it
+   HTTP now flows confidentially
 ```
 
-#### Move 2 — walking the trust establishment
+The handshake happens once per fresh TCP connection and is amortized across reused connections (the keep-alive from `03`). flattr never triggers it explicitly — it's a side effect of the first `fetch` to each host.
 
-**Every endpoint is HTTPS.** Check the scheme on all five: `https://overpass-api.de` (`pipeline/overpass.ts:4`), `https://api.open-meteo.com` (`pipeline/elevation.ts:106`), `https://maps.googleapis.com` (`pipeline/elevation.ts:72`), `https://nominatim.openstreetmap.org` (`pipeline/geocode.ts:5`), `https://tiles.openfreemap.org` (`mobile/src/MapScreen.tsx:21`). There is no `http://` anywhere in the network code. So encryption-in-transit is universal — nothing flattr sends crosses the wire in cleartext.
+### Move 2 — walk the trust facts
 
-```
-  Trust inventory — all HTTPS, all platform-verified
-
-  overpass-api.de            https ✓   verify: OS store
-  api.open-meteo.com         https ✓   verify: OS store
-  maps.googleapis.com        https ✓   verify: OS store
-  nominatim.openstreetmap.org https ✓  verify: OS store
-  tiles.openfreemap.org      https ✓   verify: OS store (MapLibre)
-  ── no http:// · no cert pinning · no custom CA ──
-```
-
-**Trust is fully delegated — no pinning, no custom CA.** flattr does not pin any certificate, does not ship a custom CA bundle, does not set `rejectUnauthorized` or any TLS option. It relies entirely on the platform's default trust chain validation. Inferred consequence: if a provider rotates to a cert signed by a CA the device trusts, flattr keeps working with zero changes — and if a man-in-the-middle presented a cert *not* chaining to a trusted CA, the platform would reject the connection and `fetch` would throw, before flattr sees any data. That's the right default for a client app; pinning would add brittleness (broken on every cert rotation) for marginal benefit against a threat model flattr doesn't face.
-
-**Termination: flattr terminates nothing.** TLS terminates at the *provider's* edge (or their CDN). flattr is purely a TLS *client* on every connection — it never presents a server certificate because it never acts as a server. There's no inbound TLS to terminate because nothing connects to flattr. This is the mirror image of a system where you'd run your own server and manage cert renewal; flattr has zero certificate operational burden.
+**Fact 1 — all four hosts are HTTPS, no exceptions.** Every endpoint constant uses `https://`:
 
 ```
-  Layers-and-hops — flattr is always the TLS client
-
-  ┌─ flattr (TLS CLIENT) ─┐  encrypted   ┌─ provider edge (TLS server) ─┐
-  │ presents no cert      │ ═══════════► │ presents cert, TERMINATES TLS │
-  │ verifies server cert  │ ◄═══════════ │ (their CDN/origin)            │
-  └───────────────────────┘              └───────────────────────────────┘
-       flattr never terminates TLS · never holds a server cert
+  https://overpass-api.de/api/interpreter        overpass.ts:4
+  https://api.open-meteo.com/v1/elevation         elevation.ts:106
+  https://maps.googleapis.com/maps/api/elevation  elevation.ts:72
+  https://nominatim.openstreetmap.org/search      geocode.ts:5
 ```
 
-**The one credential on the wire rides inside TLS.** The Google Elevation API key (`pipeline/elevation.ts:72`) is the only secret flattr ever transmits. It goes as a `&key=` query parameter — which means TLS is doing real work here: the key is encrypted in transit by the HTTPS channel, so it's not visible to a network observer. (It *would* land in provider-side server logs and any proxy that terminates TLS, which is a `05`/secrets concern, not a transit concern — in transit, TLS protects it.) Three of the four default providers send no credential at all.
+No `http://` anywhere in the network code (confirmed by grep). So every byte — including the user's typed address going to Nominatim and the Google API key going to Google — travels encrypted.
 
-#### Move 3 — the principle
-
-For a pure client app, TLS is a scheme decision and a trust-store dependency, nothing more. You get encryption and server-identity verification for free by writing `https://` and trusting the platform. The operational cost of TLS — cert issuance, renewal, rotation, pinning maintenance — only appears when you run a *server*, and flattr runs none. The discipline is just: never write `http://`, and let the platform verify.
-
-═════════════════════════════════════════════════
-PRIMARY DIAGRAM
-═════════════════════════════════════════════════
-
-The full TLS picture — flattr's one decision, the platform's verification, the provider's termination.
+**Fact 2 — cert verification is the platform default, untouched.** There is no TLS configuration in the repo: no `rejectUnauthorized`, no `NODE_TLS_REJECT_UNAUTHORIZED`, no custom `https.Agent` with a CA bundle, no `ca:` option, no pinning library. This means the platform's *default* verification is in force — the OS trust store validates each server's cert chain, and a bad/expired/mismatched cert makes `fetch` throw, which flattr's `try/catch` handles as a normal failure.
 
 ```
-  flattr TLS — one decision, fully delegated trust
+  Layers-and-hops — where a cert failure surfaces in flattr
 
-  ┌─ flattr (decides: https) ──────────────────────────────────┐
-  │  every URL is "https://"  ·  the API key rides inside TLS  │
-  └────────────────────────────┬───────────────────────────────┘
-            https scheme seam   │
-  ┌─ Platform (establishes trust) ▼────────────────────────────┐
-  │  ClientHello → recv cert chain → verify vs OS trust store  │
-  │  → key exchange → encrypted channel.  No pinning, no custom CA│
-  └────────────────────────────┬───────────────────────────────┘
-            encrypted TCP       │
-  ┌─ Provider edge (TERMINATES TLS) ▼──────────────────────────┐
-  │  presents cert, decrypts, serves.  flattr never terminates.│
-  └─────────────────────────────────────────────────────────────┘
+  ┌─ OS TLS ────────────┐ hop: bad cert → reject
+  │ verify fails        │ ─────────────────────────┐
+  └─────────────────────┘                          ▼
+  ┌─ platform fetch ────┐                  throws / rejects Promise
+  │ Promise rejects     │ ─────────────────────────┐
+  └─────────────────────┘                          ▼
+  ┌─ flattr ────────────┐          catch {} → build degrades / route errors
+  │ overpass.ts:46 throw │          (same path as any network failure)
+  │ useTileGraph:219 catch                          
+  └──────────────────────┘
 ```
 
-═════════════════════════════════════════════════
-IMPLEMENTATION IN CODEBASE
-═════════════════════════════════════════════════
+A TLS failure isn't special-cased — it lands in the same `catch` as a 500 or a dropped connection. At build time it propagates and fails the build (`run-build.ts:54`); at runtime it degrades the region (`useTileGraph.ts:219`).
 
-**Use cases.** TLS is "reached for" implicitly on every call via the `https://` scheme. The only TLS-adjacent *decision* visible in code is the API key transmission — the one secret that depends on TLS to stay confidential in transit.
+**Fact 3 — termination is at the provider, flattr terminates nothing.** flattr has no server, so there's no TLS termination point flattr owns — no nginx, no load balancer offloading TLS, no cert flattr presents. Each connection terminates at the provider's own edge (Overpass's server, Open-Meteo's CDN, Nominatim's infra). flattr is purely a TLS *client*, never a server. *(Inference about provider-side edge architecture; flattr-side fact is certain — no server exists.)*
 
-**The only credential on the wire** — `pipeline/elevation.ts` (lines 65-75):
+**Fact 4 — the User-Agent identity is sent inside the encrypted channel.** Each request includes a `User-Agent` header identifying flattr (`overpass.ts:38`, `geocode.ts:22`, etc.). Because the channel is TLS, that identity — and on the Google path, the API key in the query string (`elevation.ts:72`) — is confidential in transit. That's the one place TLS does real work for flattr's security posture: the Google key never travels in cleartext. *(Security depth on the key lives in `.aipe/study-security/`; here the point is only that TLS protects it on the wire.)*
 
-```
-  pipeline/elevation.ts  (lines 65-75)
+### Move 2.5 — current vs future
 
-  export function googleProvider(apiKey: string, ...) {
-    ...
-    const url = `https://maps.googleapis.com/maps/api/elevation/json
-                  ?locations=...&key=${apiKey}`;   ← key in query string
-    const res = await fetchImpl(url);              ← sent over HTTPS
-        │
-        └─ the `https` means the full URL — INCLUDING ?key= — is encrypted
-           on the wire. A network sniffer sees only the encrypted bytes.
-           (It IS visible in provider logs; that's a secrets-handling issue,
-           covered in 05, not a transit issue. In transit, TLS protects it.)
-  }
-```
+**Now:** TLS as a pure client, platform-verified, no pinning. **If flattr added cert pinning:** it would harden the provider calls against a compromised CA, at the cost of breakage when a provider rotates certs — high-maintenance for free public APIs that rotate on their own schedule. Not worth it here. **If flattr grew a backend:** flattr would become a TLS *server* too, and termination (where TLS ends — at a load balancer or the app) would become a real architecture decision. Neither is exercised today.
 
-The key as a query param is fine *for transit* precisely because TLS encrypts the whole request line. The thing to flag isn't the wire — it's that query-string secrets tend to leak into logs and `Referer` headers; on the wire itself, it's protected.
+### Move 3 — the principle
 
-**The absence of TLS config — the finding.** A search for `rejectUnauthorized`, `ca:`, `pfx`, `cert`, `pinning`, or any `https.Agent` TLS option across the repo finds nothing. flattr sets no TLS options anywhere. This is correct and `not yet exercised` simultaneously: correct because the platform defaults are what you want for a client, `not yet exercised` because flattr has never had a reason to override them.
+For a client-only app hitting public APIs, "use `https://` and don't override verification" is the complete and correct TLS posture. Pinning and custom CAs are hardening you add only when you control both ends or face a specific threat model. Adding them speculatively trades a real maintenance cost for a benefit you can't yet use. flattr's restraint here is the right call.
 
-═════════════════════════════════════════════════
-ELABORATE
-═════════════════════════════════════════════════
+## Primary diagram
 
-Certificate pinning — hardcoding which cert/CA a host is allowed to present — is the one TLS hardening that mobile apps sometimes add, to defend against a compromised CA or a corporate MITM proxy. flattr doesn't pin, and it shouldn't: pinning these public OSM endpoints would mean re-shipping the app every time a provider rotates certs, trading real availability for defense against a threat (CA compromise targeting a free elevation API) nobody is mounting. The right posture for a client talking to public infrastructure is exactly what flattr does — `https://` plus platform trust. Where pinning earns its place is high-value targets (banking, your own auth backend), and flattr has neither. The general trust-boundary analysis (is each boundary *safe*?) belongs to `.aipe/study-security/`; this guide only establishes that the channel is encrypted and platform-verified.
-
-═════════════════════════════════════════════════
-INTERVIEW DEFENSE
-═════════════════════════════════════════════════
-
-**Q: "How does your app handle TLS and certificate verification?"**
-
-Answer: "Every endpoint is `https://`, so everything's encrypted in transit — there's no `http://` in the code. I delegate trust entirely to the platform store: no cert pinning, no custom CA, no TLS options set. flattr is always the TLS client and terminates nothing, because it runs no server. The only secret on the wire is the optional Google Elevation key, and it rides inside the HTTPS channel as a query param, so it's encrypted in transit."
+The full TLS picture — flattr's one decision, the platform's enforcement, where failures land.
 
 ```
-  https everywhere → encrypted, no cleartext
-  trust: OS store, no pinning (correct for public APIs)
-  flattr = TLS client only, terminates nothing
+  flattr TLS — one decision, delegated enforcement
+
+  ┌─ flattr decides ────────────────────────────────────────┐
+  │  https:// on all 4 hosts  ·  no verification override     │
+  │  no pinning · no custom CA · no mutual TLS                │
+  └────────────────────────┬─────────────────────────────────┘
+                           │ the "s" requests TLS
+  ┌─ platform enforces (OS trust store) ────────────────────┐
+  │  handshake → cert chain verify → cipher → encrypted HTTP │
+  │  bad cert → Promise rejects                              │
+  └────────────────────────┬─────────────────────────────────┘
+                           │ rejection
+  ┌─ flattr handles ────────▼────────────────────────────────┐
+  │  build time: throws, build fails (run-build.ts:54)       │
+  │  runtime: catch → degrade region (useTileGraph.ts:219)   │
+  └──────────────────────────────────────────────────────────┘
+     not exercised: pinning · custom CA · mTLS · TLS termination
+                    (flattr owns no server)
 ```
 
-Anchor: *for a pure client, TLS is one scheme decision plus a trust-store dependency — no cert ops.*
+## Elaborate
 
-**Q: "Why don't you pin certificates?"**
+The interesting thing about TLS in a no-backend app is how *little* there is to do and how easy it is to do wrong anyway — the classic mistake is `rejectUnauthorized: false` to "make the cert error go away" during development, which silently disables the entire point of TLS. flattr has none of that, which is worth noting precisely because it's the common foot-gun. When the AI-engineering pivot adds an LLM provider, the same rule holds: HTTPS, platform verification, and the provider key protected by the channel — never a verification bypass to unblock a demo.
 
-Answer: "Pinning would break the app on every provider cert rotation, and the threat it defends against — a compromised CA targeting a free, keyless elevation API — isn't flattr's threat model. The cost (brittleness, re-shipping on rotation) outweighs the benefit. Pinning earns its place against high-value targets like an auth backend; flattr talks to public OSM infrastructure."
+## Interview defense
 
-Anchor: *pinning trades availability for protection against a threat flattr doesn't face.*
+**Q: How does flattr verify it's actually talking to Open-Meteo and not a man in the middle?**
+The `https://` scheme triggers a TLS handshake where the platform verifies Open-Meteo's certificate against the OS trust store; flattr overrides nothing, so a forged or mismatched cert makes `fetch` reject and lands in the normal `catch`. flattr writes the `s` and trusts the platform for the rest. Anchor: *one decision — HTTPS, no override.*
 
-═════════════════════════════════════════════════
-VALIDATE
-═════════════════════════════════════════════════
+**Q: Where does flattr terminate TLS?**
+Nowhere — flattr owns no server and is a TLS client only. Each connection terminates at the provider's own edge. The User-Agent identity and (on the Google path) the API key ride inside the encrypted channel, so they're confidential in transit. Anchor: *client-only; termination is the provider's, not flattr's.*
 
-1. **Reconstruct:** What's the *only* TLS decision flattr makes per request, and where does trust verification actually happen?
-2. **Explain:** Why does flattr terminate no TLS? (Hint: what role does flattr play on every connection?)
-3. **Apply:** A new provider only offers `http://`. What breaks, and what's the minimum you'd require before integrating it?
-4. **Defend:** Argue for and against pinning `overpass-api.de`'s certificate, then commit to flattr's actual choice and justify it.
+## See also
 
-═════════════════════════════════════════════════
-SEE ALSO
-═════════════════════════════════════════════════
-
-- `03-tcp-udp-connections-and-sockets.md` — the TCP connection TLS rides on.
-- `05-http-semantics-caching-and-cors.md` — the API key as a query param and where it can leak off the wire.
-- `.aipe/study-security/` — whether each trust boundary is actually safe.
+- `03-tcp-udp-connections-and-sockets.md` — the TCP connection TLS rides on
+- `02-dns-routing-and-addressing.md` — resolving the name before the handshake
+- `.aipe/study-security/` — the Google API key handling and trust-boundary depth

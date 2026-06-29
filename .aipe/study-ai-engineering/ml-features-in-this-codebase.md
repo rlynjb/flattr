@@ -1,44 +1,127 @@
 # ML features in this codebase
 
-**This codebase does not currently use any machine-learning features.**
+**Verdict first: flattr does not currently use any machine-learning
+features.** No trained model, no inference runtime (no ONNX, no TFLite, no
+MediaPipe, no Core ML), no training pipeline, no feature engineering, no
+dataset. SECTION 04's ML concepts are covered in `08-machine-learning/` as
+study material — taught as new ground, not as a refresher.
 
-No supervised pipeline, no training, no learned features, no train/val/test
-split, no model artifacts, no on-device inference, no quantization, no drift
-detection, no recommender. Nothing in the repo learns from data.
+## What's "intelligent" in flattr — and why it isn't ML
 
-## How to verify
+flattr's decision-making is **classical search over a hand-built graph**,
+decided by deterministic rules. It is the opposite of a learned model:
+every output is reproducible and every cost is hand-coded.
 
-The same grep used for the AI file (`openai|...|mediapipe|tensorflow|pytorch|
-onnx|inference|...`) returns zero source-file hits. Neither `package.json`
-declares an ML runtime. The heaviest dependency in `mobile/` is
-`@maplibre/maplibre-react-native` — a map renderer, not an ML framework.
+```
+flattr's "intelligence" — algorithmic, not learned
 
-## What looks like ML but isn't
+  Node {lat, lng, elevationM}
+  Edge {lengthM, riseM, gradePct (signed), absGradePct}
+        │
+        ▼  hand-written cost function (features/routing/cost.ts)
+  ┌──────────────────────────────────────────────────┐
+  │ A* search, admissible haversine heuristic         │
+  │ (features/routing/astar.ts + pqueue.ts binary heap)│
+  └──────────────────────────────────────────────────┘
+        │
+        ▼
+  shortest "flat-enough" path — DETERMINISTIC, no weights learned
 
-- **The cost model** (`features/routing/cost.ts`) is a *hand-written* grade
-  penalty — a deterministic function keyed off `userMax`, not a function
-  *learned* from data.
-- **The grade classifier** (`features/grade/classify.ts`) maps a signed grade
-  to a band and color by fixed thresholds. It's classification by `if`, not by
-  a trained classifier.
-- **The benchmark harness** (`bench/run.ts`, `bench/report.ts`) runs and
-  compares routing algorithms over fixed fixtures. It's an eval harness in
-  spirit — and the deterministic analog an ML/LLM eval harness would be built
-  in the image of — but it scores algorithms, not models.
+  contrast: an ML pipeline would LEARN the edge costs from data.
+            flattr SETS them with a formula. That's the whole difference.
+```
 
-## The one genuine future-ML idea
+There's a tempting false positive worth killing explicitly: the **grade
+classifier** in `features/grade/classify.ts` has "classifier" in the name.
+It is **not** an ML classifier. It's a threshold table — signed grade →
+band → color — pure `if`/range logic. No training, no parameters fit to
+data. A confusion matrix would be meaningless against it because there's
+nothing learned to be confused.
 
-flattr's comfort cost curve (`features/routing/cost.ts`) is hand-tuned. A real
-ML direction would be to *learn* that curve from user behavior — which routes
-people actually accept vs reject at a given `userMax`. That's the only place ML
-would earn its keep, and nothing in the repo touches it today. It would need a
-data-collection layer that doesn't exist (the app has no backend, no accounts,
-no telemetry — `mobile/assets/graph.json` is a static read-only artifact).
+## You've shipped ML elsewhere — here's where it'd attach here
 
-## The ML concepts are covered as study material
+Your one shipped ML pipeline is **contrl**: on-device MediaPipe
+pose-landmark detection feeding a rep counter, inside a real-time
+frame-rate budget, no network in the hot path. That's the closest analog
+to anything flattr could grow.
 
-See `00-overview.md` §08 (classical ML) and §09 (ML system-design templates) —
-both walked as `not yet exercised`, with the cost-curve-learning idea named as
-the single honest future seam. The reader's prior ML hands-on (contrl's
-MediaPipe pose pipeline, per `me.md`) is real ML experience; flattr simply
-isn't an ML project.
+Where ML would plausibly attach in flattr (all currently absent):
+
+```
+hypothetical ML attachment points (none exist today)
+
+  ┌─ build pipeline ──────────────────────────────────────┐
+  │ pipeline/elevation.ts  → learned elevation infill      │
+  │   (today: Open-Meteo API lookup, not a model)          │
+  │ pipeline/grade.ts      → learned surface/grade smoothing│
+  │   (today: arithmetic from rise/length)                 │
+  └────────────────────────────────────────────────────────┘
+  ┌─ routing cost ────────────────────────────────────────┐
+  │ features/routing/cost.ts → LEARN edge cost from rider   │
+  │   behavior instead of the hand-coded grade penalty.     │
+  │   This is the real ML opportunity: a learned-to-rank or │
+  │   regression model over edge features.                  │
+  └────────────────────────────────────────────────────────┘
+```
+
+The honest read: flattr's project constraint is **hand-rolled graph +
+router only** (`docs/flattr-spec.md` §14) — no Valhalla/OSRM, and by
+extension the routing logic is deliberately *not* a black box. Replacing
+the hand-coded `cost.ts` with a learned model would be a real architectural
+shift, not a drop-in. That's why it's a future exercise, not a seam you'd
+add casually.
+
+## The one place a learned cost would attach
+
+**Where:** `features/routing/cost.ts` — the signed directed-grade penalty.
+
+Today this is a formula: grade in, penalty out, with two hard invariants
+from the spec — the penalty must stay **≥ 0** (so A*'s heuristic remains
+admissible) and `BLOCKED` is a large-finite value, not `Infinity` (so
+"no flat route" stays distinct from "disconnected"). Any learned model
+that replaced it would have to preserve both invariants, which constrains
+the model class hard: you'd need a **monotone, non-negative** cost — closer
+to isotonic regression or a constrained GBM than a free-form neural net.
+
+That constraint is itself the lesson. flattr's invariants tell you which ML
+you're allowed to use here, before you pick a model.
+
+## Project exercises
+
+### MLX.1 — Learned edge cost (replace the hand-coded penalty)
+
+- **What to build:** a regression/learned-to-rank model over edge features
+  (`gradePct`, `lengthM`, `kind`, maybe surface) that predicts a
+  rider-perceived cost, swapped in behind the existing `cost.ts` interface.
+- **Why it earns its place:** it's the only ML feature that touches the
+  *core* of flattr, and it forces you to respect the admissibility (`≥ 0`)
+  and `BLOCKED`-finite invariants — real ML-under-constraints, not a toy.
+- **Files to touch:** `features/routing/cost.ts` (interface stays, body
+  becomes model inference), a new training script under `pipeline/` or a
+  sibling `ml/`, plus `bench/` to prove route quality didn't regress.
+- **Done when:** the learned cost produces routes a held-out set of riders
+  prefer over the hand-coded penalty, *and* `npm run bench` confirms A*
+  still terminates with the heuristic admissible (no negative costs leaked).
+- **Estimated effort:** multi-day; needs a labeled dataset that doesn't
+  exist yet — call that out before starting.
+
+### MLX.2 — On-device elevation/grade infill (contrl-shaped)
+
+- **What to build:** a small on-device model to infill or smooth elevation
+  where Open-Meteo returns gaps, removing a network dependency from the
+  build pipeline.
+- **Why it earns its place:** closest to your shipped contrl pattern
+  (on-device inference, no network in the path) and directly addresses the
+  documented Open-Meteo 429 caveat in the project context.
+- **Files to touch:** `pipeline/elevation.ts`, `pipeline/grade.ts`, plus a
+  model artifact + inference shim.
+- **Done when:** the build produces a complete `graph.json` with Open-Meteo
+  unavailable, and grade values stay within a measured error band of the
+  API ground truth.
+- **Estimated effort:** multi-day; the contrl experience transfers.
+
+## See also
+
+- [`ai-features-in-this-codebase.md`](ai-features-in-this-codebase.md) — the LLM half (also: none) + the three seams
+- [`08-machine-learning/01-supervised-pipeline.md`](08-machine-learning/01-supervised-pipeline.md)
+- [`08-machine-learning/12-on-device-inference.md`](08-machine-learning/12-on-device-inference.md)

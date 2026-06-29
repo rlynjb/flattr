@@ -1,77 +1,65 @@
-# Recursion, backtracking & dynamic programming
+# Recursion, Backtracking & Dynamic Programming
 
-**Industry names:** recursion / iterative-recursion · backtracking · dynamic
-programming (memoization / tabulation) · optimal substructure · path
-reconstruction. **Type:** Industry standard. The repo uses **iterative path
-reconstruction** (the iterative form of a recursive walk) and **spatial
-bucketing** (a fold/aggregation). Backtracking and classic DP are
-`not yet exercised`; this file teaches them and names where they'd land.
+**Industry names:** path reconstruction, back-pointer chasing,
+backtracking, memoization, tabulation, optimal substructure.
+**Type:** Industry standard.
 
 ---
 
-## Zoom out, then zoom in
+## Zoom out — where this concept lives
 
-Three of this file's ideas show up in `flattr`, all in the *aggregation* and
-*reconstruction* corners, not the search loop itself. The came-from walk that
-turns A\*'s result into a route is the iterative form of a recursive
-back-pointer trace. The zone bucketing is a fold. And A\*'s own correctness rests
-on **optimal substructure** — the same property DP exploits.
+flattr's clearest member of this family is **path reconstruction** — the
+backtrack from goal to start through the `came` map. It's written
+iteratively, but it *is* the backtracking shape, and it's the place to
+anchor. Dynamic programming proper isn't in the repo — but A* itself
+quietly has DP's defining property (optimal substructure), which is worth
+naming precisely rather than skipping.
 
 ```
-  Zoom out — where these ideas live
+  Zoom out — recursion/backtracking/DP in flattr
 
-  ┌─ Search layer ─────────────────────────────────────────────────┐
-  │  A* relies on OPTIMAL SUBSTRUCTURE (the DP property)             │
-  │  reconstruct() — iterative back-pointer walk  ← ★ recursion form │
-  │  features/routing/astar.ts:86-103                               │
-  └─────────────────────────┬────────────────────────────────────────┘
-  ┌─ Aggregation layer ─────▼────────────────────────────────────────┐
-  │  computeZones() — fold edges into grid buckets ← ★ aggregation   │
-  │  features/grade/zones.ts:23-58                                    │
-  └─────────────────────────┬────────────────────────────────────────┘
-  ┌─ Stretch (NOT built) ───▼────────────────────────────────────────┐
-  │  k-alternative routes via penalty method  ← ★ DP-adjacent (gap)  │
-  │  spec §14.5                                                       │
-  └────────────────────────────────────────────────────────────────────┘
+  ┌─ Search produces back-pointers ─────────────────────────────┐
+  │  astar.ts: came: Map<id, {edge, prev}>  (file 02)          │
+  └───────────────────────────┬──────────────────────────────────┘
+                              │ goal popped
+  ┌─ Reconstruction (backtrack) ────────────────────────────────┐
+  │  ★ reconstruct(came, start, goal)  → walk prev to start ★  │ ← we are here
+  │     (iterative, but the backtrack-to-base-case shape)      │
+  └──────────────────────────────────────────────────────────────┘
+  ┌─ DP-adjacent (the property, not the technique) ─────────────┐
+  │  A* relaxation: g[next] = min over paths   = optimal substr.│
+  │  not yet exercised: tabulation / memoized recurrence        │
+  └──────────────────────────────────────────────────────────────┘
 ```
 
-Zoom in: recursion is "solve a problem by solving a smaller version of itself."
-DP is recursion where the *same* subproblem recurs and you cache it. Backtracking
-is recursion that *undoes* choices to explore alternatives. `flattr` touches the
-first and the substructure-property behind DP; it doesn't need backtracking or
-memo tables because A\* already computes optimal subpaths greedily via the heap.
+**Zoom in.** Reconstruction is a backtrack: start at the goal, follow
+`prev` pointers until you hit the base case (the start), collecting edges
+as you go. This file walks that, then names where DP would belong and why
+A* already embodies its core idea without being "a DP."
 
 ---
 
-## The structure pass
+## Structure pass — one axis across the family
 
-**Layers.** These three techniques layer by *how they handle repeated/overlapping
-work*:
+These three are usually taught together because they share one axis:
+**how is a big answer built from smaller answers?**
 
 ```
-  One question — "how is repeated work handled?" — across the techniques
+  Axis: "how does the solution compose from subproblems?"
 
-  ┌──────────────────────────────────────────────┐
-  │ PLAIN RECURSION  → recompute every subproblem  │  fine if no overlap
-  └────────────────────┬───────────────────────────┘
-       ┌───────────────▼─────────────────────────┐
-       │ MEMOIZATION (top-down DP) → cache results │  overlapping subproblems
-       └───────────────┬─────────────────────────┘
-           ┌───────────▼───────────────────────┐
-           │ TABULATION (bottom-up DP)            │  build the table iteratively
-           └───────────┬───────────────────────┘
-               ┌───────▼─────────────────────┐
-               │ BACKTRACKING → recurse + UNDO │  explore a state space, prune
-               └───────────────────────────────┘  ← e.g. Rein's river-crossing PG.ts
+  recursion     → solve(n) calls solve(smaller)    base case stops it
+  backtracking  → recursion that UNDOES choices    explore → retreat
+  DP            → recursion + remember subanswers   overlapping subproblems
+  reconstruction→ follow a chain of stored sub-answers to a base case
 ```
 
-**Axis = repeated work / state.** Hold "do subproblems overlap, and do we save
-state?" constant. Plain recursion recomputes; DP caches; backtracking mutates and
-restores. A\*'s relaxation (`astar.ts:69`) is *implicitly* DP: it keeps the best
-cost to each node in the `g` map (`astar.ts:31`) — that map *is* a memo table for
-"cheapest cost to reach node X." The seam is the `g` map: it's where A\* turns a
-potentially exponential path-enumeration into a polynomial search by remembering
-the best subpath cost to each node.
+The seam in flattr: reconstruction has the recursion/backtracking
+*shape* (chain to a base case) but **no overlapping subproblems**, so it
+needs no memoization — it's a single linear walk, not a tree of repeated
+work. A* has the *optimal-substructure* half of DP (best path to a node =
+best path to its predecessor + one edge) but builds it iteratively with a
+priority queue instead of a recurrence. Naming which half each piece has
+is the whole lesson.
 
 ---
 
@@ -79,261 +67,245 @@ the best subpath cost to each node.
 
 ### Move 1 — the mental model
 
-You've written a recursive tree walk: visit a node, recurse into children, combine.
-Path reconstruction is the *reverse* of that — follow a single chain of
-back-pointers from the goal to the start. DP is the optimization you apply when a
-naive recursion would recompute the same subanswer over and over: you cache it.
+Backtracking is recursion that retraces its steps: you go forward making
+choices, hit a base case or a dead end, and walk back. Reconstruction is
+the *walk-back* without the forward exploration — the search already did
+the forward part, leaving a trail of `prev` pointers. You just follow the
+trail home.
 
 ```
-  Three shapes
+  Reconstruction — follow prev to the base case
 
-  RECURSION (a chain)        DP / MEMO (a cached DAG)     BACKTRACKING (a pruned tree)
-   goal                       f(5)                          [ ]
-    │ back-pointer            ╱  ╲  ← f(3) computed once     ╱ │ ╲   try, recurse,
-   prev                     f(4)  f(3)   reused              ●  ●  ●  undo if dead end
-    │                       ╱ ╲   (cached)                  ╱╲    ╲
-   prev                  f(3) f(2)                         ●  ✗    ●  prune
-    │
-   start                  ← reconstruct() is this chain (astar.ts:86-103)
+  goal ──prev──► N3 ──prev──► N2 ──prev──► N1 ──prev──► start
+   │                                                      │
+   │  collect edge at each hop                            │
+   └──────────── base case: cur == start ────────────────┘
+   then reverse → [start, N1, N2, N3, goal]
 ```
 
-### Move 2 — the moving parts
+It's a linked-list traversal where the list is threaded through a hash map
+(`came`). The base case is `cur === startId` — the equivalent of a
+recursion's stopping condition.
 
-**Path reconstruction — iterative recursion via back-pointers.**
-`reconstruct` (`astar.ts:86-103`) is a recursive idea written as a loop: start at
-the goal, follow `came.get(cur)` to the predecessor, push the node and the edge,
-repeat until you hit the start, then reverse. It's iterative (a `while` loop) not
-recursive-with-the-call-stack — a deliberate choice, because a deep path would
-blow the call stack, and the loop is the same `O(path length)` work without that
-risk.
+### Move 2 — reconstruction, then the DP gap
 
-```
-  reconstruct goal→start (astar.ts:92-100)
+#### `reconstruct()` — the backtrack walk
 
-  came = { G:{edge:ag, prev:A}, A:{edge:sa, prev:S} }   start=S goal=G
-  cur=G  push G        nodes=[G]
-         entry=came[G]={ag,A}  push edge ag  cur=A  push A  nodes=[G,A]
-  cur=A  entry=came[A]={sa,S}  push edge sa  cur=S  push S  nodes=[G,A,S]
-  cur=S == start → stop
-  reverse → nodes=[S,A,G] edges=[sa,ag]   ← the route, in travel order
-```
-
-The load-bearing subtlety: it records `entry.edge` — the *exact edge the search
-relaxed* — not a re-lookup by node pair. With parallel edges (two A→B blocks), a
-node-pair re-lookup could report the wrong one (**05**, the parallel-edge trap,
-`astar.test.ts:102-128`). The back-pointer carries the *identity* of the choice,
-not just the endpoints.
-
-**Optimal substructure — the property A\* (and DP) exploit.** A shortest path
-from S to G through some node X contains *within it* a shortest path from S to X.
-That's optimal substructure, and it's exactly why A\* can be greedy: when it
-finalizes X (closes it), it has X's optimal cost and never needs to reconsider it.
-The `g` map (`astar.ts:31`) is the memo table — "best cost to reach each node so
-far." *Without* optimal substructure (e.g. if cost depended on the whole prior
-path, not just the current node), A\* would be wrong and you'd need full
-enumeration or DP over richer states.
-
-```
-  Optimal substructure → A* as implicit DP
-
-  g map = memo of "cheapest cost to reach this node"  (astar.ts:31)
-  relax (astar.ts:69):  if tentative < g[next] → update
-        └─ this IS the DP recurrence:
-           bestCost[next] = min over edges (bestCost[cur] + edgeCost)
-  closed set = "this subproblem is SOLVED, don't recompute"  (astar.ts:61)
+```ts
+// features/routing/astar.ts:86-103
+function reconstruct(came, startId, goalId) {
+  const nodes = [goalId];
+  const edges = [];
+  let cur = goalId;
+  while (cur !== startId) {            // ← base case: reached the start
+    const entry = came.get(cur)!;
+    edges.push(entry.edge);            // collect the EXACT edge relaxed
+    cur = entry.prev;                  // step backward one hop
+    nodes.push(cur);
+  }
+  nodes.reverse();                     // goal→start becomes start→goal
+  edges.reverse();
+  return { nodes, edges };
+}
 ```
 
-**Spatial bucketing — a fold / aggregation.** `computeZones` (`zones.ts:23-58`)
-isn't recursion, but it's the other half of this file's territory: reducing many
-items to per-group summaries. It folds the edge list into a `Map<"col,row",
-number[]>` (group edges by grid cell), then maps each bucket to its p85
-(`zones.ts:53`). Group-then-reduce is the shape behind histograms, GROUP BY, and
-MapReduce.
+Execution trace — reconstruct a 3-node path S→A→G:
 
 ```
-  computeZones fold (zones.ts:31-57)
+  reconstruct trace (came: G→{prev:A}, A→{prev:S})
 
-  edges ──group-by-cell──► Map{ "0,0":[4,10], "3,1":[5] } ──reduce──► cells
-          (midpoint → col,row)                              (p85 each)
-   step 1: bucket each edge by geometry midpoint  (zones.ts:31-42)
-   step 2: per bucket, value = percentile(grades, 0.85)  (zones.ts:45-56)
-   empty cells never created → omitted (zones.ts:44 iterates only seen buckets)
+  cur=G   nodes=[G]
+    G != S → entry=came[G]={edge:ag, prev:A}
+             edges=[ag], cur=A, nodes=[G,A]
+  cur=A   A != S → entry=came[A]={edge:sa, prev:S}
+             edges=[ag,sa], cur=S, nodes=[G,A,S]
+  cur=S   S == S → stop (base case)
+  reverse: nodes=[S,A,G], edges=[sa,ag]
 ```
 
-### Move 2.5 — current state vs future state
+This is the backtracking skeleton written as a `while` loop instead of a
+recursive call — same shape, no stack-overflow risk on long paths. A
+recursive version would call `reconstruct(came[cur].prev)` and unwind;
+the iterative version makes the unwinding explicit with `.reverse()`.
 
-Reconstruction and bucketing ship. Backtracking and explicit DP are absent; the
-nearest future use is k-alternative routes.
+#### The exact-edge subtlety — why it stores the edge, not the pair
+
+Here's the part that's easy to get wrong and the repo gets right. `came`
+stores the **exact edge object** that was relaxed, not just the previous
+node. Why does that matter? Because two parallel edges can connect the
+same node pair — a short-steep street and a long-flat one between the same
+intersections.
+
+```ts
+// astar.ts:71 — stores the edge, not just the node pair
+came.set(next, { edge, prev: current });
+```
 
 ```
-  Phase A (shipped)                Phase B (spec §14.5, not built)
-  ┌────────────────────────┐       ┌──────────────────────────────────────┐
-  │ reconstruct (iterative) │       │ k-alternative routes (penalty method): │
-  │ computeZones (fold)     │  ───► │   1. run A*, get best path             │
-  │ implicit DP via g map   │       │   2. inflate cost of its edges         │
-  │                         │       │   3. re-run → a DISTINCT 2nd-best path │
-  └────────────────────────┘       │   repeat k times                       │
-                                    └──────────────────────────────────────┘
-  the penalty method is iterated-search-with-state, the DP-adjacent stretch.
-  flattr's alternatives.ts is named in spec §9 but NOT implemented.
+  Parallel edges — why the exact edge must be stored
+
+  A ═══[short-steep, 50m, 20%]═══► B
+  A ───[long-flat,  100m,  0%]───► B
+
+  directed grade router relaxes the LONG-FLAT edge (steep is penalized)
+
+  ┌─ store node pair only ──────────┐  ┌─ store exact edge (actual) ─────┐
+  │ reconstruct re-resolves (A,B)   │  │ reconstruct reports long-flat   │
+  │ → might pick short-steep        │  │ → correct edge, correct length, │
+  │ → wrong length, wrong steepEdge │  │   correct steepEdges            │
+  └─────────────────────────────────┘  └──────────────────────────────────┘
 ```
+
+The test pins this exactly: a graph with two parallel A→B edges, the grade
+router picks the flat one, and reconstruction must report `["long-flat"]`
+with `lengthM: 100` and empty `steepEdges` (`astar.test.ts:102-128`). The
+docstring on `reconstruct` says it outright: *"Using the relaxed edges —
+not re-resolving by node pair — keeps cost/steepEdges correct when parallel
+edges share a node pair"* (`astar.ts:80-85`). `bidirectional.ts:119-144`
+does the same thing on both halves of its split path.
+
+#### not yet exercised — dynamic programming
+
+There's no DP in flattr: no memoization table, no tabulation, no recurrence
+solved bottom-up. But here's the precise thing to say in an interview
+rather than just "no DP": **A* has optimal substructure** — DP's first
+prerequisite — but **not overlapping subproblems** in the DP sense.
+
+```
+  A* vs dynamic programming — what's shared, what isn't
+
+  shared:    optimal substructure
+             best path to N = best path to N's predecessor + edge(pred→N)
+             (this is the relaxation: g[next] = min(g[next], g[cur]+cost))
+
+  NOT shared: DP solves a fixed table of subproblems bottom-up
+             A* solves them lazily, priority-ordered, pruned by heuristic
+             → A* is "DP guided by a heuristic over an implicit graph"
+```
+
+`g.set(next, tentative)` in `astar.ts:70` *is* the optimal-substructure
+update — it's the same `dist[v] = min(dist[v], dist[u]+w)` you'd write in a
+DP shortest-path table. The difference: a DP (Bellman-Ford, Floyd-Warshall)
+computes *all* subproblems in a fixed order; A* computes only the ones the
+heuristic says are promising, in priority order. So flattr doesn't "use DP"
+— but its relaxation is the DP recurrence, evaluated lazily.
+
+**Where actual DP would belong:** if flattr added a constraint like "route
+with at most K steep segments" or "minimize climb subject to a distance
+budget," that's a multi-dimensional state (`node × budget`) with
+overlapping subproblems — textbook DP. It's not in the product today.
+
+#### not yet exercised — backtracking search
+
+No backtracking *search* (the explore-then-undo kind — N-queens,
+Sudoku, subset-sum). flattr's state space is explored by best-first A*,
+not depth-first backtracking. Your reincodes `PG.ts` (river-crossing puzzle
+via BFS over a state graph) is the closest relative — it's state-space
+search, just breadth-first rather than backtracking. The shape transfers;
+flattr just picks the priority-queue frontier over the recursion stack.
 
 ### Move 3 — the principle
 
-**When subproblems overlap and have optimal substructure, remember answers
-instead of recomputing them.** A\* embodies this: the `g` map is a memo table, the
-`closed` set marks solved subproblems, and reconstruction reads the recorded
-choices back. You rarely need an explicit DP table when a graph search with a
-visited set already gives you the memoization for free — recognizing that A\* *is*
-DP over the node-cost subproblem is the insight that connects this file to **05**.
+Reconstruction is backtracking with the forward search already done — you
+follow stored sub-answers to a base case. The detail that separates a
+correct implementation from a subtly-broken one is *what* you store: the
+exact decision (the edge), not a re-derivable summary (the node pair),
+because re-derivation can pick a different valid-looking answer. And the
+deeper point: A*'s relaxation is the dynamic-programming recurrence
+evaluated lazily — flattr gets DP's optimal-substructure guarantee without
+ever building a DP table, by letting the priority queue decide evaluation
+order.
 
 ---
 
 ## Primary diagram
 
-The recursion/DP ideas as they actually appear in the repo.
+Reconstruction's backtrack walk plus where it sits relative to DP, in one
+frame.
 
 ```
-  flattr's recursion & DP surface
+  Reconstruction (backtrack) + the DP-adjacency
 
-  ┌─ implicit DP (in the search, astar.ts) ───────────────────────┐
-  │  g map     = memo: cheapest cost per node    (astar.ts:31,69)  │
-  │  closed    = "subproblem solved"             (astar.ts:61)     │
-  │  optimal substructure ⟹ greedy finalize is correct            │
-  └─────────────────────────┬──────────────────────────────────────┘
-  ┌─ reconstruction (astar.ts:86-103) ──────────▼─────────────────┐
-  │  back-pointer chain goal→start, carries EDGE IDENTITY          │
-  │  iterative (no call stack) · O(path length) · reverse at end   │
-  └──────────────────────────────────────────────────────────────────┘
-  ┌─ aggregation (zones.ts:23-58) ─────────────────────────────────┐
-  │  fold: group edges by cell → reduce each to p85                 │
-  └──────────────────────────────────────────────────────────────────┘
-  ┌─ GAPS: backtracking (state-space search) · explicit DP tables · │
-  │        k-alternatives penalty method (spec §14.5)               │
-  └──────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## Implementation in codebase
-
-**Use cases.** Reconstruction runs at the end of every successful search
-(`astar.ts:53`, `bidirectional.ts:121-143`). Bucketing runs once to build the
-heatmap. The implicit DP runs continuously inside the search loop.
-
-```
-  features/routing/astar.ts  (lines 92-100)  — reconstruct (iterative back-walk)
-
-  const nodes = [goalId]; const edges = [];
-  let cur = goalId;
-  while (cur !== startId) {              ← walk back until we reach the start
-    const entry = came.get(cur)!;        ← the back-pointer for this node
-    edges.push(entry.edge);              ← record the EXACT relaxed edge
-    cur = entry.prev;                    ← step to the predecessor
-    nodes.push(cur);
-  }
-  nodes.reverse(); edges.reverse();      ← we built it goal→start; flip it
-       │
-       └─ iterative, not recursive, on purpose: a long path would overflow the
-          call stack with recursion. pushing entry.edge (not re-resolving by
-          node pair) is what keeps parallel edges correct (astar.test.ts:102-128).
-          This is the reverse of a recursive tree descent — a single chain.
-```
-
-```
-  features/grade/zones.ts  (lines 31-42)  — the bucketing fold
-
-  for (const e of graph.edges) {                    ← fold over all edges
-    const midLat = (first[0]+last[0])/2;            ← group key from geometry
-    const midLng = (first[1]+last[1])/2;
-    const col = clamp(Math.floor((midLng-minLng)/cellW));
-    const row = clamp(Math.floor((midLat-minLat)/cellH));
-    const arr = buckets.get(`${col},${row}`);
-    if (arr) arr.push(e.absGradePct);               ← accumulate into the group
-    else buckets.set(`${col},${row}`, [e.absGradePct]);  ← new group
-  }
-       │
-       └─ group-then-reduce: this loop is the GROUP BY, percentile() (zones.ts:53)
-          is the aggregate. clamp keeps a midpoint exactly on the bbox edge inside
-          the grid (zones.ts:29) — without it a boundary edge indexes out of range.
+  ┌─ during search: build the trail (astar.ts:71) ──────────────┐
+  │  relax edge → came.set(next, {edge: EXACT, prev: current})  │
+  │  this update = optimal substructure (the DP recurrence)     │
+  └───────────────────────────┬──────────────────────────────────┘
+                              │ goal popped
+  ┌─ reconstruct (astar.ts:86-103) — the backtrack ─────────────┐
+  │  cur = goal                                                  │
+  │  while cur != start:        ◄── base case                  │
+  │     edges.push(came[cur].edge)   ◄── EXACT edge (parallel-  │
+  │     cur = came[cur].prev              edge correctness)     │
+  │  reverse() → [start ... goal]                              │
+  └──────────────────────────────────────────────────────────────┘
+  ┌─ not yet exercised ─────────────────────────────────────────┐
+  │  DP table / tabulation  (would need K-steep or budget state)│
+  │  backtracking search    (A* uses a frontier, not the stack) │
+  └──────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
 ## Elaborate
 
-Recursion is as old as the call stack; the insight that *overlapping* recursive
-subproblems should be cached is Bellman's dynamic programming (1950s) — the
-shortest-path connection is direct, since Bellman-Ford and Dijkstra are both DP
-over "best cost to each node." A\* is the goal-directed, heuristic-pruned member
-of that family (**05**). Backtracking (exploring a state space with undo) powers
-constraint solvers, puzzles, and parsers — Rein's `reincodes/PG.ts` (river-crossing
-puzzle via BFS over an implicit state graph) is the closest built example, and
-the place a `flattr` feature like "route avoiding a list of blocked streets" might
-eventually need it. The k-alternative-routes penalty method (spec §14.5,
-`alternatives.ts` named but unbuilt) is the repo's most concrete DP-adjacent
-stretch: iterated search with accumulated state. Next read: **05** for the search
-this all hangs off, and **08** for where to practice the gaps.
-
-**`not yet exercised` — explicit DP tables and backtracking.** No memo table, no
-tabulation, no backtracking search in the repo. They'd matter for: k-shortest /
-k-alternative routes (penalty method or Yen's algorithm), constraint-based
-routing (avoid a set, visit waypoints in order), and build-time graph validation.
-The implicit DP in A\*'s `g` map covers the single-shortest-path case, which is
-all v1 needs.
+Path reconstruction via predecessor pointers is the standard companion to
+Dijkstra/A* — the search computes `came`, a separate walk extracts the
+path, keeping the search loop clean. The exact-edge-vs-node-pair distinction
+is a real-world routing gotcha: OSM graphs have genuine parallel edges
+(two ways between the same junctions), so re-resolving by endpoints is a
+known bug source — flattr sidesteps it by construction. DP and A* are
+cousins: both rest on optimal substructure, and Dijkstra is sometimes
+taught as "DP on a graph with a priority queue." The honest framing for
+flattr is "the recurrence is here, the table isn't." You've built the
+state-space-search relative in reincodes (`PG.ts`, BFS over an implicit
+graph) and recursion-with-call-stack visualizers (`Tree.ts` generators) —
+backtracking is the same recursion with an undo step, and memoized DP is
+that recursion with a cache. Read file 05 for the search that fills `came`,
+file 08 for where DP enters the practice plan.
 
 ---
 
 ## Interview defense
 
-**Q: "Is there any dynamic programming in this routing engine?"**
-
-Yes — implicitly. A\*'s `g` map (`astar.ts:31`) is a memo table of "cheapest cost
-to reach each node," and the relaxation (`astar.ts:69`) is the DP recurrence
-`bestCost[next] = min(bestCost[cur] + edgeCost)`. The `closed` set marks solved
-subproblems. It works because shortest paths have optimal substructure — a
-shortest S→G path contains a shortest S→X path for any X on it.
+**Q: How is the route reconstructed, and why store the edge instead of the
+node pair?**
 
 ```
-  g map = memo · relax = recurrence · closed = "solved"
-  optimal substructure ⟹ greedy finalize correct ⟹ no explicit table needed
-  anchor: astar.ts:31,61,69
+  came[cur] = {edge, prev}  → walk prev to start, collect EXACT edges
+  parallel edges: short-steep vs long-flat between same (A,B)
+  node-pair re-resolution could pick the wrong one → wrong steepEdges
 ```
 
-**Q: "Why is reconstruction iterative and not recursive?"**
+*Model answer:* "When the search relaxes an edge it records `{edge, prev}`
+in `came`. Reconstruction starts at the goal and follows `prev` to the
+start — the base case — collecting edges, then reverses. It stores the
+*exact* edge object because OSM graphs have parallel edges: a short-steep
+and a long-flat street between the same two junctions. If reconstruction
+re-resolved by node pair, it might report the steep one even though the
+grade router chose the flat one, corrupting the length and `steepEdges`.
+There's a test that pins exactly this."
 
-A long path would overflow the call stack with recursion. The `while` loop does
-the same `O(path length)` back-pointer walk without that risk (`astar.ts:92-100`).
-And it records the exact relaxed edge, not a node-pair re-lookup, so parallel
-edges stay correct.
+*Anchor:* store the exact relaxed edge; node-pair re-resolution breaks on
+parallel edges.
 
-**Q: "Where would backtracking show up if you extended this?"**
+**Q: Does flattr use dynamic programming?**
 
-Constraint routing — "avoid these streets" or "visit waypoints in order" — is a
-state-space search that explores and undoes choices. The penalty method for
-k-alternatives (spec §14.5) is the nearest planned thing: run A\*, inflate the
-used edges' cost, re-run for a distinct path.
+*Model answer:* "Not as a technique — no memoization table, no tabulation.
+But A*'s relaxation, `g[next] = min(g[next], g[cur] + cost)`, *is* the
+dynamic-programming shortest-path recurrence; it has optimal substructure.
+The difference is A* evaluates subproblems lazily in priority order over an
+implicit graph, pruned by the heuristic, instead of filling a fixed table
+bottom-up. So flattr has DP's core property without a DP table. Real DP
+would enter if I added a constraint like 'at most K steep segments,' which
+makes the state `node × budget` — overlapping subproblems."
 
----
-
-## Validate
-
-1. **Reconstruct:** Write the back-pointer walk from `astar.ts:92-100` from
-   memory, including why it reverses at the end.
-2. **Explain:** Why is A\*'s `g` map a memo table, and what property of shortest
-   paths makes the greedy `closed`-finalize correct?
-3. **Apply:** Trace `computeZones` (`zones.ts:31-42`) bucketing two edges with
-   midpoints `[0.1,0.1]` and `[0.2,0.2]` over a 2×2 grid on bbox `[0,0,1,1]`;
-   check against `zones.test.ts:45-55`.
-4. **Defend:** Argue why reconstruction is iterative not recursive, and why it
-   stores `entry.edge` rather than re-resolving by node pair
-   (`astar.test.ts:102-128`).
+*Anchor:* the recurrence is present, the table isn't; A* is lazy,
+heuristic-guided DP over an implicit graph.
 
 ---
 
 ## See also
 
-- **05-graphs-and-traversals.md** — the search whose `g` map is the implicit DP.
-- **06-sorting-searching-and-selection.md** — `percentile`, the reduce step of the fold.
-- **02-arrays-strings-and-hash-maps.md** — the `Map` buckets and `g`/`came` memo tables.
-- **08-dsa-foundations-practice-map.md** — where to drill backtracking and DP.
+- `05-graphs-and-traversals.md` — the search that builds `came`.
+- `02-arrays-strings-and-hash-maps.md` — `came` as a hash-threaded list.
+- `08-dsa-foundations-practice-map.md` — where DP enters the plan.

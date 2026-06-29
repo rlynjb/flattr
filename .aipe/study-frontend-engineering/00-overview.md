@@ -1,132 +1,96 @@
-# Frontend Engineering — flattr `mobile/`
-## one-page orientation
+# Overview — the flattr frontend in one page
 
-This is your home turf, so no on-ramp. flattr's frontend is **not** the
-Next.js web app the design spec (`docs/flattr-spec.md` §8) describes — that
-was never built. The real frontend is an **Expo / React Native** app under
-`/Users/rein/Public/flattr/mobile/`: Expo `~56.0.12`, React Native `0.85.3`,
-React `19.2.3`, rendering native MapLibre views through
-`@maplibre/maplibre-react-native@^11` (`mobile/package.json:4-11`).
+One screen. No router, no Redux/Zustand, no design system, no SSR. The whole UI is `MapScreen.tsx`
+orchestrating a declarative MapLibre map plus a handful of absolutely-positioned overlays. The
+interesting engineering isn't in the component tree — it's in *where state lives* and *when work
+runs*.
 
-If you only read one file, read this one.
+## Rendering mode, in one sentence
 
----
+A single-screen native app (Expo SDK ~56, React Native 0.85, React 19) where the map is rendered by
+`@maplibre/maplibre-react-native` v11 native views and everything else is React Native components
+laid over it — React's virtual-DOM reconciliation drives the JS-side overlays, the native MapLibre
+view owns the actual map raster (`mobile/src/MapScreen.tsx:281`).
 
-### The rendering mode, in one sentence
+## The state graph
 
-It's a **single-screen native app** — no router, no SSR, no hydration: one
-React tree (`App.tsx` → `MapScreen`) that declaratively describes native iOS/
-Android views, which React Native's renderer commits across the JS↔native
-bridge; the map itself is a **native MapLibre view**, not DOM and not canvas
-you draw to (`mobile/App.tsx:5-12`, `mobile/src/MapScreen.tsx:261-292`).
+Every piece of UI state lives in `MapScreen` as `useState`, then flows down as props. The
+load-bearing decision: **endpoints are stored as coordinates, not node ids** — the ids are *derived*
+each render so they re-snap as graph tiles load.
 
 ```
-  flattr mobile — the whole frontend in one frame
+  flattr state graph — all owned by MapScreen, derived downward
 
-  ┌─ JS thread (your React code) ──────────────────────────────┐
-  │  App.tsx                                                    │
-  │    └─ MapScreen.tsx  ← the entire UI lives here (1 screen)  │
-  │         state: userMax, startPt, endPt, view, userLoc…      │
-  │         derived (useMemo): heatmap, zones, routed (A*!)     │
-  │         hook: useTileGraph → graph (base ∪ view ∪ corridor) │
-  │         children: <Map> overlays (AddressBar, Legend,       │
-  │                   GradeSlider, RouteSummaryCard)            │
-  └───────────────────────────┬────────────────────────────────┘
-                              │  bridge / Fabric  (serialized props)
-  ┌─ Native thread ───────────▼────────────────────────────────┐
-  │  MapLibre MapView  ·  GeoJSONSource + Layer (GPU lines)     │
-  │  expo-location (GPS)  ·  UIView / android.view             │
-  └─────────────────────────────────────────────────────────────┘
-                              │  network (off-thread, async)
-  ┌─ Remote ──────────────────▼────────────────────────────────┐
-  │  Overpass (OSM)  ·  Open-Meteo (elevation)  ·  Nominatim    │
-  │  openfreemap (basemap tiles)                                │
-  └─────────────────────────────────────────────────────────────┘
+  ┌─ source-of-truth state (useState in MapScreen) ──────────────┐
+  │  startPt {lat,lng}    endPt {lat,lng}    userMax (8)          │
+  │  view "off|edges|zones"    fromText/toText    userLoc         │
+  └───────────────────┬──────────────────────────────────────────┘
+                      │  useMemo (re-derived every render)
+  ┌─ derived state ───▼──────────────────────────────────────────┐
+  │  startId = nearestNode(graph, startPt)   ← re-snaps as tiles  │
+  │  endId   = nearestNode(graph, endPt)        load (:133-134)   │
+  │  routed  = directedAstar(graph, startId, endId, userMax)      │
+  │            → fc + summary + found          (:151-162)         │
+  │  heatmap / zonesFC = graphToGeoJSON(...)   (:121-129)         │
+  └───────────────────┬──────────────────────────────────────────┘
+                      │  props down
+  ┌─ leaf components ─▼──────────────────────────────────────────┐
+  │  AddressBar   GradeSlider   Legend   RouteSummaryCard         │
+  │  + MapLibre GeoJSONSource/Layer (route, edges, zones)         │
+  └───────────────────────────────────────────────────────────────┘
 ```
 
----
+No state is lifted *into* a child and lifted back — children are pure presentational, every handler
+is a callback passed down from `MapScreen`. The one stateful exception is `useTileGraph`, a custom
+hook that owns the tile-fetch machine and hands back `graph` / `displayGraph` / `loadingStep`.
 
-### The state architecture, in one diagram
+## The network seam
 
-Everything keys off `userMax`. There is **no store, no context, no reducer** —
-all state is `useState`/`useRef` inside `MapScreen`, and the expensive outputs
-(heatmap, zones, the A* route) are **derived state via `useMemo`**, not stored.
-
-```
-  state graph — one component owns everything
-
-  SOURCE STATE (useState in MapScreen.tsx:52-65)
-    userMax ──┐   startPt ──┐   endPt ──┐   view   userLoc
-              │             │           │
-              ▼             ▼           ▼
-  DERIVED STATE (useMemo — recomputed on dep change)
-    heatmap  = graphToGeoJSON(graph, bandsForUserMax(userMax))   :116
-    zonesFC  = zonesToGeoJSON(computeZones(graph), userMax)      :120-121
-    startId  = nearestNode(graph, startPt)                       :125
-    endId    = nearestNode(graph, endPt)                         :126
-    routed   = directedAstar(graph, startId, endId, userMax) ◄── A* RUNS HERE :143-154
-              │
-              ▼
-  GRAPH STATE (useTileGraph hook — its own useState/useRef)
-    graph = stitch( merge( base, corridor, view ) )    useTileGraph.ts:72-85
-```
-
-The load-bearing, surprising choice: **the A\* shortest-path search runs
-inside a `useMemo` at `MapScreen.tsx:143-154`** — synchronously, on the JS
-thread, during render. That's the single most important thing to understand
-about this frontend, and the hazard the runtime-systems guide picks up.
-
----
-
-### The network seam, in one diagram
-
-Server state crosses into client state at exactly two places: the
-`useTileGraph` hook (street graph + elevation) and the geocode calls
-(address ↔ coordinate). No react-query, no SWR — hand-rolled `async`
-functions guarded by a debounce and a single-flight gate.
+flattr talks to three external services, all through the shared `pipeline/` engine, all from the
+JS thread. There is no react-query, no SWR — fetch orchestration is hand-rolled in `useTileGraph`.
 
 ```
-  network seam — where server state becomes client state
+  network seam — frontend → pipeline → external HTTP
 
-  ┌─ UI ──────────────────────────────────────────────────┐
-  │ pan map ──► onRegionDidChange (debounced 600ms)        │
-  │ type addr ─► scheduleSuggest (debounced 400ms)         │
-  │ set both endpoints ─► ensureBbox (corridor)            │
-  └───────────┬─────────────────┬──────────────────────────┘
-              │ pump()          │ geocodeSuggest / geocode
-              ▼ (single-flight) ▼
-  ┌─ async fetch (off JS thread) ─────────────────────────┐
-  │ fetchOverpass → buildGraph → bestEffortElevation       │
-  │ Nominatim geocode / reverseGeocode                     │
-  └───────────┬────────────────────────────────────────────┘
-              ▼ setState → re-render → new derived graph
+  ┌─ UI (mobile/src) ─────────────────────────────────────────────┐
+  │  AddressBar typing → scheduleSuggest (400ms debounce)          │
+  │  Route button → handleRoute                                    │
+  │  map pan → onRegionDidChange (600ms debounce)                  │
+  └───────┬─────────────────┬──────────────────┬───────────────────┘
+          │ geocodeSuggest  │ geocode          │ queueViewport/ensureBbox
+          ▼                 ▼                  ▼
+  ┌─ pipeline/ (shared engine, synced into .engine) ──────────────┐
+  │  geocode.ts → Nominatim   overpass.ts → Overpass              │
+  │  elevation.ts → Open-Meteo (cached + best-effort fallback)    │
+  └────────────────────────────────────────────────────────────────┘
+          │ persistent cache
+          ▼
+  ┌─ AsyncStorage ────────────────────────────────────────────────┐
+  │  elevCache.ts — ~90m DEM cells, survives restarts (:7)        │
+  └────────────────────────────────────────────────────────────────┘
 ```
 
----
+## The three highest-leverage frontend patterns
 
-### The three highest-leverage frontend patterns (with paths)
+1. **Render-time A\*** (`01-render-time-astar.md`) — `MapScreen.tsx:151-162`. The router runs inside
+   a `useMemo`, on the JS thread, every time `graph`/`startId`/`endId`/`userMax` changes. Cheap to
+   write, but it couples route compute to React's render cycle and to the single JS thread.
 
-1. **On-demand tile graph with single-flight pump** —
-   `mobile/src/useTileGraph.ts:89-129`. The hook that turns a bundled static
-   graph into a pan-to-load, route-corridor-aware data source while never
-   running two network builds at once. → `01-on-demand-tile-graph.md`
+2. **Coordinates-not-ids endpoints** (`02-coords-not-ids-endpoints.md`) — `MapScreen.tsx:59-60,
+   133-134`. Storing `{lat,lng}` and re-deriving the node id means endpoints automatically re-snap to
+   a better node as corridor tiles stream in. Without it, a route set before tiles load would pin to
+   a stale node.
 
-2. **Derived render-time A\*** — `mobile/src/MapScreen.tsx:143-154`. The route
-   is not stored; it's recomputed by running the full A* search inside a
-   `useMemo`. Elegant data-flow, real main-thread hazard.
-   → `02-derived-render-time-astar.md`
+3. **Single-flight tile pump** (`03-single-flight-tile-pump.md`) — `useTileGraph.ts:166-227`. One
+   network build at a time, corridor prioritized over viewport, debounced, with a capped self-heal
+   retry for elevation-degraded regions. This is the closest thing flattr has to a data layer.
 
-3. **Native MapLibre declarative layers** — `mobile/src/MapScreen.tsx:263-292`.
-   Source/layer components with `key`-driven remount on toggle and
-   data-driven styling (`["get","color"]`) pushed to the GPU.
-   → `03-native-maplibre-declarative-layers.md`
+Two more pattern files cover the **data-driven map layers** (`04`) and the **debounced controlled
+inputs** (`05`).
 
-Plus a fourth that earns a file: **controlled-input search with debounce +
-suggestion lifecycle** (`04-controlled-search-with-debounce.md`).
+## What's deliberately absent
 
----
-
-### Reading order
-
-See `README.md`. Start here, then `audit.md` (the 8-lens sweep), then the
-four pattern files in order.
+No routing library (one screen). No global store (props suffice). No design tokens — colors are
+inline hex, the one shared palette is `bandColor` in the engine (`features/grade/classify.ts:18`).
+No theming (`userInterfaceStyle: "light"` is hard-set in `app.json`). No tests in `mobile/src/`. See
+`audit.md` for the full `not yet exercised` list.

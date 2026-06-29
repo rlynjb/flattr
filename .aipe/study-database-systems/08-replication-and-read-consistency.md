@@ -1,322 +1,275 @@
 # Replication and read consistency
 
-**Industry name(s):** replication / read replicas / replication lag / stale reads
-/ failover · **Type:** Industry standard — **`not yet exercised`.** There is one
-bundled copy of the data per app install; no replicas, no lag, no failover.
+**Industry name(s):** replication / primary-replica / replication lag / stale
+reads / read-your-writes / eventual consistency · **Type:** Industry standard.
+
+> **Status in flattr: `not yet exercised`.** flattr is a single device reading a
+> single bundled artifact — there are no replicas, no lag, no failover. But there
+> *is* a clean real-world analog already in the repo: the bundled `graph.json` is
+> a *replica* of the pipeline's output, and it can go *stale* relative to the
+> source data. This file teaches replication in full and grounds the consistency
+> lessons in that analog.
 
 ## Zoom out, then zoom in
 
-Verdict first: **flattr has no replication and no read-consistency problem,
-because there's exactly one copy of the data that each app reads locally.**
-Replication exists to keep multiple copies of data in sync across machines so
-reads can scale and survive a node loss — and it introduces lag, stale reads, and
-failover as the price. flattr ships one immutable copy *inside each app bundle*,
-so there's no primary/replica relationship, nothing to sync, and no lag window.
-
 ```
-  Zoom out — where replication WOULD live (it doesn't)
+  Zoom out — replication copies the write path's output to read paths
 
-  ┌─ Many app installs (each a "replica"?) ──────────────────────────┐
-  │  phone A: graph.json   phone B: graph.json   phone C: graph.json │
-  │     each is a full, independent, immutable copy                   │
-  │     NOT replicas: no primary, no sync, no lag between them        │
-  └───────────────────────────┬──────────────────────────────────────┘
-        ┌─────────────────────▼─────────────────────┐
-        │  ✗ NO PRIMARY/REPLICA · NO LAG · NO        │  ← the absent topology
-        │     FAILOVER · NO STALE-READ WINDOW ✗      │
-        └─────────────────────┬──────────────────────┘
-  ┌─ Source of truth ─────────▼──────────────────────────────────────┐
-  │  the build pipeline + OSM/elevation (regenerates the artifact)   │
-  └───────────────────────────────────────────────────────────────────┘
+  ┌─ Source of truth ────────────────────────────────────────┐
+  │  pipeline output (data/graph.json) · a future primary DB  │
+  └────────────────────────────┬─────────────────────────────┘
+  ┌─ Replication layer ────────▼─────────────────────────────┐
+  │  ★ copy graph.json into mobile/assets (manual "replica") ★│ ← the analog
+  │  ✗ DB replicas · ✗ streaming WAL · ✗ failover (not present)│
+  └────────────────────────────┬─────────────────────────────┘
+  ┌─ Read paths ───────────────▼─────────────────────────────┐
+  │  loadGraph() on each device reads its bundled copy        │
+  └───────────────────────────────────────────────────────────┘
 ```
 
-Zoom in: the question is *"if there are multiple copies of the data, how do reads
-stay consistent across them?"* flattr's answer is that the copies are
-*independent immutable snapshots*, not synced replicas — so consistency *across*
-copies isn't maintained at all, and it doesn't need to be, because the data is
-read-only and changes only on the deploy cadence.
+Zoom in. Replication is *keeping multiple copies of the data in sync so reads can
+be served from any of them.* The central problem it creates is **lag**: a replica
+is always a little behind the primary, so a read from a replica can be **stale** —
+return a value that's already been overwritten. flattr has no live replicas, but
+it ships the *static* version of exactly this: a copy of the data (`graph.json`
+bundled into the app) that's a snapshot of the source and goes stale until the
+next build+ship. Reasoning about *that* staleness is the on-ramp to reasoning
+about replica staleness.
 
 ## The structure pass
 
-**Layers.** Source of truth (the build), and N independent copies (one per app
-install). There's no replica tier in between — the "copies" are deploy artifacts,
-not database replicas.
+**Layers** (by copy, source → reader):
+1. **Source** — pipeline output, the freshest graph.
+2. **The shipped copy** — `mobile/assets/graph.json`, frozen at build time.
+3. **The runtime patch** — live viewport/corridor tiles fetched on demand
+   (`useTileGraph.ts`), which *refresh* parts of the stale copy.
 
-**The axis: consistency — do all copies agree, and how fresh is each read?** This
-is the axis that exposes the (benign) truth:
+**Axis traced — "how stale can a read be, and does the reader know?"**
 
 ```
-  Axis = "do the copies agree / how stale can a read be?"
+  axis — "staleness of a read" — across the copies
 
-  ┌─ Source (build) ──────────────────────────────┐
-  │  produces a versioned artifact per deploy      │  → the canonical version
-  └───────────────────────────┬─────────────────────┘
-        seam: ship into app bundle  ═════════════╪═══
-  ┌─ App copies (N installs) ─▼─────────────────────┐
-  │  each holds whatever version it last installed  │  → can differ ACROSS
-  │                                                 │    installs, but each is
-  │                                                 │    internally consistent
-  └───────────────────────────────────────────────────┘
+  ┌─ pipeline output (source) ──────────────┐
+  │  staleness = 0 (it IS the truth)         │  freshest
+  └────────────────────┬─────────────────────┘
+       seam ═══════════╪═══════  (build + ship: hours/days/release cycle)
+  ┌─ bundled graph.json (the "replica") ────┐
+  │  staleness = age since last build/ship   │  could be weeks behind reality
+  └────────────────────┬─────────────────────┘
+       seam ═══════════╪═══════  (runtime tile fetch refreshes a region)
+  ┌─ live merged graph (per session) ───────┐
+  │  staleness = seconds (just fetched)       │  freshest for the viewed area
+  └───────────────────────────────────────────┘
 ```
 
-**Seams.** The would-be replication seam — "primary → replica sync with lag" —
-doesn't exist. The *real* consistency seam is the **deploy**: an old app install
-runs an old `graph.json` until the user updates. That's the only "stale read"
-flattr has, and it's measured in app-update cadence (days/weeks), not replication
-lag (milliseconds). It's a versioning concern, not a replication one.
+The axis-answer is the whole lesson: flattr's bundled graph is a replica with a
+*replication lag measured in release cycles*, and the runtime tile fetch is a
+"read from primary for the hot region" pattern that papers over the staleness
+where the user is actually looking. That's structurally identical to "serve most
+reads from a replica, but route the latency-sensitive ones to the primary."
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You know how a deployed frontend can be stale — a user has an old bundle cached
-until they hard-refresh. flattr's "replication" is exactly that: each install has
-a bundled `graph.json`, and an install is "stale" only relative to the latest
-deploy, not relative to a live primary. There's no replica catching up to a
-primary in real time, because there's no live primary at all.
+You know a CDN: the origin has the truth, edge nodes have copies, and a copy can
+serve a stale asset until it's invalidated. Database replication is a CDN for
+*rows* — one primary takes writes, replicas take reads, and a replica can serve a
+row that's a few milliseconds (or, under load, seconds) out of date. The new
+hazard versus a CDN is *read-your-writes*: a user who just saved something and
+immediately reads it from a lagging replica sees their own write *missing*.
 
 ```
-  The pattern — replication keeps copies in sync; flattr has no sync
+  the pattern — primary takes writes, replicas serve reads (with lag)
 
-  replicated DB:  primary ──(stream writes, lag)──► replica ──► reads
-                                  ↳ stale read = read replica before lag closes
-  flattr:         build ──(deploy)──► app copy ──► reads
-                                  ↳ "stale" = old app version, not live lag
+  writes ─►┌─ PRIMARY ─┐── stream WAL ──►┌─ REPLICA A ─┐◄─ reads
+           │ source of │── stream WAL ──►┌─ REPLICA B ─┐◄─ reads
+           │  truth    │                 └─────────────┘
+           └───────────┘   lag = how far behind the replica's apply is
+   stale read: replica returns a value the primary has already changed
+   read-your-writes: user reads their own just-made write → may be MISSING
 ```
 
-### Move 2 — what's here, what's absent
+The mechanism is literally `07`'s WAL shipped over the network and replayed on the
+replica — replication is "apply the primary's log somewhere else."
 
-#### Each app install is an independent immutable copy
+### Move 2 — replication mechanics + flattr's analog
 
-When the app ships, `graph.json` is in the bundle. Every install reads its own
-local copy. These copies don't talk to each other and don't sync to a primary —
-they're frozen at whatever version shipped with that app build. So "are the
-replicas consistent?" is the wrong question; the right one is "are all installs on
-the same app version?" — a release-management question, not a database one.
-
-```
-  N installs = N independent snapshots (not replicas)
-
-  install A (v1.2 graph) ──┐
-  install B (v1.3 graph) ──┼── never sync · no primary · each internally
-  install C (v1.2 graph) ──┘   consistent · differ only by app version
-```
-
-#### The only "stale read": an old app version
-
-The single consistency gap is version skew across installs: a user who hasn't
-updated runs an older graph. For a street network this is nearly harmless — roads
-and grades change on the scale of months, and the app degrades gracefully
-(routing still works on the old graph). Contrast a replicated DB's stale read,
-where a millisecond of lag can show a user their own write hasn't landed. flattr
-has no writes, so it can't have *that* anomaly at all.
-
-#### The runtime tile builds are caching, not replication
-
-`useTileGraph` builds extra graph regions at runtime and merges them onto the base
-graph. It's tempting to call the merged result a "replica," but it isn't — it's a
-**read-through cache**: fetch-on-demand, hold in memory, discard on reload. There's
-no second authoritative copy being kept in sync; there's a base artifact plus
-transient cached extensions. (This is a real pattern worth knowing — see the
-system-design guide — just not replication.)
+**Sync vs async replication — the durability/latency dial.** A write to the
+primary can wait for replicas to confirm (*synchronous* — no data loss on primary
+failure, but every write pays the slowest replica's latency) or not (*asynchronous*
+— fast writes, but a primary crash loses un-shipped writes). It's the same window
+idea as durability (`07`), now across machines.
 
 ```
-  Tile builds = read-through cache, NOT replication
+  sync vs async replication
 
-  base graph.json (authoritative) + on-demand tile builds (cached, transient)
-       │                                    │
-       └─ merged in memory for this session ┘  → discarded on reload; no sync,
-                                                 no second source of truth
+  SYNC:  write → primary → WAIT for replica ack → client ack
+         ▲ safe (replica has it) but slow (slowest replica gates every write)
+  ASYNC: write → primary → client ack ─┄┄► replica catches up later
+         ▲ fast but a primary crash loses the un-shipped tail
 ```
 
-#### Failover: nothing to fail over to (or from)
-
-Failover promotes a replica when the primary dies. flattr's data read is a local
-file access — it can't "go down" the way a network DB can, and there's no replica
-to promote. The data layer has no availability failure mode at all. (The
-*network* build path in `useTileGraph` *can* fail — Overpass/Open-Meteo down — and
-it degrades to flat-elevation or keeps the last region; that's graceful
-degradation of an enrichment step, not data-layer failover.)
-
-#### Move 2.5 — current vs future state
+**flattr's analog: the bundled graph as an async replica.** `mobile/assets/
+graph.json` is a copy of the pipeline's `data/graph.json`, copied in manually
+(the `loadGraph.ts:2-4` comment: "regenerate with `npm run build:graph` then copy
+data/graph.json here"). That's *asynchronous replication with a human as the
+replication stream* — the replica (the app's bundle) only catches up to the source
+when someone rebuilds and re-ships. The "lag" is the time between a real-world
+street/grade change and the next app release. A user routing on a months-old
+bundle is doing a **stale read** of the world.
 
 ```
-  Phase A (now): independent copies        Phase B (a shared live store)
+  flattr's static replication — human as the WAL shipper
 
-  one bundled copy per install             central DB + read replicas
-  no primary, no sync, no lag              primary → replicas with lag
-  "stale" = old app version (days)         "stale" = replication lag (ms)
-  no failover (local file can't fail)      failover promotes a replica
-  no read-your-writes problem (no writes)  read-your-writes becomes a real concern
+  pipeline ──build──► data/graph.json ──HUMAN copies──► mobile/assets/graph.json
+   (source)            (fresh)            (manual sync)   (app bundle = replica)
+                                                              │ loadGraph()
+                                                              ▼
+                                                       stale until next release
+   lag = release cadence; reader has NO signal that its copy is stale (red-flag #2)
 ```
 
-The trigger is the same as files `05`–`07`: a live, writable, shared store. The
-moment edits are central and reads scale across replicas, you inherit replication
-lag, stale reads, read-your-writes consistency, and failover — none of which
-flattr has today.
+**The runtime refresh = "route hot reads to fresher data."** `useTileGraph.ts`
+fetches live Overpass tiles for the viewport and route corridor and merges them
+over the bundled base. That's flattr serving the *cold* bulk from the stale
+replica (the bundle) but refreshing the *hot* region (what the user is looking at
+and routing through) from the source-ish (live Overpass). It's the read-routing
+strategy: most reads from the replica, latency/freshness-sensitive reads from a
+fresher source.
+
+```
+  hot/cold read routing (useTileGraph.ts)
+
+  cold (whole city)  ─► bundled graph.json   (stale replica, instant)
+  hot (viewport,     ─► live Overpass fetch  (fresh, merged over base)
+       route corridor)
+   merged graph = stale base + fresh patch where the user actually is
+```
+
+**Read consistency models — what a reader is promised.** Across replicas you pick
+a guarantee:
+- **Eventual consistency** — replicas converge *eventually*; a read may be stale.
+  flattr's bundle is eventually consistent with reality (next release).
+- **Read-your-writes** — a reader always sees its own prior writes. flattr has no
+  user writes to the graph, so this is trivially satisfied (nothing to miss).
+- **Monotonic reads** — you never see *time go backwards* (a later read showing
+  older data than an earlier one). flattr's merge could *technically* violate a
+  monotonic-read-like property if a fresh tile is later evicted back to stale base
+  — but since the base is a strict subset-in-time, this is benign.
+
+**The failover flattr doesn't have.** When a primary dies, a replica is promoted.
+The hazards — split-brain (two primaries accept writes), losing the async tail,
+electing a lagging replica — are all real-engine problems flattr never faces with
+one device and one read-only artifact. The trigger is, again, **a live backend
+with replicas** (the spec's Postgres target), at which point read-replica scaling
+and failover become real and every hazard above activates.
+
+### Move 2.5 — current vs future
+
+```
+  Phase A (now)                       Phase B (live backend + replicas)
+
+  copies: bundle = manual async       copies: primary + N read replicas
+          replica of pipeline output  stream: WAL shipped continuously
+  lag: release cadence (huge)         lag: ms–seconds (load-dependent)
+  staleness signal: NONE              staleness: monitor replica lag metric
+  failover: n/a (single device)       failover: promote replica; handle split-brain
+  read routing: hot=live, cold=bundle read routing: writes→primary, reads→replica
+  carries over: the hot/cold tile-merge instinct is ALREADY the read-routing
+                pattern — it survives the migration almost unchanged.
+```
 
 ### Move 3 — the principle
 
-**Independent immutable copies aren't replicas — they're versions.** flattr
-distributes its data by *baking it into the deploy*, so consistency across copies
-is a release-cadence question, not a sync-and-lag question. The general lesson:
-replication's costs (lag, stale reads, failover complexity) are the price of a
-*live shared* store; if your data is read-only and changes on a deploy cadence,
-shipping independent copies sidesteps all of it — at the cost of version skew,
-which is usually the cheaper problem.
+Replication buys read scale and availability at the price of *staleness you must
+reason about explicitly* — every replica read is a bet that "a little behind" is
+acceptable for this query. The discipline is to name, per read, how stale is too
+stale, and route the reads that can't tolerate it to the primary. flattr already
+does the static version of this — stale bulk from the bundle, fresh hot region
+from the live source — so the instinct is in the codebase even though the
+machinery isn't. Reading a system for "which reads can tolerate staleness and
+which can't" is the move that tells you where a replica is safe and where it'll
+bite.
 
 ## Primary diagram
 
-The full picture: independent copies, the deploy seam, the absent replica tier.
-
 ```
-  flattr replication & consistency — full picture
+  flattr's replication analog vs real DB replication
 
-  ┌─ SOURCE OF TRUTH ────────────────────────────────────────────────┐
-  │  build pipeline + OSM/elevation → versioned graph.json per deploy │
-  └───────────────────────────┬──────────────────────────────────────┘
-            ═══ DEPLOY SEAM ═══┼═══ (the only "consistency" boundary)
-  ┌─ APP INSTALLS (N independent immutable copies) ──▼────────────────┐
-  │  phone A: graph v1.3   phone B: graph v1.2   phone C: graph v1.3  │
-  │    each internally consistent · differ only by app version        │
-  │    + runtime tile builds = read-through CACHE (not a replica)      │
-  │                                                                   │
-  │  ✗ no primary/replica  ✗ no lag  ✗ no failover  ✗ no stale-read   │
-  │    window  ✗ no read-your-writes problem (no writes)              │
-  │  [Phase B] central writable store → replication topics land here  │
-  └───────────────────────────────────────────────────────────────────┘
-```
-
-## Implementation in codebase
-
-**Use cases.** Replication: never exercised. The closest real pattern is the
-read-through tile cache in `useTileGraph`, which people might mistake for
-replication and isn't.
-
-**The single bundled copy — `mobile/src/loadGraph.ts` (lines 7-11):**
-
-```
-  import graph from "../assets/graph.json";   ← THE copy: one per app bundle,
-                                                immutable, no sync to anything
-  export function loadGraph(): Graph {
-    return graph as unknown as Graph;
-  }
-       │
-       └─ this import is the entire "data distribution" mechanism. Each install
-          has its own graph.json frozen at install time. No primary to replicate
-          from, no replica to lag behind — just N independent frozen copies.
-```
-
-**The read-through cache (NOT replication) — `mobile/src/useTileGraph.ts` (lines 72-85):**
-
-```
-  const graph = useMemo(
-    () => baseGraph
-      ? stitchGraph(mergeGraphs([
-          baseGraph,                              ← authoritative bundled copy
-          ...(corridor ? [corridor.graph] : []),  ← cached, transient extensions
-          ...(view ? [view.graph] : []),          ← built on-demand this session
-        ]))
-      : null,
-    [baseGraph, corridor, view]
-  );
-       │
-       └─ corridor/view graphs are a read-through CACHE: fetched on demand, held
-          in memory, gone on reload. They are NOT a synced second copy of the
-          data — there's no primary keeping them consistent. Mislabeling this as
-          replication is the trap; it's caching layered on the one authoritative
-          artifact.
-```
-
-**Graceful degradation of the enrichment step (not failover) — `mobile/src/useTileGraph.ts` (lines 18-28):**
-
-```
-  function bestEffortElevation(p: ElevationProvider): ElevationProvider {
-    return { async sample(points) {
-      try { return await p.sample(points); }
-      catch { return points.map(() => 0); }   ← API down → fall back to flat (0m)
-    }};
-  }
-       │
-       └─ this degrades the ELEVATION enrichment when the API fails — streets
-          still render, grades fill in later. It's graceful degradation of a
-          network step, NOT data-layer failover. The data layer (the bundled
-          graph) has no failure mode to fail over from.
+  ┌─ flattr (now): static, human-shipped replica ─────────────┐
+  │ pipeline ─build─► data/graph.json ─human copy─► bundle     │
+  │ bundle = async replica; lag = release cadence; no signal   │
+  │ hot/cold routing: viewport+corridor ─► LIVE Overpass       │
+  │                   rest ─────────────► stale bundle         │
+  └────────────────────────────────────────────────────────────┘
+  ┌─ real DB (not present; the upgrade) ──────────────────────┐
+  │ writes ─► PRIMARY ─stream WAL─► REPLICA(s) ◄─ reads        │
+  │ sync→safe+slow / async→fast+lossy tail                     │
+  │ consistency: eventual | read-your-writes | monotonic       │
+  │ failover: promote replica (split-brain, lagging-replica)   │
+  └────────────────────────────────────────────────────────────┘
+   trigger to cross: a live backend serving multiple devices at read scale
 ```
 
 ## Elaborate
 
-Replication is the backbone of how databases scale reads and survive node loss,
-and it's genuinely absent here — correctly, for a read-only artifact shipped in an
-app bundle. The disciplined move is to refuse the easy mislabeling: independent
-deploy copies are *not* replicas, and the runtime tile cache is *not* a replica
-either. Calling them out by their real names (versions; read-through cache) is
-more useful than pretending flattr has a replication topology it doesn't.
+Replication is where the CAP theorem stops being abstract: when the network
+between primary and replica partitions, you must choose — keep serving reads from
+the replica (available, but possibly stale/inconsistent) or refuse (consistent,
+but unavailable). Most app databases choose availability with async replication
+and bounded staleness, and bolt read-your-writes on top by routing a user's reads
+to the primary (or to a replica known to have caught up) for a short window after
+their write. That "sticky read" trick is the single most common production fix for
+the "I saved it and it's gone" bug.
 
-The transferable insight: replication's entire cost structure — lag, stale reads,
-read-your-writes, failover — is downstream of having a *live shared mutable*
-store. flattr avoids the cost by avoiding the cause. The same reasoning shows up
-across your portfolio's local-first apps (dryrun, buffr in the system-design
-portfolio): when each client holds its own copy and the canonical store is local
-or build-time, the distributed-consistency problems shrink to a sync/versioning
-problem, which is usually far cheaper. flattr is the extreme version — no sync at
-all, just versioned redeploys.
-
-This is the last `not yet exercised` topic. The audit (`09`) ranks all of them
-together with the read-side findings.
+flattr's static-bundle replication is the same family as your `dryrun`
+(GitHub-as-backend — clients pull a copy of the repo, which lags the canonical
+remote) and `buffr` (SQLite local canonical + Supabase mirror — the mirror is an
+async replica of local). Across your portfolio, replication shows up every time
+there's a canonical store and a copy that lags it; flattr's copy just happens to
+lag by a whole release cycle. The `study-distributed-systems` guide owns the
+multi-replica coordination and partition behavior; this file owns the storage-side
+consistency the application has to assume.
 
 ## Interview defense
 
-**Q: "What's the replication and read-consistency story here?"**
+**Q: "flattr is one device with no replicas. So what's there to say about
+replication?"**
 
-> There isn't one, by design. The data is a read-only artifact bundled into each
-> app install, so every install has its own independent immutable copy — not a
-> replica syncing to a primary. There's no replication lag, no failover, and no
-> read-your-writes problem because there are no writes. The only "stale read" is
-> an old app version running an older `graph.json`, which is a release-cadence
-> issue, not a millisecond-lag one — and harmless for a street graph that changes
-> monthly. The runtime tile builds look like replication but are a read-through
-> cache on top of the one authoritative copy.
-
-```
-  N installs = N versioned copies (no sync)   tile builds = read-through cache
-  "stale" = old app version (days)            no primary/replica, no lag, no failover
-```
-
-Anchor: *independent immutable copies are versions, not replicas — no sync, no lag.*
-
-**Q: "Aren't the runtime tile builds a form of replication?"**
-
-> No — they're a read-through cache. They fetch graph regions on demand, hold them
-> in memory for the session, and discard them on reload. There's no second
-> authoritative copy being kept in sync with a primary; it's transient caching
-> layered on the one bundled artifact. The tell: nothing keeps them consistent
-> over time, because they're thrown away, not synced.
+> The bundled `graph.json` is a replica — a copy of the pipeline's output,
+> shipped into the app, that lags the source by a full release cycle. So flattr
+> has a static replication lag, and a user can do a stale read of the world on an
+> old bundle. The interesting part is `useTileGraph`: it serves the cold bulk from
+> the stale bundle but refreshes the hot region — viewport and route corridor —
+> from live Overpass. That's exactly the read-routing pattern of "replica for most
+> reads, fresher source for the ones that matter."
 
 ```
-  bundled graph (authoritative) + on-demand tiles (cached, discarded) ≠ replica
+  bundle = stale replica (lag = release cadence)
+  hot region ─► live fetch (fresh) ; cold ─► bundle (stale)
 ```
 
-Anchor: *cached-and-discarded is a cache; synced-and-authoritative is a replica.*
+Anchor: *flattr already does hot/cold read routing against a stale replica — the
+machinery is manual, the instinct is real.*
 
-## Validate
+**Q: "What's the load-bearing hazard of replication people forget?"**
 
-1. **Reconstruct:** explain why N app installs are "versions, not replicas" using
-   the no-primary/no-sync argument.
-2. **Explain:** why does the read-through tile cache in `useTileGraph.ts:72-85`
-   *not* count as replication? Name the distinguishing property (no sync to an
-   authoritative second copy).
-3. **Apply:** flattr moves to a central writable store so users can edit edges and
-   see each other's edits. Which replication concerns suddenly appear?
-   (Lag, stale reads, read-your-writes, failover.)
-4. **Defend:** someone says "no replication means no availability." Counter it for
-   the data layer using `loadGraph.ts:7` (a local file can't go down) and
-   distinguish the network enrichment path's degradation (`useTileGraph.ts:18-28`).
+> Read-your-writes. Async replicas mean a user can save something and immediately
+> read it back from a lagging replica and see it *missing* — which reads as a data-
+> loss bug even though the write is safe on the primary. The fix is sticky reads:
+> route that user's reads to the primary for a short window after their write.
+> flattr dodges it entirely today because the graph is read-only — there are no
+> user writes to fail to see.
+
+Anchor: *the replication bug that looks like data loss is read-your-writes under
+async lag; flattr is immune only because it has no writes to the replicated data.*
 
 ## See also
 
-- `07-wal-durability-and-recovery.md` — the reproducible-artifact strategy this extends
-- `01-database-systems-map.md` — the single bundled copy as the whole store
-- `09-database-systems-red-flags-audit.md` — all `not yet exercised` topics ranked together
-- `.aipe/study-system-design/` — the read-through tile cache as a system-design pattern
-- `.aipe/study-distributed-systems/` — replication and consistency in the live-store case
+- `07-wal-durability-and-recovery.md` — replication IS WAL shipping
+- `05-transactions-isolation-and-anomalies.md` — anomalies across replicas
+- `01-database-systems-map.md` — the bundle as a copy of pipeline output
+- `09-database-systems-red-flags-audit.md` — the stale-bundle / no-version risk
+- `../study-distributed-systems/` — multi-replica coordination, CAP, partitions
+- `../study-system-design/` — read-replica scaling and failover architecture

@@ -1,59 +1,122 @@
-# Options and opportunity cost
+# Options and Opportunity Cost — flattr
 
-Every problem has more than one response, and "build the thing I already wanted to build" is not automatically the right one. The staff move is to lay the real options side by side — *including doing nothing* — and name what each one costs you, including the cost of the path you picked. A brief that only describes the chosen solution hasn't made a decision; it's rationalized one.
+> Four options, including `do nothing`. Each names what it buys and what it costs
+> you to choose it (the opportunity cost = the next-best option you give up).
+> Coach posture: there's a recommended call, and it's stated up front.
+
+## The verdict first
+
+> **Recommended: Option B — run the discovery slice.** It is the only option
+> that buys information about the empty column (demand). Every other option
+> spends solo-dev hours improving the column that's already full (solvability).
+
+Now the four options, and why B wins.
+
+## The decision in one frame
 
 ```
-  THE OPTIONS — and what each one costs
+  flattr — four moves, what each buys, what each gives up
 
-  A. DO NOTHING
-     cost: the problem stays unsolved; but you also don't spend
-     weeks on unproven demand. The honest baseline.
+                    buys you...              opportunity cost
+                    ───────────              ────────────────
+  A  do nothing     a finished portfolio     never learn if anyone
+     (ship as-is)   artifact, zero new       wants it; no demand datum
+                    risk                      ever
 
-  B. WRAP AN EXISTING ROUTER (OSRM/Valhalla/GraphHopper)
-     cost: fast to a route; but grade-as-directional-cost fights
-     their cost models, AND you learn ~nothing about graph search.
+  B  discovery ★    the FIRST real demand     ~1-2 weeks of dev time
+     slice          signal (5 travelers,      (and the answer might be
+                    one bbox, A→B prefs)      "no one cares")
 
-  C. ★ HAND-ROLL A GRADE-AWARE ROUTER  (chosen)
-     cost: no city-scale machinery (no contraction hierarchies);
-     but you own the cost model AND the algorithm depth.
+  C  more engine    a more impressive         hours sunk into the PROVEN
+     (bidir, k-alt) DSA portfolio piece       column; demand still 0
 
-  D. BUY/USE A GRADE API (e.g. a commercial elevation-routing SDK)
-     cost: money + a key + vendor lock; overkill for a prototype
-     whose whole point is the build.
+  D  more coverage  a bigger map              cost-before-demand; free
+     (multi-city)   (city-scale graph)        elevation 429s; still 0 demand
 ```
 
-The chosen option, C, only makes sense once you're honest that its cost — no city scale — is real. The reason it still wins is the project's actual goal, which isn't "ship a routing product" but "demonstrate I can build a real graph engine." For that goal, the opportunity cost of *not* hand-rolling is the entire learning value.
+Read the right column top to bottom. Three of four options pay their cost into a
+column that's already full. Only B pays into the empty one.
 
-## Option A — Do nothing
+## Option A — do nothing more (ship/freeze as-is)
 
-The real baseline. Doing nothing costs the unsolved problem, but it also costs zero weeks on demand that isn't proven. For a *product* decision, "do nothing until discovery validates demand" would be defensible. flattr exists because the goal is different — it's a portfolio/learning bet where the build itself is the return — so "do nothing" loses not on the problem's merits but on the project's actual purpose. Naming that distinction is the honest framing.
+**This is a real option, not a strawman.** flattr today is a working, tested,
+on-device grade-aware router with a clean correctness story. As a *portfolio
+artifact* it already does its job: it proves Rein can build a routing engine from
+the graph up, with an admissible heuristic, an oracle-checked optimality gate,
+a measured algorithm progression, and an honest fallback.
 
-## Option B — Wrap an existing routing engine
+- **Buys:** a finished, defensible artifact. Zero new risk. Frees 100% of hours
+  for other projects in the pivot-to-AI arc (`me.md`).
+- **Opportunity cost:** you never find out if the *problem* is real. The §3 user
+  table stays a hypothesis forever. If flattr's value is "I built a router,"
+  that's fine; if its value is "I solved a real travel problem," A forecloses it.
+- **When A is correct:** if flattr is explicitly a DSA/system-design portfolio
+  piece and *not* a product attempt. Then there's nothing to validate — the
+  artifact is the deliverable. Be honest about which one it is.
 
-OSRM, Valhalla, and GraphHopper are production routers; bolting flattr's UI onto one would produce routes fast. Two costs sink it for this project. First, technical: the directional grade cost (uphill penalized, downhill free, so A→B ≠ B→A) doesn't slot cleanly into their distance/time cost models — you'd be fighting the engine. Second, and decisive: it removes the entire learning goal. You'd have a routing app and no graph-search depth to show for it.
+## Option B — run the discovery slice  ★ recommended
 
-## Option C — Hand-roll the router (chosen)
+Build nothing new; bundle one neighborhood and put the existing colored-path +
+climb-number UI in front of 5 real self-powered travelers (full cut in `02`).
 
-Build the engine: a parametric A\* (`features/routing/`) where Dijkstra, A\*, and the grade variants are one function with different cost/heuristic arguments, a lazy-deletion heap, an admissible heuristic proven optimal against a Dijkstra oracle, and a directional cost model. **Opportunity cost, owned:** no contraction hierarchies, no spatial index, so it's neighborhood-scale, not city-scale. For the project's goal — own the algorithm, prove it correct — that cost is acceptable and the alternative (city scale) wouldn't teach more.
+- **Buys:** the first demand evidence flattr has ever had. Converts the empty
+  column of `00`'s diagram into a data point — even a *negative* result is a win
+  (it cheaply kills the product question).
+- **Opportunity cost:** ~1-2 weeks, and the emotional cost that the answer might
+  be "people shrug." That risk is the *reason* to run it cheaply before
+  investing more.
+- **Why it wins:** it's the only option whose output changes what you'd do next.
+  A, C, and D all leave you exactly as ignorant about demand as you are today.
 
-## Option D — Buy a grade/elevation routing SDK
+## Option C — build more engine (bidirectional, k-alternatives, CH)
 
-A commercial elevation-aware routing SDK would handle grade out of the box. Costs: money, an API key, vendor lock-in, and — same as B — it guts the learning goal. It's the right call for a funded product on a deadline; it's the wrong call for a prototype whose entire point is the build.
+The spec §14.5 stretch goals: bidirectional A*, k alternative routes,
+contraction hierarchies, ALT landmarks.
 
-## The opportunity cost of the chosen path
+- **Buys:** genuine DSA depth and a more impressive benchmark table (the
+  bench harness already supports adding stages — `bench/run.ts`).
+- **Opportunity cost:** every hour here is an hour not spent learning whether
+  anyone wants the thing. You'd be optimizing the search over a graph nobody has
+  asked to route across.
+- **When C is correct:** *only* under Option A's framing (pure portfolio) — if
+  the goal is to show algorithmic range, C is the strongest portfolio move. As a
+  *product* move it's premature optimization of demand-unvalidated software.
 
-Say this part without flinching: choosing to hand-roll means flattr **cannot route across a city today**, and a reviewer who wants a deployable product will see that as a miss. The trade was deliberate — neighborhood scale validates the premise and maximizes the learning, city scale does neither — but the cost is real and the honest brief states it rather than hiding behind "it's a prototype."
+## Option D — expand coverage (multi-city / city-scale)
 
-▸ Naming the cost of the path you *chose* is more convincing than listing the flaws of the paths you rejected.
+Spec §10 Phase 4: vehicle presets, multi-city pipeline, saved routes.
 
-## One-page summary
+- **Buys:** a bigger map; more places to route.
+- **Opportunity cost:** the worst ratio of the four. Coverage is a cost you pay
+  to *serve* demand; paying it before demand exists is backwards. Plus it
+  collides with a hard constraint: free Open-Meteo elevation **429s under heavy
+  testing** (project context) — scaling the pipeline fights the free-tier
+  ceiling that spec §11.A already flagged as make-or-break.
+- **When D is correct:** after B returns positive *and* you know which
+  neighborhoods the validated users actually travel.
 
-**Core claim:** Four real options existed including *do nothing*; hand-rolling won not because it's the only way to route, but because the project's goal is owning the algorithm — and that makes "wrap a library" and "buy an SDK" lose the entire learning value.
+## The opportunity-cost principle
 
-- **A. Do nothing:** honest baseline; loses to the project's learning purpose, not the problem's merits.
-- **B. Wrap OSRM/Valhalla:** fast routes, but directional grade fights their cost model and removes the learning goal.
-- **C. Hand-roll (chosen):** own the cost model + algorithm depth; cost = no city scale.
-- **D. Buy an SDK:** out-of-box grade, but money + lock-in + no learning.
-- **Owned cost of C:** can't route city-wide today — deliberate, correctly sequenced after validation.
+```
+  spend hours where the uncertainty is, not where the comfort is
 
-┃ "Wrapping a library would give me a routing app and no graph-search depth to show for it."
+       certainty  ◄─────────────────────────────►  uncertainty
+       ───────────                                  ───────────
+       engine works        ░░░░░░░░░░░░░░░░░░        anyone wants it?
+       (A* == Dijkstra)                              (no data at all)
+            ▲                                              ▲
+            │                                              │
+       C and D invest here                          B invests here
+       (the easy, proven side)                      (the hard, unknown side)
+```
+
+The senior move is to invest against uncertainty. The engine being done is
+*exactly* the reason the next dollar should not go to the engine.
+
+## See also
+
+- `02-scope-cuts-and-non-goals.md` — what Option B actually bundles, and the
+  engine work it deliberately cuts.
+- `04-success-metrics-and-feedback-loop.md` — how you'd know Option B succeeded.
+- `05-skeptical-reviewer-questions.md` — defending the "do nothing more on
+  features" stance in a review.

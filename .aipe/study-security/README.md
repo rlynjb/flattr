@@ -1,71 +1,83 @@
 # Study — Security (flattr)
 
-The trust axis as a discipline: for every boundary in this repo, what can
-each side see, reach, or tamper with — and what happens when an attacker
-reaches it.
+The only question this guide asks: **what can an attacker reach, and what
+happens when they do?** Everything below traces one axis — *trust* — across
+every boundary where data crosses from somewhere you don't control into code
+you do.
+
+flattr is unusual for a security audit: it's a client-side TypeScript router
+with **no auth, no backend, no server-side secrets, no database, no cookies**.
+That removes most of the classic attack surface (no SQLi, no CSRF, no session
+fixation, no XSS-via-server-render). What's left is a narrower but real set of
+trust boundaries — all about *external data entering a pipeline that trusts it
+too much*.
+
+## The trust map (zoom out)
 
 ```
-  the only question this guide answers
+  flattr — where untrusted data crosses into trusted code
 
-  what can an attacker reach, and what happens when they do?
-
-  trace the trust axis across every boundary ──────────────────────
-     where does untrusted input enter?     → third-party APIs + user text
-     who is allowed past this boundary?     → NOBODY (no auth surface)
-     what's hidden, what's exposed?         → GPS + search queries leave device
-     what do my dependencies let in?        → Expo / MapLibre / RN tree
+  ┌─ Trusted: your code ────────────────────────────────────────┐
+  │                                                              │
+  │   A* router · grade math · GeoJSON shaping · React UI        │
+  │                                                              │
+  └───▲───────────────▲───────────────────────▲─────────────────┘
+      │ boundary 1     │ boundary 2             │ boundary 3
+      │ OSM geometry   │ graph.json artifact    │ user input → 3rd-party URL
+      │ + elevation    │ (cast, not validated)  │ (GPS + typed text)
+  ┌───┴────────────┐ ┌─┴──────────────────┐ ┌──┴────────────────────┐
+  │ Overpass (OSM) │ │ mobile/assets/     │ │ Nominatim (OSM geocode)│
+  │ Open-Meteo     │ │   graph.json       │ │ — display_name back     │
+  │ (keyless APIs) │ │ (build output)     │ │   into the UI           │
+  └────────────────┘ └────────────────────┘ └────────────────────────┘
+   Untrusted: third parties + an artifact nobody re-checks at load
 ```
 
-## The honest verdict, up front
-
-flattr has a **modest, honest attack surface**. There is no auth, no
-accounts, no server you operate, no database, no session, no LLM/agent
-layer. That removes whole classes of vulnerability (no SQLi, no CSRF, no
-broken-authz, no prompt injection) — and this guide says so plainly rather
-than inventing threats to look thorough.
-
-What *is* real: this app trusts data from four third-party services it does
-not control (Overpass/OSM, Open-Meteo, Nominatim, OpenFreeMap tiles), it
-sends the user's GPS coordinate and typed search text to one of those
-services, and it loads a half-megabyte build artifact (`graph.json`) into
-the routing engine through an **unchecked type cast** with zero runtime
-validation. None of these is a CVE. All of them are trust assumptions, and
-this guide names where each one would break.
+The three boundaries are the three Pass-2 pattern files. Everything else the
+8-lens audit marks honestly — most as `not yet exercised`, because the
+architecture genuinely doesn't have the surface.
 
 ## Reading order
 
-1. **`00-overview.md`** — one-page orientation: the whole trust map in one
-   diagram, the four boundaries, the ranked findings.
-2. **`audit.md`** — Pass 1, the 8-lens security audit. Each lens names what
-   the repo does (with `file:line`) or emits `not yet exercised` honestly.
-   The capstone lens is a consolidated red-flag checklist.
-3. **Pattern files** — Pass 2, the security-shaped mechanisms worth a deep
-   walk:
-   - **`01-external-data-trust-boundary.md`** — the build pipeline trusts
-     OSM geometry and DEM elevation; the `MAX_GRADE_PCT` clamp is the one
-     place that data is sanitized before it drives routing cost.
-   - **`02-unvalidated-artifact-load.md`** — `graph.json` enters the engine
-     via `as unknown as Graph` with no schema check. The single highest-
-     consequence trust assumption in the runtime.
-   - **`03-user-input-to-third-party-url.md`** — geocode/search text is
-     URL-encoded into Nominatim requests; what's safe, what leaves the
-     device, what the privacy cost is.
+1. **`00-overview.md`** — one page: the trust axis, the verdict, the ranked
+   exposure list. Start here.
+2. **`audit.md`** — Pass 1. All 8 security lenses walked against real files,
+   with `not yet exercised` named honestly and triggers for when each lens
+   *starts* to apply.
+3. **`01-external-data-trust-boundary.md`** — Overpass OSM geometry +
+   Open-Meteo elevation entering the pipeline with one clamp (`±40%` grade)
+   and no schema check. Runs at **both** build-time and runtime.
+4. **`02-unvalidated-artifact-load.md`** — `graph.json` cast `as unknown as
+   Graph` with zero runtime validation. The highest *availability* risk in the
+   repo.
+5. **`03-user-input-to-third-party-url.md`** — exact GPS coords + typed search
+   text sent to Nominatim on every query; `display_name` strings come back
+   attacker-influenced and render in the UI. The seam to watch when the future
+   LLM layer lands.
+
+## The verdict up front
+
+There is **no confidentiality or integrity exposure** here worth losing sleep
+over — no secrets to leak, no other user's data to reach, no privileged action
+to escalate to. The entire risk surface is **availability + data integrity of
+the route**: malformed external data or a drifted artifact crashes the app or
+silently produces a wrong (unsafe-grade) route. The single worst exposure is
+`02` — an unvalidated artifact that fails deep inside A* with a cryptic error
+instead of at the boundary with a clear one.
 
 ## Cross-links to sibling guides
 
-- **`.aipe/study-networking/`** — the outbound calls themselves (DNS, TLS,
-  retries, timeouts) live there; this guide covers only the *trust* placed
-  in what those calls return.
-- **`.aipe/study-system-design/`** — the artifact boundary as an
-  architecture decision (build-time vs runtime split) lives there; here we
-  cover it as a trust boundary.
-- **`.aipe/study-data-modeling/`** — the *shape* of `graph.json` lives
-  there; here we cover the fact that the shape is asserted, never verified.
-
-## The one rule this guide follows
-
-Every claim cites a real path and line range. Every abstract statement is
-followed by a concrete consequence ("if the artifact ships with a malformed
-edge, `nearestNode` reads `undefined.lat` and the screen white-screens").
-"This is secure" is banned. `not yet exercised` is used wherever the repo
-genuinely lacks the surface — and explains what would introduce it.
+- **`study-system-design`** — the same three boundaries seen as architecture
+  (build-time pipeline vs runtime tile loading); the artifact handoff.
+- **`study-networking`** — the Overpass/Open-Meteo/Nominatim fetch posture:
+  retries, timeouts, rate-limit backoff (`overpass.ts`, `elevation.ts`).
+- **`study-data-modeling`** — the `Graph` schema itself (what `02` should
+  validate against).
+- **`study-debugging-observability`** — where a malformed artifact actually
+  surfaces (deep in A*, not at load) and why that's a debugging tax.
+- **`study-ai-engineering` / `study-prompt-engineering` / `study-agent-architecture`**
+  — the future LLM seam flagged in `03`: `display_name` is attacker-influenced
+  text that must never reach a prompt unframed.
+- **`study-performance-engineering`** — the rate-limit clamps
+  (`MAX_CORRIDOR_SPAN_DEG`, batch sizes) that double as a crude DoS guard on
+  the free APIs.

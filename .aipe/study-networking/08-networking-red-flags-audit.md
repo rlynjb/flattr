@@ -1,277 +1,203 @@
-# 08 — Networking red-flags audit
-### ranked protocol and network-failure risks grounded in the repo
-**Industry name:** network resilience audit — *Project-specific*
+# 08 — Networking Red-Flags Audit
 
-═════════════════════════════════════════════════
-ZOOM OUT, THEN ZOOM IN
-═════════════════════════════════════════════════
+**Ranked protocol and network-failure risks** · *Project-specific audit*
 
-This file is the ranked risk register — every networking weakness in the repo, ordered by *consequence*, each grounded in a real `file:line` and paired with the move that fixes it. It's the verdict-first summary the other seven files build toward.
+## Zoom out, then zoom in
+
+Every other file in this guide taught a mechanism. This one ranks what's *wrong or missing*, by consequence, with evidence. flattr's networking is small and mostly clean — three `fetch`-based APIs with sensible retry and a strong cache. The risks are concentrated: one is genuinely serious, the rest are low-to-medium polish items. No risk here is "this is broken"; the top one is "this fails badly under a failure mode that will eventually happen."
 
 ```
-  Zoom out — where each red flag lives
+  Zoom out — where the risks live on the map
 
-  ┌─ Pre-request (avoid) ────────────────────────────┐
-  │  FLAG 4: no mirror rotation (pinned host)        │
-  └─────────────────────────┬─────────────────────────┘
-  ┌─ In-request (recover) ───▼────────────────────────┐
-  │  ★ FLAG 1: NO TIMEOUT ★  FLAG 2: inconsistent     │ ← top risks
-  │  retry policy  FLAG 5: unchecked .json()           │
-  └─────────────────────────┬─────────────────────────┘
-  ┌─ Cross-request (cap) ────▼────────────────────────┐
-  │  FLAG 3: busy-lock + no timeout = wedge risk      │
-  └─────────────────────────┬─────────────────────────┘
-  ┌─ Secrets-adjacent ───────▼────────────────────────┐
-  │  FLAG 6: API key in query string                  │
-  └────────────────────────────────────────────────────┘
+  ┌─ scheduler ──────────────────────────────────────────────┐
+  │  single-flight gate  ←── ⚠ R1 jams here on a hang         │
+  └────────────────────────┬──────────────────────────────────┘
+  ┌─ resilience band ───────▼─────────────────────────────────┐
+  │  retry+backoff  ←── ⚠ R2 no jitter, ⚠ R4 no Retry-After   │
+  │  cache          ←── ⚠ R5 no integrity/version guard       │
+  └────────────────────────┬──────────────────────────────────┘
+  ┌─ UI ────────────────────▼─────────────────────────────────┐
+  │  debounced geocode  ←── ⚠ R3 in-flight not cancelled       │
+  └────────────────────────────────────────────────────────────┘
 ```
 
-Zoom in: not all of these are equally dangerous. The ranking is by blast radius — what actually breaks for a user, how likely, how hard to fix.
+Zoom in: the audit answers *"where will flattr's networking hurt first, and what's the cheapest fix?"* Ranked by consequence × likelihood, with the verdict first on each.
 
-═════════════════════════════════════════════════
-THE STRUCTURE PASS
-═════════════════════════════════════════════════
-
-**Layers.** Same four resilience layers from `07` — avoid / recover / cap / degrade — plus a secrets-adjacent concern that crosses into `.aipe/study-security/`.
-
-**Axis — consequence (what does a user actually lose?).** The ranking *is* the axis traced across every flag:
+## The ranked findings
 
 ```
-  Axis "what does the user lose?" — ranked by consequence
-
-  FLAG 1 (no timeout)      → app WEDGES, silent, unrecoverable  ████ worst
-  FLAG 2 (retry incons.)   → unpredictable recovery, geocode fails ███
-  FLAG 3 (lock + hang)     → runtime tile-loading dies after 1 hang ███
-  FLAG 4 (no mirror rot.)  → build/coverage dies if 1 host down   ██
-  FLAG 5 (unchecked json)  → cryptic crash on HTML error page     ██
-  FLAG 6 (key in query)    → key leaks to logs (not the wire)     █  (non-default)
-```
-
-**Seams.** The audit's seam is the test seam — every provider module injects `fetchImpl`, so all of these can be reproduced and regression-tested without hitting the network (`pipeline/overpass.test.ts`, `pipeline/elevation.test.ts`). The fixes are testable today.
-
-═════════════════════════════════════════════════
-HOW IT WORKS — the ranked register
-═════════════════════════════════════════════════
-
-#### Move 1 — the shape of the risk surface
-
-You know how a code review sorts findings by severity, not by file order? This is that, for the wire. The pattern: each flag is `(consequence, likelihood, fix-cost)`, and the ranking weights consequence first.
-
-```
-  Pattern — each flag is a triple, ranked by consequence
-
-   flag = { consequence: how bad for the user
-            likelihood:  how often it fires
-            fix-cost:    lines to fix }
-   rank by consequence DESC, break ties by likelihood
-```
-
-#### Move 2 — the flags, ranked
-
----
-
-**FLAG 1 — No client-side timeout on any request. `★ highest consequence ★`**
-
-*Evidence:* No `fetch` call in the repo passes an `AbortSignal` or deadline — `pipeline/overpass.ts:33`, `pipeline/elevation.ts:75` & `:109`, `pipeline/geocode.ts:21` & `:47` & `:64`. The Overpass QL has a *server-side* `[timeout:60]` (`pipeline/overpass.ts:10`), which does not bound the client.
-
-*Consequence:* If a provider accepts the TCP connection but never responds (half-open / black-hole), `await fetch` hangs for the OS default (minutes). At build time the CLI stalls. At runtime it's worse — see FLAG 3.
-
-*Fix:* Add `signal: AbortSignal.timeout(ms)` to every `fetch`, and treat the resulting abort as a retryable failure in the retry loops. ~1 line per call site plus a retry-condition tweak.
-
-```
-  Comparison — today vs fixed
-
-  TODAY:  await fetch(url)                  ← hangs forever on a black-hole
-  FIXED:  await fetch(url,
-            { signal: AbortSignal.timeout(8000) })  ← bounded, then retry
+  rank  finding                              severity   fix cost
+  ────  ───────────────────────────────────  ─────────  ────────
+  R1    no request timeout on any fetch      HIGH       low
+  R2    no jitter on retry backoff           MEDIUM     low
+  R3    in-flight geocode not cancelled      LOW-MED    low
+  R4    Retry-After header ignored           LOW-MED    low
+  R5    elev cache no integrity/version guard LOW       low
 ```
 
 ---
 
-**FLAG 2 — Inconsistent retry policy across providers.**
+## R1 — No request timeout on any fetch (HIGH)
 
-*Evidence:* Three different policies. Overpass retries `{429,502,503,504}` with *linear* backoff (`pipeline/overpass.ts:18`, `:43`). Open-Meteo retries *only* `429` with *exponential* backoff (`pipeline/elevation.ts:114-115`). Nominatim retries *nothing* — one shot, throw (`pipeline/geocode.ts:24`, `:50`, `:67`).
+**Verdict:** the one serious risk. Every `fetch` in the codebase can hang indefinitely; at runtime a single hang jams the whole map-loading pipeline until the OS TCP timeout fires (minutes).
 
-*Consequence:* Unpredictable behavior; a reader can't reason about recovery without reading each module. Concretely, a transient Nominatim 503 fails a geocode that Overpass/Open-Meteo would have retried — the user sees "From not found" (`mobile/src/MapScreen.tsx:176`) for a blip that a retry would have survived.
+**Evidence.** Repo-wide search for `AbortController`, `AbortSignal`, and any `signal:` option returns nothing across `pipeline/`, `mobile/src/`, `lib/`, `features/`. The raw fetches:
+- `pipeline/overpass.ts:33` — `await fetchImpl(endpoint, { method, headers, body })`, no signal
+- `pipeline/elevation.ts:109` — `await fetchImpl(url)`, no signal
+- `pipeline/geocode.ts:21,47,64` — no signal
 
-*Fix:* Extract one `fetchWithRetry(url, init, { retryable, backoff, retries, jitter })` helper and use it for all three providers. Unify on exponential-with-jitter.
-
-```
-  Policy table — the inconsistency
-
-  Overpass    {429,5xx}  linear      retries 3
-  Open-Meteo  {429}      exponential retries 3 (build) / 1 (runtime)
-  Nominatim   none       —           retries 0   ← the outlier that bites
-```
-
----
-
-**FLAG 3 — Busy-lock + no timeout = a single hang wedges runtime tile loading.**
-
-*Evidence:* `useTileGraph` caps builds at one in-flight via `busyRef` and only clears it in a `finally` (`mobile/src/useTileGraph.ts:104`, `:124-126`). Combined with FLAG 1 (no timeout), a hung `fetchOverpass` never reaches the `finally`.
-
-*Consequence:* `busyRef.current` stays `true` forever; every subsequent pan or route early-returns at `if (busyRef.current) return` (`:90`). Tile loading silently dies for the session — no error, no recovery, no crash.
-
-*Fix:* FLAG 1's timeout fixes this transitively (the abort reaches `finally`, clears the lock). Belt-and-suspenders: a watchdog that force-clears `busyRef` after a max build duration.
+**Why it bites.** Retries only trigger on a *returned* status (`overpass.ts:42`, `elevation.ts:114`). A connection that opens but never responds — a half-open socket, a hung server — never returns a status, so the retry loop never engages. The `await` just blocks.
 
 ```
-  State — the wedge
+  Failure trace — runtime hang jams the gate
 
-  busy=true ──fetch hangs (no timeout)──► finally never runs
-       │                                       │
-       └── busyRef stuck true ◄────────────────┘
-              │
-              └─ every later pump() hits `if (busy) return` → dead
-```
-
----
-
-**FLAG 4 — Single pinned host per provider, no mirror rotation.**
-
-*Evidence:* One hardcoded hostname each (`pipeline/overpass.ts:4`, `pipeline/geocode.ts:5`). Retry re-issues to the *same* host (`pipeline/overpass.ts:32-45`).
-
-*Consequence:* If `overpass-api.de` is down or blocks flattr's User-Agent, the build fails outright and runtime coverage can't extend — retrying the same dead host doesn't help. Overpass specifically runs multiple public mirrors, so this is a real, avoidable single point of failure.
-
-*Fix:* A host list + rotate-on-failure in the retry loop (try mirror B when mirror A gives a retryable error). Addressing-layer change, not transport.
-
----
-
-**FLAG 5 — Unchecked `res.json()` assumes well-formed JSON.**
-
-*Evidence:* Every module does `await res.json()` and uses the shape directly, no try/catch, no schema check (`pipeline/overpass.ts:41`, `pipeline/elevation.ts:111`, `pipeline/geocode.ts:25`).
-
-*Consequence:* Overpass mirrors sometimes return HTTP 200 with an HTML error/"too busy" page under load. `.json()` throws a parse error (not a clean status error), which surfaces as a cryptic exception rather than a recognizable "provider busy" signal. It *is* caught upstream (the retry loop's caller or `useTileGraph`'s catch), so it degrades rather than crashes — but the error is misleading.
-
-*Fix:* Check `Content-Type: application/json` before parsing, or wrap `.json()` and map a parse failure onto the retryable-failure path (so a busy-page 200 retries like a 503).
-
----
-
-**FLAG 6 — Google Elevation API key in the URL query string. `(non-default provider)`**
-
-*Evidence:* `pipeline/elevation.ts:72` — `&key=${apiKey}` in the URL.
-
-*Consequence:* On the wire it's safe — HTTPS encrypts the full request (`04`). The risk is *off* the wire: query-string secrets leak into provider server logs, proxy logs, and any monitoring that records full URLs. Lower priority because Google is the non-default provider (Open-Meteo is default and keyless), so this path is rarely exercised.
-
-*Fix:* If Google ever becomes primary, move the key to a header where the API supports it, and keep it out of any URL that gets logged. Cross-ref `.aipe/study-security/` for secrets handling.
-
-#### Move 3 — the principle
-
-Rank by consequence, not by how clever the fix is. The single timeout (FLAG 1) is one line per call site and fixes the worst failure mode *plus* FLAG 3 transitively — that's the highest-leverage networking change in the entire repo. Everything below it (consistency, mirror rotation, parse hardening) is real but secondary. A risk register that sorts by blast radius tells you what to do Monday morning.
-
-═════════════════════════════════════════════════
-PRIMARY DIAGRAM
-═════════════════════════════════════════════════
-
-The full ranked register in one frame.
-
-```
-  flattr networking red flags — ranked by consequence
-
-  RANK  FLAG                      EVIDENCE                  FIX
-  ────  ────────────────────────  ────────────────────────  ──────────────
-   1    no client timeout         overpass.ts:33,           AbortSignal.
-        (app wedges)              elevation.ts:75,109,      timeout on every
-                                  geocode.ts:21,47,64       fetch + retry it
-   2    inconsistent retry        overpass.ts:18, elevation one fetchWithRetry
-        (geocode fails on blip)   .ts:114, geocode.ts:24    helper, unify
-   3    lock + hang = wedge       useTileGraph.ts:90,104,   fixed by #1
-        (runtime tiles die)       124-126                   (+ watchdog)
-   4    pinned host, no rotation  overpass.ts:4,            host list +
-        (1 dead host = no build)  geocode.ts:5              rotate on fail
-   5    unchecked res.json()      overpass.ts:41,           check Content-Type
-        (cryptic crash on HTML)   elevation.ts:111          / map to retry
-   6    key in query string       elevation.ts:72           header (if Google
-        (logs, not wire)          (non-default)             becomes primary)
-```
-
-═════════════════════════════════════════════════
-IMPLEMENTATION IN CODEBASE
-═════════════════════════════════════════════════
-
-**Use cases.** This audit is reached for in a code review, a reliability pass, or when prepping to widen the bbox / promote Google to primary (both of which raise request volume and thus the stakes on FLAGS 1–4).
-
-**The clearest reproduction of FLAG 1+3** — `mobile/src/useTileGraph.ts` (lines 104-127):
-
-```
-  mobile/src/useTileGraph.ts  (lines 104-127)
-
-  busyRef.current = true;                  ← lock acquired
-  (async () => {
-    try {
-      const osm = await fetchOverpass(bbox); ← FLAG 1: no timeout → can hang
-      ...
-    } catch { /* keep last region */ }
-    finally {
-      busyRef.current = false;             ← FLAG 3: only cleared HERE…
-      pump();
-    }
-  })();
+  pump() → busyRef = true → await fetchOverpass(bbox)
+                                  │ server accepts, never responds
+                                  ▼
+                            await blocks (no status, no retry)
+                                  │
+  busyRef STAYS true ─────────────┘
         │
-        └─ if fetchOverpass hangs (FLAG 1), control never reaches finally,
-           busyRef stays true, and `if (busyRef.current) return` (line 90)
-           kills every future pan/route. One hang = dead tile loading.
+        ▼ consequence
+  every later pump() returns early ("if busyRef.current return")
+  → no viewport loads, no route builds, loader stuck "Fetching streets"
+  → recovers only when OS TCP timeout fires (minutes), then catch frees busyRef
 ```
 
-**The test seam that makes every fix verifiable** — `pipeline/overpass.test.ts` (lines 49-54):
+At build time the symptom is milder (the script just stalls) but the same root cause.
+
+**Fix.** Wrap each fetch in an `AbortController` with a 5–10s timeout; the abort throws, which the existing `catch`/retry already handles, and `busyRef` frees in the `finally`. Low cost, removes the jam entirely. Detailed comparison in `07` Move 2.
+
+---
+
+## R2 — No jitter on retry backoff (MEDIUM)
+
+**Verdict:** the backoff curves are fixed-schedule, so synchronized retries can re-overload a recovering server (thundering herd). Partially mitigated by single-flight, not eliminated.
+
+**Evidence.**
+- `overpass.ts:44` — `sleep(delayMs * (attempt + 1))` — deterministic 2/4/6s
+- `elevation.ts:115` — `sleep(delayMs * 2 ** (attempt + 1))` — deterministic .6/1.2/2.4s
+
+No `Math.random()` anywhere in the delay computation.
+
+**Why it bites.** If a provider returns `429` to many in-flight batches at once (build time, sequential batches that all start hitting quota), they all back off on the *identical* schedule and retry in sync, re-spiking the load right when the server is trying to recover.
 
 ```
-  pipeline/overpass.test.ts  (lines 49-54)
+  Comparison — fixed vs jittered backoff
 
-  const fakeFetch = vi.fn(async () => new Response("rate", { status: 429 }));
-  await expect(
-    fetchOverpass(bbox, "https://example/api",
-      fakeFetch as ..., { retries: 2, delayMs: 0 })  ← inject fake fetch
-  ).rejects.toThrow(/429/);
-  expect(fakeFetch).toHaveBeenCalledTimes(3);        ← initial + 2 retries
-        │
-        └─ the injectable fetchImpl means a timeout test (FLAG 1) can simulate
-           a never-resolving fetch and assert the abort fires — no network.
-           Every fix in this audit is regression-testable through this seam
+  fixed (now):           batch1 ──2s──► retry ┐ all retry
+                         batch2 ──2s──► retry ┤ at the SAME
+                         batch3 ──2s──► retry ┘ instant → re-spike
+
+  jittered (fix):        batch1 ──2.3s──► retry  spread out,
+                         batch2 ──1.7s──► retry  no synchronized
+                         batch3 ──2.9s──► retry  re-spike
 ```
 
-═════════════════════════════════════════════════
-ELABORATE
-═════════════════════════════════════════════════
+**Mitigation already present.** The runtime single-flight gate (`useTileGraph.ts:166`) ensures only one build retries at a time, and the build-time batch loop is sequential — so the herd is small by construction. The risk is real but bounded.
 
-The honest framing: flattr's networking is *better than typical hobby code* — it has real retry/backoff, request collapsing, a concurrency cap, and graceful degradation, all motivated by a documented free-tier rate limit (`.aipe/project/context.md`). The gaps are the *last mile* of resilience (timeout, jitter, consistency), and they cluster around one root cause — taking the platform `fetch` defaults without bounding them. The timeout is the keystone: it's the cheapest fix and it unblocks the worst failure mode. If you do one networking thing to this repo, add `AbortSignal.timeout` everywhere. The general theory behind these flags — overload control, retryable-vs-permanent failures, partial failure — lives in `.aipe/study-distributed-systems/`; whether the boundaries are *safe* (FLAG 6) lives in `.aipe/study-security/`.
+**Fix.** `sleep(base * factor * (1 + Math.random()))`. One-line change per curve.
 
-═════════════════════════════════════════════════
-INTERVIEW DEFENSE
-═════════════════════════════════════════════════
+---
 
-**Q: "If I gave you an hour to harden this app's networking, what would you do?"**
+## R3 — In-flight geocode request not cancelled (LOW-MED)
 
-Answer: "Add `AbortSignal.timeout` to every `fetch`, and make the abort a retryable condition. That single change fixes the worst bug — no client timeout means a hung connection hangs forever — *and* it fixes a runtime-specific failure where that hang holds the single-build concurrency lock and silently kills all tile loading for the session. After that, I'd extract one `fetchWithRetry` helper to kill the three-different-policies inconsistency and add jitter. Mirror rotation and parse-hardening are real but secondary."
+**Verdict:** the autocomplete debounce cancels the *timer* but not an already-fired request, so a slow earlier suggestion can land after a newer one and show stale results.
+
+**Evidence.** `MapScreen.tsx:73-89` — `scheduleSuggest` clears `suggestTimer` (the pending timer) but once `geocodeSuggest` is awaited (`MapScreen.tsx:82`), there's no `AbortController` to cancel it. If request A (slow) fires, then the user types more and request B fires and returns first, A can still resolve afterward and call `setSuggestions(A)`, overwriting B's fresher results.
 
 ```
-  hour 1: AbortSignal.timeout everywhere → fixes #1 AND #3
-  then:   one fetchWithRetry helper + jitter → fixes #2
-  later:  mirror rotation (#4), parse guard (#5)
+  Sequence — last-write-wins goes wrong without cancellation
+
+  type "pik"  → debounce → fire A (slow)
+  type "pike" → debounce → fire B (fast)
+  B resolves  → setSuggestions(B)   ✓ correct
+  A resolves  → setSuggestions(A)   ✗ stale, overwrites B
 ```
 
-Anchor: *the timeout is the keystone — one line per call site, fixes the worst failure plus the wedge transitively.*
+**Why it's only LOW-MED.** It's a stale-suggestion flicker, not a correctness bug in routing. The 400ms debounce makes the overlap window small. Still a real out-of-order race.
 
-**Q: "What's the most dangerous line of networking code in this repo?"**
+**Fix.** Same `AbortController` from R1 — abort the previous suggest before firing a new one. Or track a request sequence number and ignore stale resolutions.
 
-Answer: "`await fetchOverpass(bbox)` inside `useTileGraph`'s build, because it has no timeout *and* sits inside a concurrency lock that only clears in a `finally`. A hung connection means the `finally` never runs, `busyRef` stays true, and every future pan or route silently no-ops. It's worse than a crash because there's no error and no recovery — the app just quietly stops loading tiles."
+---
 
-Anchor: *no timeout + a lock that clears only in finally = one stuck call wedges the whole runtime path.*
+## R4 — Retry-After header ignored (LOW-MED)
 
-═════════════════════════════════════════════════
-VALIDATE
-═════════════════════════════════════════════════
+**Verdict:** when a provider returns `429` *with* a `Retry-After` header telling flattr exactly how long to wait, flattr ignores it and uses its own backoff guess instead.
 
-1. **Reconstruct:** List the six flags from memory in consequence order, with the one-line fix for each.
-2. **Explain:** Why does FLAG 1 (no timeout) make FLAG 3 (the lock wedge) possible? Trace `mobile/src/useTileGraph.ts:90, 104, 124`.
-3. **Apply:** You promote Google Elevation to the default provider and widen the bbox 10×. Which flags get more dangerous, and in what order would you fix them now?
-4. **Defend:** Someone says "just add a circuit breaker." Argue why the timeout (FLAG 1) is higher-leverage than a circuit breaker for *this* repo.
+**Evidence.** The retry blocks (`overpass.ts:42-45`, `elevation.ts:114-117`) read only `res.status`, never `res.headers.get("Retry-After")`. The wait is always the computed backoff.
 
-═════════════════════════════════════════════════
-SEE ALSO
-═════════════════════════════════════════════════
+**Why it bites.** If the server says "wait 30s" and flattr's backoff says "wait 2s," flattr retries too early and eats another `429`, wasting a retry from its budget and adding load. Conversely if the server says "wait 1s" flattr over-waits.
 
-- `07-timeouts-retries-pooling-and-backpressure.md` — the resilience mechanisms these flags are gaps in.
-- `05-http-semantics-caching-and-cors.md` — the status codes behind the retry inconsistency.
-- `02-dns-routing-and-addressing.md` — the pinned-host single point of failure (FLAG 4).
-- `.aipe/study-distributed-systems/` — overload, partial failure, circuit breaking.
-- `.aipe/study-security/` — the API-key-in-query secrets concern (FLAG 6).
+**Why it's only LOW-MED.** Overpass and Open-Meteo don't reliably send `Retry-After` on their free tiers (provider-dependent), so the header is often absent anyway. *(Inference — flattr never inspects it, so whether the providers send it is unverified from the code.)* The cost is suboptimal retry timing, not failure.
+
+**Fix.** `const wait = Number(res.headers.get("Retry-After")) * 1000 || computedBackoff;` — honor it when present, fall back when not.
+
+---
+
+## R5 — Elevation cache has no integrity or version guard on read (LOW)
+
+**Verdict:** the persistent cache trusts whatever JSON it parses from AsyncStorage; a corrupt or schema-changed blob is partially absorbed but could feed bad elevations.
+
+**Evidence.** `elevCache.ts:21-28` — `JSON.parse(raw)` inside a `try/catch`, and the catch handles a *parse* failure (corrupt JSON) gracefully. But if the JSON parses yet contains wrong-typed or stale-schema values (e.g. a future format change), they're loaded as-is into `mem` (`elevCache.ts:24`). The `STORAGE_KEY` is versioned (`flattr.elevCache.v1`, `elevCache.ts:7`), which is the right instinct, but there's no per-value validation.
+
+**Why it's only LOW.** DEM elevation values never change (the comment at `elevCache.ts:3` is correct), the key is already versioned so a format bump can use `v2`, and a bad cached elevation only mis-colors a grade band — it doesn't break routing connectivity. The blast radius is cosmetic.
+
+**Fix.** Validate value types on load (`typeof v === "number" && isFinite(v)`), skip bad entries. Cheap defense-in-depth.
+
+---
+
+## What's clean (the non-findings)
+
+Worth stating, because an audit that only lists problems misleads:
+
+```
+  ✓ all HTTPS, no verification bypass        (04 — no rejectUnauthorized)
+  ✓ User-Agent sent everywhere               (good free-tier citizenship)
+  ✓ fetch injected everywhere for tests      (overpass/geocode/elevation)
+  ✓ retry sets matched to each API's errors  (05 — per-module, deliberate)
+  ✓ persistent cache + dedup = strong rate-  (07 — the real throttle defense)
+    limit defense
+  ✓ best-effort degradation + self-heal      (07 — graceful runtime failure)
+  ✓ single-flight gate = real backpressure   (07 — collapses pan backlog)
+```
+
+## Primary diagram
+
+The complete audit — risks placed on the request path, ranked.
+
+```
+  flattr networking audit — risks on the path
+
+  user gesture
+      │
+      ▼ debounce ──── R3: in-flight not cancelled (stale suggest)
+  single-flight gate ─ R1: HANGS here on a no-response fetch ⚠ HIGH
+      │
+      ▼ cache/dedup ── R5: no per-value integrity check (low)
+      │
+      ▼ retry+backoff ─ R2: no jitter (herd)  R4: ignores Retry-After
+      │
+      ▼ fetch ──── ⚠ R1 again: no AbortController = unbounded wait
+      │
+      ▼ degrade (best-effort + self-heal) ── clean
+```
+
+## Elaborate
+
+The pattern across these findings: flattr handles the failures it *can see* (a returned `429`, a parse error) and is exposed to the failures that are *silent* (a hang, an out-of-order resolution, a header it never reads). That's a common maturity gap — you build for the errors you've observed in testing, and the silent ones show up only in production under real network conditions. The single highest-leverage move is R1: one `AbortController` pattern, applied to all five fetch sites, closes the worst risk and incidentally enables the fix for R3. For the AI-engineering pivot, carry this forward: LLM provider calls hang too (a stalled stream, a slow first token), and the same timeout discipline is the first thing to add.
+
+## Interview defense
+
+**Q: You've got 30 minutes to harden flattr's networking. What do you do?**
+R1 first — wrap all five fetch sites in a shared `AbortController` helper with a 5–10s timeout. It closes the only HIGH risk (a hang jamming the single-flight gate, `useTileGraph.ts:166`), reuses the existing `catch`/retry path, and the same helper fixes R3 (cancel stale geocode suggestions). Then add jitter to the two backoff curves (R2). Everything else is polish. Anchor: *timeout first — it's the failure flattr can't currently see.*
+
+**Q: What does flattr's networking get right?**
+The rate-limit defense is genuinely good: persistent semantic-key cache + same-cell dedup + single-flight gate means revisited areas issue zero requests and rapid panning collapses to one build. Retry sets are matched per-API to real failure modes, all traffic is HTTPS with no verification bypass, and failure degrades gracefully (flat elevation + self-heal). The gaps are silent-failure handling, not architecture. Anchor: *strong on avoiding requests; weak on bounding the ones that hang.*
+
+## See also
+
+- `07-timeouts-retries-pooling-and-backpressure.md` — the mechanisms these findings critique, in depth
+- `05-http-semantics-caching-and-cors.md` — the retry status sets and the cache design
+- `.aipe/study-security/` — the trust-boundary view of these same outbound calls
+- `.aipe/study-debugging-observability/` — how a hung request would (not) surface today

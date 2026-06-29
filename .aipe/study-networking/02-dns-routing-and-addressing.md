@@ -1,216 +1,163 @@
-# 02 — DNS, routing, and addressing
-### names, addresses, routing, proxies, edge layers, and origin resolution
-**Industry name:** name resolution / addressing — *Industry standard*
+# 02 — DNS, Routing, and Addressing
 
-═════════════════════════════════════════════════
-ZOOM OUT, THEN ZOOM IN
-═════════════════════════════════════════════════
+**Name resolution, hosts, proxies, edge layers** · *Industry standard*
 
-Every `fetch(url)` you've ever written started with a hostname that had to become an IP before a single byte moved. You never think about it because the platform does it silently. flattr is the same — and the lesson here is mostly about what flattr *doesn't* do: no DNS config, no proxy, no edge layer it owns, no service discovery. Just four hardcoded hostnames handed to the OS resolver.
+## Zoom out, then zoom in
+
+Every `fetch` in flattr starts with a hostname, and a hostname is not an address — something has to turn `api.open-meteo.com` into an IP before a packet can leave the device. flattr does none of that work itself. It hands a URL string to `fetch` and the OS does the rest.
 
 ```
-  Zoom out — where addressing sits
+  Zoom out — where addressing sits in the request path
 
-  ┌─ App / Build layer ─────────────────────────────┐
-  │  fetch("https://overpass-api.de/api/...")        │
-  │             │  hostname string                   │
-  └─────────────▼────────────────────────────────────┘
-  ┌─ ★ Resolution layer (OS / platform — NOT flattr) ★┐
-  │  DNS resolver: hostname ──► IP address           │ ← we are here
-  └─────────────┬────────────────────────────────────┘
-                │  IP + port 443
-  ┌─ Network ───▼────────────────────────────────────┐
-  │  routed across the public internet to the provider│
-  └───────────────────────────────────────────────────┘
+  ┌─ App code ───────────────────────────────────────┐
+  │  fetch("https://api.open-meteo.com/v1/elevation") │ ← we are here
+  └───────────────────────┬──────────────────────────┘
+                          │ hostname string
+  ┌─ ★ Resolution (OS / platform) ★ ─────────────────┐
+  │  DNS lookup: name ──► IP   (getaddrinfo / native) │
+  └───────────────────────┬──────────────────────────┘
+                          │ IP + port 443
+  ┌─ Network / routing (OS, ISP, internet) ──────────┐
+  │  TCP connect ──► route to the provider's host     │
+  └──────────────────────────────────────────────────┘
 ```
 
-Zoom in: addressing is "how does `overpass-api.de` become a machine I can open a connection to?" In flattr the answer is entirely delegated — flattr names the host, the OS resolves it, the internet routes it. flattr writes the *name* and nothing below it.
+Zoom in: the only addressing decisions flattr makes are *which hostnames to use* — three of them, all hard-coded constants — and *what query/body to attach*. Resolution, routing, and edge layering are entirely the platform's job. So this concept is mostly "here's the three names, here's who owns turning them into addresses, here's what flattr does NOT control."
 
-═════════════════════════════════════════════════
-THE STRUCTURE PASS
-═════════════════════════════════════════════════
+## Structure pass
 
-**Layers.** Name (the URL string in the code) → Resolution (DNS, owned by the OS) → Routing (the public internet) → Origin (the provider's servers, possibly behind their own CDN you can't see).
-
-**Axis — control (who decides the next step?).**
+**Layers.** Name → address → route. flattr lives only in the top layer (it picks names); the OS owns the bottom two.
 
 ```
-  Axis "who controls this step?" — down the addressing stack
+  Layers — addressing, and who owns each layer
 
-  ┌─────────────────────────────────────┐
-  │ Name: the URL constant in source     │  → flattr decides
-  └─────────────────────────────────────┘
-      ┌─────────────────────────────────┐
-      │ Resolution: DNS lookup           │  → OS / platform decides
-      └─────────────────────────────────┘
-          ┌─────────────────────────────┐
-          │ Routing + origin CDN         │  → provider / internet decides
-          └─────────────────────────────┘
-
-  control flips from flattr → platform → provider as you descend
+  ┌─ flattr owns ───────────────────────────────────┐
+  │  the hostname constants + the URL/query/body     │
+  └───────────────────────┬─────────────────────────┘
+                          │ everything below is delegated
+  ┌─ OS / platform owns ────────────────────────────┐
+  │  DNS resolution · connection · routing · retry-  │
+  │  of-resolution · happy-eyeballs (IPv4/IPv6)      │
+  └─────────────────────────────────────────────────┘
 ```
 
-**Seams.** The seam is the URL string itself. Above it, flattr decides (it picks the hostname, e.g. `DEFAULT_ENDPOINT` in `pipeline/overpass.ts:4`). Below it, control flips entirely to the platform and then the provider. Because the hostnames are *hardcoded constants*, the seam is rigid — there's no environment-based endpoint switching except the one case where Google vs Open-Meteo is chosen by env var (and that's a provider swap, not a DNS/endpoint config).
+**Axis = control (who decides the address?).** Trace it: flattr decides the *name*, the OS decides the *IP*, the provider's infrastructure decides which *backend* serves it. Three different deciders, and flattr is only the first.
 
-═════════════════════════════════════════════════
-HOW IT WORKS
-═════════════════════════════════════════════════
+**Seam.** The load-bearing boundary is the **URL string handed to `fetch`**. Above it, flattr's concern (correct host, correct query encoding). Below it, the platform's concern (resolution, connection). flattr cannot see or influence anything below that seam — no custom resolver, no `/etc/hosts` override in code, no DNS cache TTL control.
 
-#### Move 1 — the mental model
+## How it works
 
-You know how `fetch("/api/x")` resolves relative to your page's origin, but `fetch("https://other.com/x")` goes somewhere else entirely? The hostname is the only thing that decides *which machine*. flattr's hostnames are all absolute and all third-party — there's no relative URL, no own-origin, because flattr has no origin.
+### Move 1 — the mental model
+
+You've typed a URL into `fetch` a thousand times. The hostname in that URL is a *name*, and names don't route — addresses do. Between your `fetch` call and the first byte leaving the device, the platform runs a name→address translation you never see. flattr's entire DNS story is: pick good names, encode the query correctly, and trust the OS for the lookup.
 
 ```
-  Pattern — name → IP → route, all below the URL string
+  Pattern — the hostname is the only DNS decision flattr makes
 
-   "overpass-api.de"        (the name flattr writes)
-          │  DNS resolve  (OS-owned)
+  "api.open-meteo.com"   ← flattr writes this (a name)
+          │
+          │  OS resolver (not flattr's code)
           ▼
-   65.21.x.x  :443         (an IP flattr never sees)
-          │  route across internet
+   104.x.x.x : 443       ← OS produces this (an address)
+          │
           ▼
-   provider origin (maybe behind THEIR CDN — invisible to flattr)
+   route over the internet to Open-Meteo's edge
 ```
 
-#### Move 2 — walking the addressing
+### Move 2 — the three names and how they're addressed
 
-**The four names.** flattr addresses exactly four hostnames, all string constants in source. There's no service registry, no DNS-SD, no config file — the names are baked into the modules that use them.
-
-```
-  The address book (all hardcoded constants)
-
-  overpass-api.de              ← pipeline/overpass.ts:4
-  api.open-meteo.com           ← pipeline/elevation.ts:106
-  maps.googleapis.com          ← pipeline/elevation.ts:72 (only if key set)
-  nominatim.openstreetmap.org  ← pipeline/geocode.ts:5, :55
-  tiles.openfreemap.org        ← mobile/src/MapScreen.tsx:21 (used by MapLibre)
-```
-
-**Resolution is invisible.** flattr never touches DNS. It hands a hostname to `fetch` (or to MapLibre for tiles) and the platform resolver does the A/AAAA lookup, honors the system DNS cache, and returns an IP. There is no custom resolver, no `/etc/hosts` override in code, no DNS-over-HTTPS configuration. Inferred: at build time Node uses the OS resolver; at runtime React Native uses the device's resolver. flattr depends on both working and configures neither.
-
-**No proxy, no owned edge.** Trace the request and you'll find nothing between flattr and the provider that flattr controls. No reverse proxy, no API gateway, no CDN flattr operates, no load balancer. Each provider may sit behind *its own* CDN (Overpass and Nominatim are well-known to), but that edge belongs to them — flattr can't see it, configure it, or cache at it.
+**The three hostnames are hard-coded constants.** No env-var indirection, no service discovery, no config server. Each lives as a module constant:
 
 ```
-  Layers-and-hops — there is no owned middle
-
-  ┌─ flattr ─┐  GET/POST    ┌─ (NOTHING flattr   ┌─ Provider edge ──┐
-  │  fetch   │ ──────────►  │   owns here)      ──► (THEIR CDN/LB,   │
-  │          │              │                      invisible)        │
-  └──────────┘              └─────────────────────└──────────────────┘
-       no proxy · no gateway · no owned CDN · no LB
+  overpass-api.de       pipeline/overpass.ts:4   DEFAULT_ENDPOINT
+  api.open-meteo.com    pipeline/elevation.ts:106 (inline in URL)
+  maps.googleapis.com   pipeline/elevation.ts:72  (Google, key-gated)
+  nominatim.openstreetmap.org  pipeline/geocode.ts:5,55  ENDPOINT / REVERSE_ENDPOINT
 ```
 
-**Addressing the *data*, not just the host.** There's a second kind of addressing worth naming: flattr addresses geographic points, and how it encodes them into URLs is a real design choice. Open-Meteo points go as parallel `latitude=` / `longitude=` comma lists (`pipeline/elevation.ts:104-106`); Google points go as `lat,lng|lat,lng` pipe-joined pairs (`pipeline/elevation.ts:71`); Overpass takes a bbox embedded in the QL body, not the URL (`pipeline/overpass.ts:7-15`). Same conceptual address (a coordinate), three wire encodings — because each provider's API defines its own.
+The Overpass endpoint is the only one parameterized — `fetchOverpass(bbox, endpoint = DEFAULT_ENDPOINT, ...)` lets a caller swap to a mirror (`overpass.ts:22`). That's the closest flattr comes to "routing": picking which Overpass mirror to resolve. It's never actually overridden in the app; the default always wins.
 
-#### Move 3 — the principle
+**Query construction is flattr's real addressing work.** For the GET APIs, the meaningful part is the query string, built two different ways:
 
-When you don't own any infrastructure between yourself and the provider, "addressing" collapses to "pick the right hostname and trust the platform with everything below it." The engineering question stops being "how do I route this" and becomes "what's my fallback when the name I hardcoded stops resolving or the origin behind it changes."
-
-═════════════════════════════════════════════════
-PRIMARY DIAGRAM
-═════════════════════════════════════════════════
-
-The full addressing picture — names flattr owns, everything below it delegated.
-
-```
-  flattr addressing — name owned, rest delegated
-
-  ┌─ flattr code (owns the NAME) ──────────────────────────────┐
-  │  4 hardcoded hostnames, no proxy, no service discovery     │
-  └────────────────────────────┬───────────────────────────────┘
-                               │  hostname string
-  ┌─ Platform (owns RESOLUTION) ▼──────────────────────────────┐
-  │  OS DNS resolver → IP   (Node at build · device at run)    │
-  └────────────────────────────┬───────────────────────────────┘
-                               │  IP:443
-  ┌─ Internet + Provider (owns ROUTING + ORIGIN) ▼─────────────┐
-  │  public routing → provider's own CDN/LB (invisible)        │
-  └─────────────────────────────────────────────────────────────┘
+```ts
+// geocode.ts:14 — URLSearchParams: encodes spaces, &, etc. correctly
+const params = new URLSearchParams({ q: query, format: "jsonv2", limit: "1" });
+// ...
+const res = await fetchImpl(`${ENDPOINT}?${params.toString()}`, { headers: {...} });
 ```
 
-═════════════════════════════════════════════════
-IMPLEMENTATION IN CODEBASE
-═════════════════════════════════════════════════
+`URLSearchParams` is the right tool — it percent-encodes the user's address string so a query like `5th & Pine` doesn't break the URL. Contrast the elevation API, which joins coordinates into the URL by hand:
 
-**Use cases.** Addressing is "reached for" implicitly on every call, but the *decisions* are visible in two places: the endpoint constants, and the one injectable-endpoint design that lets tests avoid resolving the real host.
-
-**The endpoint constant + the injection seam** — `pipeline/overpass.ts` (lines 4, 21-26):
-
-```
-  pipeline/overpass.ts  (lines 4, 21-26)
-
-  const DEFAULT_ENDPOINT =
-    "https://overpass-api.de/api/interpreter";   ← the hardcoded NAME
-
-  export async function fetchOverpass(
-    bbox, 
-    endpoint: string = DEFAULT_ENDPOINT,          ← but overridable…
-    fetchImpl: typeof fetch = fetch,              ← …and fetch is injectable
-    ...
-        │
-        └─ tests pass a fake endpoint + fake fetch (overpass.test.ts:32),
-           so the suite NEVER resolves overpass-api.de. The injectable
-           endpoint is the seam that decouples logic from real DNS.
+```ts
+// elevation.ts:104-106 — manual join; safe only because lat/lng are numbers
+const lats = batch.map((p) => p.lat).join(",");
+const lngs = batch.map((p) => p.lng).join(",");
+const url = `https://api.open-meteo.com/v1/elevation?latitude=${lats}&longitude=${lngs}`;
 ```
 
-The default is a constant, but the signature lets a caller (or a test) substitute the endpoint and the fetch implementation. That's the one place flattr's addressing is configurable — and it exists for testability, not for production endpoint switching.
+This is safe *only because* lats/lngs are numbers, never user text — no encoding needed. If a user string ever reached this path it would be an injection risk; it never does. The Google adapter does encode (`encodeURIComponent` at `elevation.ts:72`) because it's the same pattern but stays defensive.
 
-**Encoding coordinates into the address** — `pipeline/elevation.ts` (lines 104-106):
-
-```
-  pipeline/elevation.ts  (lines 104-106)
-
-  const lats = batch.map((p) => p.lat).join(",");   ← parallel arrays:
-  const lngs = batch.map((p) => p.lng).join(",");   │  all lats, all lngs
-  const url = `https://api.open-meteo.com/v1/elevation
-                ?latitude=${lats}&longitude=${lngs}`; ← addressed in query
-        │
-        └─ the "address" of the data is the query string; 100 points ride
-           in one URL. Note: no encodeURIComponent here — fine because
-           numbers and commas are URL-safe, but it's an unstated assumption
-```
-
-═════════════════════════════════════════════════
-ELABORATE
-═════════════════════════════════════════════════
-
-Hardcoded hostnames are the right call for a hobby/MVP build but they're also the quietest fragility in the repo. Public OSM endpoints rotate and rate-limit by host: `overpass-api.de` is one of several mirrors (there's also `overpass.kumi.systems`, `lz4.overpass-api.de`), and the polite move under sustained use is to rotate across mirrors. flattr doesn't — it pins one host. If that mirror is down or blocks flattr's User-Agent, there's no automatic failover at the addressing layer (the retry layer in `07` retries the *same* host, not a different one). The fix, when it matters, is a host list + rotation, not anything DNS-level.
-
-═════════════════════════════════════════════════
-INTERVIEW DEFENSE
-═════════════════════════════════════════════════
-
-**Q: "How does flattr handle service discovery / endpoint configuration?"**
-
-Answer: "It doesn't need to — there's no fleet of services to discover. Endpoints are hardcoded hostname constants, one per provider. The only configurability is a test seam: `fetchOverpass` takes the endpoint and the fetch impl as parameters so the suite never resolves the real host. The one runtime 'choice' is Google-vs-Open-Meteo elevation, selected by an env var, but that swaps the whole provider, not just an endpoint."
+**Resolution and routing: delegated, invisible.** There is no DNS code in the repo — confirmed: no custom resolver, no IP literals, no `lookup` option passed to `fetch`. On Node (build time) resolution goes through undici/`getaddrinfo`; on React Native (runtime) it goes through the native networking stack (NSURLSession on iOS, OkHttp on Android). flattr sees none of it. *(Inference, from the absence of any resolver code and the platform defaults — not from an explicit config.)*
 
 ```
-  4 constants → no registry, no discovery
-  test seam: endpoint + fetchImpl injectable
-  env var: GOOGLE_ELEVATION_KEY picks provider, not endpoint
+  Layers-and-hops — name to first byte, who owns each hop
+
+  ┌─ flattr ──┐ hop1: hand URL string   ┌─ platform fetch ──┐
+  │ build URL │ ──────────────────────► │ parse host        │
+  └───────────┘                         └─────────┬─────────┘
+                          hop2: resolve name      ▼
+                                        ┌─ OS resolver ─────┐
+                                        │ name ──► IP (DNS) │
+                                        └─────────┬─────────┘
+                          hop3: TCP/TLS connect   ▼
+                                        ┌─ provider edge ───┐
+                                        │ serves the bytes  │
+                                        └───────────────────┘
 ```
 
-Anchor: *no owned infrastructure means addressing is just picking a hostname and delegating the rest.*
+### Move 2.5 — current vs future
 
-**Q: "What happens if `overpass-api.de` stops resolving?"**
+**Now:** three public names, OS-resolved, no edge layer flattr owns. **If flattr grew a backend:** it would gain a fourth name (its own API), and *that* is where DNS/routing decisions would start to matter — a CDN in front, a health-checked origin, maybe a custom resolver for the provider calls to fail over between Overpass mirrors. None of that exists yet, and for a no-backend app it shouldn't. The `endpoint` parameter on `fetchOverpass` is the one seam already in place for mirror failover if it's ever needed.
 
-Answer: "The build fails outright — there's no fallback host. At runtime, `useTileGraph` catches the error and keeps the last graph, so the app degrades rather than crashes, but it can't fetch new coverage. The honest gap is no mirror rotation; the retry logic retries the same host, which doesn't help against a dead host."
+### Move 3 — the principle
 
-Anchor: *one pinned host, no failover — fine for an MVP, a known fragility at scale.*
+Hard-coding three public hostnames is the right call for an app with no backend and no edge layer. The moment to add indirection (env vars, service discovery) is when a name changes per environment — dev/staging/prod. flattr has one environment (the user's device hitting public APIs), so a constant is honest. Adding config indirection now would be complexity with nothing behind the seam.
 
-═════════════════════════════════════════════════
-VALIDATE
-═════════════════════════════════════════════════
+## Primary diagram
 
-1. **Reconstruct:** Name all four (five with Google) hostnames and the file:line where each is defined.
-2. **Explain:** Why does `fetchOverpass` take `endpoint` as a parameter when there's only ever one real value? (`pipeline/overpass.ts:23`)
-3. **Apply:** You want to rotate across three Overpass mirrors. Where in the code does that change land — the addressing layer or the retry layer? What's the minimal change?
-4. **Defend:** Is hardcoding the hostname a bug or an acceptable MVP choice? Argue both sides, then commit to one.
+The complete addressing picture — what flattr decides vs what's delegated.
 
-═════════════════════════════════════════════════
-SEE ALSO
-═════════════════════════════════════════════════
+```
+  flattr addressing — decided vs delegated
 
-- `01-network-map.md` — all hosts in one map.
-- `03-tcp-udp-connections-and-sockets.md` — what happens after the name resolves.
-- `07-timeouts-retries-pooling-and-backpressure.md` — why retrying the same host doesn't survive a dead host.
+  ┌─ DECIDED by flattr (in code) ───────────────────────────┐
+  │  3 hostname constants  ·  query via URLSearchParams      │
+  │  (geocode)  ·  query via string-join (elevation, numbers)│
+  │  1 swappable endpoint param (Overpass mirror)            │
+  └────────────────────────┬────────────────────────────────┘
+                           │ URL string crosses the seam
+  ┌─ DELEGATED to platform (no flattr code) ────────────────┐
+  │  DNS resolution · IPv4/IPv6 selection · routing ·        │
+  │  connection reuse · resolver caching/TTL                 │
+  └─────────────────────────────────────────────────────────┘
+       not exercised: CDN · reverse proxy · custom resolver ·
+                      service discovery · multi-region routing
+```
+
+## Elaborate
+
+DNS is the layer everyone forgets until it's the outage. flattr's exposure is real but not in its control: if `overpass-api.de` has a DNS or routing problem, every build and every live tile fails, and flattr's only defense is the `endpoint` parameter (manual mirror swap) plus the runtime's degrade-to-cached behavior. The deeper lesson for the AI-engineering pivot: when you add a vector DB or an LLM provider, *that* hostname becomes a single point of failure with the same shape, and the move is the same — keep the endpoint swappable, and degrade gracefully when resolution fails.
+
+## Interview defense
+
+**Q: How does flattr resolve `api.open-meteo.com` to an IP?**
+It doesn't — it hands the URL to `fetch` and the platform resolver does the lookup (undici on Node at build time, native stack on RN at runtime). There's no resolver code in the repo. flattr's only addressing decision is the hostname constant and the query encoding. Anchor: *flattr picks names; the OS picks addresses.*
+
+**Q: A user types an address with an ampersand. Does the URL break?**
+No, because `geocodeSuggest`/`geocode` build the query with `URLSearchParams` (`geocode.ts:14,41`), which percent-encodes it. The elevation path joins values into the URL by hand (`elevation.ts:106`) and is safe only because those are numbers, never user text. Anchor: *user text → URLSearchParams; numbers → safe to join.*
+
+## See also
+
+- `04-tls-and-trust-establishment.md` — what happens after the name resolves (the 443 handshake)
+- `07-timeouts-retries-pooling-and-backpressure.md` — the `endpoint` param as the mirror-failover seam
+- `05-http-semantics-caching-and-cors.md` — the methods and query semantics per host

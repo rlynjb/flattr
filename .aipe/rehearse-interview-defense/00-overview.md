@@ -1,67 +1,131 @@
 # Interview Defense — flattr
 
-This is the book you read to defend **flattr** in a senior-engineering interview. Not the concept files — those teach you the patterns one at a time, slowly, so you understand them. This is the other half: turning that understanding into speech, under pressure, when an interviewer says "walk me through what you built" and then keeps pushing.
+> A book for defending **flattr** as a whole project in a senior interview.
+> Eight chapters, read in order at least once. Coach voice throughout.
+> Every defense is grounded in real files in this repo — no fabricated claims.
 
-flattr is a grade-aware pedestrian/scooter router: a hand-rolled A\* engine over an elevation-annotated street graph, wrapped in an Expo/React Native map app, optimized for *flat* instead of *fast*. Everything keys off one knob — `userMax`, the steepest uphill you'll tolerate. That's the whole pitch, and the rest of this book is how you hold it together when someone leans on it.
+flattr is a grade-aware pedestrian/scooter router. It optimizes for **flat,
+not fast**. The whole project is one hand-rolled parametric search engine —
+`search()` in `features/routing/astar.ts:22` — running over a build-time static
+graph (`mobile/assets/graph.json`, 1,621 nodes / 1,879 edges of Seattle).
+There's no backend, no database, no LLM. The interesting part isn't the
+search; it's the **cost function**: cost is directional, so A→B ≠ B→A, because
+uphill costs and downhill is free.
 
-Here's the thing you have going for you: you didn't build a CRUD app with a database behind it. You built a real graph search engine — a lazy-deletion binary heap, an admissible-heuristic A\* proven optimal against a Dijkstra oracle, a directional cost model where A→B ≠ B→A. That is a *strong* interview project, and it sits right on top of your reincodes DSA portfolio (Graph, BinaryHeap, PriorityQueue with decrease-key). The graph work is the point. Lead with it.
+This book teaches you to own that in a room, under pressure, without bluffing.
 
-## The system at a glance
+---
 
-This is the master diagram. Every chapter is a zoom into one part of it; come back here when you need to re-anchor.
+## The system at a glance — the master diagram
+
+This is the diagram you return to whenever you lose the thread. Everything in
+the book hangs off this picture: a build-time half that bakes `graph.json`, and
+a runtime half that loads it and routes over it with zero server in between.
 
 ```
-  flattr — the whole system in one frame
+  flattr — the whole system, build-time vs runtime
 
-  ┌─ BUILD TIME (offline, your machine) ───────────────────────────┐
-  │  OSM via Overpass ─► split/densify ─► Open-Meteo elevation      │
-  │       (overpass.ts)     (split.ts)        (elevation.ts)        │
-  │                                │                                │
-  │                                ▼  grade per segment (grade.ts)  │
-  │                       build-graph.ts ─► graph.json  (~1621 nodes)│
-  └────────────────────────────────┬───────────────────────────────┘
-                                    │ bundled into the app
-  ┌─ RUNTIME (on device, offline-capable) ──▼──────────────────────┐
-  │  ENGINE (pure TS, no framework)         features/routing/       │
-  │    pqueue.ts  ── lazy-deletion min-heap (the frontier)          │
-  │    astar.ts   ── ONE search(): dijkstra│astar│grade│directed    │
-  │    cost.ts    ── penalty(grade,userMax), BLOCKED=1e9            │
-  │    graph.ts   ── directedGrade(): undirected store, directed walk│
-  │    bidirectional.ts ── two frontiers, balanced potential       │
-  │                                │                                │
-  │  UI (Expo RN + MapLibre)       ▼        mobile/src/             │
-  │    MapScreen ─ useTileGraph ─ single-flight pump:               │
-  │       viewport fetch + route corridor fetch (re-runs pipeline)  │
-  │       elevation cache → AsyncStorage (persists across launches) │
-  │    AddressBar (geocode+debounce) · GradeSlider · RouteSummaryCard│
-  └─────────────────────────────────────────────────────────────────┘
-
-  no live backend · no database server · graph is a read-only artifact
+  ┌─ BUILD TIME (pipeline/, run once per area) ───────────────────────┐
+  │                                                                    │
+  │  Overpass API ──► parseOsm ──► splitWays ──► sampleElevations ──┐  │
+  │  (OSM streets)    osm.ts       split.ts      elevation.ts       │  │
+  │                                              (Open-Meteo, free) │  │
+  │                                                                 ▼  │
+  │                                          computeGrades ──► buildGraph
+  │                                          grade.ts          build-graph.ts
+  │                                                                 │  │
+  └─────────────────────────────────────────────────────────────────┼──┘
+                                                                      │
+                              graph.json  ◄────────────────────────────┘
+                              1,621 nodes / 1,879 edges  (static artifact)
+                                       │  bundled into the app
+                                       ▼
+  ┌─ RUNTIME (mobile/, Expo + RN + MapLibre) ─────────────────────────┐
+  │                                                                    │
+  │  loadGraph() ──► nearestNode(tap) ──► directedAstar() ──► route    │
+  │  loadGraph.ts    nearest.ts           astar.ts            line     │
+  │                       │                    │                       │
+  │                       │                    └─ one search() with    │
+  │                       │                       (costFn, heuristicFn)│
+  │                       └─ O(N) linear scan ◄── FIRST bottleneck     │
+  │                                                                    │
+  │  No backend. No DB. No network in the routing hot path.            │
+  └────────────────────────────────────────────────────────────────────┘
 ```
 
-## The 8 chapters
+The seam between the two halves is `graph.json`. Build-time spends an
+elevation API quota to bake grades in; runtime never touches that quota again.
+That split is the answer to half the questions in this book.
+
+---
+
+## The eight chapters
 
 | # | Chapter | The question it defends |
-|---|---------|-------------------------|
-| 01 | **The pitch** | "Tell me about a project you built." (10s / 30s / 90s) |
-| 02 | **The architecture** | "Walk me through the system." |
-| 03 | **The choices** | "Why hand-rolled A\*? Why Expo? Why Open-Meteo? Why no database?" |
-| 04 | **The scale story** | "What breaks first as this grows?" |
-| 05 | **The failure story** | "What happens when the elevation API is down?" |
-| 06 | **The hard parts** | "Hardest bug? Proudest part? Weakest spot?" |
-| 07 | **The counterfactuals** | "What would you do differently?" |
-| 08 | **The AI question** | "Did you use AI to build this?" |
+|---|---------|--------------------------|
+| 01 | **The pitch** | "Tell me about a project you built." 10s / 30s / 90s. |
+| 02 | **The architecture** | "Walk me through the system." Trace one request. |
+| 03 | **The choices** | "Why this stack?" Hand-rolled vs OSRM, Expo vs Next.js, free vs paid elevation, static vs DB. |
+| 04 | **The scale story** | "What breaks first at 10x?" Graph size, elevation quota, per-query work — *not* users. |
+| 05 | **The failure story** | "What happens when things go wrong?" Elevation 429, steep-vs-disconnected, the unvalidated graph load. |
+| 06 | **The hard parts** | Hardest bug, proudest part, least-confident defense. |
+| 07 | **The counterfactuals** | "What would you do differently?" Validate on load, ElevationProvider seam, design the data seam up front. |
+| 08 | **The AI question** | "Did you use AI to build this?" Three modes of decision-making, never bluff code. |
 
-## How to read this book
+---
 
-- **First pass:** in order, one chapter a sitting. Chapter 2 (architecture) is the spine — if you can redraw the master diagram from memory and walk it, half the interview is won.
-- **Review pass:** skim the chapter-opening diagrams, the pull quotes, and the side-by-side answer tables. That's ~70% of the book.
-- **Night before:** read only the one-page summary at the end of each chapter.
+## How to use this book
 
-## Where you'll get pushed past your depth
+```
+  FIRST READ          one chapter per sitting, in order, front to back.
+                      The chapters build: 02 sets the architecture that
+                      04 and 05 stress-test.
 
-Be honest with yourself about this now, not in the room. flattr's scale story (Chapter 4) and failure story (Chapter 5) are where an interviewer who does distributed systems will probe — multi-region, hot-path queues, load balancing under sustained traffic. That's the gap in your portfolio (`me.md` names it), and flattr is a *client-side* app, so the honest answer is "this never had a server to scale." The single question most likely to push you over your edge is **"how would you serve this for a whole city / many concurrent users?"** — Chapter 4's "I don't know" box is built for exactly that. Don't fake server-scale war stories. Own that this is an offline client and pivot to the scale axis that *is* real here: graph size and the free-tier elevation quota.
+  REVIEW              skim the chapter-opening diagrams and the pull
+                      quotes (┃-marked). ~70% of the book is in the
+                      visual treatments alone.
 
-## How this pairs with the rest of the study system
+  NIGHT BEFORE        read only the one-page summary at the end of each
+                      chapter. Eight pages total. That's your warm-up.
+```
 
-This book is the **wide opener** — the whole project at once. The **deep dives** live in the concept files: `study-dsa-foundations/05-graphs-and-traversals.md` and `03-stacks-queues-deques-and-heaps.md` for the A\*/heap drills, `study-system-design/` for the build-time/runtime split, `study-distributed-systems/` and `study-performance-engineering/` for the API-boundary and benchmark depth. When this book says "have the admissibility proof ready," that proof is drilled in `05-graphs-and-traversals.md`. Read the concept files to *understand*; read this book to *perform*.
+The six recurring treatments, so your eye learns them:
+
+- **Chapter-opening diagram** — the spine of the chapter, 15-30 lines.
+- **`THEY ASK` / `WHAT THEY'RE TESTING` callout** (single border) — before every question.
+- **Weak / strong side-by-side** — the contrast does the teaching.
+- **`WHEN YOU DON'T KNOW` box** (double border ╔╗) — at least one per chapter, leaning into the distributed-systems gap.
+- **Follow-up decision tree** — where the conversation goes next.
+- **Pull quotes** (┃ or ▸) — the lines you carry into the room.
+
+---
+
+## Where this book sits in your study system
+
+This is the **project-level** defense — the wide opener, the "walk me through
+your app" moment. It pairs with the deep-dive concept files already generated
+under `.aipe/`:
+
+- **Drill into the algorithm** (admissibility, lazy deletion, bidirectional
+  consistency) → `.aipe/study-dsa-foundations/`
+- **Drill into the system shape** (build/runtime split, no-backend, failure
+  surfaces) → `.aipe/study-system-design/`
+
+When an interviewer drills past the project level into *one* decision, that's
+where the per-concept Interview-defense blocks live. This book gets you to the
+drill confidently; those files get you through it.
+
+---
+
+## The one thing to remember walking in
+
+Most candidates over-claim scale and under-own decisions. You do the reverse.
+You scoped this deliberately: no server, no DB, no LLM, hand-rolled engine.
+Every one of those is a *decision you can defend*, not a gap you have to hide.
+
+```
+        ▸ You didn't build a smaller Google Maps.
+          You built the one part of Google Maps that's
+          interesting — the cost function — and you
+          can reason about it from the invariant up.
+```

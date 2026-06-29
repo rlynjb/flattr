@@ -1,311 +1,258 @@
 # Lazy-deletion priority queue
-### Binary min-heap with stale-entry skipping / generic container — Industry standard, hand-rolled here
+
+> **Lazy deletion / stale-entry tolerance over decrease-key**
+> — Industry standard (the common A\*/Dijkstra implementation choice).
 
 ## Zoom out, then zoom in
 
-The search loop needs "give me the cheapest frontier node" fast, over and over.
-That's a priority queue. Here's where it sits and what it hides.
+A\* needs a priority queue, and the textbook version needs a `decrease-key`
+operation: when you find a cheaper path to a node already on the heap, you
+*update* its priority in place. That requires tracking every node's heap
+position and re-sifting it — index bookkeeping that bloats the queue's
+interface. flattr skips it entirely. It pushes a *new* entry at the better
+priority and lets the stale one rot in the heap until it surfaces, then
+discards it on pop. Simpler queue, one cheap check in the search loop.
 
 ```
-  Zoom out — where the priority queue lives
+  Zoom out — where the queue sits
 
-  ┌─ Engine layer (features/routing) ─────────────────────────────┐
-  │  search() / bidirectional()                                   │
-  │     open.push(node, priority)   open.pop()   open.isEmpty()   │
-  │             │ tiny interface — 4 verbs                        │
-  │             ▼                                                  │
-  │  ★ pqueue.ts: PQueue<T> ★  hides: array, sift up/down, swap,  │ ← we are here
-  │             the binary-heap parent/child index math            │
-  └───────────────────────────────────────────────────────────────┘
+  ┌─ Core: features/routing ──────────────────────────┐
+  │  search() / bidirectional()                       │
+  │     ┌─ frontier ─────────────────────────────┐    │
+  │     │  ★ PQueue<string> (pqueue.ts) ★         │    │ ← we are here
+  │     │     push(item, priority) / pop()        │    │
+  │     └─────────────────────────────────────────┘    │
+  │  on pop:  if (closed.has(current)) continue;  ◄────┼── discards stale
+  └────────────────────────────────────────────────────┘
 ```
 
-**Zoom in.** You've built a `BinaryHeap` and a `PriorityQueue` from scratch
-(it's in your reincodes repo). flattr's `PQueue<T>` is the same primitive, but
-with one deliberate simplification: **no decrease-key**. Instead of updating a
-node's priority in place when the search finds a cheaper path, it just pushes a
-*duplicate* with the better priority and skips the stale copies on the way out.
-The pattern is **lazy deletion**: don't pay to remove stale entries; pay a tiny
-check to ignore them. The whole heap mechanism — the array, the sift loops, the
-parent/child index arithmetic — is hidden behind four methods.
+Zoom in: this is a **deep module that got deeper by leaving something out.**
+`PQueue` (`pqueue.ts:4-78`) has no `decreaseKey`, no `contains`, no
+`updatePriority` — just `push`/`pop`/`peek`/`isEmpty`/`size`. The complexity
+that a decrease-key heap carries inside its interface is instead handled by
+*one line* in the caller: skip an entry if its node is already finalized.
 
 ## Structure pass
 
-**Layers.** The **interface layer** is `push` / `pop` / `isEmpty` / `peek`
-(plus a test-only `checkInvariant`). The **mechanism layer** is the private
-`siftUp` / `siftDown` / `swap` and the `heap` array. The interface is generic
-(`<T>`) and knows *nothing* about graphs, grades, or A*.
+**Layers.** Queue vs caller, split by the staleness check:
+- *The queue*: `PQueue` — a generic min-heap, knows nothing of graphs.
+- *The seam*: `push(item, priority)` / `pop()`.
+- *The caller*: `search()` — owns the `closed` set that detects staleness.
 
-**Axis — "who knows the heap is an array with index math?"**
+**Axis — "where does duplicate-handling live?"**
 
 ```
-  One question down the layers: "who knows it's a binary heap?"
+  axis = "who deals with a node appearing twice in the frontier?"
 
-  ┌──────────────────────────────────────┐
-  │ search() (astar.ts)                  │  → NOTHING. push/pop/isEmpty.
-  └──────────────────────────────────────┘
-      ┌──────────────────────────────────┐
-      │ PQueue public methods            │  → know "ordered by priority"
-      └──────────────────────────────────┘
-          ┌──────────────────────────────┐
-          │ siftUp/siftDown/swap (private)│  → know parent=(i-1)>>1, the array
-          └──────────────────────────────┘
+  ┌─ PQueue ──────────────────┐  doesn't know or care — holds duplicates
+  │  push twice → two entries  │  no identity tracking at all
+  └──────────┬─────────────────┘
+             │ seam: pop() returns the cheaper one FIRST
+  ┌─ search() ────────────────┐  detects staleness: closed.has(current)
+  │  closed set is the dedup   │  pops stale entry, skips it, continues
+  └────────────────────────────┘
 
-  the index arithmetic is sealed at the bottom. nobody above sees it.
+  duplicate-handling moved OUT of the queue, INTO the caller's closed set
 ```
 
-**Seam.** The public methods are the seam between "I need cheapest-first" and
-"it's a binary heap in a flat array." The cost axis flips across it: above, the
-caller assumes O(log n) without knowing why; below, the sift loops *are* the
-O(log n). Swap the heap for a pairing heap or a bucket queue and the four
-methods don't change — that's the substitution the seam buys.
+**Seam.** The contract is minimal: `push` accepts `(item, priority)` and may
+hold the same item twice; `pop` returns lowest priority first. The queue
+makes no promise of uniqueness. The caller's `closed` set is what makes
+duplicates harmless. The axis — "who handles a re-discovered node?" — lives
+entirely above the seam.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-The shape is a binary tree packed into an array, where every parent is ≤ its
-children, plus a rule for ignoring duplicates.
+You know `Promise.race` — you fire several promises and act on the first to
+resolve, letting the losers settle into nothing. Lazy deletion is the same
+attitude toward stale heap entries: when a node gets a better priority, you
+push a fresh entry to "race" against the old one. The better (lower-priority)
+entry wins the pop; the loser surfaces later and you simply ignore it.
 
 ```
-  Pattern — binary min-heap in an array + lazy deletion
+  the pattern — race the stale entry, discard the loser
 
-  array:  [ 3, 5, 4, 8, 9, 7 ]      tree view:        3
-  index:    0  1  2  3  4  5                         ╱ ╲
-                                                    5   4
-  parent(i) = (i-1) >> 1                           ╱╲   ╱
-  children(i) = 2i+1, 2i+2                        8  9 7
-
-  lazy deletion: pushing a better priority for X leaves the old X in
-  the array. pop returns it later; the SEARCH loop's closed-set check
-  throws the stale one away.
+  push C@10 ──┐
+              ├─► heap ─► pop C@7  (winner: process C)
+  push C@7 ───┘            │
+                           ▼ later...
+                       pop C@10  → closed.has(C)? YES → skip (loser)
 ```
 
-The heap doesn't *know* an entry is stale — staleness is a search concept. The
-heap just stores `{item, priority}` pairs; the search loop decides which pops to
-ignore. Clean division of labor.
+In one sentence: **tolerate duplicate entries and discard stale ones on pop,
+instead of paying to keep the heap unique.**
 
-### Move 2 — the walkthrough (load-bearing skeleton)
+### Move 2 — the step-by-step walkthrough
 
-The kernel of a heap is: **an array + sift-up on insert + sift-down on remove +
-the parent/child index rule.** Name each part by what breaks without it.
+#### The queue holds duplicates without complaint
 
-**`push` + `siftUp` — insert and bubble up.** Append at the end, then swap
-upward while you're smaller than your parent.
-
-```
-  push(item, priority):
-      if priority is NaN: throw          // poison value → fail loud (see below)
-      heap.append({item, priority})
-      siftUp(lastIndex)
-
-  siftUp(i):
-      while i > 0:
-          parent = (i - 1) >> 1
-          if heap[parent].priority <= heap[i].priority: break   // heap ok
-          swap(i, parent); i = parent
+```ts
+// pqueue.ts:23-27 — push, annotated
+push(item: T, priority: number): void {
+  if (Number.isNaN(priority)) throw new Error("PQueue: NaN priority forbidden");
+  this.heap.push({ item, priority });   // no identity check — same item OK twice
+  this.siftUp(this.heap.length - 1);    // bubble to its place — O(log n)
+}
 ```
 
-What breaks without `siftUp`: the appended element sits at the bottom violating
-the heap property, and `pop` returns the wrong minimum. The `>> 1` is integer
-parent-index math — the load-bearing arithmetic.
+No `Map` from item to heap index, no "is this item already here?" lookup. The
+same `item` (a node id) can sit in the heap multiple times at different
+priorities. The only guard is the NaN check (`pqueue.ts:24`) — a real bug
+catcher, since `tentative + heuristic` going NaN would silently corrupt heap
+order. **What breaks if you removed the staleness tolerance — i.e., demanded
+uniqueness?** You'd need `decreaseKey`, which needs an item→index map kept in
+sync through every sift. That's ~30 more lines and a bigger interface, all to
+avoid a few extra heap entries.
 
-**`pop` + `siftDown` — remove the min and sink the replacement.** Take the root
-(the minimum), move the last element to the root, sink it down past its smaller
-child.
+#### The caller's closed set does the deduplication
+
+```ts
+// astar.ts:48-69 — the loop, staleness handling annotated
+while (!open.isEmpty()) {
+  const current = open.pop()!;
+  pops++;
+  if (closed.has(current)) continue;   // ◄── stale duplicate: discard, move on
+  if (current === goalId) { /* reconstruct */ }
+  closed.add(current);                  // finalize: any later copy is now stale
+  for (const edgeId of graph.adjacency[current] ?? []) {
+    // ...
+    if (tentative < (g.get(next) ?? Infinity)) {
+      g.set(next, tentative);
+      open.push(next, tentative + heuristicFn(...));  // ◄── push NEW entry, don't update
+    }
+  }
+}
+```
+
+Two lines carry the whole scheme. Line `astar.ts:51` (`if (closed.has(current))
+continue`) is the discard — when a stale duplicate finally surfaces, its node
+is already closed, so it's skipped. Line `astar.ts:72` (`open.push(...)`) is
+the "decrease-key replacement" — instead of updating the existing entry, push
+a fresh one at the better priority. Because `pop` returns lowest-first, the
+better entry always processes first and closes the node, so the worse copy
+gets discarded later. **What breaks if you forget the `closed.has` check?**
+You'd re-expand nodes through stale entries — wasted work, and worse, you
+could overwrite a finalized optimal cost with a stale comparison. The check is
+load-bearing.
+
+#### The skeleton — what's irreducible vs what's hardening
 
 ```
-  pop():
-      if empty: return undefined
-      top = heap[0]
-      last = heap.removeLast()
-      if heap not empty:
-          heap[0] = last
-          siftDown(0)
-      return top.item
+  the kernel (cannot remove any of these):
+    ┌─ binary min-heap (array, siftUp/siftDown) ─┐  ordering
+    ┌─ pop returns lowest priority ──────────────┐  correctness of A*
+    ┌─ caller's closed set ──────────────────────┐  staleness detection
+    ┌─ push-new instead of decrease-key ─────────┐  the "lazy" in lazy deletion
 
-  siftDown(i):
-      loop:
-          smallest = i among {i, 2i+1, 2i+2} by priority
-          if smallest == i: break          // both children ≥ me → done
-          swap(i, smallest); i = smallest
+  optional hardening (nice, not required):
+    ┌─ NaN priority guard (pqueue.ts:24) ────────┐  bug catcher
+    ┌─ checkInvariant (pqueue.ts:42) ────────────┐  test-only assertion
+    ┌─ peekPriority (pqueue.ts:19) ──────────────┐  needed by bidirectional
 ```
 
-What breaks without the "move last to root" step: a hole at the root and the
-array no longer packs the tree. What breaks without `siftDown`: the moved
-element (was a leaf, probably large) sits at the root claiming to be the
-minimum.
-
-**The `NaN` guard — the part people forget.** `push` throws on a `NaN` priority
-(`pqueue.ts:24`). Why it's load-bearing: `NaN` compares `false` to *everything*,
-so a single `NaN` priority silently corrupts every sift comparison and the heap
-stops being a heap — with no error, just wrong pops. Catching it at push turns a
-maddening silent-corruption bug into an immediate throw. This is "define the
-error out by detecting it at the boundary."
-
-**Lazy deletion — the design choice (optional hardening, omitted on purpose).**
-A "complete" priority queue offers `decreaseKey` (your reincodes
-`PriorityQueue` has `updatePriority` with a value→index lookup). flattr
-*deliberately doesn't*. Instead the search pushes a duplicate
-(`astar.ts:72`) and the loop skips stale pops with the closed-set check
-(`astar.ts:51`). The trade: a few extra heap entries (more memory, more pops)
-for a much simpler heap (no index map to maintain). For a graph this size, the
-right call — and naming *why* it's omitted is the lesson.
-
-```
-  Comparison — decrease-key vs lazy deletion
-
-  decrease-key (your reincodes PQ)     lazy deletion (flattr PQ)
-  ┌─────────────────────────────┐      ┌──────────────────────────┐
-  │ heap + value→index Map       │      │ heap only                │
-  │ update in place, re-sift     │      │ push duplicate, skip      │
-  │ exactly 1 entry per node     │      │   stale on pop            │
-  │ more code, less memory       │      │ less code, more entries   │
-  └─────────────────────────────┘      └──────────────────────────┘
-```
+The kernel is the heap plus the closed-set discard. Drop the heap's ordering
+and A\* isn't A\*. Drop the closed set and stale entries corrupt the result.
+The rest is hardening: `checkInvariant` exists purely so `pqueue.test.ts` can
+assert the heap property holds; `peekPriority` exists because
+`bidirectional.ts:50` needs to compare the two frontiers' best priorities
+without popping. **The part people forget:** the closed-set discard. Everyone
+remembers "A\* uses a priority queue." The interview signal is naming that the
+queue tolerates stale entries and the *caller* discards them on pop — that's
+how you know someone implemented it rather than imported it.
 
 ### Move 3 — the principle
 
-A container should expose *what it guarantees* (cheapest-first) and hide *how*
-(array + sift + index math). And sometimes the deepest move is to *leave a
-feature out*: lazy deletion is simpler than decrease-key, and the simplicity is
-worth more than the memory it costs at this scale. Knowing which hardening to
-skip is design judgment, not laziness.
+Sometimes the deepest module is the one that refuses a feature. `decreaseKey`
+would make `PQueue` "complete," and worse for it — a bigger interface, an
+item→index map to keep in sync, more surface to misuse. By tolerating
+duplicates and pushing the staleness check up to the one caller that has a
+closed set anyway, the queue stays a clean generic. The general lesson:
+**before adding an operation to make a module self-sufficient, check whether
+the caller already has the state to handle it more cheaply.**
 
 ## Primary diagram
 
-The full container: tiny interface, hidden mechanism, generic over `T`.
+The whole scheme: caller pushes duplicates, heap orders them, caller discards
+stale on pop.
 
 ```
-  PQueue<T> — full picture (pqueue.ts)
+  lazy-deletion priority queue — complete
 
-  ┌─ public interface (the seam) ─────────────────────────────────┐
-  │ push(item, priority)   pop(): T?   isEmpty()   peek()          │
-  │ peekPriority()   checkInvariant() [test-only]                  │
-  │ push throws on NaN priority ← poison guard                     │
-  └───────────────────────────┬──────────────────────────────────┘
-                              ▼ private mechanism (hidden)
-  ┌───────────────────────────────────────────────────────────────┐
-  │ heap: Entry<T>[]   (Entry = {item, priority})                  │
-  │ siftUp(i):   bubble toward root while < parent                 │
-  │ siftDown(i): sink toward leaves while > smaller child          │
-  │ swap(i,j)    parent=(i-1)>>1   children=2i+1,2i+2              │
-  └───────────────────────────────────────────────────────────────┘
-       used by search() + bidirectional(); lazy deletion handled
-       by the CALLER's closed-set check, not by the heap.
-```
-
-## Implementation in codebase
-
-**Use cases.** `search` holds one `PQueue<string>` of node ids ordered by
-`f = g + heuristic` (`astar.ts:30,45,72`). `bidirectional` holds *two*
-(`openF`, `openR`) for the forward and backward frontiers
-(`bidirectional.ts:40–43`). Both rely on lazy deletion: neither ever updates a
-priority in place; they push duplicates and skip stale pops with their closed
-sets.
-
-**The interface + the NaN guard — `features/routing/pqueue.ts:23–39`.**
-
-```
-  pqueue.ts  (lines 23–39)
-
-  push(item, priority): void {
-    if (Number.isNaN(priority)) throw new Error("PQueue: NaN priority forbidden");
-    this.heap.push({ item, priority });   ← append at the end
-    this.siftUp(this.heap.length - 1);    ← bubble up to restore heap property
-  }                                          └─ guard: NaN would silently corrupt
-  pop(): T | undefined {
-    const n = this.heap.length;
-    if (n === 0) return undefined;        ← empty → undefined, not a throw
-    const top = this.heap[0];             ← the minimum (root)
-    const last = this.heap.pop()!;
-    if (n > 1) { this.heap[0] = last; this.siftDown(0); }  ← move last to root, sink
-    return top.item;
-  }
-```
-
-**The hidden mechanism — `features/routing/pqueue.ts:50–77`.**
-
-```
-  pqueue.ts  (lines 50–77, condensed)
-
-  private siftUp(i) {
-    while (i > 0) {
-      const parent = (i - 1) >> 1;                       ← integer parent index
-      if (this.heap[parent].priority <= this.heap[i].priority) break;
-      this.swap(i, parent); i = parent;
-    }
-  }
-  private siftDown(i) {
-    for (;;) {
-      const left = 2*i+1, right = 2*i+2;                 ← child indices
-      let smallest = i;
-      if (left  < n && heap[left].priority  < heap[smallest].priority) smallest = left;
-      if (right < n && heap[right].priority < heap[smallest].priority) smallest = right;
-      if (smallest === i) break;                         ← both children ≥ me → done
-      this.swap(i, smallest); i = smallest;
-    }
-  }
-       │
-       └─ none of this index math escapes the class. search() never sees it.
-          checkInvariant() (line 42) lets tests assert parent≤child without
-          exposing the array — a test seam, not a public capability.
+  ┌─ search() — owns the closed set ───────────────────────────┐
+  │  found cheaper path to C?  → open.push(C, 7)   (NEW entry)  │
+  │                                                            │
+  │  loop:  current = open.pop()                               │
+  │         closed.has(current)?  ── YES ──► skip (stale)      │
+  │                               ── NO  ──► close + expand    │
+  └───────────────────────────┬────────────────────────────────┘
+                              │ push / pop  (the only contract)
+  ┌─ PQueue (pqueue.ts) — generic min-heap ────────────────────┐
+  │  heap: [{item,priority}]   siftUp / siftDown               │
+  │  holds C@10 AND C@7 happily — no identity tracking         │
+  │  pop() → C@7 first (lowest), C@10 later (becomes stale)    │
+  │  NaN guard · checkInvariant (test) · peekPriority (bidir)  │
+  └────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-This is a textbook **binary heap** (you've built it — `BinaryHeap.ts`,
-`PriorityQueue.ts` in reincodes), here serving as A*'s open set. The design
-interest isn't the heap — it's the *deliberate omission* of decrease-key in
-favor of lazy deletion, and the `NaN` guard as boundary error-detection. The
-`checkInvariant` method (`pqueue.ts:42`) is a nice secondary lesson: it exposes
-*testability* without exposing the *array*, so tests can prove the heap property
-without coupling to the representation.
+Lazy deletion is the standard practical choice for A\*/Dijkstra in languages
+without a built-in indexed priority queue — the asymptotic cost is a few extra
+heap entries (bounded by the number of relaxations), which is almost always
+cheaper in practice than maintaining decrease-key bookkeeping. flattr's
+`PriorityQueue.ts` in the reincodes DSA repo *does* have `updatePriority` with
+a value→index map; this `PQueue` deliberately doesn't, because the search loop
+already has a closed set and doesn't need it. Same engineer, two designs,
+chosen by context — that contrast is itself the lesson.
 
-Read next: `01-parametric-search-over-cost-fns.md` for how the search loop's
-closed-set check completes the lazy-deletion design. For the heap as a reusable
-data structure, see `.aipe/study-dsa-foundations/`.
+It pairs with pattern `01`: `PQueue` is the frontier that `search()` pops
+from, and it's a second example of the deep-module property — small interface,
+the hard heap mechanics hidden. For the heap algorithm itself (siftUp,
+siftDown, array layout), see `study-dsa-foundations/`.
 
 ## Interview defense
 
-**Q: Your priority queue has no decrease-key. Isn't that incomplete?** It's
-deliberate. A* with lazy deletion pushes a duplicate when a node's cost improves
-and skips the stale pop via the closed set (`astar.ts:51`). That trades a little
-memory and a few extra pops for dropping the entire value→index map that
-decrease-key needs. At graph sizes this app routes over, simpler wins. If
-profiling showed heap size dominating, I'd add the index map back.
+**Q: "Your priority queue can't update a key. Isn't that the whole point of a
+PQ for Dijkstra — decrease-key when you find a shorter path?"**
+
+It's *a* way, not the point. The point is "always expand the cheapest frontier
+node next," and lazy deletion delivers that without decrease-key. When I find
+a cheaper path to a node, I push a new entry at the better priority instead of
+updating the old one. Because pop returns lowest-first, the better entry comes
+out first, closes the node, and the stale entry — when it eventually
+surfaces — hits `closed.has(current)` and is discarded (`astar.ts:51`). The
+cost is at most one extra heap entry per relaxation; the benefit is the queue
+stays a clean generic with no item→index map to keep in sync through every
+sift. For a graph this size, that trade is clearly right.
 
 ```
-  the lazy-deletion contract spans TWO modules
-  ┌─ PQueue ──────────┐         ┌─ search() ─────────────────┐
-  │ push duplicate OK  │  ───►   │ if closed.has(node): skip  │
-  │ (no dedup inside)  │         │  ← throws away the stale   │
-  └────────────────────┘         └────────────────────────────┘
-  the heap can't dedup alone; the caller's closed set completes it.
+  decrease-key heap            vs     lazy-deletion heap
+  ┌──────────────────┐                ┌──────────────┐
+  │ push/pop         │                │ push/pop     │  smaller interface
+  │ + item→index map │ sync on        │ (that's it)  │
+  │ + decreaseKey    │ every sift     └──────┬───────┘
+  └──────────────────┘                caller's closed set discards stale
 ```
 
-**Q: What's the load-bearing part people forget?** The `NaN` priority guard
-(`pqueue.ts:24`). `NaN` breaks every comparison silently, so without the guard a
-single bad priority turns the heap into a non-heap with no error. Catching it at
-push is the difference between a thrown exception and an afternoon of "why is my
-route wrong sometimes."
+*Anchor: lazy deletion replaces decrease-key with push-new + discard-stale-on-
+pop — the closed set the caller already has does the dedup.*
 
-**Anchor:** "Binary min-heap, hand-rolled, *no* decrease-key on purpose — lazy
-deletion, completed by the search loop's closed-set check. Guards `NaN` at push."
+**Q: "What's the load-bearing line, and what breaks without it?"**
 
-## Validate
+`if (closed.has(current)) continue;` at `astar.ts:51`. Without it, stale
+duplicates get re-expanded — you'd redo work and could relax neighbors off a
+finalized node's outdated cost. That one line is what makes the duplicates
+harmless, and it's the part people forget when they describe "A\* uses a
+heap." Naming it is how you signal you built the loop.
 
-1. **Reconstruct:** write `siftUp` and `siftDown` from memory, including
-   `parent = (i-1)>>1`. Check `pqueue.ts:50–71`.
-2. **Explain:** why does `pop` move the *last* element to the root before sinking
-   (`pqueue.ts:34–37`), instead of promoting a child?
-3. **Apply:** trace `push 5, push 3, push 8, pop` — what's the array after each?
-4. **Defend:** a teammate wants to add `decreaseKey`. Walk the two-module
-   lazy-deletion contract (`pqueue.ts` + `astar.ts:51`) and say when the trade
-   flips in favor of decrease-key.
+*Anchor: the closed-set discard on pop is the line that makes stale entries
+harmless — forget it and A\* re-expands finalized nodes.*
 
 ## See also
 
-- `01-parametric-search-over-cost-fns.md` — the search loop that completes lazy
-  deletion.
-- `audit.md` Lens 2 (deep module — no classitis), Lens 6 (NaN guard).
-- `.aipe/study-dsa-foundations/` — the binary heap as a reusable structure.
+- `01-parametric-search-over-cost-fns.md` — the engine this queue powers.
+- `05-blocked-as-large-finite.md` — the other "simpler than it looks" choice.
+- `audit.md` Lens 2 (deep modules), Lens 6 (the NaN guard as a low-level mask).
+- `study-dsa-foundations/` — binary heap siftUp/siftDown mechanics.

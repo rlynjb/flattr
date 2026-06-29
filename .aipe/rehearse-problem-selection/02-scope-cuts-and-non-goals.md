@@ -1,58 +1,132 @@
-# Scope cuts and non-goals
+# Scope, Cuts, and Non-Goals — flattr
 
-The skill this file trains is the one that separates people who ship from people who plan: choosing the *narrowest* slice that proves the premise, and writing down everything you deliberately won't build so the scope can't creep. A problem brief without explicit non-goals is a wishlist, and wishlists don't ship.
+> The narrowest slice that validates the *premise* (not the engine), and an
+> explicit list of what NOT to build. Coach posture: prefer a validated slice
+> over a feature wishlist. Every cut here is a time-back-to-discovery decision.
 
-The premise flattr has to validate is one sentence: **routing can optimize for flat-and-comfortable instead of fast, and the result is visibly different and useful.** Everything that doesn't serve proving *that* is a cut.
+## The discipline: validate the premise, not the engine
+
+The engine is done and proven (`01` §2). So the slice is **not** "build more
+routing." The slice is the cheapest thing that answers *"does a real
+self-powered traveler prefer flattr's flat route over the default route?"* —
+which the repo has never tested.
 
 ```
-  SCOPE — the smallest thing that proves the premise
+  two different "smallest slices" — pick the right one
 
-  ┌─ THE VALIDATING SLICE (build this) ──────────────────────┐
-  │  one neighborhood, bundled graph                          │
-  │  + set two endpoints (type address or tap map)            │
-  │  + route optimized for grade via one knob (userMax)       │
-  │  + show the route colored by steepness + a climb number   │
-  │  + a grade heatmap you can toggle on                      │
-  │  = a user can SEE flat-first routing differ from shortest │
-  └──────────────────────────┬───────────────────────────────┘
-                             │ everything past here is a NON-GOAL
-  ┌─ NON-GOALS (explicitly NOT in the slice) ─────────────────┐
-  │  turn-by-turn voice nav · global/city-wide coverage ·     │
-  │  accounts/saved routes · live re-routing while moving ·   │
-  │  multi-modal (transit/car) · social/sharing · offline     │
-  │  map tiles · production elevation accuracy                 │
-  └───────────────────────────────────────────────────────────┘
+  ┌─ WRONG slice (more of what's proven) ──────────────────┐
+  │  add bidirectional · add k-alternatives · add zones     │  ← engine work,
+  │  → proves the engine is better. demand still unknown.   │    zero demand signal
+  └─────────────────────────────────────────────────────────┘
+
+  ┌─ RIGHT slice (tests the unproven thing) ───────────────┐
+  │  ONE neighborhood, set A→B, colored path + climb number │  ← already built
+  │  → put in front of 5 real travelers, measure preference │  ← the NEW work
+  └─────────────────────────────────────────────────────────┘
 ```
 
-That bundled-neighborhood slice is the whole bet. If a real scooter rider looks at the colored route and says "yeah, that's the way I'd actually go," the premise holds. Nothing else needs to exist to learn that.
+## The smallest validating slice — spelled out
 
-## Why this is the right slice
+Everything in the box already exists in the repo except the last line.
 
-The validating slice is *small on purpose*. It cuts every feature that's about being a product (accounts, sharing, coverage) and keeps only what's needed to answer the one question — does grade-first routing produce a visibly better route for the target user? A neighborhood graph is enough; a whole city is a scaling problem, not a premise problem. Tap-or-type endpoints are enough; turn-by-turn is navigation polish that doesn't change whether the *route choice* is good.
+```
+  flattr validating slice — bundle once, test with humans
 
-## The non-goals, and why each is cut
+  ┌─ Build (offline, ONCE) ─────────────────────────────────┐
+  │  one bbox: a known-hilly neighborhood                    │
+  │  (spec §10 Phase 0: downtown + Capitol Hill)             │
+  │  pipeline/run-build.ts → graph.json  (bundled, offline)  │  ✓ exists
+  └───────────────────────────────┬─────────────────────────┘
+                                  │
+  ┌─ Client (Expo, on device) ────▼─────────────────────────┐
+  │  AddressBar: set start + end (geocoded into the bbox)    │  ✓ exists
+  │  MapScreen: draw the route, color segments by            │
+  │             directedGrade (green/yellow/red)             │  ✓ exists
+  │  RouteSummaryCard: ONE climb number + distance +         │
+  │                    steepCount  (summary.ts routeSummary) │  ✓ exists
+  └───────────────────────────────┬─────────────────────────┘
+                                  │
+  ┌─ The actual experiment ───────▼─────────────────────────┐
+  │  show 5 real self-powered travelers the same A→B in      │  ✗ NEVER DONE
+  │  flattr AND in Google Maps. ask which they'd take and    │     ← this is the
+  │  why. record the answer.                                 │       whole slice
+  └─────────────────────────────────────────────────────────┘
+```
 
-| Non-goal | Why it's cut |
-|----------|--------------|
-| **City/global coverage** | A scaling problem (spatial index, tiling, CH), not a premise problem. The neighborhood proves the idea; coverage proves nothing new and costs the most. |
-| **Turn-by-turn voice nav** | Navigation UX, orthogonal to "is the route choice good?" The thing being validated is the *path*, not the guidance. |
-| **Accounts / saved routes / sharing** | Product/retention features. Premature before the core route is proven useful. |
-| **Live re-routing while moving** | Real-time tracking is a large surface; the static A→B route is enough to validate flat-first routing. |
-| **Multi-modal (transit/car)** | Cars want *fast* — that's the opposite of the premise. Including it dilutes the one thing flattr does differently. |
-| **Production-grade elevation accuracy** | The free 90m DEM is "good enough to feel the difference." Finer elevation (paid) is a fidelity upgrade to defer until demand is proven. |
+Why this is the right slice:
 
-## The cut that hurt (and was right)
+- **It's bounded.** One bbox keeps `graph.json` small (the shipped artifact is
+  already 544 KB for its current extent) and offline. No city-scale pipeline,
+  no tiling work, no server.
+- **It reuses everything proven.** The colored path comes from
+  `grade/classify.ts` over `directedGrade`; the climb number comes from
+  `summary.ts` `routeSummary` (`climbM` = sum of positive directed rise). You
+  write no new engine code.
+- **It targets the empty column.** The output of the experiment is the first
+  real demand datum flattr has ever had. That is the entire point.
 
-The honest one to call out: **city-scale coverage is cut, and it's the cut that makes flattr look like a toy to a casual observer.** It's still right. Proving the premise needs one neighborhood; scaling to a city is months of work (spatial index, tiling, contraction hierarchies) that teaches you *nothing about whether anyone wants flat-first routing*. Spending that effort before validating demand would be optimizing the wrong thing. The cut is defensible precisely because it's sequenced correctly — validate, then scale.
+## What "done" looks like for the slice
 
-▸ A non-goal isn't a feature you failed to build. It's a feature you decided, on purpose, not to build yet — and can say why.
+You are done when you can answer, with evidence not assertion:
 
-## One-page summary
+- Did the flat route differ meaningfully from the default route for these A→B
+  pairs? (Engine-side, measurable now — see `04`.)
+- When shown both, did real travelers prefer flattr's route, and was their
+  stated reason "the grade"? (Demand-side, only measurable via the experiment.)
 
-**Core claim:** The validating slice is a bundled-neighborhood, two-endpoint, grade-routed map with a visible colored route and a climb number — the smallest thing that proves flat-first routing is different and useful.
+If the answer to the second question is "no" or "they didn't care," that is a
+*successful* experiment — it cheaply told you not to invest more.
 
-- **Build:** bundled graph, set endpoints, route by `userMax`, route colored by grade + climb number, toggleable heatmap.
-- **Cut:** city coverage, turn-by-turn, accounts/sharing, live re-route, multi-modal, production elevation accuracy.
-- **The hard cut:** city-scale coverage — makes it look small, but scaling teaches nothing about demand, so it's correctly sequenced *after* validation.
+## Non-goals — what NOT to build (and why)
 
-┃ "The neighborhood proves the idea; the city proves nothing new and costs the most."
+These are cuts, stated without apology. Each one is hours returned to discovery.
+The first group is from `docs/flattr-spec.md` §13; the framing is this book's.
+
+```
+  non-goals — each is a deliberate cut, not a missing feature
+
+  ┌───────────────────────┬────────────────────────────────────────┐
+  │ NON-GOAL              │ WHY it's cut (now)                      │
+  ├───────────────────────┼────────────────────────────────────────┤
+  │ city-wide coverage    │ premise is unproven; coverage is a      │
+  │                       │ cost you pay AFTER demand, not before.  │
+  │                       │ one bbox tests the premise for free.    │
+  ├───────────────────────┼────────────────────────────────────────┤
+  │ turn-by-turn nav      │ a navigation product, not a routing     │
+  │                       │ premise test. huge surface, zero        │
+  │                       │ bearing on "is flat-first wanted?"      │
+  ├───────────────────────┼────────────────────────────────────────┤
+  │ accounts / sync       │ no user → no account. pure overhead     │
+  │                       │ until there's someone to save state for.│
+  ├───────────────────────┼────────────────────────────────────────┤
+  │ multi-modal / transit │ different problem entirely. flattr is   │
+  │                       │ self-powered travel; transit dilutes    │
+  │                       │ the one thing being tested.             │
+  └───────────────────────┴────────────────────────────────────────┘
+```
+
+Also explicitly cut for the validating slice (engine-side temptations):
+
+- **Bidirectional A*, k-alternatives, contraction hierarchies** (spec §14.5) —
+  search-speed and route-variety refinements. Real DSA depth, zero demand
+  signal. They make a *better* engine, not a *validated* problem. Keep them as
+  portfolio stretch, not as the next investment.
+- **Zone choropleth** (spec §11, `grade/zones.ts`) — nice map polish; doesn't
+  test whether a traveler prefers the route.
+- **Multi-city pipeline** (spec §10 Phase 4) — pure cost-before-demand.
+
+## The cut that matters most
+
+If you build *anything* before the 5-traveler experiment, you are spending the
+one resource you can't get back (solo-dev hours) on the column the repo already
+fills. The hardest, most senior cut here is cutting *more engineering*.
+
+## See also
+
+- `03-options-and-opportunity-cost.md` — `do nothing more on features` as a real
+  option, with opportunity cost named.
+- `04-success-metrics-and-feedback-loop.md` — how to measure the slice.
+- `.aipe/study-system-design/00-overview.md` — the build-time/runtime split that
+  makes the one-bbox bundle cheap.
+- `.aipe/study-data-modeling/05-build-and-evolve-the-artifact.md` — how the
+  graph.json artifact is built and bounded.

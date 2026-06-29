@@ -1,338 +1,276 @@
 # The datastore map
 
-**Industry name(s):** read-only data store / immutable artifact / embedded
-data file · **Type:** Project-specific (the pattern — "ship the data inside the
-app" — is Industry standard for read-only datasets)
+**Industry name(s):** storage architecture / data-access map · **Type:**
+Language-agnostic (the concepts) anchored to project-specific shape.
 
 ## Zoom out, then zoom in
 
-Before any mechanism, here's the whole picture. There is exactly one box in
-this system that plays the role a database plays in a normal app — and it isn't
-a database. It's a JSON file.
+Before any mechanism, here's where "the database" lives in flattr — and the
+first surprise is that there isn't one process you'd call a database. There are
+two storage surfaces, in two different lifecycles.
 
 ```
-  Zoom out — where the "database" lives in flattr
+  Zoom out — where storage lives in flattr
 
-  ┌─ Build layer (offline, pipeline/) ──────────────────────────────┐
-  │  Overpass + Open-Meteo  ──►  buildGraph()  ──►  JSON.stringify   │
-  └──────────────────────────────────────────┬──────────────────────┘
-                                              │  writes graph.json
-  ┌─ Storage layer ────────────────────────── ▼ ─────────────────────┐
-  │  ★ graph.json — the ONLY persistent store ★   ← we are here      │
-  │  immutable · read-only · bundled into the app · 544 KB           │
-  └──────────────────────────────────────────┬──────────────────────┘
-                                              │  import (once, at startup)
-  ┌─ Runtime layer (Expo RN) ──────────────── ▼ ─────────────────────┐
-  │  loadGraph() ─► in-memory Graph ─► A* / nearestNode / GeoJSON    │
-  └───────────────────────────────────────────────────────────────────┘
+  ┌─ BUILD layer (pipeline/, runs offline on your machine) ──────┐
+  │  osm.ts → split.ts → grade.ts → build-graph.ts               │
+  │      writes ──►  ★ graph.json ★   (the artifact / "the DB")  │ ← we are here
+  └────────────────────────────┬─────────────────────────────────┘
+                               │  git-committed, bundled by Expo
+  ┌─ APP layer (mobile/, runs on device) ─▼──────────────────────┐
+  │  loadGraph.ts  ── reads graph.json once ──► Graph (in RAM)    │
+  │  useTileGraph  ── merges live tiles ──────► Graph (in RAM)    │
+  │  elevCache.ts  ── reads/writes ───────────► AsyncStorage (KV) │ ← and here
+  └───────────────────────────────────────────────────────────────┘
 ```
 
-Zoom in: the question this file answers is *"where does flattr's data live,
-how is it read, and what's the boundary past which durability stops being the
-app's problem?"* The answer is unusual and worth saying out loud: the store is
-write-once-at-build, read-only-at-runtime, and lives **inside the app bundle**.
-That single fact determines everything downstream — it's why transactions,
-locks, WAL, and replication are all `not yet exercised`.
+Zoom in. The thing this whole guide circles is: *how does flattr execute and
+preserve reads and writes, and which engine guarantees does it assume it has?*
+The answer is "almost none, and it doesn't need them" — but you can't say that
+with confidence until you've mapped the two surfaces and named what each one
+is standing in for. That map is this file.
 
 ## The structure pass
 
-**Layers.** Three, top to bottom: the *build layer* (`pipeline/`) that produces
-the artifact, the *storage layer* (the `graph.json` file itself), and the
-*runtime layer* (`features/` + `mobile/src/`) that reads it.
+Three layers, one axis held constant, and the seams where the axis flips.
 
-**The axis: state — who owns it, where it lives, is it mutable?** Trace that one
-question down the stack and watch the answer flip:
+**Layers** (by lifecycle):
+1. **Build** — `pipeline/`, runs once offline, produces `graph.json`.
+2. **Bundle/read** — `loadGraph.ts`, reads the artifact into memory at startup.
+3. **Runtime mutate** — `elevCache.ts` + `useTileGraph.ts`, the only places
+   data changes after startup.
+
+**Axis traced — "is this data mutable, and who can write it?"**
 
 ```
-  Axis = "who owns the data and can they mutate it?"  — traced downward
+  one axis — "who can write this data?" — across the layers
 
-  ┌─ Build layer ─────────────────────────────────┐
-  │  OWNS + WRITES the data (the only writer)      │  → mutable here
-  └───────────────────────────┬────────────────────┘
-            seam: JSON.stringify → file  ═══════╪═══  (state freezes)
-  ┌─ Storage layer ───────────▼────────────────────┐
-  │  graph.json — holds the data, nobody mutates it │  → immutable
-  └───────────────────────────┬────────────────────┘
-            seam: import / loadGraph()  ═════════╪═══  (copy into RAM)
-  ┌─ Runtime layer ───────────▼────────────────────┐
-  │  in-memory Graph — READS only, never writes back│  → read-only
-  └───────────────────────────────────────────────────┘
+  ┌─ Build layer ─────────────────┐
+  │  graph.json: WRITABLE          │   the pipeline owns it; full rewrite
+  └───────────────┬────────────────┘
+       seam ══════╪══════  (artifact frozen, committed to git)
+  ┌─ Read layer ──▼────────────────┐
+  │  graph.json: READ-ONLY          │   loadGraph() never writes back
+  └───────────────┬────────────────┘
+       seam ══════╪══════  (a second, independent store appears)
+  ┌─ Runtime layer ▼───────────────┐
+  │  elevCache: WRITABLE (KV, 1 wr.)│   debounced single-writer persistence
+  │  merged graph: WRITABLE (RAM)   │   rebuilt, never persisted
+  └─────────────────────────────────┘
 ```
 
-**Seams.** Two load-bearing ones, and the axis flips at both:
+The axis-answer **flips twice**, and each flip is a load-bearing seam:
 
-- **build → storage** (`JSON.stringify(graph)` → `writeFileSync`,
-  `pipeline/run-build.ts:12`). Before this seam the data is mutable, in-flight,
-  being assembled. After it, it's a frozen byte sequence. This is the
-  bulk-load / commit boundary — the moment the dataset becomes canonical.
-- **storage → runtime** (`import graph from "./graph.json"`,
-  `mobile/src/loadGraph.ts:7`). The file is deserialized into a JS object once.
-  After this seam there is no path back to the file — the runtime can mutate its
-  in-memory copy all it wants and the artifact never notices.
+- **Build → Read seam.** The artifact goes from writable to frozen. This is the
+  seam with *no contract* — no schema version, no checksum, no handshake. The
+  app trusts that whatever `build-graph.ts` last emitted matches the `Graph`
+  type the app casts to (`loadGraph.ts:9`). That's red-flag #2.
+- **Read → Runtime seam.** A *second, completely separate* store appears
+  (AsyncStorage), with its own (weak) durability rules. The graph and the
+  elevation cache never share a transaction, a lock, or a consistency guarantee.
 
-That second seam is *why* there's no durability problem at runtime: writes (if
-there were any) would never reach disk, so there's nothing to lose on a crash
-and nothing to recover.
+**Why map seams before mechanics:** the interesting database lessons in flattr
+all live at these two seams. The missing schema version is a *contract* gap at
+the first seam. The debounced KV writes are a *durability* mechanism at the
+second. Learn the joints and the rest hangs off them.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You already know the shape: it's a `fetch()` that returns a big JSON blob,
-except the fetch is `import` and the server is the app bundle. The data ships
-*with the code*. There's no round-trip, no connection pool, no query — just a
-deserialize-once-then-read-from-memory loop.
+You already know the shape of a normal app's data layer: a React component calls
+`fetch('/api/thing')`, a handler runs a SQL query against Postgres, rows come
+back. flattr deletes the middle two boxes. The "query" runs in-process against a
+data structure that's already in RAM; the "rows" are object references.
 
 ```
-  The pattern — load-once, read-many over an immutable blob
+  the pattern — flattr collapses the data stack into RAM
 
-   build time              run time
-   ──────────              ────────────────────────────
-   assemble  ──► FILE ──► load once ──► [ in-RAM Graph ] ──► read
-   (writer)     (frozen)  (deserialize)      ▲                ▲
-                                             │                │
-                                       never written     read by A*,
-                                       back to disk       nearest, GeoJSON
+  normal app:                     flattr:
+  ┌──────────┐                    ┌──────────┐
+  │ UI       │                    │ UI       │
+  └────┬─────┘                    └────┬─────┘
+   fetch│ (network hop)            call│ (function call, same process)
+  ┌────▼─────┐                    ┌────▼──────────────┐
+  │ handler  │                    │ astar / nearest   │
+  └────┬─────┘                    │   over Graph (RAM)│
+   SQL │ (network hop)            └────┬──────────────┘
+  ┌────▼─────┐                     ref │ (pointer deref)
+  │ Postgres │                    ┌────▼──────────────┐
+  │  (disk)  │                    │ nodes / adjacency │  already loaded
+  └──────────┘                    └───────────────────┘
 ```
 
-The whole engine is a reader. That's the thing to hold in your head.
+The strategy: **pay the I/O cost once at build+load time, then every read is a
+memory access.** That's why there's no query planner and no transactions — those
+mechanisms exist to manage disk I/O and concurrent durable mutation, and flattr
+has neither in the hot path.
 
-### Move 2 — the moving parts
+### Move 2 — the four storage surfaces, one at a time
 
-#### The artifact is the source of truth
-
-The canonical dataset is one file. In a Postgres app the source of truth is the
-data directory the server guards; here it's a 544 KB JSON file you can open in
-an editor. There's no server process mediating access — the "DBMS" is
-`JSON.parse` (done implicitly by the bundler's JSON import) plus plain object
-property access.
-
-What breaks if you forget this: you go looking for a connection string, a
-migration runner, a pool config — and none exist, because there's no server to
-connect to. The data *is* the file.
-
-#### The load is a single deserialize, not a connection
+**The artifact: `graph.json`.** This is flattr's "tablespace." One file, JSON,
+544 KB, holding the whole dataset. Top-level keys (verified by inspecting the
+file): `city`, `bbox`, `nodes`, `edges`, `adjacency`. The `Graph` type that
+mirrors it is `features/routing/types.ts:22`.
 
 ```
-  Layers-and-hops — the one and only data fetch
+  graph.json — the artifact's logical layout
 
-  ┌─ Storage ────┐  hop 1: bundler resolves the JSON import   ┌─ Runtime ─┐
-  │  graph.json  │ ──────────────────────────────────────────►│ JS object │
-  └──────────────┘  hop 2: loadGraph() casts to Graph type    └─────┬─────┘
-                    (no network, no parse cost beyond bundle)       │
-                                                                    ▼
-                                                          A* / nearest / map
+  {
+    "city":  "seattle-mvp",                ← metadata
+    "bbox":  [minLng,minLat,maxLng,maxLat],← spatial bounds
+    "nodes": { "n0": {...}, "n1": {...} }, ← 1621 entries, keyed by id  (the PK map)
+    "edges": [ {...}, {...} ],             ← 1879 entries, an array     (scanned)
+    "adjacency": { "n0": ["e3","e7"] }     ← 1621 entries, id→edgeId[]  (the index)
+  }
 ```
 
-One hop, no network. Compare a normal app: client → load balancer → service →
-connection pool → DB → back. Here the "DB" is in-process, so the read latency
-is a property access, measured in nanoseconds.
+The two access shapes inside one artifact are the whole storage-engine lesson:
+`nodes` is a **hash map** (primary-key lookup), `edges` is an **array** (full
+scan unless you go through the index), and `adjacency` is the **hand-built
+secondary index** that connects them. Hold that — `03` walks it in full.
 
-#### The access paths fan out from the loaded object
+**The reader: `loadGraph()`.** The entire "open the database" path:
 
-Once `loadGraph()` returns the `Graph`, three readers consume it, each via a
-different access path (this is what the rest of the guide unpacks):
-
-- **PK lookup** — `graph.nodes[id]` (a hash lookup; file `03`)
-- **index scan** — `graph.adjacency[id]` then `byId.get(edgeId)` (file `03`)
-- **full scan** — `nearestNode` loops every node (file `04`)
-
-#### Move 2.5 — current state vs. future state
-
-This concept is fully shipped on the read side and *deliberately empty* on the
-write side. Here's the comparison that matters:
-
-```
-  Phase A (now): read-only artifact     Phase B (if a DB arrived)
-
-  graph.json bundled in app             Postgres / SQLite store
-  load once at startup                  connection + pool
-  no write path                         INSERT/UPDATE on edge edits
-  rebuild = redeploy                    migrations + live writes
-  durability: N/A (nothing written)     WAL + fsync + backups
-  consistency: trivial (1 copy)         isolation levels matter
+```ts
+// mobile/src/loadGraph.ts:6-11 — the whole reader
+import graph from "../assets/graph.json";   // line 7: Metro bundles the JSON at build
+export function loadGraph(): Graph {
+  return graph as unknown as Graph;          // line 10: cast, no validation
+}
 ```
 
-The takeaway for Phase B: almost nothing on the *read* side changes — A* still
-asks for `adjacency[current]`. What changes is everything this guide marks `not
-yet exercised`: you'd suddenly need transactions (file `05`), concurrency
-control (`06`), a WAL (`07`), and a replication story (`08`). The read-only
-choice is what buys their absence.
+Line 7 is the load: Metro (Expo's bundler) inlines `graph.json` into the JS
+bundle, so by the time the app runs the object is already parsed and in memory —
+there's no `fs.readFile`, no `await`. Line 10 is the seam with no contract: a
+double cast (`as unknown as Graph`) that tells TypeScript "trust me" and does
+**zero runtime validation.** If a future `build-graph.ts` renames `adjacency`,
+this line still compiles and still "succeeds" — the breakage surfaces later as
+an undefined-index crash deep in A*. That's the schema-version gap made concrete.
+
+**The runtime read+write store: `elevCache`.** The only thing in flattr that
+writes durable data after startup. It's a key/value store: keys are `~90m DEM
+cell` strings (`useTileGraph.ts:36`), values are elevation in meters. Backed by
+AsyncStorage under one key, `flattr.elevCache.v1` (`elevCache.ts:7`).
+
+```
+  elevCache — KV store layered over AsyncStorage
+
+  ┌─ in-memory tier ────────────┐
+  │  Map<string, number> (mem)  │  ← every getElev/putElev hits this first
+  └──────────────┬───────────────┘
+        dirty?    │ debounced 4s (PERSIST_DEBOUNCE_MS)
+  ┌──────────────▼───────────────┐
+  │  AsyncStorage["...elevCache.v1"]  one JSON blob, whole-map rewrite
+  └──────────────────────────────┘
+```
+
+Note the `.v1` in the key — the elevCache *does* version its storage namespace,
+which is exactly the discipline `graph.json` is missing. Bump it to `.v2` and
+old caches are simply ignored, never misread. `07` walks the write/durability
+path; `02` walks why "whole-map rewrite" is the cost model it is.
+
+**The transient join: the merged graph.** `useTileGraph.ts:132-145` stitches the
+base graph + live viewport tiles + route corridor into one merged `Graph` on
+every relevant state change. This is a *materialized view* computed in RAM and
+never persisted — pure derived state. It's the closest flattr gets to a "query
+result set," and `04` treats it as one.
 
 ### Move 3 — the principle
 
-**Immutability is a design decision that deletes problems.** By making the store
-write-once-at-build, flattr trades away the ability to edit data at runtime and
-gets, in exchange, the deletion of every hard consistency-and-durability problem
-a stateful DB carries. For a routing app over a city that changes on the scale
-of months, that's the right trade. The general lesson: before reaching for a
-database, ask whether your data actually changes at runtime — if it doesn't, a
-bundled artifact is simpler and faster, and the "missing" DB machinery was never
-needed.
+A datastore is wherever the system's source-of-truth bytes live plus the rules
+for reading and changing them. flattr has two such places with two different
+rule sets — a frozen artifact with no contract, and a KV cache with a weak
+durability contract. Mapping *where the bytes live and who's allowed to change
+them* is the move that makes every other database concept findable; you can't
+reason about isolation or recovery until you know which store you're talking
+about.
 
 ## Primary diagram
 
-The full map, every layer and hop labelled.
+The full map: two storage surfaces, two lifecycles, the seams between them.
 
 ```
-  flattr datastore — full map
+  flattr — the complete datastore map
 
-  ┌─ BUILD (pipeline/, offline) ────────────────────────────────────┐
-  │  parseOsm → splitWays → sampleElevations → computeGrades         │
-  │                              │ buildAdjacency()                  │
-  │                              ▼                                    │
-  │                     Graph {nodes,edges,adjacency}                │
-  │                              │ JSON.stringify (run-build.ts:12)   │
-  └──────────────────────────────┼───────────────────────────────────┘
-                  ═══ COMMIT SEAM ┼═══ (state freezes; mutable→immutable)
-  ┌─ STORAGE ────────────────────▼───────────────────────────────────┐
-  │  graph.json  —  544 KB  —  1621 nodes · 1879 edges · 1 bbox       │
-  └──────────────────────────────┼───────────────────────────────────┘
-                  ═══ LOAD SEAM ══┼═══ (deserialize into RAM; read-only)
-  ┌─ RUNTIME (Expo RN) ──────────▼───────────────────────────────────┐
-  │  loadGraph()  →  Graph in memory                                  │
-  │      ├─ nodes[id]        PK hash lookup        (→ file 03)        │
-  │      ├─ adjacency[id]    secondary index scan  (→ file 03)        │
-  │      └─ nearestNode()    full scan O(N)        (→ file 04)        │
+  ┌─ BUILD (offline, pipeline/) ─────────────────────────────────────┐
+  │  OSM ─► split ─► grade ─► build-graph ─► graph.json               │
+  │                                            │ WRITABLE here only    │
+  └────────────────────────────────────────────┼─────────────────────┘
+                              seam: no version / no checksum  ║ frozen
+  ┌─ APP (on device, mobile/) ─────────────────▼─────────────────────┐
+  │                                                                   │
+  │  graph.json ──loadGraph()──► Graph (RAM, READ-ONLY)               │
+  │                 │                                                 │
+  │                 ├─ nodes      Record<id,Node>   ► PK map  (O(1))  │
+  │                 ├─ adjacency  id→edgeId[]        ► 2ndary index   │
+  │                 └─ edges      Edge[]             ► scanned        │
+  │                                                                   │
+  │  reads:  astar.search() ── adjacency walk ──► path                │
+  │          nearestNode() ──── O(N) edge/node scan ──► id            │
+  │                                                                   │
+  │  useTileGraph ── merge(base, view, corridor) ► merged Graph (RAM) │
+  │                                                                   │
+  │  ┌─ separate store ─────────────────────────────────────────┐    │
+  │  │ elevCache  getElev/putElev ─► Map ─debounce─► AsyncStorage│    │
+  │  │            (the ONLY durable write path; key ".v1")       │    │
+  │  └───────────────────────────────────────────────────────────┘   │
   └───────────────────────────────────────────────────────────────────┘
-```
-
-## Implementation in codebase
-
-**Use cases.** Every screen load in the mobile app hits this path exactly once:
-`MapScreen` mounts, calls `loadGraph()`, and from then on routing and the
-heatmap read the in-memory copy. The `useTileGraph` hook *extends* this base
-artifact at runtime by building extra tiles, but the bundled `graph.json` is
-always the foundation it merges onto.
-
-**The loader — `mobile/src/loadGraph.ts` (lines 6-11):**
-
-```
-  import type { Graph } from "features/routing/types";   ← the store's schema
-  import graph from "../assets/graph.json";              ← the ONLY persistent
-                                                            store, bundled
-
-  export function loadGraph(): Graph {
-    return graph as unknown as Graph;   ← cast: JSON has no types; we assert
-  }                                       it matches Graph. No validation —
-       │                                  the build pipeline is trusted to
-       │                                  have produced a well-formed graph.
-       └─ this is the entire "open a connection to the database" step.
-          No pool, no retry, no auth. The import IS the connection, and it
-          can't fail at runtime (bundle-time resolved). Without this cast
-          the rest of the app couldn't treat the blob as a typed Graph.
-```
-
-**The commit seam — `pipeline/run-build.ts` (lines 10-13, 47-48):**
-
-```
-  function writeGraph(graph: Graph, path: string): void {
-    writeFileSync(path, JSON.stringify(graph));   ← the bulk-load "COMMIT":
-  }                                                 mutable Graph → frozen bytes
-  ...
-  mkdirSync("data", { recursive: true });
-  writeGraph(graph, "data/graph.json");           ← writes to data/, then a
-       │                                            human copies it to
-       │                                            mobile/assets/ (loadGraph.ts
-       └─ note: this is the ONLY writeFileSync in the data path. There is no    comment).
-          runtime write anywhere. Search the runtime for fs writes — there are
-          none. That absence is the whole durability story (→ file 07).
-```
-
-**The schema the store conforms to — `features/routing/types.ts` (lines 22-28):**
-
-```
-  export type Graph = {
-    city: string;
-    bbox: [number, number, number, number];  ← the partition key range (file 02)
-    nodes: Record<string, Node>;              ← PK-indexed table (file 03)
-    edges: Edge[];                            ← heap file: unordered rows (file 02)
-    adjacency: Record<string, string[]>;      ← secondary index (file 03)
-  };
-       │
-       └─ this type IS the storage schema. graph.json is a serialization of
-          exactly this shape. The store has no schema enforcement of its own —
-          the TypeScript type is the only contract, checked at build, asserted
-          (not validated) at load.
 ```
 
 ## Elaborate
 
-The "ship data inside the app" pattern is old and respectable: SQLite databases
-bundled in mobile apps, static-site generators baking content into HTML, CDNs
-serving JSON. It works when (a) the data is read-mostly or read-only, and (b)
-the dataset fits in memory. flattr satisfies both — 544 KB fits trivially, and
-the street graph for a neighborhood doesn't change between deploys.
+This shape has a name: **embedded / in-process storage**, the same family as
+SQLite, LMDB, or RocksDB-as-a-library — the data engine runs inside your process
+rather than as a separate server you talk to over a socket. flattr is the
+extreme end: the engine is *just JavaScript objects*, and the "query language" is
+hand-written functions. You've shipped the next rung up in `buffr` (SQLite as the
+canonical local store) and `dryrun` (GitHub-as-backend) — both trade the network
+hop for local files, same instinct as flattr, but with a real engine managing
+the bytes.
 
-The spec (`docs/flattr-spec.md` §5, lines 139-173) originally planned to put the
-artifact in **Netlify Blobs** with per-city tiles, fronted by a thin Next.js
-runtime. The repo as built skips Blobs entirely and bundles the file into the
-Expo app — a simplification that's correct for a single-city MVP and would need
-revisiting for multi-city (you don't want every city's graph in every app
-bundle).
-
-Where it stops working: the moment users can *edit* the graph (report a closed
-sidewalk, add a path), you need a write path, and a write path is where every
-`not yet exercised` topic in this guide wakes up. Read file `05` for what that
-first write would cost.
-
-What to read next: `02` for how a single `Node`/`Edge` is laid out inside the
-blob, then `03` for the indexes that make reads fast.
+The spec's intended target (`docs/flattr-spec.md` §8) is Next.js + Postgres +
+pgvector — the same stack as your `AdvntrCue`. The day flattr makes that jump,
+this map gains a *third* layer (a real server, over the network) and every
+`not yet exercised` concept in this guide activates at once. The map is the thing
+that tells you which.
 
 ## Interview defense
 
-**Q: "Walk me through where this app's data lives and how it's accessed."**
+**Q: "Walk me through flattr's data layer."**
 
-> It's a read-only artifact, not a database. One JSON file — `graph.json`, about
-> 544 KB, 1621 nodes and 1879 edges — built offline by the `pipeline/` and
-> bundled into the app. At startup `loadGraph()` deserializes it into an
-> in-memory `Graph` object once. From there three access paths read it:
-> primary-key lookup via `nodes[id]`, a secondary-index scan via `adjacency[id]`,
-> and a full scan in `nearestNode`. There's no server, no connection, no query
-> language — the import is the connection and property access is the query.
-
-```
-  build ──► graph.json ──► loadGraph() ──► in-RAM Graph ──► A*/nearest/map
-  (writer)  (immutable)    (deserialize)   (read-only)
-```
-
-Anchor: *the import is the connection; property access is the query.*
-
-**Q: "Why no database? Isn't that a shortcut?"**
-
-> It's a deliberate fit-to-the-problem call. The street graph is read-only at
-> runtime and changes on the scale of months, so a bundled artifact gives
-> nanosecond reads and deletes every transaction, locking, WAL, and replication
-> problem a stateful DB carries. It becomes the wrong call the day users can
-> edit the graph — then you need a write path and all that machinery comes back.
+> Two surfaces. A read-only artifact, `graph.json` — built offline by the
+> pipeline, bundled, loaded once into RAM, never written back. And a key/value
+> cache, `elevCache`, over AsyncStorage — the only durable write path, used to
+> avoid re-hitting a throttled elevation API. The artifact is where the
+> index-vs-scan lessons live; the cache is where the durability lessons live.
+> Everything between them — transactions, locks, a query planner — is absent
+> because the workload is read-mostly against in-memory data.
 
 ```
-  read-only data?  ──yes──►  bundle it  (delete the DB problems)
-        │
-        └──no, runtime writes──►  now you need: txns, locks, WAL, replicas
+  artifact (RO, RAM) ──┐
+                       ├──► two stores, two rule sets, no shared txn
+  elevCache (KV, disk)─┘
 ```
 
-Anchor: *immutability is a design decision that deletes problems.*
+Anchor: *two storage surfaces, two lifecycles, two contracts — and the
+interesting bugs live at the seams between them.*
 
-## Validate
+**Q: "Where's the riskiest part of that map?"**
 
-1. **Reconstruct (from memory):** draw the three-layer map (build / storage /
-   runtime) and mark the two seams. Name what flips at each seam.
-2. **Explain:** why does `loadGraph()` (`mobile/src/loadGraph.ts:9`) have no
-   error handling or retry? (Because the import is bundle-time resolved — it
-   can't fail at runtime the way a network DB connection can.)
-3. **Apply to a scenario:** a user reports a sidewalk is closed and wants it
-   removed from routing. Trace every layer that would have to change. (Storage
-   gains a write path; build is no longer the only writer; durability, isolation,
-   and recovery — files `05`–`07` — all become live.)
-4. **Defend the decision:** someone says "you should've used SQLite from day
-   one." Make the counter-argument grounded in `loadGraph.ts:9` and the absence
-   of any runtime `writeFileSync`.
+> The build→read seam. The app does `graph.json as unknown as Graph` with no
+> runtime validation and no schema version. The two sides are coupled only by a
+> TypeScript type that's erased at runtime. A field rename in the pipeline
+> ships a broken bundle silently.
+
+Anchor: *a frozen artifact with no version field is an un-versioned API between
+two programs that can't be deployed in lockstep.*
 
 ## See also
 
-- `02-records-pages-and-storage-layout.md` — how a `Node`/`Edge` sits in the blob
-- `03-btree-hash-and-secondary-indexes.md` — the access paths' index structures
-- `07-wal-durability-and-recovery.md` — why the rebuild is the recovery story
-- `.aipe/study-system-design/` — why a build-time artifact, and how tiling scales
-- `.aipe/study-data-modeling/` — the `Graph` schema's shape and field choices
+- `02-records-pages-and-storage-layout.md` — why JSON-as-storage costs what it does
+- `03-btree-hash-and-secondary-indexes.md` — the nodes map and adjacency index
+- `07-wal-durability-and-recovery.md` — the elevCache write path
+- `09-database-systems-red-flags-audit.md` — the missing schema version, ranked
+- `../study-system-design/` — which datastore and how it scales
+- `../study-data-modeling/` — the schema shape itself

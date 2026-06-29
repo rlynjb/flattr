@@ -1,40 +1,57 @@
-# Agent architecture — study guide for flattr
+# Study — agent architecture (flattr)
 
-**Honest verdict: this repo has no LLM agent.** No reasoning loop, no
-tool-calling, no multi-agent orchestration, no AI layer at all. The
-"intelligence" is a deterministic hand-rolled **A\* graph search**
-(`features/routing/astar.ts`), not an agent. The spec says so: *"No LLM layer
-in v1"* (`docs/flattr-spec.md` §8, line 254); the NL/agent features are out of
-scope (§13, line 380).
+**flattr has no LLM, no agent, no tool-calling, no multi-agent
+orchestration.** This guide is honest about that. Its value is two things
+flattr *does* have:
 
-So every agent-architecture concept is **`not yet exercised`**, and this guide
-is proportionate to that — an honest overview plus two focused files where a
-real diagram earns its place. No padded concept tree for machinery that doesn't
-exist.
+1. **The control-loop contrast** — `search()` in `features/routing/astar.ts`
+   is the agent-loop skeleton with *code* in the decision slot instead of a
+   model. Learn the agent loop here, where every step is testable.
+2. **The router-as-tool seam** — `search`/`routeSummary`/`geocode`/
+   `nearestNode` are already shaped like agent tools. A future planner agent
+   wraps them without changing the router.
+
+Everything else (agentic retrieval, multi-agent topologies, agent memory,
+planning loops) is marked *not yet exercised* with the attachment point named.
 
 ## Reading order
 
-1. **[`00-overview.md`](00-overview.md)** — the no-agent verdict and the full
-   `not yet exercised` inventory (every agent-architecture concern, each paired
-   with the real file + line range where it *would* attach if the out-of-scope
-   NL/agent features were built).
-2. **[`01-control-loop-contrast.md`](01-control-loop-contrast.md)** — the one
-   diagram worth drawing: **code decides next step** (the A\* loop) vs **model
-   decides next step** (an agent loop). Same skeleton, opposite control axis. A
-   teaching *contrast* — explicitly **not** a claim that A\* is an agent.
-3. **[`02-router-as-agent-tool-seam.md`](02-router-as-agent-tool-seam.md)** —
-   the single real future seam: a "describe my route" / NL-destination feature
-   where a tool-calling agent wraps the existing router as a **tool**, consuming
-   `features/routing/summary.ts` and feeding `pipeline/geocode.ts` /
-   `mobile/src/AddressBar.tsx`. Includes the tool/injection risk cross-link.
+1. [`00-overview.md`](00-overview.md) — the honest frame + where flattr sits
+2. [`01-reasoning-patterns/01-chains-vs-agents.md`](01-reasoning-patterns/01-chains-vs-agents.md) — is there a loop at all?
+3. [`01-reasoning-patterns/02-agent-loop-skeleton.md`](01-reasoning-patterns/02-agent-loop-skeleton.md) — **the contrast** (code-decides vs model-decides)
+4. [`03-multi-agent-orchestration/01-when-not-to-go-multi-agent.md`](03-multi-agent-orchestration/01-when-not-to-go-multi-agent.md) — the escalation gate
+5. [`agent-patterns-in-this-codebase.md`](agent-patterns-in-this-codebase.md) — **the seam** (router-as-tool, mapped)
+6. [`06-orchestration-system-design-templates/`](06-orchestration-system-design-templates/) — interview templates
+7. [`audit.md`](audit.md) — every spec lens, honestly marked
 
-## Cross-links
+## File list
 
-- `.aipe/study-dsa-foundations/` — A\*, priority queues, admissible heuristics
-  (the deterministic side of the control-loop contrast).
-- `.aipe/study-system-design/` — the chain-shaped engine pipeline.
-- `.aipe/study-security/` — the prompt-injection trust boundary the
-  router-as-tool seam would open.
-- `.aipe/study-ai-engineering/`, `.aipe/study-prompt-engineering/` — single-LLM
-  and prompt mechanics if an AI layer is ever added (sibling folders, not yet
-  generated).
+```
+  00-overview.md
+  README.md                            ← you are here
+  audit.md                             ← Pass 1: every lens, honest
+  agent-patterns-in-this-codebase.md   ← the router-as-tool seam
+  01-reasoning-patterns/
+    01-chains-vs-agents.md
+    02-agent-loop-skeleton.md          ← THE control-loop contrast
+  03-multi-agent-orchestration/
+    01-when-not-to-go-multi-agent.md
+  06-orchestration-system-design-templates/
+    01-multi-agent-research-assistant.md   (Applies: no)
+    02-agentic-support-system.md           (Applies: partially — the seam)
+    03-agentic-coding-system.md            (Applies: no — chain contrast)
+```
+
+Note: SECTIONS B (agentic retrieval), D (agent infrastructure), and E
+(production serving for agents) generate **no concept files** — flattr matches
+none of those shapes at all, so per the spec those patterns are skipped (not
+stubbed). They are walked in `audit.md` with attachment points instead.
+
+## Cross-links to sibling guides
+
+- `study-dsa-foundations` — A* search mechanics inside the control loop
+- `study-system-design` — router + pipeline as system boundaries
+- `study-ai-engineering` — tool-calling / single-agent mechanics (model side)
+- `study-prompt-engineering` — aipe as agent-adjacent prompt orchestration
+- `study-runtime-systems` — the build pipeline as a fixed-order chain
+- `study-testing` — `bench/` as the seam where agent trajectory evals attach

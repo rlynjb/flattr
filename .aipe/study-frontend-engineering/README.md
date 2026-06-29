@@ -1,54 +1,51 @@
 # Study — Frontend Engineering (flattr `mobile/`)
 
-A per-repo frontend-engineering guide for the **Expo / React Native** app at
-`/Users/rein/Public/flattr/mobile/`. This is the real frontend surface — the
-Next.js stack named in `docs/flattr-spec.md` §8 was never built; the Expo RN
-app is the source of truth (confirmed direction).
+The frontend surface of flattr is one Expo / React Native screen — `MapScreen.tsx` — that
+wraps a declarative MapLibre map, a controlled address bar, two grade-display overlays, and a
+route summary card. There's no router, no global store, no design-token system, no service
+worker. What *is* here is dense: an A\* router run inside a render-time `useMemo`, a single-flight
+tile-fetch state machine in a custom hook, data-driven map layers styled by GeoJSON properties,
+and a persistent elevation cache behind AsyncStorage.
 
-Calibrated to a frontend engineer: no on-ramp for what a hook or a component
-is. The interesting parts of this codebase are *where frontend meets a
-hand-rolled graph router* — the route runs in a `useMemo`, the data source is
-a pan-to-load tile graph, and the rendering target is a native map view across
-the JS↔native bridge.
+This guide is audit-style (two passes, per `me.md`):
+
+- **`audit.md`** — Pass 1. Walks the 8 frontend lenses against `mobile/src/`. Names what's there
+  with `file:line` grounding, or marks `not yet exercised`.
+- **`01`–`05`** — Pass 2. One file per load-bearing frontend pattern this repo actually exercises.
 
 ## Reading order
 
-1. **`00-overview.md`** — one-page orientation. Rendering mode in one
-   sentence, state graph in one diagram, network seam in one diagram, the
-   three highest-leverage patterns named with paths. Skim-only readers stop
-   here.
-2. **`audit.md`** — Pass 1, the 8-lens frontend audit. One `##` section per
-   lens, `file:line` grounded, `not yet exercised` named honestly. The final
-   lens ranks frontend red flags by user-visible consequence.
-3. **`01-on-demand-tile-graph.md`** — the `useTileGraph` hook: pan-to-load
-   coverage, single-flight `pump()`, corridor-over-viewport priority.
-4. **`02-derived-render-time-astar.md`** — the route as derived state: A*
-   inside a `useMemo`, and the main-thread hazard that creates.
-5. **`03-native-maplibre-declarative-layers.md`** — native MapLibre source/
-   layer composition, `key`-driven remount, data-driven GPU styling.
-6. **`04-controlled-search-with-debounce.md`** — controlled From/To inputs,
-   debounced autocomplete, the suggestion lifecycle, tap-to-set endpoints.
+1. **`00-overview.md`** — the whole frontend in one page: rendering mode, state graph, network seam,
+   the three highest-leverage patterns. Skim only this and you know what the app is.
+2. **`audit.md`** — the 8-lens sweep. Read it to see what's exercised and what isn't.
+3. The pattern files, in order:
+   - **`01-render-time-astar.md`** — the router runs in a `useMemo` on the JS thread. The most
+     surprising and most load-bearing choice in the codebase.
+   - **`02-coords-not-ids-endpoints.md`** — endpoints stored as coordinates, node ids re-derived
+     each render so they re-snap as tiles load. The source-of-truth decision that makes everything
+     else work.
+   - **`03-single-flight-tile-pump.md`** — the `useTileGraph` fetch state machine: one build at a
+     time, corridor priority, debounce, degraded-region self-heal.
+   - **`04-data-driven-map-layers.md`** — declarative GeoJSON sources/layers styled by feature
+     properties, with the frozen-id remount-by-key trick.
+   - **`05-debounced-controlled-inputs.md`** — the controlled AddressBar + debounced geocode
+     autocomplete, the throttle that keeps Nominatim under its rate limit.
 
 ## Cross-links to neighboring guides
 
-- **`.aipe/study-runtime-systems/`** — the single JS thread and the
-  synchronous-A*-in-render hazard. Frontend owns *that the route is derived
-  state*; runtime-systems owns *what blocking the thread costs*.
-- **`.aipe/study-dsa-foundations/`** — the A* search the UI invokes
-  (`features/routing/astar.ts`), the binary heap, the graph model.
-- **`.aipe/study-networking/`** — Overpass / Open-Meteo / Nominatim wire
-  behavior, rate limits, retry/backoff. Frontend owns the *debounce and
-  single-flight seam*; networking owns *what travels and how it fails*.
-- **`.aipe/study-system-design/`** *(not yet generated)* — system-level state
-  ownership of the graph artifact and the build pipeline.
-- **`.aipe/study-performance-engineering/`** *(not yet generated)* — measuring
-  the cost of render-time A* and full-graph GeoJSON rebuilds (frame budget,
-  numbers). Frontend names the pattern; performance-engineering measures it.
-
-## What this guide does NOT cover
-
-- The routing algorithm internals (A*, bidirectional, the binary heap, cost
-  function) → `study-dsa-foundations`.
-- The build pipeline that produces `graph.json` (`pipeline/`) → it's
-  build-time, not frontend runtime; touched only where the hook reuses it.
-- Wire-level HTTP semantics, TLS, connection pooling → `study-networking`.
+- **`study-runtime-systems`** — the JS event loop, why A\* in a `useMemo` blocks the UI thread, the
+  `setTimeout` debounce mechanics. This guide names *that* the router runs render-time; the runtime
+  guide owns *how the single thread schedules it*.
+- **`study-networking`** — Overpass / Open-Meteo / Nominatim HTTP semantics, rate limits, retry
+  backoff on the wire. This guide names the fetch seam; networking owns the protocol.
+- **`study-system-design`** — base graph + viewport + corridor merge architecture, local-first
+  storage strategy, the build-time `graph.json` artifact. This guide names where client state lives;
+  system-design owns the system-level data ownership.
+- **`study-performance-engineering`** — the actual cost of render-time A\* in milliseconds, frame
+  budget, bundle size as numbers. This guide names the perf *coupling*; performance owns the
+  *measurement*.
+- **`study-dsa-foundations`** — A\*, the binary-heap priority queue, the graph itself. This guide
+  treats the router as a black box called from render; DSA owns the algorithm internals.
+- **`study-software-design`** — module boundaries between `mobile/src/` and the shared `features/`
+  engine, the `useTileGraph` hook as a deep module. This guide names the seam; software-design owns
+  the interface depth analysis.

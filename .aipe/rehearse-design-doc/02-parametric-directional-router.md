@@ -1,99 +1,288 @@
-# Design Doc — A parametric router with a directional grade cost
+# RFC 02 — Parametric directional router
 
-**One-line summary:** flattr hand-rolls one `search()` function that is Dijkstra, A\*, grade-A\*, and directed-A\* depending on the cost and heuristic passed to it, with a *directional* grade cost (uphill penalized, downhill free, so A→B ≠ B→A) and a large-but-finite `BLOCKED` sentinel that keeps "too steep" distinct from "no route."
+**Decision:** there is exactly one search function. Dijkstra, A*, grade-aware A*, and
+directional A* are not four algorithms — they're four `(costFn, heuristicFn)` arguments
+to the same `search()` (`features/routing/astar.ts:22`). Direction is real: A→B and B→A
+cost differently because the grade penalty reads a *signed* directed grade. And the
+"too steep" cost is `BLOCKED = 1e9` — large but **finite**, not `Infinity`
+(`features/routing/cost.ts:5`).
 
-Lead with the shape: this isn't four algorithms, it's one engine with the domain pushed entirely into a cost function. That separation is the decision, and it's what a reviewer should walk away remembering.
+> Coach: the verdict up front is "one engine, parameterized — the algorithm names are
+> just argument presets." That reframes a reviewer who expects to see four functions.
+> Then the two things they'll actually probe: directional cost and the finite BLOCKED.
+> Lead with those; they're where the design earns its keep.
 
-## Context / problem
+═════════════════════════════════════════════════
+2. CONTEXT / PROBLEM
+═════════════════════════════════════════════════
 
-flattr's whole premise is routing for *flattest comfortable*, not shortest. That means the cost of crossing a block depends on its grade — and on the *direction* you cross it, because climbing is hard and descending is free. Off-the-shelf routers (OSRM, Valhalla) optimize for distance/time and don't model directional grade-effort cleanly. And the project's stated goal is to own the graph algorithm, not call a library. So the problem is: design a search that's correct, provably optimal, and where the grade logic lives in exactly one place.
+flattr "optimizes for flat, not fast." That means three things a stock router doesn't do:
 
-## Goals & non-goals
+- **Grade is a cost, not just a label.** A short steep block should cost more than a
+  longer flat detour. The router has to weight edges by steepness against the user's
+  comfort knob `userMax`.
+- **Grade is directional.** Going *up* a 8% hill is hard; going *down* it is free. The
+  same physical street has a different cost depending on which way you travel it. A→B ≠ B→A.
+- **"No flat route" must differ from "no route at all."** If every path has a steep block,
+  the user should still get the flattest one *flagged*, not a blank "no route." Those are
+  two genuinely different answers (`docs/flattr-spec.md` §14.4).
 
-```
-  GOALS                                 NON-GOALS
-  ─────                                 ─────────
-  optimal paths, provably               city-scale query latency
-    (admissible heuristic)                (no contraction hierarchies)
-  grade logic in ONE seam               a general routing platform
-  directional cost (A→B ≠ B→A)          turn restrictions / one-ways
-  honest failure: steep ≠ disconnected    (not modeled yet)
-  the search loop is domain-agnostic    k-alternative routes
-```
+And the framing constraint: the graph work is the project (`docs/flattr-spec.md` §14, no
+OSRM/Valhalla). The router is hand-rolled, and it's also a *benchmarkable progression* —
+Dijkstra → A* → grade → directional → bidirectional — that has to be measured against
+itself (`docs/flattr-spec.md` §15.2, `bench/`).
 
-The decisive goal is **one seam for the domain**: the search loop must never mention grade, and the cost function must never mention search. That constraint is what makes the engine teachable and the variants free.
+═════════════════════════════════════════════════
+3. GOALS & NON-GOALS
+═════════════════════════════════════════════════
 
-## The decision
+**Goals**
+- One correct search core; the algorithm progression expressed as parameter choices, not
+  copy-pasted functions.
+- A* heuristic stays **admissible** (haversine lower bound; penalty ≥ 0) so A* returns
+  the optimal path, not just *a* path.
+- Directional grade cost: free downhill, penalized uphill, asymmetric per direction.
+- "Flattest-but-steep" returns a flagged path; "disconnected" returns null.
 
-One `search(graph, start, goal, userMax, costFn, heuristicFn)` engine. The named algorithms are argument tuples; direction is derived at traversal from undirected storage.
+**Non-goals**
+- *Not* continental scale. No contraction hierarchies, no preprocessing tricks — those
+  buy speed at city/continent scale the neighborhood graph doesn't need, and they'd hide
+  the hand-rolled traversal that's the point.
+- *Not* turn-by-turn / lane-level routing. Node-and-edge granularity only.
+- *Not* multi-criteria Pareto routing. One scalar cost per edge.
 
-```
-  ONE ENGINE, FOUR BEHAVIORS — the seam is the cost function
+═════════════════════════════════════════════════
+4. THE DECISION
+═════════════════════════════════════════════════
 
-  search(graph, s, g, userMax, COSTFN, HEURISTICFN)
-    ├─ dijkstra      = distanceCost,      zeroHeuristic    (h=0, floods)
-    ├─ astar         = distanceCost,      haversine        (cones to goal)
-    ├─ gradeAstar    = gradeCostAbs,      haversine
-    └─ directedAstar = gradeCostDirected, haversine        (A→B ≠ B→A)
-
-  STORAGE → TRAVERSAL → COST  (where direction enters)
-  ┌────────────────────────────────────────────────────────────┐
-  │ undirected edge in adjacency  ── stored once, both ends      │
-  │        │ directedGrade(edge, fromNode)                       │
-  │        ▼ +grade if entered from one end, −grade from other   │
-  │ penalty(signedGrade, userMax):                              │
-  │   downhill/flat → 0   |  up to ½·max → linear               │
-  │   ½·max..max → quadratic |  > max → BLOCKED (1e9, FINITE)    │
-  └────────────────────────────────────────────────────────────┘
-
-  outcomes A* distinguishes:
-    clean path        → route, no steep edges
-    only-steep path   → route returned, steep edges flagged (BLOCKED finite)
-    disconnected      → null  (frontier drains, goal unreached)
-```
-
-Two non-obvious choices live in that diagram. First, **direction is derived, not stored** — one physical edge yields two costs depending on travel direction, halving the graph and keeping the asymmetry in one function. Second, **`BLOCKED` is `1e9`, not `Infinity`** — so an all-steep route stays a finite, comparable, *returnable* answer (flagged "flattest available"), while `null` is reserved for a genuinely disconnected graph. `Infinity` would collapse those two states and `Infinity − Infinity = NaN` would corrupt the heap.
-
-## Alternatives considered
-
-| Alternative | Why it lost |
-|-------------|-------------|
-| **Use OSRM / Valhalla / GraphHopper** | Production-grade and city-scale, but directional grade-effort fights their distance/time cost models, and using one removes the project's entire learning goal. Right for a funded product on a deadline; wrong here. |
-| **Four separate algorithm implementations** | Dijkstra, A\*, grade-A\* as distinct functions. Rejected: massive duplication, and it hides the actual insight that Dijkstra is A\* with a zero heuristic. The parametric form *teaches* the relationship. |
-| **Materialize two directed edges per street** | Store A→B and B→A separately with baked directional costs. Rejected: doubles the graph and scatters the directional logic across the data instead of concentrating it in `directedGrade`. Derive-don't-materialize is cheaper and cleaner. |
-| **`BLOCKED = Infinity`** | Simpler to write, but collapses "too steep" into "no route" and breaks heap arithmetic via NaN. The finite sentinel is a deliberate correctness choice. |
-
-## Tradeoffs accepted
-
-We chose a hand-rolled, neighborhood-scale engine, accepting **no contraction hierarchies and no spatial index** — so it doesn't answer city-scale queries in microseconds the way OSRM does, and `nearestNode` is an O(N) scan. For the project's goal and graph size, that cost is acceptable and the alternative wouldn't teach more.
-
-> Coach note — where a reviewer pushes: "isn't a lazy-deletion heap wasteful?" The framing that holds: "it trades a bigger heap for dead-simple correctness — no decrease-key bookkeeping. The bench measures `pops` vs `nodesExpanded`; I'd port the decrease-key heap I've already built only when that ratio says the staleness actually hurts. Measure, then optimize."
-
-## Risks & mitigations
+One `search()`. The algorithm is whatever `(costFn, heuristicFn)` you hand it. The four
+named stages are thin wrappers that pick the pair.
 
 ```
-  RISK                               MITIGATION
-  ────                               ──────────
-  inadmissible heuristic → wrong     oracle test: A* cost == Dijkstra
-    'optimal' paths                    cost, or the suite fails
-  bidirectional returns non-optimal  balanced consistent potential
-    path (subtle)                      pf=(h_goal−h_start)/2; tested to
-                                       match directed-A* cost
-  lazy-deletion staleness slows       bench tracks pops≫expanded as the
-    search                             trigger to upgrade to decrease-key
-  parallel-edge reconstruction lies   reconstruct via the exact relaxed
-    about the route                    edge, not a node-pair re-lookup
+  One engine, four presets — the parameter table IS the algorithm progression
+
+                         costFn            heuristicFn        what you get
+  ───────────────────────────────────────────────────────────────────────
+  dijkstra        →   distanceCost        zeroHeuristic   uniform-cost search
+  astar           →   distanceCost        haversine       shortest distance
+  gradeAstar      →   gradeCostAbs        haversine       flattest, undirected
+  directedAstar   →   gradeCostDirected   haversine       flattest, A→B ≠ B→A
+                         │                    │
+                         │                    └─ admissible lower bound (≥0 penalty
+                         │                       keeps it a valid A* heuristic)
+                         └─ the ONLY thing that changes between stages
+
+  astar.ts:136-163 — each wrapper is a one-liner calling search(…)
 ```
 
-## Rollout / migration
+The kernel — strip everything and this is still A* (`features/routing/astar.ts:48-77`):
 
-Foundational, nothing to migrate. The forward path is preprocessing: contraction hierarchies or ALT landmarks add a *build-time* layer for city-scale queries without changing the query-time search, the cost model, or the heap. The engine is designed so that scaling is an additive preprocessing step, not a rewrite.
+```
+  The A* kernel — what breaks if each part is removed
 
-## Open questions
+  open  = priority queue, ordered by g + h          ← remove: it's BFS/DFS, not A*
+  g     = best known cost to each node               ← remove: can't relax edges
+  closed= finalized nodes                            ← remove: re-expands, slow/loops
+  came  = predecessor edge per node                  ← remove: no path to reconstruct
 
-1. **Decrease-key threshold:** at what `pops/nodesExpanded` ratio is the heap upgrade worth the added bookkeeping?
-2. **Bidirectional consistency proof:** the balanced potential is tested correct, but the formal non-negative-reduced-cost proof deserves to be written down.
-3. **Turn restrictions / one-ways:** real routing needs them eventually; how do they enter the cost model without breaking the single-seam property?
+  loop:
+    current = open.pop()                             // lowest g+h
+    if closed.has(current): continue                 // ← LAZY DELETION: skip stale dupes
+    if current == goal: reconstruct + return         // ← termination
+    closed.add(current)
+    for edge in adjacency[current]:                  // ← adjacency = the index (RFC 01)
+      tentative = g[current] + costFn(edge, current, userMax)   // ← the ONLY parametric line
+      if tentative < g[next]:
+        g[next] = tentative
+        came[next] = {edge, current}
+        open.push(next, tentative + heuristicFn(next, goal))    // ← + admissible h
+```
 
-┃ "Dijkstra is A\* with a zero heuristic — and the code proves it by being the same function."
-┃ "Direction is derived at traversal, not stored — one edge, two costs, one seam."
+The single parametric line is `costFn(edge, current, userMax)` at `astar.ts:68`. Swap
+the function passed in and the *same loop* becomes a different algorithm. The heap is a
+generic lazy-deletion binary min-heap that knows nothing about graphs or grades
+(`features/routing/pqueue.ts:1`) — it just orders by priority.
+
+**Directionality — the part reviewers probe first.** The cost function receives `current`
+(the node you're traversing *from*), and grade is signed by travel direction
+(`features/routing/graph.ts:17`):
+
+```ts
+  // features/routing/graph.ts:17 — same edge, opposite sign depending on direction
+  export function directedGrade(edge: Edge, fromNodeId: string): number {
+    return fromNodeId === edge.fromNode ? edge.gradePct : -edge.gradePct;
+  }
+
+  // features/routing/cost.ts:32 — free downhill, penalized uphill
+  export const gradeCostDirected: CostFn = (edge, fromNodeId, userMax) =>
+    edge.lengthM * (1 + penalty(directedGrade(edge, fromNodeId), userMax));
+```
+
+```
+  Why A→B ≠ B→A on the same physical edge
+
+  edge: A ──(gradePct = +8%)──► B          stored ONE direction
+
+  traverse A→B:  directedGrade = +8%  → penalty(+8) = quadratic, expensive (uphill)
+  traverse B→A:  directedGrade = -8%  → penalty(-8) = 0           (downhill, free)
+                                          cost.ts:16  if g <= 0 return 0
+
+  the router climbs A→B reluctantly and descends B→A for free — asymmetry by design
+```
+
+**The finite BLOCKED — the surprising choice, and the most load-bearing constant.** An
+edge steeper than `userMax` doesn't cost `Infinity`. It costs `1e9`
+(`features/routing/cost.ts:5`):
+
+```ts
+  // features/routing/cost.ts:5
+  export const BLOCKED = 1e9; // Large but FINITE, so an only-steep path is still returned and flagged.
+
+  // cost.ts:16 — the penalty curve
+  export function penalty(g, max, k1=0.4, k2=1.0) {
+    if (g <= 0) return 0;              // downhill/flat: free
+    if (g > max) return BLOCKED;       // over the user's comfort: huge but FINITE
+    const half = 0.5 * max;
+    if (g <= half) return k1 * g;      // moderate: linear
+    return k2 * (g - half) ** 2 + k1 * half;  // steep: quadratic
+  }
+```
+
+```
+  Why finite, not Infinity — three outcomes the router must distinguish
+
+  scenario              cost of best path        what the user sees
+  ────────             ─────────────────        ──────────────────
+  clean flat route     normal (no BLOCKED)       "Flat all the way"
+  only-steep route     ~1e9 (BLOCKED in sum)     "⚠ Flattest available, N steep blocks"
+  disconnected         null (open empties)       "No route between those points"
+
+  if BLOCKED were Infinity:
+    Infinity + anything = Infinity → every steep path ties → can't pick the FLATTEST
+    steep one, and "only-steep" collapses into "no route". The middle row vanishes.
+```
+
+`1e9` is enormous next to real edge lengths (meters), so the router avoids steep edges
+whenever any alternative exists — but because it's finite, *summing* it still produces an
+orderable cost, so the router can return the least-steep path and flag exactly which edges
+crossed the line. That flagging is `steepEdges` (`astar.ts:126`), surfaced to the user as
+the steep-block count (`mobile/src/RouteSummaryCard.tsx:35`).
+
+> Coach: the finite-BLOCKED point is your strongest signal in this whole doc. Anyone can
+> say "I used A*." Saying "I made the blocked cost finite so flattest-but-steep stays
+> distinct from no-route, because Infinity arithmetic destroys the ordering" tells the
+> reviewer you *built* this, you didn't read about it. Bring it up unprompted.
+
+═════════════════════════════════════════════════
+5. ALTERNATIVES CONSIDERED
+═════════════════════════════════════════════════
+
+```
+  ┌─ A. OSRM / Valhalla routing engine ─────────────────────────┐
+  │  drop in a mature C++ router with contraction hierarchies    │
+  │  WHY IT LOST: no native directional-grade cost — you'd fork  │
+  │  it. Hides the traversal §14 says to build by hand. And it   │
+  │  optimizes for fast, not flat — the whole differentiator.    │
+  └──────────────────────────────────────────────────────────────┘
+  ┌─ B. four separate algorithm implementations ────────────────┐
+  │  hand-write dijkstra(), astar(), gradeAstar() as full,       │
+  │  independent functions                                       │
+  │  WHY IT LOST: four copies of the same loop = four places a   │
+  │  bug hides. A heap fix has to land in all four. The bench-   │
+  │  mark progression (§15.2) compares them — if they don't      │
+  │  share a core, you're comparing implementation noise, not    │
+  │  the cost/heuristic choice.                                  │
+  └──────────────────────────────────────────────────────────────┘
+  ┌─ C. one parametric search(costFn, heuristicFn) (CHOSEN) ─────┐
+  │  WHY IT WON: one correct loop, four configs. The benchmark   │
+  │  measures exactly the variable that changed (the cost/heur   │
+  │  pair) against a fixed core. Directional grade is just a     │
+  │  third costFn — no new engine. Heap is swappable underneath. │
+  └──────────────────────────────────────────────────────────────┘
+```
+
+The deciding factor against four implementations is the **benchmark**. The progression
+*is* the portfolio story (`docs/flattr-spec.md` §15.2) — and a benchmark only means
+something if the only thing varying between runs is the thing you're studying. Share the
+core; vary the parameters; the numbers attribute cleanly to the cost/heuristic choice.
+
+═════════════════════════════════════════════════
+6. TRADEOFFS ACCEPTED
+═════════════════════════════════════════════════
+
+We chose the one-parametric-engine, accepting:
+
+- **No contraction hierarchies / no continental scale.** Plain A* with lazy deletion is
+  fast at neighborhood scale and dead simple to reason about. It would not route across a
+  country in milliseconds. That's a non-goal — flattr is one neighborhood — but it's a
+  real ceiling, named.
+- **`BLOCKED = 1e9` is a magic-ish constant.** It's tuned to dwarf real edge lengths
+  (meters) while staying summable. If someone fed the router a graph with edges measured
+  in millimeters and paths thousands of edges long, the BLOCKED gap could erode. For this
+  data it's safe by orders of magnitude — but it's a calibrated number, not a law.
+- **`gradeCostAbs` is symmetric on purpose, and that's a real difference.** The undirected
+  stage (`cost.ts:28`) uses `absGradePct` — it treats up and down the same. It exists for
+  the benchmark progression, not for production routing; the directional stage is the one
+  the app uses. Shipping the wrong one would silently make downhill cost as much as uphill.
+
+═════════════════════════════════════════════════
+7. RISKS & MITIGATIONS
+═════════════════════════════════════════════════
+
+```
+  Risk                              Mitigation
+  ────                              ──────────
+  inadmissible heuristic →          haversine is a true lower bound; penalty
+    A* returns non-optimal path     ≥ 0 (cost.ts:16). Spec constraint §14.
+  NaN priority corrupts the heap    PQueue.push throws on NaN (pqueue.ts:25)
+  parallel edges between same nodes  reconstruct() walks the EXACT relaxed
+    → wrong cost on reconstruct      edges, not re-resolved by node pair
+                                     (astar.ts:86-103)
+  BLOCKED summed enough to overflow  1e9 chosen with headroom; would need
+    a meaningful cost                ~millions of blocked edges to matter
+  swapped abs vs directed cost       directedAstar is the app's entry point;
+                                     gradeCostAbs scoped to the benchmark
+```
+
+═════════════════════════════════════════════════
+8. ROLLOUT / MIGRATION
+═════════════════════════════════════════════════
+
+- **The router is pure and data-source-agnostic.** `search()` takes a `Graph` object and
+  returns a `SearchResult` — it doesn't know if the graph was bundled, tile-built, or a
+  fixture. That's why RFC 01's artifact and RFC 03's degraded tiles both flow through the
+  same function untouched.
+- **Adding a new stage** is adding a `costFn` and a wrapper — bidirectional already does
+  this, reusing `summarizePath` and `indexEdges` from `astar.ts`
+  (`features/routing/bidirectional.ts:6`). No core change.
+- **Swapping the heap** (the hand-rolled `PQueue`) for an npm library touches one file and
+  nothing else — the heap knows nothing about routing (`pqueue.ts:1`). The hand-rolled
+  version is a deliberate DSA-portfolio choice, not an architectural lock-in.
+
+═════════════════════════════════════════════════
+9. OPEN QUESTIONS
+═════════════════════════════════════════════════
+
+- **Does `BLOCKED` want to be relative instead of absolute?** A constant tuned to one
+  graph's units is fragile. A BLOCKED expressed as a multiple of total graph length would
+  be unit-independent. Worth it, or over-engineering for a single-neighborhood app?
+- **Is bidirectional worth shipping, or is it benchmark-only?** It's implemented and
+  measured but the app uses `directedAstar`. At neighborhood scale the speedup may not
+  justify the added complexity at the meet-in-the-middle seam.
+- **Should the penalty curve (`k1`, `k2`) be user-tunable?** Today `userMax` is the only
+  knob. Some users may want "avoid steep at all costs" vs "mild preference" — that's the
+  `k2` quadratic weight, currently fixed.
+
+> Coach: when a reviewer pushes "why not just use OSRM," don't get defensive about
+> reinventing wheels. The answer is one sentence: "OSRM optimizes for fast and has no
+> directional grade cost — the two things flattr is *about*." You're not reinventing a
+> router; you're building a router that does something theirs can't.
+
+─────────────────────────────────────────────────
+**See also**
+- `study-dsa-foundations/05-graphs-and-traversals.md` — Dijkstra/A* foundations
+- `study-dsa-foundations/03-stacks-queues-deques-and-heaps.md` — the binary heap behind PQueue
+- `study-system-design/04-honest-fallback-routing.md` — flattest-but-steep as a graph problem
+- RFC 01 — the graph artifact this router traverses
+- RFC 03 — degraded (flat) tiles still route through this engine
+- `docs/flattr-spec.md` §6 (algorithm), §14.2-14.4 (core + honest fallback), §15.2 (benchmark)

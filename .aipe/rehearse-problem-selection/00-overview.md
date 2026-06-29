@@ -1,40 +1,110 @@
-# Problem Selection — flattr
+# Problem Selection — flattr (overview)
 
-This brief answers the question that comes *before* "is the code good?" — namely, "was this problem worth solving at all, and can you defend the choice to invest in it?" That's the staff-level skill: not just building the thing, but justifying why the thing deserved your time over everything else you could have built.
+> Coach posture. Base persona: `teacher.md` (staff engineer), voice shifted to
+> coach for `me.md` (Rein). Diagrams primary, second person, no hedging, no
+> marketing. This book justifies **why** flattr deserves investment *before* any
+> solution design — and it is brutally honest about what the repo can and cannot
+> prove.
 
-Here's the honest frame you have to hold, because a skeptical reviewer will test it in the first minute: **flattr is a learning/portfolio project, not a product with users.** The repo proves the *technical* premise — you can route for flat instead of fast over a real elevation graph — but it contains no evidence that anyone is currently in pain over hilly routes, no usage data, no market signal. So this brief does two things at once: it makes the genuine case for the problem (grade-aware routing is real and underserved), and it's straight about where that case is *inference* rather than *evidence*. The strongest version of you in a review room is the one who says "here's what I can prove, here's what I'm assuming, and here are the discovery questions I'd answer before betting real resources."
+## The one thing to internalize before you defend this
+
+You built a router. You did **not** validate a problem. Those are two different
+claims, and a sharp reviewer will separate them in the first thirty seconds.
+This book makes you the one who separates them first.
+
+Here is the whole brief in one frame. Read the two columns as two different
+kinds of truth — one you can point at a file for, one you cannot.
 
 ```
-  THE BRIEF AT A GLANCE — claim, and where it stands
+  flattr — what the repo proves vs. what it only asserts
 
-  PROBLEM        grade-aware routing for self-powered travel
-                 ("flattest comfortable," not "shortest")
-       │
-       ├─ EVIDENCE (provable from repo) ──────────────────┐
-       │   the technical premise works: directional A* over │
-       │   an elevation graph, userMax knob, honest fallback │
-       │                                                    │
-       ├─ INFERENCE (plausible, unproven) ─────────────────┤
-       │   scooter riders / wheelchair users / cargo-bike   │
-       │   commuters avoid hills — real, but no user data    │
-       │   in this repo                                      │
-       │                                                    │
-       └─ GAP (must discover before investing) ────────────┘
-           who, how many, how often, would they switch?
+  ┌─ EVIDENCE (point at a file) ────────────┐   ┌─ INFERENCE (plausible, unproven) ──┐
+  │ • A* == Dijkstra optimality gate        │   │ • that kick-scooter commuters      │
+  │     astar.test.ts:38,47,51              │   │     exist in measurable numbers    │
+  │ • node-expansion drops (bench harness)  │   │ • that they'd switch from Google   │
+  │     bench/run.ts → report.ts            │   │     Maps to a flat-first router     │
+  │ • signed directional grade cost         │   │ • that "show me the flat" is a      │
+  │     cost.ts penalty()                    │   │     felt pain, not a nice-to-have   │
+  │ • honest fallback (BLOCKED finite)      │   │ • that grade ceiling is a hard,     │
+  │     cost.ts:6, astar fallback           │   │     non-negotiable need for anyone  │
+  │ • free data pipeline runs               │   │ • the AccessMap differentiator      │
+  │     pipeline/*.ts, graph.json 544 KB    │   │     ("personalized userMax") matters│
+  │ • ships on device (Expo app)            │   │                                     │
+  │     mobile/src/MapScreen.tsx            │   │                                     │
+  └─────────────────────────────────────────┘   └────────────────────────────────────┘
+        ↑ the problem is SOLVABLE                       ↑ the problem is WORTH solving
+          (proven, technically)                           (NOT proven — discovery needed)
 ```
 
-That diagram is the whole posture: separate what the repo proves from what you're inferring, and name the gap out loud.
+The repo lands the left column hard. The right column is empty of evidence —
+there are no users, no logs, no interviews, no waitlist, no analytics, nothing.
+`docs/flattr-spec.md` §3 prints a three-row user table; that table is a
+**hypothesis written by the author**, not a finding. Treat it as inference.
 
-## The five files
+## The honesty framing this book uses
 
-| File | What it answers |
-|------|-----------------|
-| `01-problem-brief.md` | Who hurts, what evidence exists vs is inferred, why now, who benefits, the constraints. |
-| `02-scope-cuts-and-non-goals.md` | The smallest useful slice, and everything deliberately not built. |
-| `03-options-and-opportunity-cost.md` | The real alternatives — including *do nothing* — and what each costs. |
-| `04-success-metrics-and-feedback-loop.md` | What observable outcome would prove the premise, and how you'd measure it. |
-| `05-skeptical-reviewer-questions.md` | The review-room questions and the answers that hold (or honestly don't). |
+One sentence, and it runs through every file:
 
-## How to use it
+> **flattr proves the problem is technically solvable. It contains zero evidence
+> the problem is worth solving. The correct next investment is discovery, not
+> features.**
 
-Read `01` first — it's the spine. `05` is the one to rehearse out loud, because the skeptical-reviewer questions are exactly what gets asked when you propose investing in *anything*, not just flattr. The transferable skill this brief trains is justifying a problem under scrutiny without overclaiming — pair it with the design docs (`.aipe/rehearse-design-doc/`) which take over once the problem is justified and the decisions need writing down.
+That is not a weakness to hide. Stated first, it reads as senior judgment —
+exactly the framing `docs/flattr-spec.md` §15.1 already reaches for about
+*scale* ("name the gap before a reviewer does"). This book applies the same move
+to *demand*.
+
+## Reading order
+
+```
+  00-overview.md                    ← you are here: the EVIDENCE/INFERENCE split
+        │
+        ▼
+  01-problem-brief.md               who hurts · what the repo proves · why now ·
+        │                           beneficiaries · constraints (the 10-point core)
+        ▼
+  02-scope-cuts-and-non-goals.md    the smallest validating slice + what NOT to build
+        │
+        ▼
+  03-options-and-opportunity-cost.md  including `do nothing` as a real option
+        │
+        ▼
+  04-success-metrics-and-feedback-loop.md  metrics available-now vs. needs-users
+        │
+        ▼
+  05-skeptical-reviewer-questions.md  the review-room questions and answers that hold
+```
+
+## Constraints baked into every recommendation
+
+These are fixed by the repo and `me.md`; they bound every option in this book.
+
+- **Free-tier data only** — OSM (Overpass) + Open-Meteo elevation. `pipeline/`
+  proves it works; Open-Meteo 429s under load (project context, external-data
+  caveat).
+- **Hand-rolled engine mandate** — no Valhalla / OSRM / GraphHopper. Locked in
+  `docs/flattr-spec.md` §14. The graph work *is* the project.
+- **Offline client** — graph is a static artifact (`mobile/assets/graph.json`),
+  the app only reads it. No live backend, no DB.
+- **Single developer** — Rein, solo. Every scope decision is a time decision.
+
+## What this book is NOT
+
+It does not invent a market, a user count, a conversion rate, or an org
+constraint. Where demand is asserted, it is labelled INFERENCE and converted
+into a **discovery question** (see `05`). If the only honest answer is "we don't
+know yet," this book says so and tells you what to go measure.
+
+## Cross-links to the study guides
+
+The 16 study guides under `.aipe/study-*/` prove the *solvability* column. This
+book points at them rather than restating:
+
+- `.aipe/study-dsa-foundations/05-graphs-and-traversals.md` — the A* / Dijkstra
+  foundation the optimality gate rests on.
+- `.aipe/study-system-design/04-honest-fallback-routing.md` — the
+  BLOCKED-finite "flat vs. disconnected" distinction.
+- `.aipe/study-performance-engineering/02-heuristic-pruning.md` — the
+  node-expansion win the bench harness measures.
+- `.aipe/study-data-modeling/01-graph-as-the-schema.md` — why the graph artifact
+  is the whole data model.

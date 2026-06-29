@@ -1,315 +1,258 @@
-# Filesystem, streams, and resource lifecycle
+# Filesystem, Streams & Resource Lifecycle
 
-*Files, streams, descriptors, handles, cleanup, resource ownership.*
-**Type:** Industry standard (synchronous fs + bundler asset import).
+**Industry name(s):** file handles · static build artifact · persistent KV store
+· timer handles as resources · resource cleanup. **Type:** Industry standard.
 
 ## Zoom out, then zoom in
 
-This is flattr's shortest runtime story, and that's the finding. The
-entire filesystem footprint is **one synchronous write at build time and
-one bundler import at run time.** No streams, no open file descriptors
-held across awaits, no manual `close()`, no temp files, no locks. The
-artifact is written whole, in one call, and read whole, by the bundler.
+flattr touches durable resources in exactly three places, and they're cleanly
+split by runtime. Build time owns a `node:fs` handle that writes one file. Run
+time owns an AsyncStorage-backed cache and a fistful of timer handles. There are
+**no streams** anywhere — all I/O is whole-body request/response.
 
 ```
-  Zoom out — the entire filesystem footprint, on the runtime map
+  Zoom out — durable & OS resources, by runtime
 
-  ┌─ BUILD process ──────────────────────────────────────────┐
-  │  ★ mkdirSync("data") + writeFileSync(graph.json) ★        │ ← we are here
-  │     one blocking write, whole object, then exit            │
-  └────────────────────────┬─────────────────────────────────┘
-                           │  graph.json copied into the bundle
-  ┌─ RUN process ──────────▼─────────────────────────────────┐
-  │  ★ import graph from "../assets/graph.json" ★             │ ← and here
-  │     bundler inlines it — NO runtime fs read at all         │
+  ┌─ BUILD time · Node ──────────────────────────────────────┐
+  │  node:fs → mkdirSync + writeFileSync(data/graph.json)    │ ← write-once
+  │  network sockets → Overpass, Open-Meteo (closed by fetch)│   artifact
+  └────────────────────────┬──────────────────────────────────┘
+                           │ ships graph.json (544 KB) into the bundle
+  ┌─ RUN time · Hermes ─────▼────────────────────────────────┐
+  │  bundled asset: graph.json (read-only, via import)       │ ← we are
+  │  AsyncStorage: "flattr.elevCache.v1" (read/write KV)     │   here
+  │  timer handles: timerRef, retryRef, persistTimer,        │
+  │   suggestTimer ── must be cleared or they leak/double-fire│
   └──────────────────────────────────────────────────────────┘
-
-   no createReadStream/createWriteStream, no fs.open/close,
-   no fds held across awaits — `not yet exercised`
 ```
 
-Zoom in: the question is *what files does flattr touch, who owns the
-handles, and when are they released?* The answer is almost trivially safe
-— synchronous calls own their handle for the duration of the call and the
-OS releases it the instant the call returns. There's nothing to leak
-because nothing is held.
+Zoom in: the question is **what resources are acquired, and who's responsible for
+releasing them?** Files and sockets are short-lived and self-closing. The
+durable resource is AsyncStorage. The *leakable* resources — the ones a careless
+edit would mishandle — are the timers.
 
 ## Structure pass
 
-**Layers.** The file lifecycle nests:
+**Layers.** Three resource classes: (1) the build artifact — a file written once,
+then read-only forever; (2) the persistent cache — a single AsyncStorage key
+holding the whole elevation Map as JSON; (3) ephemeral OS handles — `setTimeout`
+IDs and the network sockets `fetch` opens and closes.
+
+**Axis traced — "who releases this, and what leaks if they don't (failure)?"**
 
 ```
-  Layered decomposition — "who holds the file handle, for how long?"
+  One axis — "who releases it / what leaks?" — across resources
 
-  ┌───────────────────────────────────────────────┐
-  │ outer: the OS file (data/graph.json on disk)   │ → OS owns the bytes
-  └───────────────────────────────────────────────┘
-      ┌─────────────────────────────────────────┐
-      │ middle: writeFileSync's transient handle  │ → held for ONE call
-      └─────────────────────────────────────────┘    (opened+closed atomically)
-          ┌─────────────────────────────────────┐
-          │ inner: the bundler's compile-time read│ → no runtime handle at all
-          └─────────────────────────────────────┘    (inlined into JS)
-
-  "who holds the handle?" — OS / a single sync call / nobody (it's inlined)
+  graph.json (fs)      → process exit releases handle; no leak (write-once)
+  fetch sockets        → fetch closes them; await res.json() drains the body
+  AsyncStorage key     → no handle to release; debounced write, capped size
+  setTimeout IDs       → ★ YOU must clearTimeout ★ or stale callbacks fire / pile up
 ```
 
-**Axis — resource lifecycle.** Trace "when is the handle acquired and
-released?" `writeFileSync` acquires a descriptor, writes, and releases it
-— all inside the one call, synchronously. The run-time import has *no*
-descriptor: the bundler turned the JSON into a JS object at compile time,
-so the phone never opens the file. The handle's lifetime is "one function
-call" at build, and "doesn't exist" at run.
-
-**Seam.** The boundary is **synchronous fs call ↔ bundler asset
-pipeline**. On the build side, a real (brief) file handle. On the run
-side, no handle — just a module reference. The lifecycle axis flips from
-"handle held for a call" to "no handle ever."
+**Seam — the import boundary on `graph.json`.** At build time it's a mutable file
+behind a `node:fs` handle. After bundling, the *same bytes* are a frozen
+read-only `import` (`loadGraph.ts:7`). The axis flips: writable file →
+immutable in-memory object. That seam is the whole "static artifact" model —
+`06`'s reason to exist. → also `01-runtime-map.md`.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You know the safe version of file I/O from any "write a config file"
-script: `writeFileSync(path, data)` opens, writes, and closes in one
-breath — you never see the descriptor, and there's nothing to forget to
-close. The dangerous version (open a stream, write chunks, remember to
-`.end()`/`.close()`, handle errors mid-stream) doesn't exist here. flattr
-uses only the safe version.
+You know the lifecycle from any resource you've used: acquire → use → release,
+and the release is the part that bites. A `fetch` is self-releasing once you read
+the body. A file handle releases on process exit. But a `setTimeout` is a
+resource you *must* release by hand — its handle outlives the function that made
+it, and if you don't `clearTimeout`, the callback fires later against stale
+state, or a new one stacks on the old.
 
 ```
-  Pattern — synchronous open-write-close as one atomic call
+  Pattern — resource lifecycle, and who owns the release
 
-   writeFileSync(path, data)
-        │
-        ├─ OS: open(path)        ─┐
-        ├─ OS: write(all bytes)   │ all inside the one call;
-        └─ OS: close(fd)         ─┘ the fd never escapes to your code
-
-   contrast (NOT used): createWriteStream → write chunks → .end()
-                        (handle lives across ticks; must remember to close)
+   resource        acquire            release             leak if not
+   ────────        ───────            ───────             ───────────
+   file            writeFileSync      process exit        (none)
+   socket          fetch()            await res.json()    held connection
+   AsyncStorage    setItem            (no handle)         stale data only
+   timer  ★        setTimeout → id    clearTimeout(id)    callback fires/stacks
 ```
 
-### Move 2 — walk the lifecycle
+### Move 2 — the walkthrough
 
-**Build writes the whole graph in one synchronous call.** `run-build.ts`
-finishes by `JSON.stringify`-ing the entire graph and handing it to
-`writeFileSync` — one string, one write, one implicit close. Because it's
-*synchronous*, the descriptor is never held across an `await`, so there's
-no "handle open while the event loop does something else" hazard. It
-blocks the build thread for the duration of the write, which is fine —
-it's the last thing the build does.
+**Part 1 — the build artifact: acquire fs, write once, exit.** The entire
+filesystem footprint of flattr:
 
-```
-  Execution trace — the build's disk lifecycle
-
-  step  call                          handle state
-  ────  ────────────────────────────  ──────────────────────
-  1     buildGraph resolves (in heap)  no fd
-  2     mkdirSync("data")              fd opened+closed (the dir)
-  3     JSON.stringify(graph)          no fd (pure CPU, big string)
-  4     writeFileSync(path, string)    fd opened → write → closed
-  5     main() resolves → process exit  no fd
-
-  at no point is a descriptor held across an await or a tick boundary
+```ts
+// pipeline/run-build.ts:11-13, 47-48
+function writeGraph(graph, path) { writeFileSync(path, JSON.stringify(graph)); }
+...
+mkdirSync("data", { recursive: true });   // ensure dir
+writeGraph(graph, "data/graph.json");      // synchronous write, handle auto-closed
 ```
 
-**`mkdirSync({recursive:true})` is idempotent and synchronous too.** It
-ensures `data/` exists before the write, and `recursive: true` makes a
-re-run a no-op rather than an error. Same lifecycle: open, act, close,
-inside the call.
+`writeFileSync` opens, writes, and closes the handle in one call — no descriptor
+to track. The process then returns from `main()` and exits. Nothing leaks because
+there's nothing held open. Note `build-graph.ts` itself has **no** `node:fs`
+(header comment line 2) — fs lives only in the CLI entry, so the build logic
+bundles for Hermes.
 
-**Run time has no file read at all.** This is the part people miss.
-`loadGraph` does `import graph from "../assets/graph.json"` — the Metro
-bundler resolves that at *build* time and inlines the parsed object into
-the JS bundle. So on the phone there is no `fs.open`, no descriptor, no
-parse-at-startup cost beyond what the JS engine spends materializing the
-inlined literal. The "file" is gone by run time; only the data survives,
-already in the heap.
+**Part 2 — the static artifact becomes a read-only import.** On the phone the same
+bytes are loaded by the module system, not the filesystem:
 
-```
-  Layers-and-hops — graph.json from build to run, crossing the bundler
-
-  ┌─ BUILD (Node fs) ─┐ hop1: writeFileSync   ┌─ disk ──────────┐
-  │ run-build.ts       │ ────────────────────► │ data/graph.json  │
-  └────────────────────┘                       └────────┬─────────┘
-                                       hop2: manual copy │
-                                            (dev step)   ▼
-                                            ┌─ mobile/assets/graph.json ┐
-                                            └────────────┬───────────────┘
-                              hop3: Metro bundler INLINES │ (compile time)
-                                                          ▼
-  ┌─ RUN (Hermes) ────┐ hop4: import returns object  ┌─ JS bundle ─────┐
-  │ loadGraph()        │ ◄─────────────────────────── │ inlined literal  │
-  └────────────────────┘  (no runtime fs read)        └──────────────────┘
+```ts
+// mobile/src/loadGraph.ts:7-11
+import graph from "../assets/graph.json"; // bundled at build; in memory at startup
+export function loadGraph(): Graph { return graph as unknown as Graph; }
 ```
 
-**No streams means no backpressure-from-disk to manage.** Streaming exists
-to bound memory when data is too big to hold at once — you read/write in
-chunks and let the consumer's pace throttle the producer. flattr holds the
-whole graph in memory anyway (`05-`), so there's nothing to stream; the
-544 KB write fits comfortably in one call. Streams would be the upgrade
-*if* the graph grew to where stringifying it whole became a memory or
-pause problem.
+There's no file open here — the bundler inlined `graph.json` into the JS bundle.
+It's a frozen object held for the app's lifetime (via the `baseGraph` `useMemo`).
+The lifecycle is trivial precisely because it's immutable: acquire at startup,
+never release, never mutate.
+
+**Part 3 — AsyncStorage: a single-key KV store with debounced, capped writes.**
+This is the one read/write durable resource:
+
+```ts
+// mobile/src/elevCache.ts:17-29, 38-39, 42-57
+export async function loadElevCache() {       // acquire: read the whole blob once
+  if (loaded) return; loaded = true;
+  const raw = await AsyncStorage.getItem(STORAGE_KEY);
+  if (raw) for (const k in JSON.parse(raw)) if (!mem.has(k)) mem.set(k, obj[k]);
+}
+export function putElev(key, value) {
+  ...
+  if (!persistTimer) persistTimer = setTimeout(persistNow, PERSIST_DEBOUNCE_MS); // ④ debounce
+}
+async function persistNow() {                  // release: write the whole blob back
+  persistTimer = null; if (!dirty) return; dirty = false;
+  ... AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(Object.fromEntries(entries)));
+}
+```
+
+The lifecycle: load-once (guarded by `loaded`), accumulate in memory, and
+write-back debounced 4 s after the last `putElev` (④). The whole Map is one JSON
+blob under one key — read-modify-write the entire thing, not per-entry. Why
+debounce: a build samples hundreds of cells in a burst; without it, each `putElev`
+would re-serialize and re-write the whole blob. The boundary condition: on a hard
+crash within the 4 s window, the unflushed entries are lost — acceptable, since
+they're just a re-fetchable cache.
+
+**Part 4 — timers are the leakable resource, and every one is paired with a
+clear.** This is where resource hygiene actually matters in the run-time process.
+Four distinct timer handles, each cleared before re-arming:
+
+```ts
+// mobile/src/useTileGraph.ts:254-255 (debounce)
+if (timerRef.current) clearTimeout(timerRef.current);     // release old
+timerRef.current = setTimeout(() => queueViewport(bounds), DEBOUNCE_MS); // acquire new
+
+// mobile/src/useTileGraph.ts:211-212 (retry)
+if (retryRef.current) clearTimeout(retryRef.current);
+retryRef.current = setTimeout(() => { ...; pump(); }, RETRY_MS);
+
+// mobile/src/MapScreen.tsx:74 (autocomplete suggest)
+if (suggestTimer.current) clearTimeout(suggestTimer.current);
+```
+
+The clear-before-set idiom is what keeps a fast pan from leaving five debounce
+timers armed — each new event cancels the prior pending one. The
+`persistTimer` is managed differently: it's set only when *not* already pending
+(`if (!persistTimer)`, `elevCache.ts:39`) and nulled inside `persistNow`, so at
+most one persist is ever scheduled.
+
+```
+  State — a debounce timer's lifecycle across two fast events
+
+   ┌────────┐  event 1   ┌──────────┐  event 2 (clearTimeout)  ┌──────────┐
+   │  idle  │ ─────────► │ pending  │ ──────────────────────►  │ pending' │
+   │ no id  │            │ id set   │  old id cancelled,       │ new id   │
+   └────────┘            └────┬─────┘  new id set              └────┬─────┘
+        ▲                     │ fires (or cleared)                  │ fires
+        └─────────────────────┴─────────────────────────────────────┘
+   only ONE timer ever armed → no stacking, no stale double-fire
+```
+
+**The gap:** none of these timers are cleared on unmount via a `useEffect`
+cleanup. For `useTileGraph` that's low-risk (the hook lives for the app's life),
+but it's the kind of resource-release a reviewer would flag — a fired-after-unmount
+`setState` warning is the symptom. Noted in the audit.
 
 ### Move 3 — the principle
 
-The safest resource is the one whose handle never escapes the call that
-opens it. Synchronous, whole-object I/O — open, act, close, atomically —
-removes the entire category of "leaked descriptor" and "handle held across
-an await" bugs. flattr earns that safety by keeping the artifact small
-enough to write and read whole. The day the artifact is too big for that
-(can't `JSON.stringify` it without a pause, can't inline it into the
-bundle), you graduate to streams — and inherit the close/cleanup
-discipline that comes with held handles.
+Resources fall into two camps: self-releasing (files, sockets — the runtime or the
+API closes them) and you-release (timers — the handle outlives its creator).
+flattr's file and socket lifecycle is trivial because they self-close; its real
+discipline is the clear-before-set timer idiom, which is the manual release the
+runtime won't do for you. Get that idiom wrong and you don't crash — you get
+stale callbacks firing against state that moved on, the subtlest class of bug.
 
 ## Primary diagram
 
-The complete filesystem lifecycle — every handle, where it's held, where
-it doesn't exist.
-
 ```
-  flattr filesystem lifecycle — the whole thing
+  All durable & OS resources, acquire → release, fully labelled
 
-  BUILD PROCESS (real, brief handles)        RUN PROCESS (no handles)
-  ──────────────────────────────────        ────────────────────────
-  mkdirSync("data")        ─ fd: open→close   import graph.json
-  JSON.stringify(graph)    ─ no fd               │
-  writeFileSync(path, str) ─ fd: open→close      │ bundler inlined it
-        │                                         │ at COMPILE time
-        ▼                                         ▼
-  ┌──────────────┐   manual copy (dev)    loadGraph() returns
-  │ graph.json   │ ─────────────────────► the inlined object
-  │ ~544 KB      │                        (zero runtime fs)
-  └──────────────┘
-
-  every handle: acquired and released inside one synchronous call
-  run-time descriptors held: none
-```
-
-## Implementation in codebase
-
-**Use cases.** The write happens once per `npm run build:graph`. The
-"read" happens once per app launch, but it's not really a read — it's a
-module evaluation of inlined data. There is no other filesystem access in
-the codebase.
-
-The entire write path — `mkdir` then one `writeFileSync`:
-
-```
-  pipeline/run-build.ts  (lines 11-13, 47-48)
-
-  function writeGraph(graph: Graph, path: string): void {
-    writeFileSync(path, JSON.stringify(graph));   ← whole object, one sync call
-  }
-  ...
-  mkdirSync("data", { recursive: true });          ← idempotent dir ensure
-  writeGraph(graph, "data/graph.json");            ← the only disk write in the repo
-        │
-        └─ synchronous, so the fd is opened, written, and closed inside the
-           call — never held across an await. recursive:true makes re-runs safe.
-           This is the LAST thing the build does before main() resolves and exits.
-```
-
-The build-graph module is deliberately fs-free so it can run on-device:
-
-```
-  pipeline/build-graph.ts  (lines 1-2)
-
-  // pipeline/build-graph.ts — orchestrate the stages into a Graph.
-  // No node:fs here so this module bundles for the app (on-device tile building).
-        │
-        └─ load-bearing comment: keeping node:fs OUT of build-graph is why
-           useTileGraph can call buildGraph on the phone (where there's no fs).
-           The fs lives only in run-build.ts, which is build-time-only.
-```
-
-The run-time "read" that isn't a read:
-
-```
-  mobile/src/loadGraph.ts  (lines 7-11)
-
-  import graph from "../assets/graph.json";   ← Metro inlines this at compile time
-  export function loadGraph(): Graph {
-    return graph as unknown as Graph;          ← returns an in-memory object,
-  }                                            ║   not a file read
-        │
-        └─ no fs.readFile, no parse call, no descriptor. The phone never opens
-           a file — the bundler already turned JSON bytes into a JS literal.
+  ┌─ BUILD · Node ───────────────────────────────────────────┐
+  │  fetch(Overpass/Open-Meteo) ─ socket ─ closed by res.json()│
+  │  writeFileSync(graph.json) ─ fs handle ─ closed in-call    │
+  │  → process exits, all handles gone                         │
+  └────────────────────────┬───────────────────────────────────┘
+                           │ graph.json bundled (read-only)
+  ┌─ RUN · Hermes ─────────▼─────────────────────────────────┐
+  │  import graph.json ─ in-memory, immutable, app lifetime   │
+  │  AsyncStorage[elevCache.v1] ─ load-once, debounced write, │
+  │                               capped 50k, whole-blob       │
+  │  timers: debounce/retry/persist/suggest                   │
+  │   ─ clear-before-set ─ at most one armed each ─ NO unmount │
+  │     cleanup ◄─ minor gap                                  │
+  └──────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-Synchronous whole-file I/O is the right default for small artifacts and
-the wrong one for large or streaming data — `writeFileSync` blocks the
-thread and `JSON.stringify` materializes the whole string in memory before
-a single byte hits disk. flattr is firmly in "small artifact" territory
-(544 KB), so the simple path is correct. The split where `build-graph.ts`
-stays `node:fs`-free while `run-build.ts` owns the fs is a nice piece of
-layering: the *orchestration* (parse→split→grade) is portable to the
-phone, and only the *persistence* is Node-bound. The upgrade path, if the
-graph ever outgrows whole-object I/O, is `createWriteStream` + JSON
-streaming (or a binary format) — at which point you inherit the
-close/error-handling discipline this code currently gets to skip. Read
-`05-` for why the graph is held whole in the first place, and `07-` for
-how the streaming-as-backpressure idea connects.
+The "static artifact + read-only client" file model is the same one in
+`01-runtime-map.md` and is the SSG pattern. The AsyncStorage usage is a classic
+*whole-blob KV cache*: one key, serialize the entire map, debounce the writes —
+simple and correct when the blob is small (50k number entries), but it's a
+read-modify-write of the *whole* store on every flush, which wouldn't scale to a
+large cache (you'd move to per-key storage or SQLite). The timer-handle hygiene is
+the run-time analog of closing file descriptors — different resource, identical
+discipline. Cross-link `.aipe/study-database-systems/` for the KV-store angle.
 
 ## Interview defense
 
-**Q: "How does the app load its graph at startup — is there a file read?"**
+**Q: What durable resources does the app manage, and how are they cleaned up?**
 
-No runtime file read. `loadGraph` does `import graph from
-".../graph.json"` (`loadGraph.ts:7`), which Metro inlines into the JS
-bundle at compile time. The phone gets the parsed object as a literal — no
-`fs.open`, no descriptor, no startup parse beyond materializing the
-inlined data. The only real file I/O is the build-time `writeFileSync`.
-
-```
-  build: writeFileSync ──► graph.json ──► bundler inlines ──► run: in-memory object
-                                          (no runtime fs read)
-```
-
-Anchor: *"The bundler turns the file into data at compile time — by run
-time there's no file, just the bytes already in the heap."*
-
-**Q: "Any risk of leaked file handles?"**
-
-None. The only fs calls are synchronous (`writeFileSync`, `mkdirSync`,
-`run-build.ts:12,47`) — the descriptor is opened, used, and closed inside
-the single call, never held across an `await` or a tick. There are no
-streams to forget to close.
+Three. The build artifact `graph.json` — written once with `writeFileSync`,
+handle auto-closed, then read-only on the phone. AsyncStorage — a single-key
+elevation cache, loaded once and written back debounced (`elevCache.ts`). And
+timers — the leakable one, handled with clear-before-set so only one of each is
+ever armed.
 
 ```
-  writeFileSync = open+write+close, atomic ─► nothing to leak
+  the cleanup story, ranked by risk
+
+  file/socket → self-close            (no risk)
+  AsyncStorage → debounced, capped    (lose <4s on crash, re-fetchable)
+  timers → clear-before-set ★         (the one you can get wrong)
+           but: no unmount cleanup    (minor leak surface)
 ```
 
-Anchor: *"Synchronous whole-file calls never let the descriptor escape —
-no held handles, no leaks."*
+Anchor: *"The clear-before-set idiom at `useTileGraph.ts:254` is the real resource
+discipline — without it, fast panning leaves a pile of armed debounce timers all
+firing stale `queueViewport` calls. The gap is no `useEffect` cleanup to clear
+them on unmount."*
 
-## Validate
+**Q: Are there any streams?**
 
-**Reconstruct.** Draw the file lifecycle: the one write (with its
-open→close), the disk artifact, the bundler inline, the run-time
-no-handle import. Check against the Primary diagram.
-
-**Explain.** Why does `build-graph.ts` deliberately avoid `node:fs`
-(`build-graph.ts:1-2`)? (So the orchestration module bundles for the
-phone, where `useTileGraph` calls `buildGraph` on-device and there's no
-filesystem.)
-
-**Apply.** The graph grows to 50 MB and `JSON.stringify` in
-`writeGraph` causes a long pause. What's the resource-lifecycle upgrade?
-(Switch to `createWriteStream` + a streaming JSON serializer or a binary
-format — bounding memory by writing in chunks, accepting the held-handle +
-explicit-close discipline that comes with it.)
-
-**Defend.** Argue that synchronous `writeFileSync` is correct here, not a
-blocking-call smell. (It's the last operation in a build-time CLI on an
-idle thread with no UI — blocking is free, and whole-object write is
-simplest for a 544 KB artifact. `run-build.ts:47`.)
+No — `not yet exercised`. Every I/O is whole-body: `await res.json()` reads the
+entire response, `JSON.stringify` writes the entire cache. That's fine at this
+data size; it becomes a problem only if a response is too big to hold in memory,
+at which point you'd reach for a `ReadableStream` and chunked parsing.
 
 ## See also
 
-- `05-memory-stack-heap-gc-and-lifetimes.md` — why the graph is held whole
-- `07-backpressure-bounded-work-and-cancellation.md` — streaming as backpressure
-- `01-runtime-map.md` — the file as the build↔run seam
+- `01-runtime-map.md` — the `graph.json` build→run seam in context.
+- `05-memory-stack-heap-gc-and-lifetimes.md` — the cache's in-memory side.
+- `07-backpressure-bounded-work-and-cancellation.md` — timers as the cancellation substitute.
+- `.aipe/study-database-systems/` — AsyncStorage as a persistent KV store.

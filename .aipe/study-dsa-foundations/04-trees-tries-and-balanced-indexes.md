@@ -1,72 +1,58 @@
-# Trees, tries & balanced indexes
+# Trees, Tries & Balanced Indexes
 
-**Industry names:** binary search tree (BST) · self-balancing trees (AVL,
-red-black, B-tree) · trie / prefix tree · spatial index (k-d tree, R-tree,
-quadtree). **Type:** Industry standard. **Status in this repo:
-`not yet exercised`** — every lookup here is a hash map or a linear scan. This
-file teaches the foundation briefly and names exactly where each tree *would*
-land in `flattr`.
+**Industry names:** binary tree, complete binary tree, trie (prefix tree),
+balanced BST (red-black/AVL), B-tree, k-d tree, spatial index.
+**Type:** Industry standard.
 
 ---
 
-## Zoom out, then zoom in
+## Zoom out — where this concept lives
 
-The repo's lookups are either keyed (`O(1)` hash map — see **02**) or full scans
-(`O(V)` linear — `nearestNode`). Trees fill the gap between those two: they give
-you **ordered** and **range/nearest** queries that a hash map can't and a scan is
-too slow for. There's no tree in `flattr` today — but there are two places
-screaming for one.
+This is a mixed file: flattr exercises *one* tree (the heap, viewed as a
+tree) and pointedly does **not** exercise the rest of the family. That's
+not a flaw to paper over — the absence of a spatial index in `nearest.ts`
+is the single clearest algorithmic gap in the repo, and naming it
+precisely is more useful than pretending a trie is hiding somewhere.
 
 ```
-  Zoom out — where a tree would slot in (none exist yet)
+  Zoom out — trees in flattr (one present, several absent)
 
-  ┌─ Input layer ──────────────────────────────────────────────────┐
-  │  nearestNode(point) → linear scan O(V)   ← ★ wants a SPATIAL TREE│
-  │  features/routing/nearest.ts:5-18           (k-d tree / R-tree)  │
-  └─────────────────────────┬────────────────────────────────────────┘
-  ┌─ Mobile UI layer (mobile/src/AddressBar.tsx) ──────────────────┐
-  │  address autocomplete                    ← ★ wants a TRIE        │
-  │  (prefix match on street names)             (not yet built)     │
-  └─────────────────────────┬────────────────────────────────────────┘
-  ┌─ Aggregation layer ─────▼────────────────────────────────────────┐
-  │  percentile() → full sort O(n log n)     ← a BALANCED INDEX or    │
-  │  features/grade/zones.ts:5-14               selection avoids it   │
-  └────────────────────────────────────────────────────────────────────┘
+  ┌─ Present ───────────────────────────────────────────────────┐
+  │  pqueue.ts: binary heap = complete binary tree in an array   │ ← we are here
+  └──────────────────────────────────────────────────────────────┘
+  ┌─ not yet exercised ─────────────────────────────────────────┐
+  │  k-d tree / grid index  → would replace nearest.ts O(N) scan │
+  │  balanced BST / B-tree  → no ordered-range queries in repo   │
+  │  trie                   → no prefix/autocomplete in engine   │
+  └──────────────────────────────────────────────────────────────┘
 ```
 
-Zoom in: a tree keeps elements in an order *and* keeps itself shallow, so
-"find," "find the neighbor," and "find everything in a range" are all `O(log n)`
-instead of `O(n)`. The price is that the tree must stay balanced — an unbalanced
-BST degrades to a linked list (`O(n)`).
+**Zoom in.** First the tree that *is* here — the heap as a complete binary
+tree, which earns its O(log n) from tree height. Then the trees that
+*aren't*, named at the exact line where they'd belong, so you know what
+you're looking at when you see the linear scan.
 
 ---
 
-## The structure pass
+## Structure pass — one axis across the tree family
 
-**Layers.** Trees are a family; they layer by *what order they impose*:
+The axis that separates these trees is **what the tree orders by, and what
+query that makes cheap.**
 
 ```
-  One question — "what query does this make cheap?" — across the tree family
+  Axis: "what does the tree order by → what query is O(log n)?"
 
-  ┌──────────────────────────────────────────────┐
-  │ BST / balanced (AVL, RB)  → ordered key lookup │  ← range, predecessor, min/max
-  └────────────────────┬───────────────────────────┘
-       ┌───────────────▼─────────────────────────┐
-       │ B-tree                → disk-page lookup  │  ← database & filesystem indexes
-       └───────────────┬─────────────────────────┘
-           ┌───────────▼───────────────────────┐
-           │ trie                  → prefix lookup│  ← autocomplete, "starts with"
-           └───────────┬───────────────────────┘
-               ┌───────▼─────────────────────┐
-               │ spatial (k-d, R-tree)         │  ← nearest-point, bbox overlap
-               └───────────────────────────────┘  ← ★ what nearest.ts wants
+  binary heap   → orders by priority   → "give me the min"   ✓ pqueue.ts
+  balanced BST  → orders by key        → "range / nearest key" ✗ absent
+  k-d tree      → orders by coordinate → "nearest point"     ✗ absent (nearest.ts gap)
+  trie          → orders by prefix     → "all words with prefix" ✗ absent
+  B-tree        → orders by key, fat   → "disk-friendly range"  ✗ absent
 ```
 
-**Axis = query type.** Hold "what am I asking?" constant. Hash map answers
-"exact key?" Tree answers "key, *and* its neighbors / range / prefix / nearest in
-space." The seam between hash map and tree is precisely: *do you need order, or
-just membership?* `flattr`'s node table needs only membership → hash map, correct
-(**02**). `nearestNode` needs *spatial proximity* → it should be a tree but isn't.
+The seam that matters: `nearest.ts` asks a **nearest-point** query and
+answers it with a linear scan because there's no coordinate-ordered tree.
+The heap answers a **min** query in `O(log n)` *because* it's a tree. Same
+family, opposite outcomes — that contrast is the lesson.
 
 ---
 
@@ -74,210 +60,218 @@ just membership?* `flattr`'s node table needs only membership → hash map, corr
 
 ### Move 1 — the mental model
 
-You know `Array.prototype.indexOf` is `O(n)` but binary search on a *sorted*
-array is `O(log n)` — you halve the search space each step. A balanced tree is
-that halving made dynamic: it stays sorted as you insert and delete, so every
-lookup is a root-to-leaf walk down `log n` levels.
+A tree earns its `O(log n)` from one thing: **height**. If a balanced tree
+has `n` nodes, it's about `log n` levels deep, so any operation that walks
+one root-to-leaf path does `log n` work. The heap is the simplest member
+of the family: a *complete* binary tree, which means it's as short and
+dense as possible.
 
 ```
-  A BST: ordered, balanced, root-to-leaf walk
+  Complete binary tree — every level full except the last (left-packed)
 
-  search for 6:           the invariant:
-        8                 left subtree  < node < right subtree
-       / \                so at each node you go ONE way → O(height)
-      4   12              balanced height = log n
-     / \                  unbalanced (sorted inserts) = n  ← the failure mode
-    2   6  ◄── found in 2 hops, not 4 scans
+              level 0:        ●            height = log n
+                            /   \
+              level 1:    ●       ●        n=7 nodes → height 2
+                         / \     / \
+              level 2:  ●   ●   ●   ●      push/pop walk one path: log n
+
+  "complete" = no gaps → maps perfectly to a flat array (file 03)
 ```
 
-### Move 2 variant — the load-bearing skeleton
+### Move 2 — the one tree present, then the absent ones
 
-A balanced search tree's kernel, named by what breaks:
+#### The heap is a tree (the array is the implementation)
 
-**1. The ordering invariant — `left < node < right`.** *Remove it* and you can't
-prune: you'd have to check both subtrees, collapsing back to `O(n)`. The invariant
-is what lets you discard half the tree at each node.
+File 03 walked the heap as an array. Here's the same structure as a tree,
+because that's where the `O(log n)` comes from.
 
-**2. The balance operation — rotations / rebalancing.** *Remove it* and a BST
-built from sorted input becomes a linked list — height `n`, every operation
-`O(n)`. This is the part people skip when hand-rolling a BST, and it's why
-production code reaches for a *self-balancing* variant (AVL, red-black) or a
-library. (Rein's `reincodes/BinarySearchTree.ts` is a plain BST — insert/search/
-delete + traversals + successor/predecessor — *without* rebalancing, which is the
-classic teaching version; production needs the balanced one.)
-
-**3. The traversal — in-order yields sorted order.** Walking left → node → right
-visits keys in ascending order. *This is the tree's superpower over a hash map*:
-a hash map can't give you "all keys between X and Y" or "the next key after this
-one" without sorting everything first.
-
-**The trie is a different shape — keyed by character position:**
-
-```
-  Trie for {"pike","pine","pin"} — prefix-keyed tree
-
-         root
-          │ p
-          ●
-          │ i
-          ●
-        n │ k
-      ┌───┴───┐
-   (pin)●     ●
-      e │     │ e
-   (pine)●  (pike)●
-
-  type "pi" → walk to the 'i' node → every leaf below is a completion
-  O(length of prefix), independent of how many words are stored
+```ts
+// features/routing/pqueue.ts:50-57 — siftUp walks one path UP the tree
+private siftUp(i: number): void {
+  while (i > 0) {
+    const parent = (i - 1) >> 1;   // step UP one tree level
+    if (this.heap[parent].priority <= this.heap[i].priority) break;
+    this.swap(i, parent);
+    i = parent;
+  }
+}
 ```
 
-### Move 2.5 — what flattr would gain
-
-**Spatial index for `nearestNode` (the strongest case).** Today
-`nearest.ts:5-18` scans *every node* and haversines each one — `O(V)` per
-snap, run once for the start and once for the goal on every route request. A k-d
-tree or R-tree built over the node coordinates turns that into `O(log V)` average.
-
 ```
-  nearestNode today vs with a spatial tree
+  siftUp = walk one root-ward path → bounded by tree height = log n
 
-  TODAY (nearest.ts:7-15)              WITH k-d TREE
-  ┌────────────────────────┐          ┌──────────────────────────┐
-  │ for id in all nodes:    │          │ descend tree by lat/lng   │
-  │   d = haversine(...)    │  ───►    │ prune subtrees that can't │
-  │   track best            │          │   contain a closer point  │
-  │ O(V) — every node       │          │ O(log V) average          │
-  └────────────────────────┘          └──────────────────────────┘
-  for a city-sized graph (V in the 100k+), this is the difference between
-  a snappy tap-to-route and a visible stall.
+  index 11 ──parent──► 5 ──parent──► 2 ──parent──► 0
+  (a leaf)                                        (root)
+  worst case: 4 swaps for n≈16, i.e. log2(16)=4 → O(log n)
 ```
 
-When does it become worth it? The spec keeps the MVP to a small bbox (§11
-decision E), so `V` is small and the linear scan is fine *today*. The moment the
-graph grows to all of Seattle, this is the first index to add.
+The `(i-1)>>1` is "go up one level"; `2i+1`/`2i+2` in `siftDown`
+(`pqueue.ts:60-61`) are "go down to the two children." The completeness
+guarantee — push always appends, pop always removes the last — is what
+keeps the tree balanced, so the height stays `log n` and the operations
+stay `O(log n)`. **Break completeness** (leave a gap mid-array) and the
+index arithmetic points at the wrong nodes; the tree-in-array trick falls
+apart. That's why `push` appends and `pop` swaps in the last element
+rather than leaving a hole.
 
-**Trie for address autocomplete.** `mobile/src/AddressBar.tsx` does address
-entry. Prefix-matching street names as the user types ("pin" → "Pine St",
-"Pike Pl") is the textbook trie use case — `O(prefix length)` regardless of how
-many streets exist. Not built; this is where it'd go.
+#### not yet exercised — k-d tree / spatial index (the nearest.ts gap)
+
+This is the gap worth dwelling on. `nearestNode` snaps a tapped coordinate
+to the closest graph node — and it does it by checking *every* node.
+
+```ts
+// features/routing/nearest.ts:5-18 — O(N) linear scan, no spatial index
+export function nearestNode(graph: Graph, point: LatLng): string {
+  let bestId: string | undefined;
+  let bestDist = Infinity;
+  for (const id of Object.keys(graph.nodes)) {   // ← scans ALL N nodes
+    const n = graph.nodes[id];
+    const d = haversine(point, { lat: n.lat, lng: n.lng });
+    if (d < bestDist) { bestDist = d; bestId = id; }
+  }
+  if (bestId === undefined) throw new Error("nearestNode: graph has no nodes");
+  return bestId;
+}
+```
+
+```
+  Comparison — linear scan (actual) vs k-d tree (the fix)
+
+  ┌─ nearest.ts now: O(N) ──────────┐  ┌─ k-d tree: O(log N) avg ────────┐
+  │ tap → check node 1              │  │ tap → descend tree, prune        │
+  │      → check node 2             │  │   half the plane each level      │
+  │      → ... → check node N       │  │      ●  split on lng             │
+  │ every snap touches all N nodes  │  │     / \                          │
+  │ a city graph: tens of thousands │  │   ●    ●  split on lat           │
+  │   of nodes, every tap           │  │  visit only the relevant cells   │
+  └─────────────────────────────────┘  └──────────────────────────────────┘
+```
+
+A **k-d tree** alternates splitting on lat then lng at each level, so a
+nearest-neighbor query descends to the right region and prunes the rest —
+`O(log N)` average. A simpler option that fits flattr perfectly: a
+**uniform grid index** (bucket nodes by cell, like `zones.ts` already
+buckets edges — `zones.ts:27-42`), then a tap only checks its own cell and
+neighbors. The repo already *has* the grid-bucketing pattern in
+`zones.ts`; `nearest.ts` just doesn't reuse it.
+
+**Why it's the clearest gap:** `nearestNode` is called twice per route
+(start + goal). On the small test graphs it's invisible. On a real city
+`graph.json`, the snap can rival the search itself in cost (file 01's
+complexity table). This is the first thing to optimize, and you've got the
+bucketing pattern one file over.
+
+#### not yet exercised — balanced BST / B-tree
+
+No red-black tree, AVL tree, or B-tree in the repo. They'd belong if
+flattr needed **ordered range queries** — "all nodes between elevation X
+and Y," "edges sorted by grade." It doesn't; `zones.ts` does a one-shot
+full sort instead (file 06). For an in-memory, build-once static graph,
+a balanced BST would be over-engineering. **When it becomes relevant:** if
+the graph went dynamic (edges added/removed at runtime) and you needed to
+keep something sorted incrementally.
+
+#### not yet exercised — trie
+
+No prefix tree. A trie answers "all keys starting with this prefix" in
+`O(prefix length)`. **Where it'd belong:** address autocomplete in the
+`AddressBar.tsx` mobile component — but that lives in `mobile/` and
+currently does geocoding (`pipeline/geocode.ts`), not local prefix
+matching. If you ever wanted offline address suggestions over the graph's
+street names, that's the trie's job.
 
 ### Move 3 — the principle
 
-**Reach for a tree when you need *order* or *proximity*, not just membership.**
-A hash map is strictly better for exact-key lookup (`O(1)` beats `O(log n)`). The
-tree earns its `log n` only when the query is "nearest," "range," "prefix," or
-"next" — questions a hash map structurally cannot answer. `flattr` correctly uses
-hash maps everywhere it needs membership; the gap is exactly the one spatial
-query (`nearestNode`) where a tree would win.
+Every tree in this family is the same bet: **pay `O(log n)` per operation
+by keeping data ordered along the tree's axis, so a query walks one path
+instead of scanning everything.** flattr takes that bet exactly once — the
+heap, ordered by priority. Everywhere else it scans linearly. That's a
+fine call for a static graph *except* at `nearest.ts`, where the scan runs
+per route and the ordering axis (geographic coordinate) is the most
+natural tree key there is.
 
 ---
 
 ## Primary diagram
 
-The decision: hash map vs tree vs scan, mapped onto `flattr`'s actual lookups.
+The tree family in flattr: what's present, what's absent, and where each
+absent one would attach.
 
 ```
-  Which structure for which lookup in flattr
+  Trees in flattr — present (✓) and not yet exercised (✗)
 
-  query needed              right structure       in this repo
-  ───────────────────────────────────────────────────────────────────
-  "node by exact id"    →   hash map O(1)      →   nodes: Record ✓ (02)
-  "edges at a node"     →   hash map O(1)      →   adjacency: Record ✓ (02)
-  "nearest node to pt"  →   spatial tree O(logV)→  LINEAR SCAN O(V) ✗ (nearest.ts)
-  "street by prefix"    →   trie O(len)        →   NOT BUILT ✗ (AddressBar.tsx)
-  "grades in a range"   →   balanced index     →   full sort O(n logn) ~ (zones.ts)
-                                                    ↑ ✓ exists  ✗ gap  ~ suboptimal
-```
-
----
-
-## Implementation in codebase
-
-**Use cases.** There are no trees in the repo. The honest finding is the *absence*
-and where it costs. The one place a tree's job is being done by a worse structure:
-
-```
-  features/routing/nearest.ts  (lines 5-18)  — the scan a tree would replace
-
-  export function nearestNode(graph: Graph, point: LatLng): string {
-    let bestId; let bestDist = Infinity;
-    for (const id of Object.keys(graph.nodes)) {   ← O(V): touches EVERY node
-      const d = haversine(point, {lat:n.lat, lng:n.lng});
-      if (d < bestDist) { bestDist = d; bestId = id; }
-    }
-    ...
-  }
-       │
-       └─ correct and fine for the MVP's small bbox. A k-d tree over (lat,lng)
-          would prune to O(log V) — the upgrade to make when V grows to a full
-          city. It's not premature now: spec §11-E keeps the bbox small on
-          purpose. (See 06 for the binary-search version of the same idea on a
-          single sorted axis.)
+  ┌─ pqueue.ts ─────────────────────────────────────────────────┐
+  │ ✓ complete binary tree (heap)   ordered by: priority        │
+  │   → "give me the min" in O(log n)   [siftUp/siftDown = path] │
+  └──────────────────────────────────────────────────────────────┘
+  ┌─ nearest.ts ────────────────────────────────────────────────┐
+  │ ✗ k-d tree / grid index         WOULD order by: coordinate  │
+  │   current: O(N) linear scan over all nodes                  │
+  │   fix: reuse zones.ts grid-bucketing → O(log N) / O(1) avg  │
+  └──────────────────────────────────────────────────────────────┘
+  ┌─ (no home in current repo) ─────────────────────────────────┐
+  │ ✗ balanced BST / B-tree   ordered by: key   (no range query)│
+  │ ✗ trie                    ordered by: prefix (no autocomplete)│
+  └──────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
 ## Elaborate
 
-The BST is foundational (1960s); the insight that it must *self-balance* to stay
-`O(log n)` produced AVL trees (1962) and red-black trees (1972), and the
-disk-optimized B-tree (Bayer & McCreight, 1972) is what every relational database
-index actually is — including the pgvector/Postgres indexes in Rein's AdvntrCue.
-Tries (Fredkin, 1960) power autocomplete and IP routing tables. Spatial trees
-(k-d tree, Bentley 1975; R-tree, Guttman 1984) are what real map software uses for
-exactly `nearestNode`'s job. The database-index angle lives in
-`.aipe/study-data-modeling/`; the spatial-index-as-a-scaling-move lives in
-`.aipe/study-system-design/`. Next read for the *flat* version of "find in sorted
-data": **06**, binary search.
+The heap-as-complete-tree is Williams (1964) again — the completeness is
+exactly what lets the tree collapse into an array (file 03). k-d trees are
+Bentley (1975), built for this nearest-neighbor problem. The grid-index
+alternative is cruder but often faster in practice for uniformly-dense
+data like a street graph, and flattr already has the ingredient in
+`zones.ts`. You've built a BST in reincodes (`BinarySearchTree.ts` with
+all traversals, successor/predecessor) — that's the *ordered* tree flattr
+doesn't need, but the same node-and-pointer machinery underpins k-d trees,
+which it *does* need at `nearest.ts`. The practice map (file 08) ranks the
+spatial index as the top hands-on build. Read file 06 next for the sort
+that a B-tree would replace, file 05 for the graph the heap serves.
 
 ---
 
 ## Interview defense
 
-**Q: "There are no trees in this repo. Where would the first one go?"**
-
-A spatial index over `nearestNode` (`nearest.ts:5-18`). It's a linear `O(V)` scan
-today, run twice per route request. A k-d tree makes it `O(log V)`. It's correct
-to defer — the MVP bbox keeps `V` small (spec §11-E) — but it's the first index
-to add when the graph grows to a full city.
+**Q: What's the data structure behind the priority queue, and where does
+its `O(log n)` come from?**
 
 ```
-  nearest.ts: O(V) scan ──[V grows]──► k-d tree O(log V)
-  defer rule: index when the scan shows up in a profile, not before
-  anchor: nearest.ts:7-15
+  complete binary tree → height = log n → one sift = one path = log n
 ```
 
-**Q: "Why a trie for autocomplete and not a hash map?"**
+*Model answer:* "A complete binary tree packed into a flat array. Children
+of index `i` are at `2i+1`/`2i+2`, parent at `(i-1)>>1`. `siftUp` and
+`siftDown` each walk a single root-to-leaf path, and since the tree is
+complete its height is `log n`, so both are `O(log n)`. Completeness is
+what lets it live in an array with no pointers — push appends, pop swaps
+the last element up, so there's never a gap."
 
-A hash map answers exact keys; autocomplete needs *prefix* matches. A trie walks
-the prefix once and every leaf below is a completion — `O(prefix length)`,
-independent of dictionary size. That'd land in `mobile/src/AddressBar.tsx`.
+*Anchor:* `O(log n)` is tree height; completeness is what keeps it that.
 
-**Q: "What breaks if you hand-roll a BST without balancing?"**
+**Q: `nearestNode` is `O(N)`. How would you fix it, and why isn't it fixed
+already?**
 
-Sorted inserts make it a linked list — `O(n)` per op, the whole `log n` benefit
-gone. Production uses a self-balancing variant; the plain BST is the teaching
-version.
+*Model answer:* "Replace the linear scan with a spatial index — a k-d tree
+for `O(log N)` average, or simpler, a uniform grid bucketing nodes by
+cell, which the repo already does for edges in `zones.ts`. A tap then only
+checks its cell and neighbors. It's not fixed because on the small test
+graphs `O(N)` is invisible; the cost only shows up on a full city
+`graph.json`, where the snap can rival the search. It's the first thing
+I'd optimize, and the bucketing pattern is already one file over."
 
----
-
-## Validate
-
-1. **Reconstruct:** State the BST ordering invariant and explain why in-order
-   traversal yields sorted keys.
-2. **Explain:** Why is `nearest.ts:5-18` `O(V)` and what tree makes it
-   `O(log V)`? Why is deferring it correct for the current MVP (spec §11-E)?
-3. **Apply:** Sketch a trie for `{"pine","pike","pin"}` and trace the lookup for
-   prefix `"pi"`.
-4. **Defend:** Argue when a hash map (`nodes: Record`, `types.ts:23`) is the right
-   call over a tree, and when the choice flips.
+*Anchor:* the grid-bucketing pattern already exists in `zones.ts`;
+`nearest.ts` just doesn't reuse it.
 
 ---
 
 ## See also
 
-- **02-arrays-strings-and-hash-maps.md** — the hash maps that handle membership today.
-- **06-sorting-searching-and-selection.md** — binary search, the flat-array cousin.
-- **05-graphs-and-traversals.md** — `nearestNode` feeds the search its start/goal.
-- `.aipe/study-data-modeling/` — B-tree database indexes.
-- `.aipe/study-system-design/` — spatial indexing as a scaling move.
+- `03-stacks-queues-deques-and-heaps.md` — the heap as an array.
+- `06-sorting-searching-and-selection.md` — the sort a B-tree replaces.
+- `08-dsa-foundations-practice-map.md` — the spatial index as the top
+  practice build.
+- sibling **performance-engineering** — the latency cost of the `O(N)`
+  snap.

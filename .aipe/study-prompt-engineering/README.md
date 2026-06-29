@@ -1,39 +1,79 @@
-# study-prompt-engineering — index
+# Prompt Engineering — flattr
 
-**Verdict: this repo has no prompts, no LLM calls, no AI layer.**
-Verified by grep (`prompt`, `openai`, `anthropic`, `llm`, `completion`,
-`gpt-`, `claude-`, `langchain`, `gemini`) — zero hits in application
-code — and confirmed by the design spec: `docs/flattr-spec.md:254`
-("No LLM layer in v1") and `:380` (the LLM destination parser is out of
-scope). flattr is a deterministic grade-aware A* router.
+> **Honest framing up front.** flattr has **zero prompts and zero LLM
+> calls** today. No `anthropic`, no `openai`, no model SDK anywhere in the
+> tree. This is a pure-TypeScript grade-aware router. So this guide is not a
+> tour of prompts that exist — it's a **map of the three seams where prompts
+> WOULD live** if flattr grew a natural-language layer, anchored to the
+> real files those prompts would attach to, and a working through of the 13
+> prompt-engineering concepts using those seams as the anchor.
+>
+> Every concept file labels its content **future / seam**, never "present."
+> Nothing here claims flattr does something it doesn't.
 
-This guide is therefore **honest and proportionate, not invented**. It
-does not fabricate a prompt system. It marks every prompt-engineering
-concept `not yet exercised` and names the real file:line seam where each
-would attach if the spec's out-of-scope NL features get built.
+## The three seams (the spine of this whole guide)
 
-## Files
+```
+  flattr's three prompt seams — none built, all anchored to real files
 
-| File | What it covers |
-|------|----------------|
-| [`00-overview.md`](00-overview.md) | The no-prompt verdict up front; the whole-system diagram with the empty LLM box; the full 13-concept inventory marked `not yet exercised`, each with its would-live-here seam; the two real seams (route summary, geocode input); the OSM injection concern. **Start here.** |
-| [`01-describe-my-route-seam.md`](01-describe-my-route-seam.md) | The one seam that earns a real diagram: how `features/routing/summary.ts` output would become a prompt's context section for a "describe my route" feature. Full `format.md` template with Move 2.5 (current vs future state). |
+  ┌─ SEAM 1: output → prompt ───────────────────────────────────────┐
+  │  features/routing/summary.ts  →  RouteSummary{distanceM,         │
+  │  climbM, steepCount}  ──would be templated into──►  prompt       │
+  │  ──►  LLM  ──►  "A mostly flat 3.2 km route along the water..."  │
+  │  STRUCTURED OUTPUT becomes the INPUT to a prompt.                │
+  └─────────────────────────────────────────────────────────────────┘
+
+  ┌─ SEAM 2: input → prompt ────────────────────────────────────────┐
+  │  "somewhere flat near the water"  ──►  LLM parse  ──►            │
+  │  structured geocode args  ──►  pipeline/geocode.ts geocode()     │
+  │  FREE TEXT becomes STRUCTURED INPUT via a prompt.                │
+  └─────────────────────────────────────────────────────────────────┘
+
+  ┌─ SEAM 3: injection boundary ────────────────────────────────────┐
+  │  Nominatim display_name (attacker-influenceable OSM string)      │
+  │  ──would flow into──►  any prompt at Seam 1 or 2                 │
+  │  UNTRUSTED DATA crossing into a prompt = injection vector.       │
+  └─────────────────────────────────────────────────────────────────┘
+```
 
 ## Reading order
 
-1. `00-overview.md` — the verdict and the map.
-2. `01-describe-my-route-seam.md` — the single future-state concept file.
+Operational discipline first, then the specific techniques.
 
-That's the whole guide. One overview, one concept file. Padding 13
-empty files for machinery that doesn't exist would be dishonest; if you
-build either NL feature later, re-run the generator and the `not yet
-exercised` rows in `00-overview.md` become real concept files.
+| #  | File | One line |
+|----|------|----------|
+| 00 | [00-overview.md](00-overview.md) | The three seams, the no-prompts-today reality, the map |
+| 01 | [01-anatomy.md](01-anatomy.md) | The four sections of a prompt — mapped onto Seam 1's template |
+| 02 | [02-structured-outputs.md](02-structured-outputs.md) | Schema-enforced output — `RouteSummary` is already the schema |
+| 03 | [03-prompts-as-code.md](03-prompts-as-code.md) | Versioned prompts — where a `prompts/` dir would live |
+| 04 | [04-token-budgeting.md](04-token-budgeting.md) | Token counting — flattr's tiny payloads make this a teaching case |
+| 05 | [05-eval-driven-iteration.md](05-eval-driven-iteration.md) | Evals before iteration — `fixtures.ts` is the eval substrate |
+| 06 | [06-single-purpose-chains.md](06-single-purpose-chains.md) | One chain, one job — the pipeline is already this shape |
+| 07 | [07-output-mode-mismatch.md](07-output-mode-mismatch.md) | JSON-vs-prose contract breaks across stages |
+| 08 | [08-few-shot.md](08-few-shot.md) | Examples constrain harder than instructions |
+| 09 | [09-chain-of-thought.md](09-chain-of-thought.md) | Reasoning prompts — and when they waste tokens |
+| 10 | [10-self-critique.md](10-self-critique.md) | Self-critique / self-consistency for high-stakes output |
+| 11 | [11-meta-prompting.md](11-meta-prompting.md) | LLMs writing prompts for other LLM calls |
+| 12 | [12-prompt-injection-defense.md](12-prompt-injection-defense.md) | Seam 3 — defending the `display_name` injection vector |
+| 13 | [13-forbidden-patterns.md](13-forbidden-patterns.md) | Stopping every route description sounding identical |
 
-## Cross-links
+## Cross-links to sibling guides
 
-- `.aipe/study-security/` — OSM `display_name` as untrusted input;
-  runtime half of prompt-injection defense.
-- `.aipe/study-ai-engineering/` — model-call / serving / output-
-  validation seams (`not yet exercised`).
-- `.aipe/study-agent-architecture/` — reasoning/agent patterns
-  (`not yet exercised`).
+- **`.aipe/study-security/`** — Seam 3 is the author-side of a trust
+  boundary; the runtime-side (never let LLM output trigger side effects,
+  output validation) lives there.
+- **`.aipe/study-ai-engineering/`** — the production-serving seam: where
+  these prompts would actually be invoked, retried, and logged.
+- **`.aipe/study-agent-architecture/`** — if Seam 2 grew into a planning
+  loop ("find me a flat loop that passes a coffee shop").
+- **`.aipe/study-system-design/`** — the pipeline / request-flow shape the
+  chains would slot into.
+- **`.aipe/study-data-modeling/`** — `RouteSummary` and `Edge` are the
+  structured shapes the prompts read and write.
+- **`.aipe/study-testing/`** — `fixtures.ts` and the eval seam.
+- **`.aipe/study-networking/`** — the Nominatim HTTP call that produces the
+  untrusted `display_name`.
+- **`.aipe/study-performance-engineering/`** — token cost as a latency and
+  dollar budget.
+</content>
+</invoke>

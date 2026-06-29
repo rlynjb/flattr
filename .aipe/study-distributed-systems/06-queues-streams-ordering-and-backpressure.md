@@ -1,267 +1,209 @@
-# Queues, streams, ordering, and backpressure
-### the single-flight pump as an in-process queue with priority and overload control
-**Industry name:** single-flight, admission control, priority queue, backpressure · **Type:** Industry standard
+# Queues, Streams, Ordering & Backpressure
+
+**Mixed status.** Real distributed *queues/streams* (Kafka, SQS, Redis Streams) are **`not yet exercised`** — flattr has no message broker, no consumers, no partitions to order. But the *backpressure* half of this concept **is exercised**, as a client-side single-flight pump in `useTileGraph.ts`. This file teaches the pump as the real thing it is, then names the trigger for actual queues.
 
 ## Zoom out, then zoom in
 
-There's no Kafka here, no SQS, no broker you operate — so message queues as infrastructure are `not yet exercised`. But the *concepts* queues exist to provide — serialize concurrent work, prioritize it, shed overload, apply backpressure — are all present in one tight piece of code: the `pump()` gate in `useTileGraph`. It's an in-process, 2-slot priority queue that admits one network build at a time. That's the file's real subject, and it's genuinely load-bearing: rip it out and the phone hammers the free APIs concurrently and gets 429'd into uselessness.
-
 ```
-  Zoom out — where the in-process queue lives
+  Zoom out — where the pump (backpressure) lives
 
-  ┌─ UI layer (the phone) ──────────────────────────────────────┐
-  │  onRegionDidChange (pan)  ·  ensureBbox (route)              │
-  │     enqueue ▼                  enqueue ▼                     │
-  ┌─ Coordination layer ──────────────────────────────────────┐ │
-  │  ★ pump() — busyRef gate + corridor>view priority slots ★  │ │ ← we are here
-  │     dequeue one ▼ (single-flight)                          │ │
-  └────────────────────────────────────────────────────────────┘ │
-  └───────────────────────────┬─────────────────────────────────┘
-                              │  ═══ NETWORK ═══ (rate-limited)
-  ┌─ Provider layer ──────────▼──────────────────────────────────┐
-  │  Overpass + Open-Meteo — free tier; concurrent calls ⇒ 429   │
+  ┌─ UI layer ──────────────────────────────────────────────────┐
+  │  MapScreen: pan/route events fire FASTER than builds finish  │
+  └────────────────────────┬─────────────────────────────────────┘
+                           │ events
+  ┌─ Coordination layer ───▼─────────────────────────────────────┐
+  │  pump() — ★ single-flight backpressure HERE ★                 │ ← we are here
+  │   busyRef (1 in-flight) + debounce + corridor-priority        │
+  │   (broker / stream slot: EMPTY — no Kafka/SQS)                │
+  └────────────────────────┬─────────────────────────────────────┘
+                           │ ONE build at a time → throttled provider calls
+  ┌─ Provider layer ───────▼─────────────────────────────────────┐
+  │  Overpass · Open-Meteo (free tier — rate-limited)            │
   └───────────────────────────────────────────────────────────────┘
 ```
 
-Zoom in: the question a queue answers is *"more work is arriving than I can do at once — how do I order it, and how do I not drown?"* On the phone, pans and route requests both want graph builds, each build is an expensive multi-API round-trip, and doing several at once trips the rate limit. `pump()` is the answer: one in flight, route beats pan, newer-supersedes-older per slot. That's admission control + priority + backpressure in ~40 lines.
+**Zoom in.** Backpressure is what a system does when work arrives faster than it can process it: shed it, buffer it, or slow the producer. A queue is the buffer-it answer at scale, with ordering and consumer semantics. flattr's producer is the user (panning generates region-change events constantly); its consumer is the graph builder (each build is a slow chain of Overpass + elevation calls). The pump is the throttle that keeps the fast producer from overwhelming the slow, rate-limited consumer.
 
 ## Structure pass
 
-**Layers.** Producers (pan handler, route handler) → the queue (`pump` + two pending refs + `busyRef`) → the worker (the async build IIFE) → network.
+**Layers.** Event producer (UI pans/routes) → pump (the throttle) → provider (the rate-limited sink).
 
-**The axis: control — "who decides what runs next, and when?"** Trace it:
+**The axis: `control` — who decides when the next unit of work runs?**
 
 ```
-  One question — "who decides what runs next?" — traced down
+  The control axis — who gates the next build?
 
-  ┌──────────────────────────────────────┐
-  │ producers (pan / route)               │  → request, but DON'T run. they
-  └──────────────────────────────────────┘    drop a bbox in a slot + call pump
-      ▼
-  ┌──────────────────────────────────────┐
-  │ pump() + busyRef                      │  → DECIDES: if busy, do nothing;
-  └──────────────────────────────────────┘    else pick corridor-then-view
-      ▼
-  ┌──────────────────────────────────────┐
-  │ worker IIFE                           │  → runs ONE build; on finish,
-  └──────────────────────────────────────┘    calls pump() to drain the next
+  ┌─ UI (producer) ─────────────┐  fires events freely (every pan frame)
+  │  onRegionDidChange          │  → CONTROL: producer, unbounded
+  └──────────────┬───────────────┘
+  ┌─ pump (the gate) ▼──────────┐  decides: run now? queue? drop?
+  │  busyRef + debounce +        │  → CONTROL: the gate (concurrency = 1)
+  │  priority + coverage check   │
+  └──────────────┬───────────────┘
+  ┌─ provider (sink) ▼──────────┐  processes one build's calls at a time
+  │  Overpass / Open-Meteo       │  → CONTROL: sink sets the real ceiling
+  └──────────────────────────────┘  (rate limit)
 ```
 
-**The seam.** `busyRef` is the seam where concurrency control flips. Above it, any number of producers fire freely (every pan event, every route). Below it, exactly one build runs. That boolean is the admission gate — the contract is "I accept unlimited requests but admit one at a time." The second seam is the priority split between the two pending refs: corridor always wins.
+**The seam.** It's `busyRef` (`useTileGraph.ts:113`). Above it, control belongs to the producer (events fire whenever). Below it, control belongs to the gate (only one build proceeds; the rest wait or get coalesced). That boolean *is* the backpressure mechanism — a concurrency limiter of size 1.
 
 ## How it works
 
-#### Move 1 — the mental model
+### Move 1 — the mental model
 
-You know single-flight from de-bounced search-as-you-type: many keystrokes, one in-flight request, the rest collapse. `pump()` is that, plus a priority rule and a self-draining loop.
-
-```
-  The single-flight-with-priority kernel
-
-   producers ──► [ pendingCorridor ]  (slot: route, HIGH priority)
-            └──► [ pendingView     ]  (slot: pan,  LOW priority)
-                        │
-                  pump() ── busy? ──yes──► return (do nothing)
-                        │ no
-                        ▼
-              pick corridor ELSE view  ──► run ONE build
-                        │
-                  on finish ──► pump()   (drain next, corridor first)
-```
-
-The whole pattern: **at most one running, a fixed priority on what runs next, and each finish kicks the next.** That self-call at the end is the load-bearing line — it's what turns a gate into a queue.
-
-#### Move 2 — the load-bearing skeleton
-
-Isolate the kernel and name each part by what breaks without it.
-
-**Part 1 — the busy flag (admission gate / single-flight).** Bridge from a `loading` boolean that disables a submit button. `busyRef` is `true` while a build runs; `pump` returns immediately if it's set. *What breaks if removed:* every pan and route launches a concurrent Overpass+Open-Meteo build. Three quick pans = three concurrent free-tier calls = 429 for all of them. The flag is the backpressure — it bounds in-flight work to one, which is the *entire* reason flattr stays under the rate limit. This is the part people forget when they "just add a fetch on pan."
+You know this from debouncing a search box: keystrokes fire faster than you want to hit the API, so you wait for a pause and fire once. The pump is debounce *plus* a concurrency limit of 1 *plus* a priority rule. It's a degenerate queue — a queue that holds at most one pending item per kind.
 
 ```
-  busyRef — bound in-flight work to exactly one
+  The backpressure kernel — single-flight with priority
 
-  pan, pan, pan (3 events)        with busyRef:        without:
-        │                          ┌─ build 1 (rest    ┌─ build 1
-        ▼                          │   collapse into    ├─ build 2  } 3 concurrent
-   pump×3                          │   the slot)        └─ build 3  } ⇒ 429×3
-                                   └─ one at a time ✓                 ⇒ all fail ✗
+  ┌──────────────────────────────────────────────────────────┐
+  │  if busy: return                  ← concurrency limit = 1  │
+  │  pick next: corridor BEFORE view  ← priority (route wins)  │
+  │  busy = true                                               │
+  │  run build (slow)                                          │
+  │  on finish: busy = false; pump()  ← drain the next         │
+  └──────────────────────────────────────────────────────────┘
+  pending slots hold only the LATEST request per kind (coalescing)
 ```
 
-**Part 2 — the two priority slots (ordering).** Bridge from a 2-element priority queue. `pendingCorridorRef` (routes) and `pendingViewRef` (pans); `pump` always checks corridor first. *What breaks if removed (one shared slot):* a user requesting a route while panning could have the route build starved by a stream of pan builds — the thing they actually asked for (a path) loses to incidental map movement. Priority guarantees the *intentional* action wins over the *incidental* one.
+Name each part by what breaks: drop the busy check and N concurrent builds hammer the rate-limited API → throttle storm. Drop the priority and a route waits behind viewport pans → user's route stalls. Drop the drain (`pump()` in finally) and pending work never runs → the system stalls after one build.
 
-```
-  Priority dequeue — corridor (intent) beats view (incidental)
+### Move 2 — the walkthrough
 
-  pump picks:   if pendingCorridor ──► run corridor, clear slot
-                else if pendingView ──► run view, clear slot
-                else ──► idle
-   a pending route is NEVER starved by panning. tested by construction.
-```
+**Part 1 — the concurrency-1 gate.** The whole pump opens with the gate:
 
-**Part 3 — last-write-wins per slot (coalescing).** Bridge from `setState` overwriting a previous pending value. Each slot holds *one* bbox; a newer pan overwrites the older pending pan. *What breaks if removed (a growing list):* you'd build every intermediate viewport the user panned through — stale work for regions they've already scrolled past. Coalescing to the latest means you only build what's relevant *now*. Combined with the `DEBOUNCE_MS` timer on pan (`:139-148`), the system does the minimum builds for where the user actually ended up.
-
-**Part 4 — the drain (the self-call).** Bridge from a recursive `processNext()` in a job runner. The worker's `finally` calls `pump()` again. *What breaks if removed:* a request that arrived *while* a build was running sits in its slot forever — the queue stalls because nothing kicks it after the gate clears. The drain is what makes it a queue and not a one-shot lock.
-
-```
-  The drain — finish kicks the next, or the queue stalls
-
-  build running ──► (pan arrives, lands in slot) ──► build finishes
-                                                          │ finally
-                                                    busyRef=false
-                                                    pump() ──► drains the pan ✓
-   without the finally-pump: the pan waits until the NEXT pan calls pump. stall.
+```ts
+// mobile/src/useTileGraph.ts:166-180
+const pump = useCallback(() => {
+  if (busyRef.current) return;            // GATE: one build in flight, full stop
+  let kind: "corridor" | "view";
+  let req: { bbox: Bbox; silent: boolean };
+  if (pendingCorridorRef.current) {       // PRIORITY: corridor (a route) first
+    kind = "corridor"; req = pendingCorridorRef.current;
+    pendingCorridorRef.current = null;
+  } else if (pendingViewRef.current) {    // then viewport
+    kind = "view"; req = pendingViewRef.current;
+    pendingViewRef.current = null;
+  } else { return; }                      // nothing pending → idle
 ```
 
-**Optional hardening — what's NOT here.** No cancellation of an in-flight stale build (an `AbortController` would cancel a pan-build superseded by a route — `study-runtime-systems` covers this gap); no bounded retry/dead-letter for a build that keeps failing (a failed build is simply dropped, `:121-122`, and retried on the next pan); no fairness beyond the fixed 2-level priority. Those are real queue hardening; the kernel is correct without them at one-user scale.
+The comment at `:164-165` states the intent: *"One graph build at a time. The route corridor takes priority over the viewport so a pending route isn't starved by panning."* This is starvation-avoidance — a classic queue-scheduling concern, here done with two priority slots instead of a priority queue (which, per `me.md`, Rein has hand-built in `PriorityQueue.ts` — same idea, two-element version).
 
-#### Move 2.5 — in-process queue vs. a real broker
+**Part 2 — coalescing: the pending slot holds only the latest.** Each pending ref is a *single* slot, not a list:
 
-```
-  Phase A (now) vs Phase B (§11 E2 server-side build farm)
-
-  NOW — in-process pump()           SERVER-SIDE BUILD FARM
-  ─────────────────────             ──────────────────────
-  queue = 2 refs in RAM             queue = SQS / Redis Streams
-  worker = one async IIFE           workers = N consumers, parallel
-  priority = if/else                priority = separate queues / msg attr
-  overload = busyRef (1 in flight)  overload = consumer concurrency + backpressure
-  poison msg = dropped, retried      poison msg = DLQ after N attempts
-  ordering = LWW per slot            ordering = partition key / FIFO queue
-  loss on crash = fine (re-pan)     loss on crash = needs durable queue + ack
+```ts
+// mobile/src/useTileGraph.ts:116-117
+const pendingViewRef = useRef<{ bbox: Bbox; silent: boolean } | null>(null);
+const pendingCorridorRef = useRef<{ bbox: Bbox; silent: boolean } | null>(null);
 ```
 
-The trigger is §11 E2 (build all cities / a tile-build farm). The concepts are *identical* — single-flight becomes consumer concurrency, the if/else priority becomes two queues, drop-and-retry becomes a DLQ. What changes is durability: an in-RAM ref vanishes on crash, which is fine when "retry" means "the user pans again"; a build farm needs the queue to survive a worker crash, so it goes durable.
+When you pan three times while a build runs, the second and third overwrite the first pending viewport — only the newest survives. That's deliberate load-shedding: there's no point building the viewport you panned *through*; you only want where you landed. A real queue would buffer all three; the pump drops the stale ones. **Coalescing is backpressure by discarding obsolete work** — the right move when only the latest state matters.
 
-#### Move 3 — the principle
+```
+  Coalescing — three pans, one build
 
-A queue is just *bounded admission + an ordering rule + a drain*. flattr proves you don't need a broker to get the value of one — `busyRef` + two refs + a self-call deliver single-flight, priority, coalescing, and backpressure in-process. The general lesson: **reach for a message broker when you need durability or cross-process fan-out, not when you just need to serialize and prioritize work** — that you can do with a flag and a couple of slots.
+  pan A ─► pending = A
+  pan B ─► pending = B   (A dropped — never built)
+  pan C ─► pending = C   (B dropped)
+  build finishes ─► pump() ─► builds C only
+```
+
+**Part 3 — the debounce in front.** Region-change events fire every frame during a pan; the debounce waits for the pan to stop:
+
+```ts
+// mobile/src/useTileGraph.ts:254-255
+if (timerRef.current) clearTimeout(timerRef.current);
+timerRef.current = setTimeout(() => queueViewport(bounds), DEBOUNCE_MS);  // 600ms
+```
+
+So there are *two* throttles stacked: debounce (don't even queue until the pan settles) then single-flight (don't run two builds at once). Belt and suspenders, both aimed at the same enemy — the free-tier rate limit.
+
+**Part 4 — the drain.** The `finally` block re-pumps so pending work isn't stranded:
+
+```ts
+// mobile/src/useTileGraph.ts:221-225
+} finally {
+  busyRef.current = false;       // release the gate
+  if (!silent) setLoadingStep(null);
+  pump();                        // drain: if something's pending, run it now (corridor first)
+}
+```
+
+This is the part people forget — the consumer must pull the next item when it finishes, or the queue stalls with work sitting in it. The recursive `pump()` in `finally` is the "dequeue next on completion" of a normal consumer loop, collapsed to a single in-flight slot.
+
+### Move 2.5 — current vs future (where real queues appear)
+
+```
+  Phase A (now): client-side single-flight     Phase B: real broker
+  ─────────────────────────────────────        ────────────────────
+  pending = 1 latest per kind (coalesced)       durable queue (SQS/Kafka)
+  ordering: corridor > view (2 priorities)      partition-ordered streams
+  failure: try/catch keeps last region          poison-message / DLQ handling
+  no durability (lost on app kill)              at-least-once + dedup (→ 03)
+  producer = user; consumer = same process      decoupled producers/consumers
+
+  TRIGGER for a real queue: build-graph moves SERVER-SIDE as a job
+   (precompute many cities' graphs, or process user-submitted regions)
+   → now you need durability, multiple workers, ordering, poison handling
+```
+
+The honest note: ordering and poison-message handling — core to real streams — are `not yet exercised`. The pump has a trivial 2-level ordering and no concept of a poison message (a failed build just keeps the last region and a pan retries). Those become real only when builds are durable jobs processed by multiple workers off a broker.
+
+### Move 3 — the principle
+
+Backpressure is non-negotiable whenever a producer can outrun a consumer; the only question is *how* — shed, buffer, or slow the producer. flattr sheds (coalesce to latest) and slows (debounce) and limits (single-flight), all without a broker, because the work is "rebuild the current view" where only the latest request matters and durability doesn't. A real queue is the same idea with durability, multiple consumers, and ordering bolted on — reach for it when work must survive a crash or scale across workers, not before.
 
 ## Primary diagram
 
-The full pump mechanism in one frame.
-
 ```
-  pump() — in-process priority queue with backpressure — recap
+  Backpressure pump — full recap
 
-  PRODUCERS                         QUEUE STATE
-  ─────────                         ───────────
-  onRegionDidChange ─debounce─► pendingViewRef   ─┐
-  ensureBbox ─────────────────► pendingCorridorRef ─┤
-                                                    ▼
-                              ┌─ pump() ────────────────────────┐
-                              │ if busyRef: return  (backpressure)│
-                              │ pick: corridor ELSE view  (prio)  │
-                              │ busyRef = true                    │
-                              └───────────┬───────────────────────┘
-                                          ▼ WORKER (one at a time)
-                              ┌──────────────────────────────────┐
-                              │ fetchOverpass ─► bestEffortElev    │
-                              │ ─► buildGraph ─► setView/setCorridor│
-                              │ finally: busyRef=false; pump() ◄───┐│  drain
-                              └────────────────────────────────────┘│
-                                          │ ═══ NETWORK ═══         │
-                                          ▼                         │
-                                Overpass + Open-Meteo (rate-limited)┘
-```
-
-## Implementation in codebase
-
-**Use cases.** `pump()` runs on every pan (after a 600ms debounce) and every route request. Producers never block the UI — they drop a bbox and return; the worker drains asynchronously. Concretely: pan the map and `onRegionDidChange` debounces then enqueues a view build; tap to route and `ensureBbox` enqueues a corridor build that *preempts* any pending pan.
-
-The gate + priority dequeue:
-
-```
-  mobile/src/useTileGraph.ts  (lines 67, 89–104)
-
-  const busyRef = useRef(false);                  ← the admission gate (Part 1)
-  const pump = useCallback(() => {
-    if (busyRef.current) return;                  ← single-flight: one at a time
-    let kind, bbox;
-    if (pendingCorridorRef.current) {             ← PRIORITY: corridor checked first
-      kind = "corridor"; bbox = pendingCorridorRef.current;
-      pendingCorridorRef.current = null;          ← consume the slot
-    } else if (pendingViewRef.current) {          ← view only if no corridor pending
-      kind = "view"; bbox = pendingViewRef.current;
-      pendingViewRef.current = null;
-    } else { return; }                            ← nothing queued → idle
-    busyRef.current = true;                        ← claim the gate
-    ...
-```
-
-The worker + the load-bearing drain:
-
-```
-  mobile/src/useTileGraph.ts  (lines 106–128)
-
-  (async () => {
-    try {
-      const osm = await fetchOverpass(bbox);                  ← network (rate-limited)
-      const elev = bestEffortElevation(openMeteoProvider(...));
-      const g = await buildGraph(kind, bbox, osm, elev, ...);
-      ... setCorridor / setView ...
-    } catch {
-      // Overpass failed — keep last region; a later pan retries.  ← poison msg = drop+retry
-    } finally {
-      busyRef.current = false;                                 ← release the gate
-      setLoadingStep(null);
-      pump();                                                  ← DRAIN next (Part 4)
-    }
-  })();
-       │
-       └─ the finally-pump is load-bearing: without it a request that arrived
-          during this build waits until the next pan calls pump. with it, the
-          queue self-drains, corridor-first. remove it and the queue stalls.
-```
-
-The coalescing producer (last-write-wins + debounce):
-
-```
-  mobile/src/useTileGraph.ts  (lines 138–148, inside onRegionDidChange)
-
-  if (timerRef.current) clearTimeout(timerRef.current);  ← debounce: cancel prior timer
-  timerRef.current = setTimeout(() => {
-    if (covers(viewRef.current, bounds)) return;          ← skip if already covered (dedup)
-    ...
-    pendingViewRef.current = [w-px, s-py, e+px, n+py];     ← LWW: overwrite the pending bbox
-    pump();
-  }, DEBOUNCE_MS);
+  ┌─ UI (producer, unbounded) ──────────────────────────────────┐
+  │  pan/route events ──► debounce (600ms) ──► queueViewport /    │
+  │                                            ensureBbox         │
+  └────────────────────────┬─────────────────────────────────────┘
+                           │ writes ONE pending slot per kind (coalesce)
+  ┌─ pump (gate, concurrency = 1) ▼──────────────────────────────┐
+  │  busyRef? ─yes─► return (shed)                                │
+  │           ─no──► pick corridor>view ─► build ─► on finish:    │
+  │                                          release + pump()      │
+  │                                          (drain next)          │
+  └────────────────────────┬─────────────────────────────────────┘
+                           │ at most ONE concurrent build's calls
+  ┌─ Provider (sink, rate-limited) ▼─────────────────────────────┐
+  │  Overpass + Open-Meteo (free tier)                           │
+  └───────────────────────────────────────────────────────────────┘
+   not yet exercised: durable broker · partition ordering · poison/DLQ
 ```
 
 ## Elaborate
 
-Single-flight is the lightest member of the queue family and the one most under-used — engineers reach for a broker when a boolean would do. The pattern shows up everywhere once you see it: SWR/React-Query de-dup concurrent requests for the same key; a database connection pool admits N queries and queues the rest; a load balancer's max-in-flight is the same idea at the fleet level. `pump()` is the in-process instance, with the extra wrinkle of a priority rule.
-
-The priority choice (corridor > view) is the interesting product call: it encodes "what the user *asked* for beats what they incidentally triggered." That's a scheduling decision, and it's the kind of thing that's invisible until it's wrong — without it, a route request submitted mid-pan would feel laggy because pan builds keep cutting the line.
-
-Where this grows up: §11 E2's build farm turns every concept here durable and multi-consumer (see Move 2.5). The migration is conceptually clean precisely because the in-process version already names all the parts — you're swapping the *substrate* (RAM refs → durable broker), not redesigning the *logic*. For the execution-model view of the same gate (event loop, async, the missing cancellation), see `.aipe/study-runtime-systems/`.
+The single-flight pattern (collapse concurrent identical work to one in-flight operation) is named in Go's `singleflight` package and is everywhere in well-built clients. Coalescing-to-latest is the same idea SwiftUI/React rendering use — only the latest state matters, intermediate states are dropped. Real distributed queues add the parts flattr skips: durability (survive a crash), partitioning for ordered parallelism (Kafka), and poison-message handling / dead-letter queues (a message that always fails must not block the rest). Those come from the producer-consumer-at-scale world that, per `me.md`, is Rein's named gap — worth building once as a worker reading off a broker. Sibling `study-performance-engineering` owns backpressure as a throughput concern; `study-runtime-systems` owns the event-loop/concurrency mechanics underneath.
 
 ## Interview defense
 
-**Q: "How do you stop concurrent tile fetches from blowing the rate limit?"**
-A single-flight gate. `busyRef` is a boolean that admits exactly one graph build at a time; producers (pans, routes) just drop a bbox in a slot and call `pump()`, which no-ops if a build is running. So unlimited UI events collapse into one in-flight network build — that's the backpressure that keeps me under the free Overpass/Open-Meteo limits. Two priority slots make a pending *route* preempt a pending *pan*, and the worker's `finally` calls `pump()` again to drain the next — that self-call is what makes it a queue and not just a lock.
+**Q: "How do you keep panning from overwhelming the rate-limited APIs?"**
+Verdict: three stacked throttles, no broker needed.
 
 ```
-   many pans/routes ──► [corridor slot][view slot] ──► pump (busy? no-op)
-                                                          │ one at a time
-                                                    build ─► finally: pump() drain
-   bound in-flight = 1  ·  corridor > view  ·  self-draining
+  debounce ──► single-flight gate ──► coalesce-to-latest
+
+  pan storm ─600ms─► 1 pending ─busy?─► 1 build ─drain─► next
 ```
-*Anchor: bounded admission + priority + a drain — the finally-pump is the load-bearing line.*
 
-**Q: "Why not just use a real queue?"**
-Because I need to serialize and prioritize work, not survive a crash or fan out across processes. A broker buys durability and multi-consumer fan-out; I have one device, one user, and "retry" means "the user pans again" — so an in-RAM gate is correct and a broker would be unused complexity. I'd reach for SQS/Redis Streams only at the §11 E2 build-farm stage, where workers run in parallel and a dropped job actually costs something. *Anchor: brokers buy durability/fan-out; for serialize+prioritize, a flag and two slots suffice.*
+"Three layers. A 600ms debounce so I don't even queue until the pan settles. A single-flight gate — `busyRef` — so only one graph build runs at a time, since each build is a chain of rate-limited Overpass and Open-Meteo calls. And coalescing: the pending slot holds only the *latest* request per kind, so panning through ten regions builds only where you landed. Plus a priority rule: a route corridor preempts viewport loads so a route never starves behind panning. It's a degenerate priority queue — concurrency one, two priority levels."
 
-## Validate
+**Anchor:** *Debounce + single-flight + coalesce-to-latest — backpressure without a broker, because only the latest view matters.*
 
-1. **Reconstruct:** write the `pump()` kernel from memory — gate, two priority slots, the drain. Which single line makes it a queue instead of a lock?
-2. **Explain:** in `useTileGraph.ts:93-100`, why is `pendingCorridorRef` checked before `pendingViewRef`? What user-visible bug does that prevent?
-3. **Apply:** a user pans three times in 400ms then taps route. With `DEBOUNCE_MS=600` and the LWW slots, how many network builds run, and in what order? Trace through `onRegionDidChange` and `ensureBbox`.
-4. **Defend:** a reviewer wants you to "fan tile fetches out in parallel for speed." Argue why `busyRef` serialization is correct against the free-tier limit, and what infrastructure change (§11 E2) would make parallelism safe.
+**Q: "When would you reach for a real queue?"**
+"When the work has to survive a crash or scale across workers — e.g. moving graph builds server-side to precompute many cities. Then I'd need durability, multiple consumers, partition ordering, and poison-message handling, none of which the in-process pump has. Today the work is 'rebuild the current view,' which is ephemeral and single-consumer, so a broker would be overhead."
+
+**Anchor:** *A queue earns its place when work must outlive a crash or fan out to workers — not before.*
 
 ## See also
 
-- `02-partial-failure-timeouts-and-retries.md` — the retries inside each serialized build.
-- `03-idempotency-deduplication-and-delivery-semantics.md` — `covers()` as request-level dedup feeding this queue.
-- `08-sagas-outbox-and-cross-boundary-workflows.md` — what a multi-step *durable* workflow on top of this would need.
-- `.aipe/study-runtime-systems/` — the same gate as event-loop/async/cancellation mechanics.
-- `.aipe/study-performance-engineering/` — backpressure and debounce as latency/throughput tuning.
+- `02-partial-failure-timeouts-and-retries.md` — the timeout gap that would wedge this single-flight gate.
+- `03-idempotency-deduplication-and-delivery-semantics.md` — at-least-once delivery appears with a real queue.
+- `04-consistency-models-and-staleness.md` — the self-heal retry rides this same pump.
+- sibling `study-performance-engineering` — backpressure as throughput.
+- sibling `study-runtime-systems` — the concurrency primitives beneath the gate.

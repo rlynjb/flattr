@@ -1,139 +1,289 @@
 # Chapter 7 — The counterfactuals
 
-"What would you do differently?" is a gift, and most candidates fumble it two ways. They either say "nothing, I'm happy with it" — which reads as no self-awareness — or they apologize for everything, which reads as no conviction. The senior move is in between and specific: name two or three decisions you'd genuinely reconsider, say what you'd do instead and why, and — critically — *don't* manufacture regret for the decisions that were right. Volunteering a real counterfactual before being asked is one of the strongest signals you can send; inventing a fake one to seem humble is one of the weakest.
+"What would you do differently if you started today?" is a trap and a gift. It's
+a trap because the weak instinct is to either say "nothing" (reads as no
+self-reflection) or invent regrets about decisions that were obviously right
+(reads as no judgment). It's a gift because the senior move — volunteering what
+you'd reconsider *before being asked* — is one of the clearest seniority signals
+there is, and this chapter hands you three real ones grounded in flattr's code.
 
-The discipline for this chapter is separating "I'd change this" from "this was right and I'd keep it." Hand-rolling the router was right — don't apologize for it. Shipping a static graph was right for the access pattern. But the *internal trust boundary*, the *elevation fidelity ceiling*, the *render-thread coupling*, and the *thrash in the data-loading design* — those are real, and owning them makes the right calls more credible by contrast.
+The discipline: name what you'd change *and* name what you'd keep. A
+counterfactual that changes everything signals you didn't believe in your
+choices. A counterfactual that changes nothing signals you can't see your
+blind spots. The strong answer is surgical — three specific changes, each with a
+reason, against a backbone of decisions you'd make again identically.
 
-```
-  COUNTERFACTUALS MATRIX — keep vs change
+---
 
-  DECISION                      VERDICT      WHAT I'D DO DIFFERENTLY
-  ──────────────────────────────────────────────────────────────────
-  hand-rolled A* engine         ✓ KEEP       nothing — it's the point
-  static graph, no DB           ✓ KEEP       right for read-only access
-  directional grade cost        ✓ KEEP       the differentiator
-  ──────────────────────────────────────────────────────────────────
-  graph.json unvalidated        ✗ CHANGE     schema + version, fail fast
-  Open-Meteo as only source     ✗ CHANGE     keep free tier + paid opt-in
-  search on render thread       ~ RECONSIDER async/worker boundary day 1
-  data-loading design           ~ RECONSIDER design the seam up front,
-   (tiles → corridor → viewport)             not by iteration under fire
-  ──────────────────────────────────────────────────────────────────
-  rule: volunteer the ✗ and ~ rows. NEVER fake a regret on a ✓ row.
-```
+## The chapter-opening diagram — the counterfactuals matrix
 
-The top three rows are your conviction; the bottom four are your self-awareness. A strong counterfactual answer walks both halves.
-
-## "What would you do differently if you started today?"
-
-┌─────────────────────────────────────────────────┐
-│ THEY ASK                                          │
-│   "Starting over, what would you change?"          │
-│                                                   │
-│ WHAT THEY'RE TESTING                              │
-│   Self-awareness with conviction. Can you name     │
-│   real regrets AND defend what you'd keep, without │
-│   collapsing into "everything could be better"?   │
-└─────────────────────────────────────────────────┘
-
-> "A few things, and I'll be specific. First, the graph artifact: `graph.json` is loaded and cast straight to the type with no validation and no schema version. I'd add a validate-on-load check that fails fast with a clear message, because right now a bad artifact surfaces as a cryptic crash deep in the search. Second, elevation: I'd keep Open-Meteo as the free default but add the paid Google provider behind the same interface from the start, because the 90-meter DEM is coarse enough that it undercuts the product's whole point — showing terrain honestly. Third, and this is more of a process regret than a code one: my data-loading layer went through three designs — per-tile loading, then a route corridor, then a whole-viewport fetch — because I designed it by reacting to bugs instead of thinking through the loading boundary up front. What I'd keep, firmly: the hand-rolled engine, the static-graph-no-database call, and the directional cost. Those were right and I'd make them again."
-
-The shape that lands: three specific changes, then an explicit "what I'd keep and why." You ended on conviction, not apology.
-
-┃ "What I'd keep, firmly: the hand-rolled engine, the no-database call, the directional cost. Those were right."
-
-| WEAK ANSWER | STRONG ANSWER |
-|---|---|
-| "Honestly there's a lot I'd improve — the code could be cleaner, I'd add more tests, maybe use a better elevation API, refactor some things…" | "Three specific things: validate the graph artifact on load, add a paid elevation provider behind the existing interface for fidelity, and design the data-loading boundary up front instead of by iteration. What I'd keep: the hand-rolled engine, no database, directional cost — those were right." |
-| **Why it's weak:** "a lot I'd improve" + "refactor some things" is content-free humility. It names nothing and signals you can't prioritize. | **Why it works:** named, prioritized, each with a reason; and it ends on what you'd keep, which shows judgment, not just regret. |
-
-## "Is there a decision you'd defend that looks questionable?"
-
-┌─────────────────────────────────────────────────┐
-│ THEY ASK                                          │
-│   "Anything you did that others might disagree     │
-│    with, but you'd stand by?"                      │
-│                                                   │
-│ WHAT THEY'RE TESTING                              │
-│   Conviction. Will you defend a contrarian-looking │
-│   call with a real reason, or fold the moment      │
-│   it's questioned?                                 │
-└─────────────────────────────────────────────────┘
-
-> "Hand-rolling the router instead of using OSRM or GraphHopper. On the surface that looks like reinventing a wheel that production systems already solved. I'd stand by it: the directional grade cost doesn't fit those engines' cost models cleanly, and more importantly the algorithm was the entire learning goal — I wanted to own the search end to end, prove the heuristic admissible, and build the heap myself. If this were a product with a deadline and a team, I'd reach for the library. As a project to demonstrate I can build the thing, not just call it, hand-rolling was the right call. I know what I gave up — contraction hierarchies, city scale — and I'd make the trade again for this context."
-
-The reason this works as a counterfactual answer: you defended a decision that *looks* wrong, gave the criterion (learning goal + cost-model fit), and bounded it ("if it were a product with a deadline, I'd use the library"). Conviction with a clear boundary, not stubbornness.
+Every reconsiderable decision, what you'd change, and — critically — the
+decisions you'd KEEP. The KEEP column is what stops this from sounding like
+regret.
 
 ```
-  IF THEY PRESS THE COUNTERFACTUALS
+  flattr — counterfactuals matrix
 
-  "I'd validate the artifact / add a paid provider / design loading up front."
+  ┌─ WOULD CHANGE ───────────────┬─ WHY ─────────────────────────┐
+  │ 1. validate graph.json on    │ loadGraph (loadGraph.ts:10)   │
+  │    load                      │ is a bare cast — bad data =   │
+  │                              │ undefined behavior deep in    │
+  │                              │ the search, not a clean error │
+  ├──────────────────────────────┼───────────────────────────────┤
+  │ 2. wire paid elevation       │ ElevationProvider seam already│
+  │    behind ElevationProvider  │ exists (elevation.ts:7); 90m  │
+  │                              │ coarse data undercuts a GRADE │
+  │                              │ router's whole point          │
+  ├──────────────────────────────┼───────────────────────────────┤
+  │ 3. design the data-loading   │ static base + runtime tiles   │
+  │    seam UP FRONT             │ grew separately; one          │
+  │                              │ GraphSource interface would   │
+  │                              │ unify them (+ host validation)│
+  └──────────────────────────────┴───────────────────────────────┘
+
+  ┌─ WOULD KEEP (decisions that were right) ─────────────────────┐
+  │  ✔ hand-rolled engine, not OSRM     the graph IS the project │
+  │  ✔ no backend / no DB                runtime is read-only     │
+  │  ✔ directional cost (A→B ≠ B→A)      the core idea, correct   │
+  │  ✔ finite BLOCKED (1e9)             steep ≠ disconnected     │
+  │  ✔ one parametric search()          elegant + provable       │
+  └──────────────────────────────────────────────────────────────┘
+```
+
+Three changes, five keeps. That ratio is the tone you want — reflective, not
+regretful.
+
+```
+┃ "The senior move is to volunteer what you'd reconsider
+┃  before being asked — and to name what you'd keep in the
+┃  same breath."
+```
+
+---
+
+## "What would you do differently?"
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ THEY ASK                                                          │
+│   "If you were starting this over today, what would you do        │
+│    differently?"                                                  │
+│                                                                   │
+│ WHAT THEY'RE TESTING                                              │
+│   Self-reflection with judgment attached. Can you critique your   │
+│   own work without trashing it? Do your regrets show good taste   │
+│   — are they real improvements, or fabricated nitpicks? Do you    │
+│   know which decisions were actually right?                       │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+> "Three things, and they're all about hardening, not rethinking the core.
+>
+> First, I'd validate `graph.json` on load. Right now `loadGraph` (loadGraph.ts:10)
+> does a bare `graph as unknown as Graph` cast — it trusts the file completely.
+> A malformed file becomes undefined behavior deep in the search instead of a
+> clean error at the boundary. I'd add a schema pass: every adjacency id resolves
+> to a real edge, every edge's endpoints exist in `nodes`, grades are finite.
+> Cheap to add, turns a mystery crash into a precise error.
+>
+> Second, I'd wire up the paid elevation provider behind a flag. The
+> `ElevationProvider` interface is already there (elevation.ts:7) with a working
+> `googleProvider` — I just default to the free Open-Meteo source. But its 90m
+> resolution smooths short steep pitches, which for a *grade* router is the
+> exact data I care most about. The seam to upgrade is built; I'd actually use
+> it.
+>
+> Third, the architectural one: I'd design the data-loading seam up front. The
+> static base graph and the runtime tile-loading (`useTileGraph.ts`) grew as two
+> separate things stitched together. If both went through one `GraphSource`
+> interface from the start, the architecture would be cleaner and validation
+> would have one obvious home instead of being missing.
+>
+> What I'd keep, all of it: the hand-rolled engine, no backend, the directional
+> cost, the finite BLOCKED, the single parametric search. Those were right and I'd
+> make them again."
+
+```
+        ▸ Three changes, all hardening. Five keeps, the
+          core. A good counterfactual sharpens the edges
+          without rebuilding the machine.
+```
+
+---
+
+## Weak vs strong — the counterfactual
+
+```
+┌──────────────────────────────┬──────────────────────────────┐
+│ WEAK ANSWER                   │ STRONG ANSWER                 │
+├──────────────────────────────┼──────────────────────────────┤
+│ "Honestly I'm pretty happy    │ "Three hardening changes: I'd │
+│ with it. Maybe I'd use a      │ validate graph.json on load — │
+│ different map library or add  │ loadGraph is a bare cast      │
+│ more tests. Or rewrite it in  │ today; I'd wire the paid      │
+│ Rust for speed."              │ elevation provider behind the │
+│                               │ interface that's already      │
+│                               │ there; and I'd design the     │
+│                               │ data-loading seam as one      │
+│                               │ GraphSource up front. The     │
+│                               │ engine, no-DB, and directional│
+│                               │ cost I'd keep exactly."       │
+├──────────────────────────────┼──────────────────────────────┤
+│ Why it's weak:                │ Why it works:                  │
+│ "Pretty happy" + vague        │ Specific, code-anchored, each  │
+│ nitpicks ("different map      │ with a reason. "Rust for       │
+│ library") + a fake regret     │ speed" is absent because at    │
+│ ("rewrite in Rust") that      │ 1,621 nodes speed isn't the    │
+│ solves a problem you don't    │ problem — naming a non-problem │
+│ have. Shows no real judgment  │ shows you know which problems  │
+│ about which decisions mattered│ are real. The KEEP list proves │
+│ or which were right.          │ conviction, not just critique. │
+└──────────────────────────────┴──────────────────────────────┘
+```
+
+The "rewrite in Rust" line is the classic fake counterfactual — it sounds
+impressive and solves nothing, because your bottleneck isn't language speed,
+it's the O(N) snap and the validation gap. Naming a *real* improvement over a
+flashy non-improvement is the judgment being tested.
+
+---
+
+## The validation fix, concretely
+
+Since this is your top counterfactual, have the actual shape ready — interviewers
+love when "I'd validate it" comes with the validation.
+
+```
+  The graph.json validation pass (the counterfactual, made real)
+
+  loadGraph()  ── today ──►  graph as unknown as Graph   (trusts blindly)
+
+  loadGraph()  ── proposed ──►  validateGraph(parsed):
+       │
+       ├─ every node has finite lat/lng/elevationM
+       ├─ every edge.fromNode and edge.toNode exist in nodes
+       ├─ every edge.gradePct / lengthM is finite
+       ├─ every adjacency id resolves to a real edge
+       └─ adjacency is symmetric with edge endpoints
+              │
+              ├─ valid   → return Graph
+              └─ invalid → throw at the BOUNDARY with the
+                           specific violation (not a crash
+                           deep in search())
+```
+
+That's the difference between "the app crashed in `otherEnd` with a cryptic
+undefined" and "the graph failed to load: edge e_412 references missing node
+n_98." The error lands where the bad data enters, not three layers down.
+
+Deeper on the validation seam, trust boundaries, and where to enforce them →
+`.aipe/study-system-design/` and `.aipe/study-security/` (input validation).
+
+---
+
+## Where the counterfactual conversation goes next
+
+```
+  You named "design the data-loading seam up front."
         │
-        ├─► "Why didn't you do those already?"
-        │     "Each was the right deferral at MVP: I control the build
-        │      so a bad artifact never shipped; the free DEM was good
-        │      enough to prove the concept; the loading design only
-        │      needed three iterations because the requirements moved."
+        ├─► IF THEY ASK "what would the GraphSource interface
+        │   │   look like?"
+        │     "One method — getGraph(bbox) → Graph — with two
+        │      impls: a StaticSource over the bundled file and
+        │      a TileSource over the live Overpass+elevation
+        │      build. MapScreen wouldn't know which it's using.
+        │      Validation lives in the interface, once."
         │
-        ├─► "Which would you do first?"
-        │     "Validate-on-load. Cheapest, and it turns the worst
-        │      failure mode — cryptic mid-search crash — into a clear
-        │      one. Highest safety-per-effort."
+        ├─► IF THEY ASK "why didn't you do it that way
+        │   │   originally?"
+        │     "The static graph came first as the simplest
+        │      thing that worked. Tile-loading was added later
+        │      for panning and route corridors. The seam grew
+        │      around the base instead of being designed — a
+        │      real but understandable order-of-work artifact."
         │
-        └─► "Anything you'd NOT change?"
-              "The engine, the static graph, the directional cost.
-               I'd make all three again. That's not me being precious
-               — they match the problem."
+        └─► IF THEY ASK "would you change the directional cost?"
+              "No. That's the core idea and it's correct.
+               Changing it would be changing what flattr IS,
+               not improving how it's built. I'd defend it,
+               not reconsider it."
 ```
 
-╔═══════════════════════════════════════════════════╗
-║ WHEN YOU DON'T KNOW                                ║
-║                                                   ║
-║   They propose a counterfactual you haven't        ║
-║   considered — "would you have used a graph         ║
-║   database like Neo4j for this?" — and you don't   ║
-║   have a worked opinion on it.                     ║
-║                                                   ║
-║   Say:                                            ║
-║   "I haven't seriously evaluated a graph database   ║
-║    here, so I won't pretend I have a strong take.   ║
-║    My instinct is it's the wrong fit — my access    ║
-║    pattern is load-the-whole-graph-once and         ║
-║    traverse in memory, with no writes, so the       ║
-║    query engine and storage Neo4j gives me would    ║
-║    be overhead I don't use. But that's reasoning    ║
-║    from the access pattern, not from having run     ║
-║    Neo4j — if you've seen it fit this shape, I'd    ║
-║    want to hear why."                             ║
-║                                                   ║
-║   What this signals: you reason from first          ║
-║   principles (the access pattern) even on an       ║
-║   unfamiliar tool, and you don't fake a take you   ║
-║   don't have.                                     ║
-║                                                   ║
-║   Do NOT say:                                      ║
-║   "Yeah Neo4j would probably be better for graphs"  ║
-║   — agreeing reflexively because it has 'graph' in  ║
-║   the name is the opposite of the access-pattern   ║
-║   thinking that's your strength.                  ║
-╚═══════════════════════════════════════════════════╝
+That last branch matters: be ready to *refuse* a counterfactual when the
+decision was right. "No, I'd keep that, and here's why" is a stronger answer
+than inventing a change to seem humble.
 
-▸ The senior-engineer move is to volunteer what you'd reconsider before being asked — and to refuse to manufacture regret for the calls that were right.
+---
 
-## What you'd change
+## The "I don't know" box — when they ask about a change you haven't scoped
 
-The meta-lesson from flattr's counterfactuals is about *when* design happens. The decisions I'm most confident in — the engine, the cost model, the storage shape — I designed deliberately, up front, because I understood the problem. The decisions I'd redo — the data-loading boundary especially — I designed *reactively*, patching each bug into a new shape until it stabilized after three rewrites. The code I planned is the code I'd keep; the code I iterated into existence is the code I'd change. If I started over, the single highest-leverage move would be to treat the runtime data-loading seam as a first-class design problem on day one, the same way I treated the search engine — because the parts I designed on purpose are the parts that held up.
+```
+╔═══════════════════════════════════════════════════════════════╗
+║ WHEN YOU DON'T KNOW                                            ║
+║                                                               ║
+║   They push past your three: "What about making the graph     ║
+║   updatable in real time — a street closes, you re-route      ║
+║   around it live. How would you architect that?"             ║
+║                                                               ║
+║   This is live-mutable-data + invalidation under load —       ║
+║   distributed-data territory you haven't built. You can       ║
+║   reason about the shape, but don't claim an architecture     ║
+║   you've never shipped.                                       ║
+║                                                               ║
+║   Say:                                                         ║
+║   "That's a real shift — it turns my read-only static graph   ║
+║    into a mutable one, which is a different system. I can      ║
+║    reason about the shape: I'd want an edge-level override     ║
+║    layer (closed = set that edge to BLOCKED-disconnected)     ║
+║    applied on top of the static graph at query time, so I      ║
+║    don't re-bake the whole thing for one closure. The hard     ║
+║    part I HAVEN'T solved is propagating those overrides to     ║
+║    every device and invalidating consistently — that's        ║
+║    distributed cache invalidation, and I haven't built that.   ║
+║    I'd flag it as design-from-scratch, not recall."           ║
+║                                                               ║
+║   What this signals: you connected the new requirement to     ║
+║   your existing primitives (BLOCKED, query-time override),    ║
+║   AND drew the line at the distributed part you haven't        ║
+║   done. Reasoning forward from your code beats both bluffing   ║
+║   and freezing.                                                ║
+║                                                               ║
+║   Do NOT say:                                                  ║
+║   "I'd use websockets and a pub-sub system and eventually     ║
+║    consistent caches..." — a stack list for a problem you      ║
+║   haven't thought through. The "what consistency guarantee?"   ║
+║   follow-up ends it.                                            ║
+╚═══════════════════════════════════════════════════════════════╝
+```
 
-## One-page summary
+---
 
-**Core claim:** Walk both halves — name 2-3 real changes with reasons, then defend what you'd keep with conviction. Never fake a regret for a decision that was right.
+## What you'd change — the chapter's own close
 
-- **Would change:** validate `graph.json` on load (schema + version, fail fast); add the paid Google elevation provider behind the existing interface for fidelity; design the data-loading boundary up front instead of through three reactive rewrites.
-- **Would keep:** the hand-rolled engine, the static-graph-no-database call, the directional cost — all matched to the problem.
-- **Contrarian call defended:** hand-rolling over OSRM — right for a learning project (own the algorithm, prove admissibility); I'd use the library if it were a product with a deadline.
-- **Do first:** validate-on-load — cheapest fix, turns the worst failure mode into a clear one.
+The meta-lesson of this chapter is the move itself: walk into the interview with
+your three counterfactuals already loaded, and volunteer them at the right
+moment rather than waiting to be cornered. The single highest-leverage one is
+graph validation on load — it's cheap, it closes the Chapter 5 gap, and it shows
+you think in trust boundaries. If you only carry one counterfactual into the
+room, carry that one.
 
-┃ "The code I planned is the code I'd keep; the code I iterated into existence is the code I'd change."
-┃ "I know what I gave up by hand-rolling — and I'd make the trade again for this context."
+---
 
-**What you'd change:** Treat the runtime data-loading seam as a first-class design problem from day one — the parts I designed deliberately held up; the part I iterated into existence is the one I'd redo.
+## One-page summary — Chapter 7
+
+**Core claim:** Volunteer three specific, code-anchored changes against a clear
+list of decisions you'd keep. The KEEP list is what makes it judgment, not
+regret.
+
+**The three counterfactuals:**
+- **Validate graph.json on load** → `loadGraph` is a bare cast (loadGraph.ts:10); add a schema pass so bad data fails at the boundary, not deep in `search()`. (Top priority — closes the Ch.5 gap.)
+- **Wire paid elevation behind `ElevationProvider`** → seam exists (elevation.ts:7), `googleProvider` works; 90m free data undercuts a grade router. Use the off-ramp.
+- **Design the data-loading seam up front** → one `GraphSource` interface for static base + runtime tiles, instead of one growing around the other.
+
+**Would KEEP:** hand-rolled engine, no backend/DB, directional cost, finite BLOCKED, parametric `search()`.
+
+**Pull quotes:**
+- ┃ "Volunteer what you'd reconsider before being asked — and name what you'd keep in the same breath."
+- ▸ Three changes, all hardening. Five keeps, the core.
+
+**What you'd change (the close):** Carry the validation counterfactual into every interview as the lead — cheap, closes a real gap, signals trust-boundary thinking.

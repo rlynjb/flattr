@@ -1,57 +1,134 @@
-# Success metrics and feedback loop
+# Success Metrics and Feedback Loop — flattr
 
-A problem worth investing in has an observable answer to "did it work?" — and the honest version names *what you can measure today* separately from *what you'd need users to measure*. flattr is pre-users, so its real, available metrics are technical (is the engine correct, is it fast enough, do the routes look right), and its product metrics are aspirational (would people switch). Don't blur them.
+> Two buckets, kept strictly apart: metrics you can produce **today** from the
+> repo (engine truth) and metrics that **need users** (demand truth). The
+> dishonest move is to dress an available-now metric up as proof of demand. This
+> file refuses to do that.
+
+## The split that keeps you honest
 
 ```
-  METRICS — by what you can actually observe
+  flattr metrics — two buckets, never conflated
 
-  AVAILABLE NOW (repo / you can measure)        FEEDBACK LOOP
-  ─────────────────────────────────────         ─────────────
-  correctness: A* cost == Dijkstra cost   ◄──── the test oracle
-  search efficiency: A* expands 4–6x       ◄──── the bench harness
-    fewer nodes than Dijkstra                    (bench/run.ts)
-  route plausibility: does the colored      ◄──── eyeball + a rider's
-    route match a flat way a human'd pick         "yeah, that's right"
-
-  NEEDS USERS (can't measure yet)               WHAT IT'D TAKE
-  ─────────────────────────────────────         ─────────────
-  adoption: do people choose flat-first?    ◄──── ship + instrument
-  switching: would they leave their app?    ◄──── interviews / A-B
-  trust: do mobility-aid users rely on it?  ◄──── field testing
+  ┌─ AVAILABLE NOW (engine truth) ──────────┐   ┌─ NEEDS USERS (demand truth) ──────┐
+  │ measurable from the repo, today          │   │ measurable only with the           │
+  │                                          │   │ discovery slice (02)               │
+  │ • A* == Dijkstra optimality (oracle)     │   │ • adoption: do people use it twice?│
+  │ • node-expansion ratio (bench harness)   │   │ • switching: flattr route chosen   │
+  │ • route plausibility (gentler than the   │   │     over the default route?        │
+  │     straight line on known-hilly A→B)    │   │ • trust: do they believe the       │
+  │ • honest-fallback correctness            │   │     colors / climb number?         │
+  │     (flat-flag vs. null)                  │   │                                    │
+  └──────────────────────────────────────────┘   └────────────────────────────────────┘
+        proves the thing WORKS                          proves the thing is WANTED
+        (you have this)                                  (you do NOT have this)
 ```
 
-The top half is the loop you already have and should lean on in any review. The bottom half is the loop you'd have to *build* — and saying "I haven't measured this yet, here's how I would" is stronger than inventing a number.
+A green left bucket tells you the engine is correct. It tells you **nothing**
+about whether to keep building. Only the right bucket does.
 
-## Metrics available now (and the loop that produces them)
+## Bucket 1 — available now (you can run these today)
 
-These are real, in the repo, and re-runnable — which is exactly why they're the metrics to cite:
+Each is producible from the repo with no users.
 
-- **Correctness — the optimality oracle.** A\* is tested to return the *exact same cost* as Dijkstra on the same graph. If they ever diverge, the heuristic is inadmissible and the test fails. This is a binary, trustworthy success signal: the router is provably finding optimal paths. The feedback loop is the test suite — it runs on every change.
-- **Search efficiency — the bench harness.** `bench/run.ts` counts nodes expanded, heap pushes, and pops per query across the algorithm stages, so "A\* beats Dijkstra" is a measured table (~4–6× fewer expansions here), not a claim. The loop: re-run the bench when the graph or cost model changes; watch the ratio of pops to expansions to know when lazy-deletion staleness would justify a decrease-key heap.
-- **Route plausibility — the eyeball test.** Does the route, colored green-to-red by grade, match the flat way a local would actually walk or scoot? This is informal but real: it's the fastest signal that the *product* premise (not just the algorithm) is working. The honest loop is to put it in front of one real scooter rider for one neighborhood they know.
+### 1a. A* == Dijkstra optimality (the oracle metric)
 
-## Metrics that need users (and the loop that doesn't exist yet)
+- **What:** for every fixed (start, goal) pair, A*'s path cost equals Dijkstra's,
+  and A* expands no more nodes than Dijkstra.
+- **Where it's already checked:** `features/routing/astar.test.ts:38`
+  (`toBeCloseTo` on cost) and `:47,:51` (`toBeLessThanOrEqual` on
+  `nodesExpanded`). Dijkstra is the ground-truth oracle.
+- **Pass bar:** equal cost to 6 digits; A* expansions ≤ Dijkstra on every pair.
+- **What it proves:** the heuristic is admissible and the router is optimal.
+  Nothing about demand.
 
-State these as the gap, with the loop you'd build:
+### 1b. Node-expansion / work ratio (the bench metric)
 
-| Metric | What it would prove | The loop to build |
-|--------|---------------------|-------------------|
-| **Adoption** — % of routes where users pick flat-first | People actually want grade-aware routing | Ship instrumented; count mode selection |
-| **Switching** — would users leave their current app | The problem is painful enough to change habits | User interviews; a small A/B if there were a userbase |
-| **Trust** — do mobility-aid users rely on the routes | The accessibility use case is real and safe | Field testing with target users; a wrong "flat" claim is a trust failure |
+- **What:** per (start, goal), per algorithm — `nodesExpanded`, `pushes`,
+  `pops`, `ms`, `cost`. The A*/Dijkstra expansion *ratio* is the headline.
+- **Where:** `bench/run.ts` runs the stages over interior pairs;
+  `bench/report.ts` `formatTable` prints the comparison. `npm run bench`.
+- **Pass bar:** A* expands materially fewer nodes than Dijkstra for the same
+  cost; bidirectional fewer still on the distance problem.
+- **What it proves:** the refinements pay off — the spec §15.2 progression story
+  is real and measured, not asserted.
 
-## The one metric that matters most, and why
+### 1c. Route plausibility (the domain-sanity metric)
 
-If you could measure only one thing, it's **route plausibility validated by a real target user** — does an actual scooter rider look at flattr's route for a neighborhood they know and say "yes, that's the way I'd go"? It dominates because it's the cheapest signal that bridges from "the algorithm is correct" (which the oracle already proves) to "the product premise is true" (which nothing proves yet). The correctness metrics tell you the engine works; only a real user's reaction tells you the engine works *on the right objective*.
+- **What:** on a *known-hilly* A→B, the grade-routed path has lower total climb
+  (`climbM`) than the shortest path, at the cost of some extra distance — i.e.
+  the router actually trades distance for flatness.
+- **Where:** `summary.ts` `routeSummary` returns `{distanceM, climbM,
+  steepCount}`; compare grade-routed vs. distance-only over the same pair.
+- **Pass bar:** grade route's `climbM` < distance route's `climbM` on pitches
+  that exceed `userMax`. This is the "Pike Place → Broadway returns a gentler
+  path" check from spec §10 Phase 2.
+- **Honesty caveat:** plausibility is gated by elevation accuracy. Spec §12 —
+  coarse elevation makes the map "lie about the steep blocks." So this metric is
+  only as trustworthy as the free Open-Meteo data feeding it. State that.
 
-▸ Cite the metric you actually have (A\* == Dijkstra, provably optimal) and name the metric you don't (adoption) — never present an aspiration as a measurement.
+### 1d. Honest-fallback correctness
 
-## One-page summary
+- **What:** an only-steep route returns a *flagged* path (not `null`); a
+  genuinely disconnected pair returns `null`.
+- **Where:** `cost.ts:6` `BLOCKED = 1e9` (finite) drives this; the distinction is
+  walked in `.aipe/study-system-design/04-honest-fallback-routing.md`.
+- **Pass bar:** the two states never collapse into one.
 
-**Core claim:** flattr's available success metrics are technical and trustworthy (provable optimality, measured search efficiency); its product metrics need users it doesn't have yet — and the honest brief keeps the two separate.
+## Bucket 2 — needs users (you cannot fake these)
 
-- **Now:** A\* cost == Dijkstra cost (oracle, provably optimal); A\* expands 4–6× fewer nodes (bench harness); route plausibility (eyeball + one real rider).
-- **Needs users:** adoption, switching, accessibility trust — name the loop you'd build, don't invent numbers.
-- **The one that matters most:** a real target user validating route plausibility — the cheapest bridge from "engine correct" to "premise true."
+These require the discovery slice from `02`. Until it runs, every one of these is
+**unknown**, and saying otherwise is the dishonesty this book exists to prevent.
 
-┃ "The oracle proves the engine works; only a real rider tells me it works on the right objective."
+```
+  the demand feedback loop — only the slice closes it
+
+  ┌─ show A→B in flattr + Google Maps ─┐
+  │  to a real self-powered traveler    │
+  └─────────────────┬───────────────────┘
+                    │  observe + ask
+                    ▼
+  ┌─ record 3 things ──────────────────┐
+  │  1. SWITCHING: which route chosen?  │
+  │  2. REASON: was "grade" the reason? │
+  │  3. TRUST: did they believe the     │
+  │     colors / climb number?          │
+  └─────────────────┬───────────────────┘
+                    │  repeat ×5 travelers
+                    ▼
+  ┌─ decide ───────────────────────────┐
+  │  ≥3/5 prefer flattr FOR the grade   │
+  │    → demand signal, consider more   │
+  │  <3/5 or "didn't care"              │
+  │    → premise weak, stop / pivot     │
+  └─────────────────────────────────────┘
+```
+
+- **Adoption** — would they use it again for their real commute? (Binary,
+  per-person. No infrastructure needed — just ask.)
+- **Switching** — shown both routes, do they pick flattr's? This is *the* metric.
+  It directly tests the spec §1 premise that Google Maps under-serves them.
+- **Trust** — do they believe the colored grades and the climb number, or do they
+  override it with local knowledge? (If they don't trust it, accuracy — bucket
+  1c — is the real blocker.)
+
+**Deliberately not invented:** no DAU/MAU, no retention curve, no conversion
+rate, no NPS, no market size. There is no product live, so there is no funnel.
+Putting a number on any of these now would be fabrication.
+
+## The one rule for using these metrics
+
+When you present flattr, lead with bucket 1 framed as *"the engine is provably
+correct"* and bucket 2 framed as *"demand is unmeasured — here's exactly the
+experiment that would measure it."* Never let a green bucket-1 metric stand in
+for a bucket-2 answer. That conflation is the single trap a sharp reviewer is
+listening for.
+
+## See also
+
+- `02-scope-cuts-and-non-goals.md` — the slice that produces bucket-2 metrics.
+- `05-skeptical-reviewer-questions.md` — handling "your metrics don't prove
+  anyone wants this."
+- `.aipe/study-performance-engineering/02-heuristic-pruning.md` — the
+  node-expansion win behind metric 1b.
+- `.aipe/study-testing/` — where the oracle-gate tests (metric 1a) live.

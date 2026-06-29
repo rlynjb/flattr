@@ -1,188 +1,174 @@
-# Clocks, coordination, and leadership
-### time, ordering, leases, leader election, split-brain — `not yet exercised`
-**Industry name:** logical clocks, leader election, leases, split-brain · **Type:** Industry standard
+# Clocks, Coordination & Leadership
+
+**Status: `not yet exercised`.** flattr has no second node to order events against, no leader to elect, no lease to hold, no split-brain to fear. There's one process. This file teaches the concepts and names the trigger — multi-device sync of user data — that would force each one into the design.
+
+> Per `me.md`: consensus/leadership/coordination-at-scale is part of the named horizontal-scale gap. Taught here honestly, not claimed from the repo.
 
 ## Zoom out, then zoom in
 
-Verdict first: **clocks, coordination, and leadership are `not yet exercised`.** These patterns exist to make *multiple nodes agree on time, order, and who's in charge* — and flattr has one node live at a time, so there's no one to agree with. No Lamport clocks, no leases, no leader election, no split-brain risk. This file teaches the vocabulary and points at the *single* place flattr makes an ordering decision (the `pump()` priority rule), which is in-process scheduling, not distributed coordination.
-
 ```
-  Zoom out — where coordination WOULD live (and why it's empty)
+  Zoom out — where clocks/coordination WOULD live (all empty)
 
-  ┌─ Coordination layer (the phone, ONE process) ───────────────┐
-  │  pump(): corridor-before-view  ← LOCAL ordering, not         │
-  │          distributed coordination                            │
-  │  ┌ ★ where leader election / leases WOULD sit ★ ┐            │ ← empty
-  │  │   (no second node to elect a leader among)    │            │
-  │  └─────────────────────────────────────────────────┘          │
-  └───────────────────────────┬─────────────────────────────────┘
-                              │  ═══ NETWORK ═══ (no coordination protocol)
-  ┌─ Provider layer ──────────▼──────────────────────────────────┐
-  │  stateless public APIs — they don't coordinate with you      │
+  ┌─ Single node ───────────────────────────────────────────────┐
+  │  one process, one wall clock, one writer (the user)          │ ← we are here
+  │  ordering of events: trivial (local program order)           │
+  │  (leadership slot: EMPTY · lease slot: EMPTY · clock-sync     │
+  │   slot: EMPTY — no other node to disagree with)              │
+  └──────────────────────────────────────────────────────────────┘
+        │ trigger: a SECOND writer appears (phone B, a server)
+        ▼
+  ┌─ would-be multi-writer tier (does not exist) ────────────────┐
+  │  [ no logical clocks, no leader election, no consensus ]      │
   └───────────────────────────────────────────────────────────────┘
 ```
 
-Zoom in: clocks answer "in what *order* did events happen across machines whose wall-clocks disagree?"; leadership answers "of N equal nodes, which one is allowed to act?"; leases answer "how does a node *prove* it's still the leader without asking everyone constantly?" flattr asks none — there's no second node, no shared mutable resource to guard, no wall-clock to reconcile. The one ordering it does care about is purely local and decided by an `if/else`.
+**Zoom in.** In one process, "what happened before what" is free — it's program order, one clock, one thread of truth. The moment two nodes both make changes, that free ordering evaporates: wall clocks drift and disagree, so you can't trust timestamps to say which write won; you need *logical* clocks (Lamport, vector) that order events by causality, or a single elected *leader* that serializes all writes so there's one authority. Leadership brings its own hazard — split-brain, where two nodes both think they're leader — which leases and consensus exist to prevent. flattr needs none of this because it has exactly one writer.
 
 ## Structure pass
 
-**Layers.** Producers → `pump()` ordering → worker. The whole "coordination" story fits in one process.
+**Layers.** Today: one writer, one clock. Future: multiple writers needing an ordering authority.
 
-**The axis: control — "who's allowed to act, and how is that decided?"**
+**The axis: `control` — who decides the order of writes?**
 
 ```
-  One question — "who's allowed to act, and who decides order?" — traced
+  The control axis — who orders writes?
 
-  ┌──────────────────────────────────────┐
-  │ producers (pan / route)               │  → not allowed to run directly
-  └──────────────────────────────────────┘
-      ▼
-  ┌──────────────────────────────────────┐
-  │ pump() if/else priority               │  → decides order LOCALLY, by code.
-  └──────────────────────────────────────┘    no election, no lease, no vote.
-      ▼
-  ┌──────────────────────────────────────┐
-  │ (distributed coordinator)             │  → DOES NOT EXIST. one node, no
-  └──────────────────────────────────────┘    peers to coordinate with.
+                  │ today (flattr)        │ when a 2nd writer appears
+  ────────────────┼───────────────────────┼──────────────────────────
+  # of writers    │ 1 (the user, local)   │ 2+ (phone A, phone B, server)
+  ordering source │ program order (free)   │ logical clock OR a leader
+  authority       │ implicit (one thread) │ elected leader / consensus
+  failure to fear │ none                   │ split-brain (two leaders)
 ```
 
-**The seam.** No seam — and again the absence is the lesson. A coordination seam exists where ≥2 equal nodes must agree on who acts or what order events took. flattr's ordering decision (corridor > view) is made by a single process reading its own two refs; there's no agreement because there's no second party. Local scheduling ≠ distributed coordination, and conflating them is the mistake to avoid.
+**The seam that doesn't exist yet.** It's the boundary between "one writer" and "many." flattr never crosses it. Cross it and ordering flips from free to the single hardest problem in distributed systems — agreeing on order without a shared clock.
 
 ## How it works
 
-#### Move 1 — the mental model
+### Move 1 — the mental model
 
-You know ordering ambiguity from merging two git branches with commits at "the same time" — wall-clocks lie, so you need a *logical* order, not a timestamp. You know leadership from "only the primary accepts writes." You know leases from a lock with a TTL that auto-expires if the holder dies.
-
-```
-  The patterns flattr does NOT have — for vocabulary
-
-  LOGICAL CLOCK             LEADER ELECTION          LEASE
-  ─────────────             ───────────────          ─────
-   node A: counter=5         3 nodes, 1 leader        leader holds lock(TTL=10s)
-   sends msg(ts=5) ──►       ┌ vote ┐                 must RENEW before expiry
-   node B: max(my,5)+1=6     A   B   C                 dies ⇒ lease expires ⇒
-   ⇒ order without clocks    └─► B wins (majority)      another node takes over
-```
-
-flattr's actual ordering is none of these — it's `if (corridor) else if (view)`, a single process choosing from its own queue.
-
-#### Move 2 — the one ordering decision, walked honestly
-
-**`pump()`'s priority is local scheduling, not coordination.** Bridge from a thread scheduler picking the highest-priority runnable task. `pump` orders work by a fixed rule: corridor (route) before view (pan). That's a *real* ordering decision — but here's why it's not distributed coordination:
+You know program order from any single-threaded code: line 2 happens after line 1, no question. Now imagine two phones editing the same saved-routes list offline, then both come online. Whose edit is "later"? Their wall clocks disagree by seconds. Timestamps lie. That's the entire problem.
 
 ```
-  Why pump's ordering is NOT distributed coordination
+  Why wall clocks can't order distributed writes
 
-  DISTRIBUTED coordination          flattr's pump ordering
-  ────────────────────────          ──────────────────────
-  ≥2 nodes must AGREE on order       ONE process reads its own 2 refs
-  needs a protocol (Paxos/Raft,      needs an if/else
-    vector clocks, a lease)
-  failure ⇒ split-brain (two         failure ⇒ nothing; one decider can't
-    nodes both think they lead)        disagree with itself
-  wall-clock skew is a problem        no clock involved at all
+  phone A clock: 10:00:05  ──edit X──►┐
+  phone B clock: 10:00:03  ──edit Y──►┤  both sync to server
+                                      ▼
+  "Y is older" by timestamp — but B's clock is just SLOW.
+  X may have causally happened first. Wall time ≠ causal order.
+
+  fixes:
+   • logical clock (Lamport): a counter that increments on each event,
+     so ordering follows CAUSALITY not wall time
+   • single leader: one node assigns the order; no clock comparison needed
 ```
 
-*The tell:* there's no agreement step. A distributed ordering needs a protocol because participants can disagree; flattr's needs none because one process decides alone. Calling `pump`'s priority "coordination" in an interview would overclaim; calling it local priority scheduling is exact.
+### Move 2 — the walkthrough (concept + trigger)
 
-**No timestamps, no ordering-by-time anywhere.** Worth stating: flattr orders work by *arrival into a slot* and *priority*, never by a timestamp. There's no event-ordering-across-machines problem because there are no events across machines — only request/response reads. So logical clocks have nothing to order.
-
-#### Move 2.5 — what makes this real (the trigger)
+**Part 1 — logical clocks, and their trigger.** A Lamport clock is a per-node counter bumped on every event and on every message received (`max(local, received) + 1`), giving a consistent "happened-before" order without synchronized wall clocks. Vector clocks go further: they detect *concurrent* writes (true conflicts) vs causally-ordered ones.
 
 ```
-  Phase A (now) vs Phase B (§11 D2/E2 multi-instance server)
+  Trigger for logical clocks in flattr
 
-  NOW — one process                MULTI-INSTANCE SERVER
-  ─────────────────                ─────────────────────
-  no leader (no peers)             N instances; if ONE must own graph rebuilds,
-                                     you need LEADER ELECTION to pick it
-  no lease                         that leader holds a LEASE so a crashed leader's
-                                     job is taken over (not stuck forever)
-  no clock skew                    cross-instance event ordering ⇒ logical clocks
-                                     or a single-writer to avoid it
-  no split-brain                   two instances both thinking they're the rebuild
-                                     leader ⇒ SPLIT-BRAIN ⇒ double/torn rebuilds
+  TODAY                          TRIGGER                      THEN
+  ─────                          ───────                      ────
+  one device, one writer    →    saved routes sync across  →  need to order
+  (program order = truth)        2+ devices, offline edits     concurrent edits
+                                                                → Lamport/vector
+                                                                  or last-writer-wins
 ```
 
-The trigger is multiple server instances sharing a mutable resource — precisely the §11 D2 server-side served graph if rebuilds are centralized. The moment two equal instances could both try to rebuild "the Seattle graph," you need exactly one to win (election), proof it's still alive (lease), and protection against both believing they won (split-brain handling). None of that exists or is needed today.
+The honest framing: flattr's *base* data (the graph) never needs this — it's read-only, built once. Only *user-generated* state (saved routes, preferences) edited on multiple devices would. That's the same trigger as replication's write (`05`) — these two files share a trigger because writes-across-nodes is the root cause of both.
 
-#### Move 3 — the principle
+**Part 2 — leadership, and why a single leader is often the simpler answer.** Instead of every node reasoning about clocks, elect *one* node as leader; all writes go through it, it assigns the order, followers replicate. Simpler to reason about — but now you must handle the leader dying (re-elect) and the nightmare of *two* nodes both believing they lead.
 
-Clocks, leadership, and leases are the cost of having *multiple equal nodes that could disagree about order or authority*. flattr has one decider, so it pays nothing — its only ordering is a local `if/else`. The general lesson: **don't reach for coordination protocols until you have ≥2 nodes that must agree** — and notice that a single-writer design (one node owns all writes) *avoids* most of this entirely. flattr is the degenerate single-writer: one process, no agreement, no clocks.
+```
+  Leader-based ordering vs the split-brain hazard
+
+  HAPPY PATH                          SPLIT-BRAIN (the failure)
+  ┌────────┐                          ┌────────┐    ┌────────┐
+  │ leader │◄── all writes            │leader? │    │leader? │
+  └───┬────┘                          └───┬────┘    └───┬────┘
+   replicate                          both accept writes → divergent state
+  ┌───▼────┐ ┌────────┐               (network partition made each think
+  │follower│ │follower│                the other died)
+  └────────┘ └────────┘               FIX: lease (time-bounded leadership)
+                                            + consensus (Raft/Paxos) to agree
+                                            on exactly one leader
+```
+
+**Part 3 — leases and consensus, why they're far off.** A *lease* is time-bounded leadership: you're leader only until the lease expires, so a partitioned old leader stops acting before a new one starts — no overlap, no split-brain. *Consensus* (Raft, Paxos) is the protocol a cluster uses to agree on one leader and one log order despite failures. flattr is multiple triggers from this: it needs multiple writers first, then enough nodes that you'd elect a coordinator. Don't reach for Raft before you have a cluster.
+
+### Move 2.5 — current vs future
+
+```
+  Phase A (now)                  Phase B (multi-device user data)
+  ─────────────                  ───────────────────────────────
+  1 writer, program order        2+ writers, offline edits
+  wall clock fine (display only)  wall clock UNTRUSTWORTHY for ordering
+  no leader (no cluster)         either: server-as-leader (simple)
+  no consensus                          or: CRDT/vector clocks (leaderless)
+                                  split-brain becomes a real risk
+```
+
+The decision at Phase B is the classic one: **leader-based** (server orders all writes — simple, but the server is a bottleneck and SPOF until you add consensus) vs **leaderless** (CRDTs / vector clocks merge concurrent edits — no SPOF, but harder to reason about). For flattr's likely scale, server-as-leader is the pragmatic call.
+
+### Move 3 — the principle
+
+Time is the lie at the heart of distributed systems: you cannot trust a wall clock to tell you what happened before what, because clocks drift and there is no global "now." The two escapes are logical clocks (order by causality, not time) and a single leader (one node defines the order). flattr sidesteps the whole problem by having one writer — and that's the right call until a second writer exists. The moment user data lives on two devices, ordering stops being free and you must choose: a leader, or logical clocks.
 
 ## Primary diagram
 
-The recap — what exists (local ordering) vs. the empty coordination slots.
-
 ```
-  Clocks/coordination/leadership in flattr — recap
+  Clocks / coordination / leadership — flattr's status
 
-  ┌─ EXISTS ────────────────────────────────────────────────────┐
-  │  pump() local priority: corridor BEFORE view (an if/else)     │
-  │  ordering = by slot + priority, never by timestamp            │
+  ┌─ TODAY: one writer ───────────────────────────────────────────┐
+  │  program order = truth · wall clock used only for display      │
+  │  logical clock ✗   leader ✗   lease ✗   consensus ✗            │
   └───────────────────────────────────────────────────────────────┘
-
-  ┌─ `not yet exercised` (empty slots) ─────────────────────────┐
-  │  ✗ logical/vector clocks   ✗ leader election                 │
-  │  ✗ leases / TTL locks      ✗ split-brain handling            │
-  │                                                              │
-  │  trigger: §11 D2 multi-instance server with centralized      │
-  │           graph rebuilds (≥2 nodes sharing a mutable resource)│
+        │ trigger: 2nd writer (multi-device sync of saved routes)
+        ▼
+  ┌─ ordering stops being free ───────────────────────────────────┐
+  │  wall clocks disagree → can't order writes by timestamp        │
+  │  choose:                                                       │
+  │    leader-based  → server serializes writes (simple, SPOF)     │
+  │    leaderless    → CRDT / vector clocks (no SPOF, complex)     │
+  │  guard split-brain → leases + consensus (Raft) once clustered  │
   └───────────────────────────────────────────────────────────────┘
 ```
-
-## Implementation in codebase
-
-**Use cases.** No coordination code exists to walk. The only ordering decision is `pump`'s priority, shown here so it's clearly *not* mistaken for distributed coordination:
-
-```
-  mobile/src/useTileGraph.ts  (lines 93–103, the ordering decision)
-
-  if (pendingCorridorRef.current) {        ← corridor (route) wins
-    kind = "corridor"; ...
-  } else if (pendingViewRef.current) {     ← view (pan) only if no corridor
-    kind = "view"; ...
-  } else { return; }
-       │
-       └─ this orders work, but ONE process decides from ITS OWN refs.
-          no peer to agree with, no protocol, no clock. local scheduling,
-          not distributed coordination. (the scheduling/execution angle
-          lives in study-runtime-systems; the queue angle in 06.)
-```
-
-That's the entire surface. Everything else here is `not yet exercised`.
 
 ## Elaborate
 
-The reason to know these patterns despite their absence: leader election and leases are the canonical "you have N nodes now" tax, and recognizing when you've *crossed* into needing them is a senior signal. The single best way to *avoid* them is the single-writer pattern — route all mutations through one owner so there's never a disagreement to resolve. flattr is the trivial single-writer (one process), which is why it's coordination-free; many production systems deliberately keep a single-writer for exactly this reason, accepting the throughput ceiling to dodge consensus.
-
-Split-brain is the failure these patterns prevent: two nodes both believing they're the leader, both acting, producing torn or doubled state. It's `not yet exercised` here because there's no leader to be split. It becomes real at the §11 D2 multi-instance stage if graph rebuilds are centralized — at which point a lease-based leader (only the lease-holder rebuilds; a crashed holder's lease expires and another node takes over) is the standard fix. Read next: `05` (the replication that coexists with leadership) and `08` (the workflows a leader would coordinate).
+Lamport's 1978 "Time, Clocks, and the Ordering of Events" is the foundational paper — the happened-before relation and logical clocks. Vector clocks (Fidge/Mattern) extend it to detect concurrency. Raft (Ongaro 2014) is the readable modern consensus protocol for leader election + log replication; Paxos is its harder ancestor. The "wall clocks lie" lesson is why Google built TrueTime (bounded clock uncertainty with atomic clocks) for Spanner — they spent hardware to make timestamps trustworthy because the alternative is so painful. flattr is `not yet exercised` here for the cleanest possible reason: a single writer needs no agreement about order. Sibling `study-system-design` owns the leader-vs-leaderless architecture decision; this guide owns why the decision becomes mandatory.
 
 ## Interview defense
 
-**Q: "How do you handle clock skew / ordering / leader election here?"**
-I don't need to — and that's a design property, not a gap. There's one process live at a time, so there are no peers to agree with, no shared mutable resource to guard, and no wall-clocks to reconcile. The only ordering I make is local: `pump()` runs route corridors before viewport pans, decided by an `if/else` reading two in-process refs. That's local priority scheduling, not distributed coordination — there's no agreement step because there's no second party. I'd only need election and leases at the §11 D2 multi-instance stage, if two server instances could both try to rebuild the same graph.
+**Q: "If flattr synced saved routes across a user's phone and laptop, how would you order conflicting edits?"**
+Lead with why timestamps fail, then the two real options.
 
 ```
-   one process decides order from its own 2 refs  → if/else, no protocol
-   "do I have ≥2 nodes that must agree?"  → no  → no clocks/election/leases
+  wall clock lies → choose an ordering authority
+
+  phone (clock +3s) edit  ─┐
+  laptop (clock -2s) edit  ─┤─► can't trust timestamps
+                           ▼
+   option A: server-as-leader (serializes writes)  ← I'd pick this
+   option B: CRDT / vector clocks (leaderless merge)
 ```
-*Anchor: I'm the degenerate single-writer — one decider can't disagree with itself.*
 
-**Q: "When would split-brain become a risk?"**
-The instant I run ≥2 server instances that could both try to own graph rebuilds (§11 D2). Two instances both thinking they're the rebuild leader would produce torn or doubled rebuilds. The fix is a lease-based leader: only the lease-holder rebuilds, and a crashed holder's lease expires so another node takes over. Today there's exactly one node, so there's nothing to be split. *Anchor: split-brain needs ≥2 equal nodes sharing a mutable resource — I have neither.*
+"I would *not* order them by wall-clock timestamp — the two devices' clocks drift and disagree, so 'later timestamp' doesn't mean 'happened later.' Two real options: make a server the leader so all writes get serialized through one authority — simplest, and fine for this scale even though the server is a SPOF until I add consensus — or go leaderless with CRDTs / vector clocks that merge concurrent edits by causality. For flattr I'd pick server-as-leader; the data is small and a single ordering authority is far easier to reason about than conflict-free merge types."
 
-## Validate
+**Anchor:** *Wall clocks lie about order — pick a leader or a logical clock; never trust the timestamp.*
 
-1. **Reconstruct:** define logical clock, leader election, and lease in one line each. Why does flattr need none today?
-2. **Explain:** give the concrete tell that `pump`'s corridor>view priority (`useTileGraph.ts:93-103`) is local scheduling, not distributed coordination.
-3. **Apply:** the spec runs two server instances that both rebuild the Seattle graph (§11 D2). Describe the split-brain failure and the lease-based fix.
-4. **Defend:** a reviewer wants a "distributed lock" around tile builds. Argue why `busyRef` (an in-process boolean) is sufficient at one node and what would have to be true for a *real* distributed lock to be warranted.
+**Q: "Why nothing here today?"**
+"One writer. Program order is the truth when there's a single thread of changes. Ordering only becomes a problem with a second writer — that's the trigger, and flattr hasn't crossed it."
+
+**Anchor:** *One writer means order is free; the problem starts at writer number two.*
 
 ## See also
 
-- `05-replication-partitioning-and-quorums.md` — the replicas a leader would coordinate (also `not yet exercised`).
-- `06-queues-streams-ordering-and-backpressure.md` — the `pump()` ordering at the queue altitude.
-- `08-sagas-outbox-and-cross-boundary-workflows.md` — the multi-step workflows a leader would own.
-- `.aipe/study-runtime-systems/` — `pump` ordering as scheduling/execution mechanics.
+- `05-replication-partitioning-and-quorums.md` — shares the trigger (writes across nodes); replicas need this ordering.
+- `04-consistency-models-and-staleness.md` — read-your-writes across devices needs this.
+- `08-sagas-outbox-and-cross-boundary-workflows.md` — multi-step workflows need ordering too.
+- sibling `study-system-design` — leader-vs-leaderless as an architecture choice.

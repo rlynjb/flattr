@@ -1,171 +1,276 @@
 # Chapter 1 — The pitch
 
-In the first ten minutes of every senior interview, someone asks you to tell them about a project. This is where most candidates lose the room — not because the project is weak, but because they ramble. They start at the OSM data, detour through the elevation API, mention a bug, and two minutes later the interviewer still doesn't know what the app *does*. Your job in the opening is the opposite of thorough: it's compression. Say what flattr is, who it's for, and the one technically interesting thing about it — then stop and let them pull.
+In the first ten minutes of every interview, someone says "tell me about a
+project you built." This is the question you cannot afford to ramble through —
+it sets the frame for everything after. If you fumble the pitch, the
+interviewer spends the rest of the loop deciding whether you actually
+understand your own code. If you nail it, they spend it exploring with you.
 
-You have three pitches, not one. The length you reach for depends on the moment: a hallway, a "tell me about yourself," the real project deep-dive. Same core, three depths. Get the 10-second one so tight you could say it asleep, because the 30 and the 90 are just that sentence with the layers added back.
+This chapter gives you the pitch at three lengths — 10 seconds, 30 seconds, 90
+seconds — and the one hook that makes flattr memorable: **directional cost.**
+The discipline here is compression. Most candidates know too much about their
+project and dump all of it. You're going to say less, on purpose, and lead with
+the one thing nobody expects.
+
+---
+
+## The chapter-opening diagram — flattr at a glance
+
+Here is the whole project on one card: what it does, what's in it, the numbers,
+and the hook. If you can redraw this from memory, you can pitch flattr at any
+length.
 
 ```
-  THE THREE PITCHES — same spine, growing depth
+  flattr — "optimized for flat, not fast"
 
-  10s ── WHAT + THE HOOK
-  ┌──────────────────────────────────────────────────────┐
-  │ "A walking/scooter router that optimizes for FLAT,    │
-  │  not fast — hand-rolled A* over an elevation graph."  │
-  └──────────────────────────────────────────────────────┘
-            │  add: the knob + the platform
-            ▼
-  30s ── WHAT + HOW IT'S USED + WHAT'S UNDER IT
-  ┌──────────────────────────────────────────────────────┐
-  │ + one knob: userMax (steepest uphill you'll accept)   │
-  │ + Expo/RN map app, works offline off a bundled graph  │
-  │ + the cost is DIRECTIONAL — uphill penalized, down free│
-  └──────────────────────────────────────────────────────┘
-            │  add: the build/run split + why it's interesting
-            ▼
-  90s ── THE REAL ANSWER (pitch → architecture → the seam)
-  ┌──────────────────────────────────────────────────────┐
-  │ + build-time pipeline (OSM+elevation → graph.json)    │
-  │ + runtime engine: one search() = Dijkstra/A*/directed │
-  │ + the interesting bit: A→B ≠ B→A, and an honest        │
-  │   fallback (BLOCKED is finite, not Infinity)          │
-  └──────────────────────────────────────────────────────┘
-
-  rule: each pitch ENDS on the hook, so they ask the next question.
+  ┌──────────────────────────────────────────────────────────────┐
+  │  WHAT          grade-aware router for pedestrians / scooters   │
+  │                one knob: userMax = max comfortable uphill %    │
+  ├──────────────────────────────────────────────────────────────┤
+  │  THE HOOK      cost is DIRECTIONAL — A→B ≠ B→A                 │
+  │                uphill is penalized, downhill is free           │
+  │                gradeCostDirected, cost.ts:32                   │
+  ├──────────────────────────────────────────────────────────────┤
+  │  THE ENGINE    ONE hand-rolled search() — no OSRM/Valhalla     │
+  │                Dijkstra → A* → grade → directed, all the same  │
+  │                function with different (costFn, heuristicFn)   │
+  │                astar.ts:22                                      │
+  ├──────────────────────────────────────────────────────────────┤
+  │  THE DATA      static graph.json, baked at build time          │
+  │                1,621 nodes / 1,879 edges  (Seattle)            │
+  │                no backend · no database · no LLM               │
+  ├──────────────────────────────────────────────────────────────┤
+  │  THE SHELL     Expo ~56 / RN 0.85 / React 19 / MapLibre 11    │
+  │                tap two points → one search() → colored route   │
+  └──────────────────────────────────────────────────────────────┘
 ```
 
-The pitch isn't a summary you recite — it's bait. End on the most interesting hook and let them bite.
+Everything you say about flattr is a zoom into one row of that card. The pitch
+is just choosing how many rows you have time for.
 
-## The 10-second version
+---
 
-┌─────────────────────────────────────────────────┐
-│ THEY ASK                                          │
-│   "So what'd you build?" (hallway, casual)        │
-│                                                   │
-│ WHAT THEY'RE TESTING                              │
-│   Can you compress? Do you know what your own     │
-│   project actually is, or do you only know its    │
-│   parts? Rambling here predicts rambling later.   │
-└─────────────────────────────────────────────────┘
+## The 90-second answer — "tell me about a project you built"
 
-Say this, in your voice:
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ THEY ASK                                                          │
+│   "Tell me about a project you built."                            │
+│                                                                   │
+│ WHAT THEY'RE TESTING                                              │
+│   Can you compress? Do you lead with what's interesting, or       │
+│   bury it under setup? Do you know what the hard part of your     │
+│   own project actually is — or do you think the hard part was     │
+│   "wiring up the map"? The pitch is a proxy for judgment.         │
+└─────────────────────────────────────────────────────────────────┘
+```
 
-> "It's a walking and kick-scooter router that optimizes for flat instead of fast. I hand-rolled the A\* search over a street graph annotated with elevation grades."
+Here's the 90-second version, in your voice. Read it aloud — it should sound
+like you talking, not a paragraph you memorized.
 
-That's it. Two sentences. The first is the product; the second is the hook ("hand-rolled the A\*") that makes a senior interviewer lean in, because it tells them this isn't a Google Maps API wrapper.
-
-┃ "Optimizes for flat, not fast" is the whole product in four words. Lead with it every time.
-
-## The 30-second version
-
-┌─────────────────────────────────────────────────┐
-│ THEY ASK                                          │
-│   "Tell me about something you've worked on."     │
-│                                                   │
-│ WHAT THEY'RE TESTING                              │
-│   Can you describe a system at the right          │
-│   altitude — what it does and how it's used —     │
-│   without diving into implementation in the       │
-│   first breath?                                   │
-└─────────────────────────────────────────────────┘
-
-> "flattr is a grade-aware router for self-powered travel — walking, kick scooters. The idea is that the shortest route isn't the best route if it goes over a hill; flattr finds the *flattest comfortable* one instead. Everything keys off a single knob, `userMax` — the steepest uphill you're willing to climb. It's an Expo/React Native app with a MapLibre map, and it works offline because the street graph ships bundled with the app. The part I find interesting is that the cost is *directional* — going up a block is penalized, coming down the same block is free — so the route from A to B isn't the reverse of B to A."
-
-Notice the shape: product → who it's for → the knob → the platform → the hook. You land on directionality because that's the thing most routers skip, and it's true of your code (`cost.ts` reads a signed grade via `graph.ts`'s `directedGrade`).
-
-| WEAK ANSWER | STRONG ANSWER |
-|---|---|
-| "It's a routing app I built with React Native and MapLibre. It uses A\* to find paths and has elevation data. I also did the data pipeline with OpenStreetMap and an elevation API, and there's a heatmap and address search and…" | "flattr routes walkers and scooters for *flattest*, not fastest, off one knob — max uphill grade. RN/MapLibre app, works offline off a bundled graph. The interesting part: the cost is directional, so A→B isn't the reverse of B→A." |
-| **Why it's weak:** it's a parts list. Frameworks and features with no spine. The interviewer can't tell what's load-bearing, and you've already used your 30 seconds on plumbing. | **Why it works:** product first, one crisp hook, ends somewhere they want to follow. You've spent zero words on the test runner and every word on what's interesting. |
-
-## The 90-second version
-
-┌─────────────────────────────────────────────────┐
-│ THEY ASK                                          │
-│   "Walk me through a project you're proud of."    │
-│                                                   │
-│ WHAT THEY'RE TESTING                              │
-│   Can you go from product to architecture to the  │
-│   one genuinely hard thing — in a structured arc, │
-│   not a brain-dump? This is the audition for the  │
-│   whole interview's communication.                │
-└─────────────────────────────────────────────────┘
-
-This is the one to rehearse out loud until it's muscle. Three beats: **product (15s) → architecture (45s) → the seam (30s).**
-
-> "flattr is a grade-aware router for walking and scooters — it optimizes for flat instead of fast, off one knob: the steepest uphill grade you'll accept.
+> "flattr is a routing app for people who travel under their own power —
+> walking, scooters, wheelchairs — where the thing you care about isn't the
+> fastest route, it's the *flattest* one. You give it one number: the steepest
+> uphill grade you're comfortable with. It finds you a route that respects
+> that.
 >
-> Architecturally it splits cleanly into build-time and runtime. At build time I run a pipeline — pull the street network from OpenStreetMap via Overpass, densify the segments, sample elevation from Open-Meteo, and compute a grade for every edge. That bakes into a static `graph.json` that ships inside the app. At runtime there's no server and no database — the app reads that graph and runs the search on-device, so it works offline. The frontend is Expo/React Native with a MapLibre map.
+> The interesting part is the cost function. In a normal router, the cost of an
+> edge is the same in both directions — distance is distance. In flattr, cost is
+> *directional*: going uphill is penalized, going downhill is free. So the cost
+> from A to B is not the cost from B to A. That one change means I'm searching a
+> directed graph where the weights depend on travel direction.
 >
-> The engine is the part I'm proud of: it's hand-rolled, not a routing library. There's one `search()` function that *is* Dijkstra, A\*, and the grade-aware variants — they're the same function with different cost and heuristic arguments. Dijkstra is just A\* with a zero heuristic. The cost function is where the domain lives: it reads a *directional* grade, so climbing a block costs more than descending it, which makes it a genuinely directed-graph problem. And the failure handling is deliberate — when every route has a steep block, I still return one and flag it, instead of saying 'no route.' I reserve 'no route' for a graph that's actually disconnected."
+> Under the hood it's one hand-rolled search function. I deliberately didn't use
+> OSRM or Valhalla, because then the project would just be tuning someone else's
+> cost weights. I wrote the priority queue, the graph, and the A* myself, and I
+> built it as a progression — plain Dijkstra first, then A* with a heuristic,
+> then the grade cost, then the directional cost — all the *same* function, just
+> swapping in different cost and heuristic arguments.
+>
+> There's no backend. The street graph is baked into a static file at build time
+> — that's where I spend the elevation-API budget — and at runtime the app just
+> loads it and routes locally. So routing has no network in the hot path at
+> all."
 
-Then stop. You've given them five places to pull: the pipeline, the offline artifact, the one-function search, the directional cost, the honest fallback. Let them pick.
+That's it. You named the what, the hook, the engineering decision, and the
+architecture — in four short beats. Notice what you *didn't* say: nothing about
+MapLibre, nothing about the address-bar autocomplete, nothing about Expo
+versions. Those are rows you skip unless asked.
 
 ```
-  WHERE THEY PULL AFTER THE 90s — map the branches
-
-  You finish the 90s pitch.
-        │
-        ├─► "Why hand-rolled and not a routing library?"
-        │     → Chapter 3. The graph work is the point of the
-        │       project; I wanted to own the algorithm, not call one.
-        │
-        ├─► "How does the directional cost work?"
-        │     → directedGrade(edge, fromNode) flips the sign by
-        │       which end you entered. cost.ts penalizes positive grade.
-        │
-        ├─► "Walk me through the architecture."
-        │     → Chapter 2. Go to the build-time/runtime diagram.
-        │
-        └─► "No backend at all? How does that work?"
-              → The graph is a read-only artifact bundled in the app;
-                tiles beyond it re-run the pipeline on-device.
+┃ "Cost is directional: uphill is penalized, downhill is
+┃  free. The cost from A to B is not the cost from B to A."
 ```
 
-╔═══════════════════════════════════════════════════╗
-║ WHEN YOU DON'T KNOW                                ║
-║                                                   ║
-║   They open with "what's the product strategy /   ║
-║   who are the users / what's the business model?"  ║
-║   flattr is a portfolio/learning project — there  ║
-║   is no user base or monetization, and pretending  ║
-║   otherwise collapses instantly.                  ║
-║                                                   ║
-║   Say:                                            ║
-║   "This is a project I built to go deep on graph  ║
-║    search and an offline-first mobile             ║
-║    architecture — it's not a product with users.  ║
-║    The problem is real, though: grade-aware       ║
-║    routing genuinely matters for scooters and     ║
-║    accessibility, and it gave me a real reason to  ║
-║    hand-roll A* with a directional cost."         ║
-║                                                   ║
-║   What this signals: you know the difference      ║
-║   between a learning project and a product, and    ║
-║   you're honest about which this is.              ║
-║                                                   ║
-║   Do NOT say:                                     ║
-║   "Well, the target market is urban commuters     ║
-║    and we'd monetize with…" — inventing a         ║
-║    business for a portfolio project reads as       ║
-║    insecure. Own that it's a craft project.       ║
-╚═══════════════════════════════════════════════════╝
+That single sentence is your hook. It's concrete, it's slightly surprising, and
+it tells the interviewer you understand graphs at a level beyond "I called a
+routing library." Lead with it every time you have more than 10 seconds.
 
-▸ Don't dress a learning project as a startup. "I built this to go deep on X" is a stronger sentence than a fake business model.
+### The 30-second hallway version
 
-## What you'd change
+> "I built flattr — a router that optimizes for flat routes instead of fast
+> ones, for walking and scooters. You set your max comfortable uphill grade and
+> it routes around the steep stuff. The fun part is the cost is directional —
+> uphill costs, downhill is free — so A-to-B isn't the same as B-to-A. It's a
+> hand-rolled A* over a graph I bake at build time. No backend."
 
-If I were re-pitching this, I'd resist the urge to mention the elevation API and the offline caching in the opener — they're real engineering, but they're not the *hook*, and naming them early buries the directional-cost story under plumbing. The pitch got tighter every time I cut a true-but-secondary detail out of the first 30 seconds. The discipline isn't adding the best parts; it's removing the merely-accurate ones until only the hook is left.
+### The 10-second elevator version
 
-## One-page summary
+> "A walking router that optimizes for *flat*, not fast. Hand-rolled A* with a
+> directional grade cost — uphill costs, downhill's free."
 
-**Core claim:** Lead with the product in four words — "flat, not fast" — and end every pitch on a hook that makes them ask the next question. Compression is the skill being tested.
+---
 
-- **"What'd you build?" (10s):** "Walking/scooter router that optimizes for flat, not fast — I hand-rolled the A\* over an elevation graph."
-- **"Tell me about a project." (30s):** product → the `userMax` knob → RN/offline → hook on directional cost (A→B ≠ B→A).
-- **"Walk me through it." (90s):** product (15s) → build-time/runtime split (45s) → the seam: one `search()` for all variants, directional cost, honest BLOCKED fallback (30s). Then stop.
-- **No business model?** Own that it's a craft/learning project with a real problem behind it. Don't fake a market.
+## Weak vs strong — the same 90 seconds, two ways
 
-┃ "Optimizes for flat, not fast." — the four words you never bury.
-┃ "Dijkstra is just A\* with a zero heuristic" — the one line that signals you own the algorithm.
+The failure mode here is real and common: candidates pitch the *framework* and
+the *features* instead of the *idea* and the *hard part*. Here's the contrast.
 
-**What you'd change:** Cut the elevation-API and caching details out of the opener — they're true but they bury the hook. Pitch the seam, not the plumbing.
+```
+┌──────────────────────────────┬──────────────────────────────┐
+│ WEAK PITCH                    │ STRONG PITCH                  │
+├──────────────────────────────┼──────────────────────────────┤
+│ "It's a React Native app      │ "It's a router that optimizes │
+│ with MapLibre. You type in    │ for flat instead of fast. The │
+│ two addresses and it draws a  │ cost function is directional — │
+│ route on the map. I used      │ uphill costs, downhill's free, │
+│ Expo for the build and there's│ so A→B ≠ B→A. Hand-rolled A*  │
+│ a slider for the grade and an │ over a graph I bake at build   │
+│ autocomplete search bar. It   │ time. No backend in the        │
+│ also has a heatmap of the     │ routing path."                 │
+│ street grades."               │                                │
+├──────────────────────────────┼──────────────────────────────┤
+│ Why it's weak:                │ Why it works:                  │
+│ Leads with the framework and  │ Leads with the idea and the    │
+│ a feature tour. Nothing here  │ one genuinely interesting      │
+│ separates it from a tutorial. │ technical decision. The        │
+│ The interviewer learns you    │ interviewer immediately has a  │
+│ can wire a map — not that you │ thread to pull ("wait, why is  │
+│ understand a graph. The hook  │ A→B different from B→A?") and  │
+│ (directional cost) is missing │ you've signaled graph depth in │
+│ entirely.                     │ one sentence.                  │
+└──────────────────────────────┴──────────────────────────────┘
+```
+
+The strong version is *shorter* and says *more*. That's the whole skill.
+
+```
+        ▸ Pitch the idea and the hard part. The
+          framework is the least interesting true
+          thing you can say about your project.
+```
+
+---
+
+## Where the pitch conversation goes next
+
+Your hook is bait — on purpose. Here's what the interviewer asks after the
+directional-cost line, and where you steer each branch.
+
+```
+  You drop the "A→B ≠ B→A" hook.
+        │
+        ├─► IF THEY ASK "why is it directional?"
+        │     "Because uphill effort and downhill effort
+        │      aren't the same. directedGrade flips the
+        │      sign by travel direction (graph.ts:17), and
+        │      the penalty only applies to positive grade
+        │      (cost.ts:16). Going down a hill is free."
+        │     → leads into Chapter 3 (the choices) and the
+        │       cost model.
+        │
+        ├─► IF THEY ASK "did you use a routing library?"
+        │     "No, deliberately. One hand-rolled search().
+        │      If I'd used OSRM this project would be config,
+        │      not graph work." → Chapter 3.
+        │
+        └─► IF THEY ASK "walk me through the architecture"
+              You're now in Chapter 2 territory. Draw the
+              build-time / runtime split, trace one tap.
+```
+
+You want every one of these. Each pulls you toward content you can defend
+deeply. That's why the hook leads.
+
+---
+
+## When they push on scale — the first "I don't know" box
+
+The pitch invites one trap immediately: the interviewer hears "router" and
+reaches for the Google-Maps comparison. Don't take that bait — name the gap
+before they make it a weakness.
+
+```
+╔═══════════════════════════════════════════════════════════════╗
+║ WHEN YOU DON'T KNOW                                            ║
+║                                                               ║
+║   They hear "router" and ask: "So how would this handle       ║
+║   millions of users? Live traffic? Distributed serving?"      ║
+║                                                               ║
+║   You have NOT built distributed systems at horizontal        ║
+║   scale. Don't improvise a sharding story you can't defend.   ║
+║                                                               ║
+║   Say:                                                         ║
+║   "I scoped this to be a graph-algorithms project, not a       ║
+║    scale project. There's no server — routing runs            ║
+║    on-device over a static graph. The DSA depth is real:      ║
+║    the cost model, the admissible heuristic, the              ║
+║    progression. The distributed-serving side — sharding the   ║
+║    graph, live traffic, load balancing under sustained        ║
+║    traffic — I haven't built, and I'd be guessing if I        ║
+║    sketched it. Happy to reason through it with you, but I'd   ║
+║    flag that it's outside what I've shipped."                  ║
+║                                                               ║
+║   What this signals: you know exactly where your project's    ║
+║   edge is. Naming the gap first reads as senior. The spec     ║
+║   itself says this (flattr-spec.md §15.1): name the gap        ║
+║   before a reviewer does.                                      ║
+║                                                               ║
+║   Do NOT say:                                                  ║
+║   "Oh I'd just add a load balancer and shard by region        ║
+║    and cache the hot routes in Redis..." — a hand-wave        ║
+║    through territory you haven't built collapses on the        ║
+║    first real follow-up. Chapter 4 makes the scale axes you   ║
+║    CAN defend explicit.                                        ║
+╚═══════════════════════════════════════════════════════════════╝
+```
+
+```
+┃ "I scoped this to be a graph-algorithms project,
+┃  not a scale project." — say this before they decide
+┃  the scale gap is a weakness.
+```
+
+---
+
+## What you'd change about the pitch
+
+If I were re-pitching flattr today, I'd add one quantified line to the 90-second
+version: the benchmark result. "A* expands roughly 4x fewer nodes than Dijkstra
+for the same path" (from `bench/run.ts`) turns the progression from a claim into
+a measured fact, and measured facts are what senior interviewers remember. The
+pitch as written is solid; adding one number would make it stick.
+
+---
+
+## One-page summary — Chapter 1
+
+**Core claim:** Lead with the idea and the hook (directional cost), not the
+framework. Compression is the skill being tested.
+
+**The pitch, three lengths:**
+- **10s** — "A walking router optimized for flat, not fast. Hand-rolled A* with a directional grade cost — uphill costs, downhill's free."
+- **30s** — add: you set max uphill grade; A→B ≠ B→A; baked at build time; no backend.
+- **90s** — add: the engine is one `search()` you wrote (not OSRM); built as a progression Dijkstra→A*→grade→directed.
+
+**Questions covered:**
+- "Tell me about a project you built" → 90-second answer, hook first.
+- "Why directional / did you use a library / walk me through it" → the follow-up tree.
+- "How does it scale to millions?" → name the gap (no server, scoped to DSA), don't improvise distributed systems.
+
+**Pull quotes:**
+- ┃ "Cost is directional: uphill is penalized, downhill is free. A→B is not B→A."
+- ▸ Pitch the idea and the hard part. The framework is the least interesting true thing.
+- ┃ "I scoped this to be a graph-algorithms project, not a scale project."
+
+**What you'd change:** Add one benchmark number to the 90-second pitch (A* ~4x fewer node expansions than Dijkstra) — turn the progression claim into a measured fact.

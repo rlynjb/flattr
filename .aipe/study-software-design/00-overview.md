@@ -1,99 +1,97 @@
-# Overview — the design shape of flattr
-## one-page orientation for the software-design audit
+# Overview — software design in flattr
 
-flattr is a hand-rolled grade-aware A* router. The design question that
-matters here isn't "does it find paths" — it's "where does the complexity
-live, and what hides it." This page puts you on the map before the audit and
-the pattern files zoom in.
+One page to orient before the audit. The whole repo is a routing engine
+plus a thin map UI, and almost every interesting design decision is about
+*where grade knowledge is allowed to live*. Hold that one question and the
+architecture reads itself.
 
 ## The layers
 
-Here's the whole system as bands, with the module-design hotspots marked.
+flattr splits cleanly into build-time and run-time, with a pure core that
+both share. Here's the whole system as bands, with the design seams marked.
 
 ```
-  flattr — layers, with the design-relevant boxes marked
+  flattr — the layers, with the design seams marked
 
-  ┌─ UI layer (mobile/src) ──────────────────────────────────────┐
-  │  MapScreen.tsx   AddressBar   GradeSlider   Legend            │
-  │  useTileGraph.ts   ★ complexity hotspot ★                     │ ← deepest
-  └───────────────────────────┬──────────────────────────────────┘   leak risk
-                              │ calls (run-time)
-  ┌─ Engine layer (features/) ▼──────────────────────────────────┐
-  │  routing/astar.ts   ★ deepest module: one search(), 4 algos ★ │ ← the point
-  │  routing/cost.ts    ★ the domain seam: penalty() ★            │   of the repo
-  │  routing/pqueue.ts  routing/graph.ts  routing/summary.ts      │
-  │  grade/classify.ts  grade/zones.ts   map/geojson.ts  tiles.ts │
-  └───────────────────────────┬──────────────────────────────────┘
-                              │ consumes the artifact / shares modules
-  ┌─ Pipeline layer (pipeline/) ▼────────────────────────────────┐
-  │  osm  overpass  elevation  split  grade  build-graph          │ ← build-time
-  │  build-graph.ts  ★ clean orchestrator: 5 stages, 1 call ★     │   (mostly)
-  └───────────────────────────┬──────────────────────────────────┘
-                              │ depends on
-  ┌─ Utility layer (lib/) ────▼──────────────────────────────────┐
-  │  geo.ts  (haversine)                                          │
-  └───────────────────────────────────────────────────────────────┘
+  ┌─ UI layer (mobile/, Expo + RN) ───────────────────────────────┐
+  │  MapScreen.tsx · GradeSlider · AddressBar · RouteSummaryCard   │
+  │  useTileGraph.ts  ← single-flight pump (07)                    │
+  └─────────────────────────────┬──────────────────────────────────┘
+                                │  Graph (in-memory), userMax (number)
+  ┌─ Core: features/routing (pure, framework-free) ────────────────┐
+  │  astar.ts   search()  ← parametric over (costFn, heuristic) (01)│
+  │  bidirectional.ts                                              │
+  │  pqueue.ts  ← lazy-deletion heap (04)                          │
+  │  cost.ts    ← THE domain seam: penalty, BLOCKED (02, 05)       │
+  │  graph.ts   ← directedGrade: derive, don't store (03)          │
+  └─────────────────────────────┬──────────────────────────────────┘
+                                │  Graph artifact (graph.json) OR
+                                │  on-device tile build
+  ┌─ Build pipeline (pipeline/, build-time + on-device tiles) ─────┐
+  │  osm → split → sampleElevations → grade → buildAdjacency       │
+  │  elevation.ts  ← ElevationProvider interface (06)              │
+  └────────────────────────────────────────────────────────────────┘
 ```
 
-## The central seam — trace one axis
+The dependency arrow points **inward**: UI and pipeline both depend on the
+pure core (`features/routing/types.ts` is the shared vocabulary); the core
+depends on nothing but `lib/geo.ts`. `build-graph.ts:2` even refuses to
+import `node:fs` so the pipeline can bundle into the mobile app for on-device
+tile building. That inward-pointing arrow is the single most important
+structural fact in the repo.
 
-Pick the axis **"who decides the cost of an edge?"** and trace it across the
-engine. The whole design turns on where the answer flips.
+## The one axis that makes the design pop
+
+Pick one question and trace it through every layer: **who knows what "grade"
+means?**
 
 ```
-  Axis: "who decides what an edge costs?" — traced across the seam
+  axis traced = "who knows the grade domain?"
 
-  ┌─ search() in astar.ts ────┐   CostFn seam   ┌─ cost.ts ──────────┐
-  │ does NOT know about grade │ ═══════╪═══════►│ penalty() decides  │
-  │ just calls costFn(edge…)  │   (it flips)    │ grade vs distance  │
-  └───────────────────────────┘                 └────────────────────┘
-         ▲                                              ▲
-         └────────── same axis, two answers ────────────┘
-            search() owns the traversal; cost.ts owns the domain.
-            That seam is why one function is four algorithms.
+  ┌─ search loop (astar.ts) ──┐  knows: cost is a number to minimize
+  │  costFn(edge, from, max)  │  knows NOTHING about grade
+  └─────────────┬──────────────┘
+                │  seam: the CostFn type
+  ┌─ cost.ts ───▼──────────────┐  knows: penalty curve, BLOCKED, userMax,
+  │  penalty(), gradeCost*     │         downhill-is-free
+  └─────────────┬──────────────┘
+                │  seam: directedGrade(edge, from)
+  ┌─ graph.ts ──▼──────────────┐  knows: sign flips with travel direction
+  │  directedGrade()           │  knows NOTHING about penalty/cost
+  └────────────────────────────┘
+
+  three layers, three disjoint pieces of knowledge — no overlap
 ```
 
-That `CostFn` seam (`features/routing/types.ts:40`) is the load-bearing
-design decision in the repo. Everything in Pass 2 either lives behind it
-(`01`, `02`, `05`), supports it (`03`, `04`), or is the place the discipline
-broke down (`06`).
+The answer flips cleanly at every seam, and — this is the win — **no two
+layers know the same fact**. The search loop never mentions grade. `cost.ts`
+never mentions the frontier. `graph.ts` knows the sign convention but not the
+penalty. That's information hiding working as designed.
 
-## The ranked verdict
+## The seams (where to study before the internals)
 
-Per the verdict-first rule, here's the call before the long audit:
+| Seam | Contract | Axis that flips | Deep walk |
+|------|----------|-----------------|-----------|
+| `CostFn` type (`types.ts:40`) | `(edge, fromNodeId, userMax) → number` | domain knowledge: agnostic → grade-aware | `01`, `02` |
+| `directedGrade` (`graph.ts:17`) | signed grade in travel direction | undirected storage → directed query | `03` |
+| `BLOCKED` (`cost.ts:5`) | large-finite, not Infinity | "too steep" → "disconnected" | `05` |
+| `ElevationProvider` (`elevation.ts:7`) | `sample(points) → number[]` | which DEM source / cache / fallback | `06` |
+| `PQueue` (`pqueue.ts:4`) | `push(item, priority)` / `pop()` | knows graph → knows nothing | `04` |
 
-- **Deepest module:** `features/routing/astar.ts` — one `search()`
-  (lines 22–78) over a substantial body (lazy-deletion A*, closed set,
-  reconstruct, summarize) behind a tiny surface. Four public algorithms
-  (`dijkstra`, `astar`, `gradeAstar`, `directedAstar`, lines 136–163) are
-  one-line wrappers that just pick a `(costFn, heuristicFn)` pair. This is the
-  best deep-module example in the repo. → `01`.
+## What the audit concluded
 
-- **Shallowest / leakiest interface:** `mobile/src/useTileGraph.ts` — a React
-  hook whose interface (`graph`, `loadingStep`, `onRegionDidChange`,
-  `ensureBbox`) is small, but whose body leaks build-time knowledge
-  (Overpass, Open-Meteo, batch sizes, rate-limit backoff, DEM resolution) up
-  into the UI layer. The hook *looks* deep but its complexity is borrowed from
-  layers below it. → `06`.
+- **Strengths (named with files):** `search()` is the deepest module in the
+  repo — four algorithm stages behind one signature. `cost.ts` is a clean
+  domain seam, 33 lines holding the entire grade model. `PQueue` knows
+  nothing about graphs. Comments explain *why* (`cost.ts:4`, `useTileGraph.ts:18`).
+- **The two real smells:** `nearestNode` (`nearest.ts:5`) is an O(n) scan
+  over every node on every tap; `edgeById` (`graph.ts:3`) is an O(E)
+  `.find()` that `summarizePath` and `routeSummary` call in a loop. Both are
+  correctness-fine and speed-suboptimal — see `audit.md` Lens 1 and Lens 8.
+- **Honest gaps:** error handling is thin by design (the core is pure
+  functions that return `null` paths, not exceptions); there's no
+  configuration-explosion problem because there's almost no configuration.
+  These lenses get "lightly exercised" verdicts, not invented findings.
 
-- **Biggest complexity risk:** also `useTileGraph.ts` — the `pump()` function
-  (lines 89–129) carries a single-flight mutex, two pending slots with
-  priority ordering, ref/state duplication, and a fire-and-forget async IIFE
-  with a swallowed catch. This is the change-amplification and unknown-unknowns
-  hotspot: a bug here is hard to even reproduce. → `06`.
-
-## What this repo does *not* exercise
-
-Honest gaps, so the audit doesn't manufacture findings:
-
-- **Deep inheritance / classitis at scale** — the codebase is almost entirely
-  pure functions and one tiny class (`PQueue`). There's no class hierarchy to
-  critique. APOSD's "classitis" red flag barely fires.
-- **Scattered exception handling** — errors are mostly *defined out*
-  (`BLOCKED`) or thrown at one obvious place (`otherEnd`, `nearestNode`). The
-  "try/except everywhere" red flag fires only in the mobile layer.
-- **Pass-through layering smell** — the engine layers earn their place. The
-  one borderline case is `build-graph.ts`, and it's defensible (see audit
-  Lens 4).
-
-Read `audit.md` next for the full lens-by-lens walk.
+Start with `audit.md` for the full lens walk, then drop into whichever
+pattern file the audit cross-links to.

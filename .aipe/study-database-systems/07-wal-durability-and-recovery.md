@@ -1,317 +1,285 @@
 # WAL, durability, and recovery
 
-**Industry name(s):** write-ahead log / durability (the D in ACID) / backup &
-restore · **Type:** Industry standard — **mostly `not yet exercised`.** There's
-no WAL and no runtime durability concern, because nothing is written at runtime.
-The real durability story is "rebuild the artifact."
+**Industry name(s):** write-ahead log / durability (the D in ACID) / fsync /
+crash recovery / backup & restore · **Type:** Industry standard.
+
+> **Status in flattr: WAL `not yet exercised`; durability exercised weakly via
+> one store.** flattr has no write-ahead log. Its only durable write path is the
+> elevCache's debounced `AsyncStorage.setItem` (`elevCache.ts:53`), which is where
+> the real (and thin) durability + recovery lessons live. This file teaches WAL in
+> full and grounds durability/recovery in that one store.
 
 ## Zoom out, then zoom in
 
-Verdict first: **flattr has no write-ahead log and needs none, because it never
-writes data at runtime.** A WAL exists to make writes survive a crash — log the
-change before applying it, replay the log on restart. flattr's data is written
-once, offline, and read-only thereafter, so there's no in-flight write to protect
-and nothing to replay. Its "recovery" is regenerating the artifact from source.
-
 ```
-  Zoom out — where durability is (and isn't) a concern
+  Zoom out — durability is the floor under every write
 
-  ┌─ Build layer (the only write) ───────────────────────────────────┐
-  │  pipeline reads OSM + elevation ──► writeFileSync(graph.json)     │
-  │      durability question lives HERE (weakly) ──► f.below          │
-  └───────────────────────────┬──────────────────────────────────────┘
-  ┌─ Storage ─────────────────▼──────────────────────────────────────┐
-  │  graph.json — the artifact. "Backup" = the build inputs + script  │
-  │  "Restore" = npm run build:graph                                  │
-  └───────────────────────────┬──────────────────────────────────────┘
-  ┌─ Runtime ─────────────────▼──────────────────────────────────────┐
-  │  reads only · ✗ no WAL · ✗ no fsync · ✗ no crash recovery ✗       │
-  │  a crash loses only in-memory search state (recomputed for free)  │
-  └───────────────────────────────────────────────────────────────────┘
+  ┌─ App layer ──────────────────────────────────────────────┐
+  │  putElev(cell, elev)  → in-memory Map (volatile)          │
+  └────────────────────────────┬─────────────────────────────┘
+  ┌─ Durability layer ─────────▼─────────────────────────────┐
+  │  ★ debounced setItem → AsyncStorage (the durability seam) ★│ ← we are here
+  │  ✗ NO write-ahead log · ✗ no fsync control · ✗ no backup  │
+  └────────────────────────────┬─────────────────────────────┘
+  ┌─ Physical layer ───────────▼─────────────────────────────┐
+  │  device storage (SQLite-backed AsyncStorage on RN)        │
+  └───────────────────────────────────────────────────────────┘
 ```
 
-Zoom in: the question is *"if the process crashes, what data is lost and how do
-you get it back?"* flattr's answer: at runtime, *nothing* is lost — the data is a
-read-only file, and any in-flight computation (an A* search) just re-runs. The
-only durable thing is the artifact, and it's recoverable by rebuilding.
+Zoom in. Durability is the promise that *once a write is committed, a crash can't
+lose it.* The hard part is that "writing to disk" isn't atomic at the hardware
+level — a crash mid-write leaves a torn page — so databases write the *intent*
+to a sequential log (the WAL) *before* touching the real data, so recovery can
+replay or undo. flattr has no WAL because its writes are whole-blob single calls
+(no torn-page risk, `02`) — but it *also* has a durability *window* during the
+debounce where writes are committed in memory but not yet on disk. That window is
+the lesson.
 
 ## The structure pass
 
-**Layers.** Build (writes the file), storage (holds it), runtime (reads it). The
-durability concern only touches the build→storage seam.
+**Layers** (by where a write lives, volatile → durable):
+1. **In-memory** — the elevCache `Map` (`elevCache.ts:11`). Volatile.
+2. **The debounce window** — committed to `Map`, scheduled but not yet persisted.
+3. **On disk** — after `setItem` resolves. Durable (as durable as AsyncStorage).
 
-**The axis: failure — what's lost on a crash, and how is it recovered?** Trace it
-down the stack and watch "what's lost" shrink to nothing at runtime:
+**Axis traced — "if the process dies right now, is this write gone?"**
 
 ```
-  Axis = "crash now — what's lost, how recovered?"
+  axis — "crash → is the write lost?" — across the write's life
 
-  ┌─ Build layer ─────────────────────────────────┐
-  │  crash mid-writeFileSync                        │  → corrupt graph.json;
-  │                                                 │    recover: rerun build
-  └───────────────────────────┬─────────────────────┘
-  ┌─ Storage ─────────────────▼─────────────────────┐
-  │  file lost / corrupt                            │  → recover: rebuild from
-  │                                                 │    OSM + elevation source
-  └───────────────────────────┬─────────────────────┘
-  ┌─ Runtime ─────────────────▼─────────────────────┐
-  │  crash mid-search                               │  → lose ONLY in-memory
-  │                                                 │    search state → re-run,
-  │                                                 │    costs nothing durable
-  └───────────────────────────────────────────────────┘
+  ┌─ putElev returns ───────────────────────┐
+  │  in Map, dirty=true, timer scheduled     │  CRASH → LOST (not on disk yet)
+  └────────────────────┬─────────────────────┘
+       seam ═══════════╪═══════  (the 4-second debounce window)
+  ┌─ persistNow runs setItem ──▼─────────────┐
+  │  awaiting AsyncStorage write              │  CRASH → maybe lost (in flight)
+  └────────────────────┬─────────────────────┘
+       seam ═══════════╪═══════  (setItem resolves)
+  ┌─ on disk ──────────▼─────────────────────┐
+  │  AsyncStorage blob committed              │  CRASH → SAFE
+  └───────────────────────────────────────────┘
 ```
 
-**Seams.** The one durability-relevant seam is the build's `writeFileSync`. It's
-where data becomes durable, and it has a small, concrete weakness: it's not
-crash-atomic (no temp-file + rename). That's the single actionable item in this
-whole file. Everything else is correctly `not yet exercised`.
+The axis-answer is "lost" for up to 4 seconds after every `putElev`. That's the
+durability gap (red-flag #3). It's an *acceptable* gap — the lost data is just
+cached elevation that gets re-fetched — but it's a real one, and naming it is the
+point. A WAL is the mechanism that shrinks that window to ~zero for data you can't
+afford to re-derive.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You know `localStorage.setItem` — it persists synchronously and survives a reload,
-but if the tab crashes mid-write the value can be half-written. A WAL is the
-database's answer to that: write the *intent* to a log first, so a crash can
-replay it. flattr is closer to the `localStorage` end — one synchronous file
-write — but it sidesteps the crash problem entirely at runtime by never writing
-at runtime.
+You know `localStorage.setItem` blocks until it's written, but a `setState`
+followed by an unmount loses the state. flattr's elevCache sits between those: a
+write is instantly in memory (like `setState`) but only *eventually* on disk
+(unlike `setItem`). The debounce is a deliberate bet — coalesce many writes into
+one disk hit — and the cost of that bet is a window where "committed in memory"
+≠ "safe on disk." A WAL is what you build when you can't afford that window.
 
 ```
-  The pattern — durability is "survive a crash with no data loss"
+  the pattern — WAL: log the intent before touching the data
 
-  WAL approach:   log change ─► fsync log ─► apply ─► (crash? replay log)
-  flattr approach: data is read-only at runtime ─► crash loses nothing durable
-                   data is rebuildable from source ─► "restore" = rebuild
+  WRITE:  append "change X to v" to LOG (sequential, fast, fsync'd)
+          ──► THEN apply the change to the data pages (can be lazy)
+  CRASH:  replay the LOG from the last checkpoint → data is reconstructed
+          ──► committed-but-unapplied changes are redone; partial ones undone
+       ▲ the log is the source of truth for durability; data pages catch up
 ```
 
-### Move 2 — what's here, what's absent
+The insight: appending to a sequential log and fsync'ing *that* is far cheaper
+than fsync'ing scattered data pages — so WAL makes durable commits fast *and*
+crash-safe. flattr's whole-blob write is the opposite trade: no log, but the data
+write itself is the durable commit (slower per write, but coalesced by debounce).
 
-#### Runtime durability: a non-problem by design
+### Move 2 — flattr's durability mechanism, one piece at a time
 
-If the Expo app crashes mid-route, what's lost? The A* search's `g`/`came`/
-`closed` maps — all in-memory, all recomputed in milliseconds on the next request.
-The `graph.json` is untouched (it's read-only and bundled). So a runtime crash
-has *zero* durable data loss. There's nothing to fsync, nothing to log, nothing
-to recover. This is the clean payoff of the read-only design.
+**The debounce — write coalescing.** `putElev` doesn't write to disk; it marks
+dirty and schedules:
 
-```
-  Runtime crash — nothing durable is lost
-
-  crash during A* ──► lose g/came/closed (in-memory) ──► next request recomputes
-  graph.json ──────► untouched (read-only bundle) ──────► no recovery needed
-```
-
-#### The artifact's durability: source + script, not a backup
-
-The `graph.json` isn't backed up in the database sense. Its durability comes from
-being *reproducible*: the build inputs (OSM via Overpass, elevation via
-Open-Meteo, the bbox in `pipeline/config.ts`) plus the build script regenerate
-it. Lose the file, run `npm run build:graph`, get it back. The "backup" is the
-source data and the deterministic pipeline.
-
-```
-  "Restore" = rebuild from source
-
-  lost graph.json ──► npm run build:graph ──► fetch OSM + elevation ──► rebuild
-       │                                                                  │
-       └─ caveat: not perfectly reproducible — OSM data and the Open-Meteo
-          DEM can change between builds, and the API 429s under load (project
-          memory). So the rebuild restores a CURRENT graph, not a byte-identical
-          one. For a street graph that's fine; for a system needing exact
-          reproducibility you'd snapshot the raw inputs too.
+```ts
+// mobile/src/elevCache.ts:35-40 — commit to memory, schedule the disk write
+export function putElev(key: string, value: number): void {
+  if (mem.has(key)) return;                  // line 36: idempotent — never overwrite
+  mem.set(key, value);                       // line 37: COMMIT to volatile memory
+  dirty = true;                              // line 38: mark there's unpersisted state
+  if (!persistTimer)                         // line 39: only ONE timer in flight
+    persistTimer = setTimeout(persistNow, PERSIST_DEBOUNCE_MS);  // 4s window
+}
 ```
 
-#### The one concrete gap: the build write isn't crash-atomic
+Line 37 is the in-memory commit (instantly visible to `getElev`). Line 39 ensures
+N puts within 4 seconds produce *one* disk write, not N — the coalescing. The cost
+is line 38's `dirty` flag describing data that exists only in RAM until the timer
+fires.
 
-`writeFileSync(path, JSON.stringify(graph))` writes in place. If the build crashes
-mid-write (or the disk fills), `graph.json` is left corrupt — and a corrupt
-artifact fails to parse at load, breaking the app. The standard fix is the atomic-
-write pattern: write to `graph.json.tmp`, then `rename` it over `graph.json`
-(rename is atomic on POSIX). One small change, closes the only durability hole.
+**The flush — the actual durable write.** `persistNow` is flattr's "checkpoint":
 
-```
-  Atomic write — the fix for the one gap
-
-  now:  writeFileSync("graph.json", json)            ✗ crash → corrupt file
-  fix:  writeFileSync("graph.json.tmp", json)
-        rename("graph.json.tmp", "graph.json")        ✓ crash → old file intact
-                                                        (rename is atomic)
-```
-
-#### WAL specifically: not present, not needed
-
-A WAL's job is to recover *uncommitted in-flight writes* after a crash. flattr has
-no in-flight writes at runtime, and the build is a single batch write (no
-incremental commits to log). So there is no WAL and adding one would protect
-nothing. Correctly `not yet exercised`.
-
-#### Move 2.5 — current vs future state
-
-```
-  Phase A (now): rebuild-as-recovery        Phase B (user edits persist)
-
-  data read-only → crash loses nothing      edits written → crash can lose them
-  restore = rebuild from source             restore = backup + WAL replay
-  no fsync, no WAL                           need fsync on commit, WAL for replay
-  build write not crash-atomic (small gap)   need a real durable write path
-  reproducible-ish from OSM                  edits aren't in OSM → must back up
+```ts
+// mobile/src/elevCache.ts:42-57 — the flush + its only recovery affordance
+async function persistNow(): Promise<void> {
+  persistTimer = null;
+  if (!dirty) return;                        // line 44: nothing to flush
+  dirty = false;                             // line 45: clear BEFORE the await (see note)
+  try {
+    let entries = [...mem.entries()];        // snapshot whole map (whole-blob write)
+    // …FIFO cap to MAX_ENTRIES…
+    await AsyncStorage.setItem(STORAGE_KEY,  // line 53: the durable write
+      JSON.stringify(Object.fromEntries(entries)));
+  } catch {
+    dirty = true;                            // line 56: write FAILED → re-mark for retry
+  }
+}
 ```
 
-The trigger, again, is the first persisted runtime write. The moment a user edit
-must survive a crash, "rebuild from OSM" stops working (OSM doesn't have the
-user's edit), and you need real durability: fsync-on-commit, a WAL, and backups of
-the mutable store.
+Line 53 is the durability boundary — before it the data is volatile, after it
+resolves it's on disk. Line 56 is flattr's *entire* recovery story for a failed
+write: on error, re-set `dirty` so the next `putElev` reschedules a flush. That's
+a crude retry, not a WAL — there's no log of *which* writes were pending, just
+"something's dirty, try again." **Inference:** clearing `dirty=false` at line 45
+*before* the await means a `putElev` arriving *during* the in-flight `setItem`
+sets `dirty=true` again and correctly schedules another flush — so concurrent puts
+aren't lost. But if the *write itself* fails, the catch re-marks dirty; the subtle
+correctness here is that the snapshot already includes all puts up to line 47, so
+re-flushing is safe (idempotent whole-blob write). It works, but it's reasoning
+flattr gets right by luck of the whole-blob design, not by an explicit log.
+
+**Recovery on startup — load, don't replay.** flattr's "crash recovery" is just
+reloading the last persisted blob:
+
+```ts
+// mobile/src/elevCache.ts:17-29 — recovery = re-read the blob, tolerate corruption
+export async function loadElevCache(): Promise<void> {
+  if (loaded) return;                        // line 18: idempotent
+  loaded = true;
+  try {
+    const raw = await AsyncStorage.getItem(STORAGE_KEY);
+    if (raw) {
+      const obj = JSON.parse(raw) as Record<string, number>;
+      for (const k in obj) if (!mem.has(k)) mem.set(k, obj[k]);  // line 24: merge in
+    }
+  } catch {
+    // line 26: corrupt/unavailable → start from whatever's in memory
+  }
+}
+```
+
+Line 24 merges the persisted blob into memory; line 26 is the durability/
+availability tradeoff — a corrupt blob is *swallowed*, not surfaced, and the cache
+starts empty. For a re-derivable cache that's the right call (worst case: re-fetch
+elevations). For real data it would be silent data loss. The `.v1` in `STORAGE_KEY`
+(line 7) is the one piece of *recovery-schema* discipline here — bump it and old
+incompatible blobs are ignored cleanly instead of mis-parsed. That's the schema
+version `graph.json` lacks (red-flag #2).
+
+**Why there's no WAL — and when there would be.** A WAL exists to make
+*partial-write* and *lost-recent-write* survivable for data you can't re-derive.
+flattr's data is either immutable+re-buildable (the graph) or re-fetchable (the
+cache), so it can afford to lose a recent write — re-derive it. The trigger for a
+real WAL is **durable user-authored data that can't be re-derived**: saved routes,
+preferences, sync state. The moment flattr stores something a user *created*
+(not something it *computed*), the 4-second loss window stops being acceptable and
+you need either synchronous writes or a real engine's WAL.
+
+### Move 2.5 — current vs future
+
+```
+  Phase A (now)                      Phase B (durable user data / Postgres)
+
+  write: debounced whole-blob        write: WAL append (fsync) → lazy data apply
+  durability gap: up to 4s lost      durability gap: ~0 (committed = logged)
+  recovery: re-read last blob;       recovery: replay WAL from checkpoint;
+            swallow corruption                 redo committed, undo partial
+  backup: none (it's a cache)        backup: base backup + WAL archive (PITR)
+  carries over: the GRAPH still needs no WAL (immutable). Only new
+                user-authored, non-re-derivable data does.
+```
 
 ### Move 3 — the principle
 
-**Reproducible data needs no backup; rebuildable beats recoverable.** flattr's
-durability strategy is to keep its data a pure function of versioned inputs, so
-"recovery" is "recompute." The general lesson: data you can deterministically
-regenerate from source doesn't need WAL/backup machinery — but the moment data
-becomes a *fact only your system knows* (a user's edit), reproducibility breaks
-and real durability becomes mandatory.
+Durability is a *window*, not a switch — the question is never "is it durable?"
+but "how long is the gap between commit-in-memory and safe-on-disk, and can I
+afford to lose what's in that gap?" flattr made the gap 4 seconds because the only
+thing in it is re-derivable cache data. A WAL is the mechanism that drives the gap
+to near-zero by logging intent sequentially before touching data — you reach for
+it exactly when the data in the window can't be reconstructed. Reading a system
+for "what's the durability window, and what's the cost of losing it" tells you
+whether a missing WAL is a bug or a correct simplification.
 
 ## Primary diagram
 
-The full durability picture: the reproducible artifact, the runtime non-problem,
-the one atomic-write gap.
-
 ```
-  flattr durability & recovery — full picture
+  flattr's durability path vs the WAL it doesn't have
 
-  ┌─ BUILD ──────────────────────────────────────────────────────────┐
-  │  OSM + elevation (versioned source) ──► buildGraph ──►            │
-  │  writeFileSync(graph.json)  ◄── ✗ NOT crash-atomic (one gap;      │
-  │                                    fix = temp file + rename)      │
-  └───────────────────────────┬──────────────────────────────────────┘
-  ┌─ STORAGE ─────────────────▼──────────────────────────────────────┐
-  │  graph.json — "backup" = source + script · "restore" = rebuild   │
-  │  (reproducible-ish: OSM/DEM may drift between builds)            │
-  └───────────────────────────┬──────────────────────────────────────┘
-  ┌─ RUNTIME ─────────────────▼──────────────────────────────────────┐
-  │  read-only · crash loses only in-memory search state (recomputed)│
-  │  ✗ no WAL  ✗ no fsync  ✗ no crash recovery  — none needed         │
-  │  [Phase B] persisted edits → WAL + fsync + backups land here      │
-  └───────────────────────────────────────────────────────────────────┘
-```
-
-## Implementation in codebase
-
-**Use cases.** Durability is a build-time-only concern. The "recovery" path is a
-developer running `npm run build:graph` when the data is stale or the file is
-lost. At runtime, durability is never exercised.
-
-**The one durable write (and its gap) — `pipeline/run-build.ts` (lines 10-13, 46-48):**
-
-```
-  function writeGraph(graph: Graph, path: string): void {
-    writeFileSync(path, JSON.stringify(graph));   ← NOT crash-atomic: a crash or
-  }                                                 full disk mid-write leaves a
-  ...                                               corrupt graph.json that fails
-  mkdirSync("data", { recursive: true });           to parse at load
-  writeGraph(graph, "data/graph.json");
-       │
-       └─ THE one durability gap in the repo. Fix: write to a .tmp path then
-          rename over the target (atomic on POSIX). Without it, an interrupted
-          build can break the app's data load.
-```
-
-**The reproducibility source — `pipeline/run-build.ts` (lines 22-43):**
-
-```
-  function pickElevation(): Picked {
-    const key = process.env.GOOGLE_ELEVATION_KEY;   ← source of elevation truth
-    if (key) return { provider: googleProvider(key), ... };   (paid, best)
-    if (FLAT_ELEVATION) return { fixtureProvider(()=>0) };     (offline fallback)
-    return { provider: openMeteoProvider(), ... };             (free, default)
-  }
-  ...
-  const osm = await fetchOverpass(BBOX);            ← source of street truth
-       │
-       └─ the artifact is a function of these inputs. "Restore" re-runs them.
-          But they can drift (OSM edits, DEM changes) and Open-Meteo 429s under
-          load (project memory) — so the rebuild is reproducible-ish, not exact.
-```
-
-**Proof of zero runtime durability concern — `features/routing/astar.ts` (lines 30-77):**
-
-```
-  const g = new Map(); const came = new Map(); const closed = new Set();
-  ...the search mutates these...
-  return { path, nodesExpanded, pushes, pops };
-       │
-       └─ all search state is in-memory and discarded on return. A crash mid-
-          search loses only this, and the next request recomputes it for free.
-          Nothing here ever touches disk — so there's nothing to make durable.
+  ┌─ flattr (now) ─────────────────────────────────────────────┐
+  │ putElev ─► Map (volatile) ─► dirty=true ─► [4s debounce] ─► │
+  │           setItem whole blob ─► AsyncStorage (durable)      │
+  │ recovery: loadElevCache re-reads blob; corruption swallowed │
+  │ GAP: up to 4s of writes lost on crash (acceptable: cache)   │
+  └─────────────────────────────────────────────────────────────┘
+  ┌─ a real WAL (not present; the upgrade path) ───────────────┐
+  │ write ─► append intent to LOG ─► fsync(log) ─► COMMIT ack   │
+  │        ─► apply to data pages lazily                        │
+  │ recovery: replay log from checkpoint (redo/undo)            │
+  │ GAP: ~0 — committed means logged means survivable           │
+  └─────────────────────────────────────────────────────────────┘
+   trigger to cross: durable user-authored, non-re-derivable data
 ```
 
 ## Elaborate
 
-WAL and crash recovery are among the most intricate parts of a real database, and
-they're genuinely absent here — the right answer, not a gap, given read-only
-runtime data. The disciplined move is to locate the *one* place durability is a
-real concern (the build write) and name its *one* real weakness (not crash-atomic),
-rather than imagine a WAL the system doesn't need.
+WAL is the single most important durability mechanism in databases, and it does
+double duty: it makes commits *fast* (one sequential fsync beats many scattered
+ones) *and* crash-safe (replay reconstructs committed work). It's also the
+substrate for two things beyond this file — **point-in-time recovery** (archive
+the WAL, replay to any moment) and **replication** (ship the WAL to a replica and
+replay it there — `08`'s mechanism is literally streaming this log). So WAL is the
+hinge between durability, recovery, and replication; understand it once and three
+chapters connect.
 
-The transferable insight is the rebuild-as-recovery strategy: when your data is a
-deterministic function of versioned source, you replace backup/restore with
-recompute. This is the same instinct as infrastructure-as-code and reproducible
-builds — and it has the same limit. The day your system records a fact that isn't
-in the source (a user's edit, a transaction), recompute can't recover it, and you
-inherit the full durability problem: fsync-on-commit, a WAL for in-flight writes,
-and real backups. flattr lives entirely on the recompute side of that line.
-
-What to read next: `08` — replication, the last `not yet exercised` topic, where
-"one bundled copy" means there's no lag or stale-read story to tell.
+flattr's "swallow corruption, start empty" recovery is the right move for a cache
+and exactly the *wrong* move for data — the difference is whether you can
+re-derive. Your `AdvntrCue` Postgres gets WAL for free (it's on by default) and
+its session memory survives a crash because of it; your `buffr` SQLite store uses
+SQLite's WAL mode for the same reason. flattr is the one project in your portfolio
+whose data is disposable enough to skip it — and recognizing *that's why* is the
+signal.
 
 ## Interview defense
 
-**Q: "What's this system's durability and recovery story?"**
+**Q: "What's flattr's durability story?"**
 
-> Runtime durability is a non-problem — the data is a read-only file, so a crash
-> loses only in-memory search state, which recomputes for free. The only durable
-> write is the build's `writeFileSync`, and durability there means "the artifact
-> is reproducible": lose `graph.json`, run `npm run build:graph`, rebuild it from
-> OSM and elevation. There's no WAL because there are no in-flight writes to
-> replay. The one real gap is that the build write isn't crash-atomic — a crash
-> mid-write corrupts the file. Fix is a temp-file-plus-rename, one line.
-
-```
-  runtime crash → lose nothing durable    build write → reproducible (rebuild)
-  WAL: not needed (no in-flight writes)   gap: writeFileSync not crash-atomic
-```
-
-Anchor: *rebuildable beats recoverable — recovery is `npm run build:graph`.*
-
-**Q: "Is the rebuild a perfect backup?"**
-
-> No — it's reproducible-*ish*. The graph is a function of OSM and the elevation
-> DEM, and both can change between builds (plus Open-Meteo 429s under load). So a
-> rebuild gives you a *current* graph, not a byte-identical one. Fine for a street
-> graph; if you needed exact reproducibility you'd snapshot the raw inputs too.
+> One store: the elevCache. A `putElev` commits to an in-memory Map instantly,
+> then a 4-second debounce coalesces writes into one whole-blob `setItem` to
+> AsyncStorage (`elevCache.ts:53`). So there's a durability window — up to 4
+> seconds of writes are lost on a crash. That's acceptable because the data is
+> just cached elevations that get re-fetched. Recovery is re-reading the blob on
+> startup, swallowing corruption and starting empty. No WAL, because nothing in
+> the window is non-re-derivable.
 
 ```
-  source (OSM + DEM) ──► rebuild ──► current graph (not byte-identical)
+  putElev → Map (gap: up to 4s) → setItem → disk
+  recovery = re-read blob; corruption → empty (cache, so fine)
 ```
 
-Anchor: *data reproducible from drifting source is recoverable-as-current, not exact.*
+Anchor: *durability is a window; flattr made it 4 seconds wide because the only
+thing in it is re-derivable cache data.*
 
-## Validate
+**Q: "When would flattr need a WAL?"**
 
-1. **Reconstruct:** explain why a runtime crash loses no durable data, using the
-   in-memory-search-state argument (`astar.ts:30-77`).
-2. **Explain:** what's the one durability gap in the repo, and what's the one-line
-   fix? (`run-build.ts:12`; temp file + rename.)
-3. **Apply:** a user edits an edge and it must survive a crash. Why does
-   "rebuild from OSM" no longer work, and what do you add?
-4. **Defend:** someone says "you have no backups, that's irresponsible." Counter
-   it using the reproducible-artifact argument (`run-build.ts:22-43`) and name
-   its actual limit (input drift).
+> The instant it stores user-authored, non-re-derivable data — saved routes, sync
+> state. Then losing the 4-second window is real data loss, and I'd either write
+> synchronously or move to an engine with a WAL. The WAL also unlocks point-in-
+> time recovery and replication, since both are just replaying the log elsewhere.
+
+Anchor: *you need a WAL when the data in the durability window can't be
+reconstructed — re-derivable cache doesn't qualify; user-authored data does.*
 
 ## See also
 
-- `05-transactions-isolation-and-anomalies.md` — the build write as a weak "commit"
-- `06-locks-mvcc-and-concurrency-control.md` — the immutability that makes runtime durability moot
-- `08-replication-and-read-consistency.md` — the last `not yet exercised` topic
-- `.aipe/study-system-design/` — the build-as-artifact pipeline in full
+- `02-records-pages-and-storage-layout.md` — whole-blob writes and torn-page avoidance
+- `05-transactions-isolation-and-anomalies.md` — the D in ACID
+- `06-locks-mvcc-and-concurrency-control.md` — the dirty-flag-across-await reasoning
+- `08-replication-and-read-consistency.md` — replication as WAL shipping
+- `09-database-systems-red-flags-audit.md` — the durability gap and missing schema version
+- `../study-runtime-systems/` — debounce, timers, the event loop

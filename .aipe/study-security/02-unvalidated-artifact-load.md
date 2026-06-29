@@ -1,77 +1,88 @@
-# Unvalidated artifact load
+# 02 — Unvalidated artifact load
 
-**Industry name:** deserialization without validation / trust-on-load (Industry
-standard). The TypeScript-specific shape: an `as unknown as T` cast that
-*asserts* a type the compiler can't and the runtime won't verify.
-Project-specific instance: `graph.json` → `Graph` in the mobile app.
+**Industry name(s):** *unsafe deserialization* / *trusting a type assertion as a
+runtime guarantee* / *boundary validation gap on a data artifact*.
+**Type label:** Industry standard.
+
+> This is the **highest-severity finding in the repo** — not because it leaks
+> anything, but because it's the most likely thing to actually break in
+> production, and it breaks in the worst place (deep in A*, not at load).
 
 ---
 
 ## Zoom out, then zoom in
 
-Here's the whole thing. The mobile app doesn't compute the street graph — it
-ships a prebuilt one as a 544 KB JSON file baked into the bundle, loads it
-once at startup, and hands it to the routing engine as gospel. The line that
-does the handoff tells TypeScript "this JSON is definitely a valid `Graph`."
-Nothing — not the compiler, not the runtime — ever confirms that's true.
+Here's the whole app-startup path. The mobile app doesn't compute the street
+graph live at launch — it ships a prebuilt artifact, `graph.json`, bundled into
+the app. At startup it reads that file and hands it to the router. One line does
+the handoff:
 
 ```
-  Zoom out — where the load sits
+  Zoom out — where the artifact load sits
 
-  ┌─ Build pipeline (laptop, earlier) ──────────────────────────────┐
-  │  run-build.ts → buildGraph → writeFileSync("data/graph.json")    │
-  └────────────────────────────┬─────────────────────────────────────┘
-            copy into the app's │ assets/  (manual step)
-  ┌─ App bundle (phone) ────────▼─────────────────────────────────────┐
-  │  assets/graph.json (544 KB, JSON)                                 │
-  └────────────────────────────┬─────────────────────────────────────┘
-                  loadGraph()   │  ★ `as unknown as Graph`  ← we are here
-  ┌─ Routing engine (trusts it 100%) ──▼──────────────────────────────┐
-  │  nearestNode · directedAstar · graphToGeoJSON — all read .nodes,  │
-  │  .edges, .adjacency as if guaranteed well-formed                  │
-  └───────────────────────────────────────────────────────────────────┘
+  ┌─ Build (offline, your machine) ─────────────────────────────┐
+  │  run-build.ts → pipeline → JSON.stringify → data/graph.json  │
+  └──────────────────────────┬──────────────────────────────────┘
+            copied into       │  mobile/assets/graph.json (bundled)
+  ┌─ App startup (mobile) ────▼──────────────────────────────────┐
+  │  import graph from "../assets/graph.json"                     │
+  │  return graph as unknown as Graph    ★ THE LOAD ★             │ ← here
+  │  (loadGraph.ts:7-10)                                          │
+  └──────────────────────────┬───────────────────────────────────┘
+                 Graph        │  (asserted, NOT validated)
+  ┌─ Routing ────────────────▼───────────────────────────────────┐
+  │  prefixGraph → A* → reads .nodes, .edges, .adjacency          │
+  └───────────────────────────────────────────────────────────────┘
 ```
 
-Zoom in: this is **deserialization without validation** — you parse external
-bytes into an in-memory object and start using it without checking it matches
-the type you claimed. The `as unknown as Graph` cast is a *promise to the
-compiler*, not a *check at runtime*. This file walks what that promise costs:
-the consequence isn't a breach (the artifact is your own build), it's that a
-single malformed field ships a hard-crashing app to every user with no
-recoverable error.
+Zoom in. The concept: an *artifact* is data produced by one process and
+consumed by another, across a trust boundary in *time* (build-then-run) rather
+than space (client-then-server). The question this load answers: *what happens
+if the artifact is malformed, truncated, or schema-drifted from what A*
+expects?* The answer in flattr today: **nothing checks, so it crashes deep
+inside the router with a cryptic error** — or worse, half-works and routes
+wrong.
 
 ---
 
-## Structure pass — the trust axis across the load
+## The structure pass
 
-Trace one question: **at each step, does anyone confirm the data is a valid
-Graph?** The answer is "no" at every layer — which is exactly why this is a
-finding. The interesting seam is where "no" *stops mattering* because the
-data has already been dereferenced.
+**Layers:** build producer → serialized JSON on disk → bundler → `loadGraph`
+consumer → A* router.
+
+**The one axis: trust (specifically, "what's verified at the load point?").**
+Trace it:
 
 ```
-  One question: "is the data validated as a Graph here?"
+  Trust at the artifact boundary
 
-  ┌──────────────────────────────────────────────┐
-  │ import graph from "graph.json"   (bundler)    │  → NO (just parses JSON)
-  └──────────────────────────────────────────────┘
-      ┌──────────────────────────────────────────┐
-      │ loadGraph(): `as unknown as Graph`        │  → NO (asserts, can't check)
-      └──────────────────────────────────────────┘
-          ┌──────────────────────────────────────┐
-          │ nearestNode / directedAstar  reads it │  → TOO LATE (dereferences)
-          └──────────────────────────────────────┘
-
-  the answer is "no" the whole way down — there is no gate at all
+  ┌────────────────────────────────────┐
+  │ build: JSON.stringify(graph)        │  → produces a STRING. No schema
+  │   (run-build.ts:12)                 │     stamped, no version, no checksum
+  └────────────────────────────────────┘
+      ┌────────────────────────────────┐
+      │ bundler: file → JS module       │  → TS infers a STRUCTURAL type from
+      │   import graph from "...json"   │     the literal — NOT the Graph type
+      └────────────────────────────────┘
+          ┌────────────────────────────┐
+          │ loadGraph: as unknown as    │  → ASSERTS Graph. `unknown` first
+          │   Graph (loadGraph.ts:10)   │     erases the inferred type, then
+          └────────────────────────────┘     casts. Zero runtime check.
+              ┌────────────────────────┐
+              │ A*: graph.nodes[id].lat │  → TRUSTS the assertion fully
+              └────────────────────────┘
 ```
 
-- **Layers:** bundler parse → `loadGraph` cast → engine consumption.
-- **Axis:** trust ("is the Graph shape verified before use?").
-- **Seam:** the `loadGraph` cast at `loadGraph.ts:10`. It's the boundary
-  where untrusted bytes *become* a trusted typed object in the program's eyes
-  — and it's a seam with no gate. The cast is load-bearing precisely because
-  it's where validation *should* live and doesn't. Contrast with file 01: there
-  the gate exists but leaks NaN; here there is no gate at all.
+**The load-bearing seam:** the `as unknown as Graph` at `loadGraph.ts:10`. This
+is *the* point where an unverified blob becomes a fully-trusted `Graph`. The
+axis (is it verified?) is "no" on the left of this line and "assumed yes" on the
+right — and nothing in between makes the assumption true. A seam where trust
+flips on an *assertion* instead of a *check* is exactly the dangerous kind.
+
+The `as unknown as` double-cast is itself a tell. TypeScript would *reject* a
+direct `graph as Graph` if the inferred JSON type isn't assignable — so the code
+launders it through `unknown` to silence the compiler. That's the type system
+telling you "I can't prove this," and the code answering "trust me anyway."
 
 ---
 
@@ -79,325 +90,251 @@ data has already been dereferenced.
 
 ### Move 1 — the mental model
 
-You know the trap from `const data = await res.json() as User`. `res.json()`
-returns `any`/`unknown`; the `as User` makes the red squiggles go away but
-checks *nothing* — if the response is missing `email`, you find out when
-`user.email.toLowerCase()` throws at runtime. `as unknown as Graph` is the
-same move, just with the `unknown` step made explicit to force the compiler
-to allow it.
+You've hit this exact bug shape before: `const user = JSON.parse(localStorage
+.getItem("user")!) as User`, and then three components later something explodes
+because the stored blob was from an old app version missing a field. The cast
+told the compiler it was a `User`; the runtime data disagreed; the failure
+surfaced far from the load. Same shape here, bigger blast radius.
 
 ```
-  The pattern — a cast is a promise, not a check
+  The pattern (anti-pattern): assert-don't-check
 
-   JSON bytes ──parse──► value: unknown ──`as Graph`──► value: Graph
-                                              │
-                                              └─ COMPILE-TIME ONLY.
-                                                 zero runtime cost,
-                                                 zero runtime check.
-                                                 the type is now a LIE
-                                                 if the bytes don't match.
+   disk blob ──► [ as Graph ]  ──► consumer
+   (unknown)      (a LIE the         (A*, trusts
+                   compiler           every field)
+                   believes)
+                       │
+                       └── no gate. malformed blob
+                           passes straight through
+
+   the fix: replace the cast with a parse
+   disk blob ──► [ schema.parse() ] ──► Graph  (or throw HERE)
 ```
 
-The skeleton of "validated load" has three parts: **parse** (bytes → value),
-**validate** (confirm value matches the schema — the part flattr omits), and
-**use** (act on the typed value). Drop the validate step and "use" becomes
-the de-facto validator: the first property access that hits a missing field
-is where you learn the load was bad — by crashing.
+The kernel: a type assertion (`as T`) is a **compile-time** claim with **zero
+runtime cost and zero runtime effect**. It does not inspect the value. It's a
+promise to the compiler, not a check on the data.
 
 ### Move 2 — the walkthrough
 
-**Part 1 — the bundler parses, doesn't validate.** `import graph from
-"../assets/graph.json"` runs at bundle time. Metro turns the JSON into a
-JS object and infers a *structural* type from the literal — but that inferred
-type is "whatever shape this exact file happened to have," which is why the
-code needs `as unknown as Graph` to force it to the real interface. Bridge
-from `JSON.parse`: same thing, the result is just an object, not a
-guaranteed-shaped one. Where it breaks: if you regenerate `graph.json` with a
-pipeline change that renames `gradePct` to `grade`, the bundle still builds,
-the cast still compiles, and the field is now `undefined` at runtime.
+**Step 1 — the producer writes an untyped string.** `writeGraph`
+(`run-build.ts:11-13`) is just `JSON.stringify(graph)`. No schema version, no
+field manifest, no checksum lands in the file. So the artifact carries *no
+self-description* — a consumer can't even tell which build produced it.
 
 ```
-  Part 1 — parse with no shape guarantee
+  Producer side (run-build.ts:11-13)
 
-  graph.json bytes ──Metro/JSON──► plain object
-                                       │
-                                       └─ structurally inferred, NOT
-                                          checked against the Graph interface
+  Graph (typed in memory) ──► JSON.stringify ──► "{...}" (string, no schema)
+                                                  └─► data/graph.json
 ```
 
-**Part 2 — the cast launders the type.** `loadGraph` returns `graph as
-unknown as Graph`. The double cast is needed because the inferred JSON type
-and `Graph` don't overlap enough for a single `as Graph` — so the author goes
-through `unknown` (the "I know better" escape hatch) to silence the compiler.
-What concretely happens: from this line on, every consumer sees a fully-typed
-`Graph` with `.nodes`, `.edges`, `.adjacency`, and the compiler will *never*
-warn about a missing field again. The type system has been told to stop
-helping at exactly the boundary where it would help most.
+**Step 2 — the consumer asserts the type away.** The entire load is two lines:
 
-```
-  Part 2 — the cast (the seam with no gate)
+```ts
+// mobile/src/loadGraph.ts:6-10
+import type { Graph } from "features/routing/types";
+import graph from "../assets/graph.json";
 
-  plain object ──`as unknown`──► unknown ──`as Graph`──► Graph
-                                                           │
-                       ════════ TRUST BOUNDARY ════════════
-                       below this line the engine believes
-                       every node/edge/adjacency entry exists
+export function loadGraph(): Graph {
+  return graph as unknown as Graph;   // ← no validation, double-cast
+}
 ```
 
-**Part 3 — the engine dereferences on faith.** The first real consumer is
-`nearestNode(graph, point)` (called from `MapScreen.tsx:125`), which iterates
-`graph.nodes` and reads `.lat`/`.lng` on each. Then `directedAstar` walks
-`graph.adjacency[nodeId]` to get edge ids and looks each up in `graph.edges`.
-Bridge from a `.map(item => item.id)` over an API list where one item is
-`null`: the same `Cannot read property of undefined`. Here's the failure
-chain for three realistic malformations:
+Read it: `import graph from "...json"` gives TypeScript a *structural* type
+inferred from the literal's shape — but a bundled JSON's inferred type generally
+isn't assignable to `Graph` (optional fields, tuple-vs-array widening), so
+`as Graph` alone won't compile. `as unknown as Graph` erases the inferred type
+to `unknown`, then asserts `Graph`. Net effect: **the compiler is satisfied and
+nothing runs.** Whatever bytes are in the file are now a `Graph` as far as the
+rest of the app is concerned.
+
+**Step 3 — where it actually breaks.** A* and its helpers index the graph
+trusting the assertion. `nearestNode` and `directedAstar` read
+`graph.nodes[id].lat`, `graph.adjacency[nodeId]`, `edge.gradePct`. Walk the
+failure for three realistic drift scenarios:
 
 ```
-  Part 3 — three malformed artifacts, three runtime outcomes
+  Execution trace — malformed artifact, three drifts
 
-  malformation                       first crash site            user sees
-  ─────────────────────────────────  ──────────────────────────  ─────────────
-  edge.toNode points to missing id   grade/nearest reads          white screen,
-                                     nodes[id].lat → undefined    no recovery
-  elevationM is a string "12"        cost math → NaN              wrong route,
-                                                                  silent
-  adjacency[id] lists a deleted      A* looks up edges[eid]       white screen
-    edge id                          → undefined.fromNode
+  drift A: a node missing `elevationM`
+    load        → passes (no check)
+    A* expand   → cost.ts reads edge.gradePct (precomputed, OK)
+    BUT grade  → if grades recomputed: undefined - n = NaN → bad route
+    surfaces   → WRONG ROUTE, no error. Worst kind: silent.
 
-  the bundle compiled fine in every case — the cast hid all three
+  drift B: adjacency references an edge id not in edges[]
+    load        → passes
+    A* expand   → graph.edges.find(e=>e.id===ref) → undefined
+    next read   → undefined.toNode → TypeError, DEEP in A*
+    surfaces   → CRASH, cryptic stack inside the router.
+
+  drift C: truncated JSON (partial write / bad copy)
+    import      → bundler may fail at build, OR ship partial object
+    load        → passes the cast
+    A* first op → graph.nodes is {} → nearestNode returns null
+    surfaces   → "Failed to load graph" IF caught at MapScreen.tsx:31,
+                 else null-deref downstream.
 ```
 
-**The one guard that does exist (and what it doesn't cover).**
-`MapScreen.tsx:28-34` wraps `loadGraph()` in a `try/catch` and renders
-"Failed to load graph." on throw. But this only catches a throw *during*
-`prefixGraph(loadGraph())` — and the cast never throws (it's compile-time).
-So a structurally-broken-but-parseable graph passes this guard and crashes
-*later*, deep in the routing engine, where there is no catch. Concrete
-consequence: the friendly error screen fires for "file totally missing" but
-*not* for "file present but malformed" — the more likely failure after a bad
-build.
+The only safety net today is the `try/catch` around `prefixGraph(loadGraph())`
+at `MapScreen.tsx:28-34`, which renders "Failed to load graph." — but that only
+catches a *throw at load*, and the cast doesn't throw. It catches drift C's
+truncation-if-it-throws; it does **not** catch drift A (silent) or drift B
+(throws later, inside A*, outside the try).
 
-### Move 2.5 — current state vs future state
-
-This is built-but-not-hardened. The artifact pipeline works; the validation
-step was never added because the producer and consumer are the same author's
-code, so the shape is "known good by construction."
+**Step 4 — the fix, concretely.** Replace the assertion with a parse. Two
+flavors:
 
 ```
-  Phase A (now)                        Phase B (hardened)
-  ─────────────────────────────        ──────────────────────────────
-  loadGraph(): graph as unknown        loadGraph(): GraphSchema.parse(graph)
-    as Graph                             (zod / manual validator)
-  trusts the build was correct         confirms shape at load
-  bad build → deep runtime crash       bad build → one clear error at startup
-  zero load cost                       one-time parse cost (~ms for 544 KB)
+  Fix A — schema parse (Zod-style), throws at the boundary
+
+  import { GraphSchema } from "./graphSchema";
+  export function loadGraph(): Graph {
+    return GraphSchema.parse(graph);   // throws HERE, with a field path,
+  }                                    // caught by MapScreen's try/catch
+
+  Fix B — hand-rolled guard (no dep), same effect
+    assert graph.nodes is object, every node has finite lat/lng/elevationM,
+    every adjacency ref resolves to an edge, throw a clear Error if not.
 ```
 
-The takeaway is what *doesn't* change: the engine, the routing, the types —
-all stay identical. Phase B adds exactly one gate at one line. The migration
-cost is a schema definition plus the parse call; the payoff is moving the
-crash from "deep in A* on a random user's phone" to "at startup, with a
-message naming the bad field."
+Either way the win is *locality*: the failure moves from "TypeError deep in A*"
+to "graph.json failed validation: nodes['n12'].elevationM expected number" at
+the load line — caught by the existing `try/catch`, shown as a clear message.
+
+### Move 2 variant — the load-bearing skeleton
+
+Kernel of a safe artifact load:
+
+1. **The single load point.** One function owns the deserialize. *Breaks if
+   missing:* casts scatter and some path skips validation. flattr *has* this —
+   `loadGraph` is the one door. Good bones.
+2. **The runtime validation.** The blob is checked against the expected schema
+   *before* it's trusted. *Breaks if missing:* a malformed artifact fails far
+   from the load, cryptically. **This is the missing part** — the cast replaces
+   the check.
+3. **The fail-closed behavior.** On invalid data, throw/refuse at the load, not
+   limp onward. *Breaks if missing:* silent wrong output (drift A). flattr is
+   *fail-open* today for non-throwing drift.
+
+**Skeleton vs hardening:** validation (2) + fail-closed (3) are skeleton. A
+*version stamp* in the artifact (so the app can say "this graph is from an
+incompatible build") and a *checksum* (to catch truncation) are hardening — nice,
+not load-bearing.
 
 ### Move 3 — the principle
 
-A type cast is a claim about data you haven't verified; the compiler enforces
-it on your *code* and never on your *bytes*. The general rule: **the boundary
-between serialized bytes and typed objects is a validation boundary whether or
-not you treat it as one.** If you skip the check, the first property access
-becomes your validator — and it validates by crashing, at the worst possible
-place. "It's my own build" lowers the *probability* of bad data; it doesn't
-change the *blast radius* when it happens.
+A type assertion is not validation. `as T` is a compile-time promise that does
+nothing at runtime — the instant data crosses from outside the program (a file,
+a network response, `localStorage`) the only thing that makes the type *true* is
+a runtime parse. The discipline: **parse at the boundary, assert never.** Every
+`as` on external data is a silent bet that the producer and consumer never
+drift. They always drift.
 
 ---
 
 ## Primary diagram
 
-The full frame: build produces bytes, the cast launders them into a trusted
-type with no gate, the engine crashes on the first bad field.
+The full load path with the gap and the fix marked.
 
 ```
-  Unvalidated artifact load — full frame
+  Unvalidated artifact load — full recap
 
-  ┌─ Build (earlier, laptop) ───────────────────────────────────────┐
-  │  buildGraph → writeFileSync(data/graph.json)                     │
-  └────────────────────────────┬─────────────────────────────────────┘
-              manual copy into  │ mobile/assets/graph.json (544 KB)
-  ┌─ Bundle parse (Metro) ──────▼─────────────────────────────────────┐
-  │  import graph from "graph.json"  → plain object (no shape check)  │
-  └────────────────────────────┬─────────────────────────────────────┘
-            loadGraph()         │
-  ═════════════════════════════╪══════ TRUST BOUNDARY (no gate) ══════
-            `as unknown as Graph`│  ← asserts type, verifies nothing
-  ┌─ Routing engine (trusts 100%) ▼───────────────────────────────────┐
-  │  nearestNode  → nodes[id].lat                                      │
-  │  directedAstar → adjacency[id] → edges[eid].fromNode              │
-  │  graphToGeoJSON → edges.map(...)                                   │
-  │     malformed field ▶ undefined deref ▶ WHITE SCREEN (no catch)   │
-  │     (the try/catch in MapScreen only covers a THROW, which the    │
-  │      cast never does — so structural breakage slips past it)      │
-  └───────────────────────────────────────────────────────────────────┘
+  ┌─ BUILD (offline) ───────────────────────────────────────────┐
+  │  pipeline → JSON.stringify (run-build.ts:12)                  │
+  │  → data/graph.json  (no schema, no version, no checksum)      │
+  └──────────────────────────┬───────────────────────────────────┘
+              copy            │  → mobile/assets/graph.json (bundled)
+  ┌─ LOAD (loadGraph.ts) ────▼───────────────────────────────────┐
+  │  import graph from json                                       │
+  │  ╔══════════════════════════════════════════════════╗        │
+  │  ║ return graph as unknown as Graph   ← THE GAP      ║        │
+  │  ║ (no runtime check; double-cast launders unknown)  ║        │
+  │  ╚══════════════════════════════════════════════════╝        │
+  │  FIX: GraphSchema.parse(graph) → throws here, caught upstream │
+  └──────────────────────────┬───────────────────────────────────┘
+            Graph (asserted)  │
+  ┌─ CONSUME (A*) ───────────▼───────────────────────────────────┐
+  │  nearestNode / directedAstar read .nodes .edges .adjacency    │
+  │  drift → NaN route (silent) | TypeError deep in A* (cryptic)  │
+  │  only net today: try/catch at MapScreen.tsx:28 (load-throw    │
+  │  only) → "Failed to load graph."                              │
+  └───────────────────────────────────────────────────────────────┘
 ```
-
----
-
-## Implementation in codebase
-
-**Use cases.** The bundled base graph loads exactly once at app startup
-(`MapScreen.tsx:28`, inside a `useMemo`). The *same* cast pattern recurs for
-the runtime-built tiles: `useTileGraph.ts` builds graphs on-device from live
-Overpass/Open-Meteo data and merges them — those go through `buildGraph` (so
-they're constructed by typed code, not cast from JSON), but they're then
-merged with the cast-loaded base via `mergeGraphs`/`stitchGraph`. So the
-base graph's unvalidated shape contaminates the merged graph the engine
-actually routes over.
-
-```
-  mobile/src/loadGraph.ts  (lines 6–11) — the whole finding, three lines
-
-  import type { Graph } from "features/routing/types";   ← the claimed type
-  import graph from "../assets/graph.json";              ← parsed, unchecked
-  export function loadGraph(): Graph {
-    return graph as unknown as Graph;                    ← THE CAST
-  }
-       │
-       └─ `as unknown as Graph` is a double cast. Single `as Graph` won't
-          compile (inferred JSON type ≠ Graph), so it routes through
-          `unknown` — TypeScript's "trust me" hatch. After this line every
-          consumer sees a guaranteed Graph. Remove the cast and the
-          compiler would force you to prove the shape — which is the point.
-```
-
-```
-  mobile/src/MapScreen.tsx  (lines 28–34) — the guard that misses
-
-  const baseGraph = useMemo(() => {
-    try {
-      return prefixGraph(loadGraph(), "base");  ← only catches a THROW
-    } catch {
-      return null;                              ← shows "Failed to load graph."
-    }
-  }, []);
-       │
-       └─ This catches "asset missing / not parseable" (loadGraph throws).
-          It does NOT catch "asset present but malformed" — the cast never
-          throws, so a bad-shape graph passes here and crashes later in
-          nearestNode/directedAstar where there is no try/catch. The guard
-          defends the wrong failure mode.
-```
-
-```
-  features/routing/nearest.ts (the first dereference) — where it actually crashes
-
-  // iterates graph.nodes, reads n.lat / n.lng on each
-  // an edge.toNode pointing at a missing node id → nodes[id] is undefined
-  //   → undefined.lat → TypeError, no recovery
-       │
-       └─ This is the sink. It trusts that every id referenced anywhere in
-          the graph resolves to a real node. That invariant is exactly what
-          a validator at loadGraph would confirm — and what the cast skips.
-```
-
-**The fix, named:** define a runtime schema (zod is the standard, or a hand-
-rolled validator matching the DSA-from-scratch ethos) and replace the cast
-with `GraphSchema.parse(graph)` in `loadGraph`. Validate three invariants the
-engine relies on: every `edge.fromNode`/`toNode` exists in `nodes`, every
-`adjacency` edge id exists in `edges`, and every `elevationM`/`gradePct` is a
-finite number (which also closes file 01's NaN leak at the consumer). One-time
-cost of parsing 544 KB is single-digit milliseconds; the payoff is a clear
-startup error instead of a deep crash.
 
 ---
 
 ## Elaborate
 
-"Deserialization without validation" is the same root cause behind a whole
-family of higher-severity bugs in server contexts — insecure deserialization
-(CWE-502), where untrusted bytes become trusted objects that carry behavior,
-not just data. flattr's version is the *benign* end of that spectrum: the
-bytes are your own build artifact and carry only data, so the worst case is a
-crash, not code execution. But the discipline is identical — the byte→object
-boundary is a validation boundary. The reason it's worth a dedicated file
-even though "it's my own data" is that the **blast radius** is total: one bad
-build white-screens every install, and the friendly error screen specifically
-doesn't catch it.
+Unsafe deserialization is OWASP A08:2021 — though the *classic* version (Java
+`readObject`, Python `pickle`, PHP `unserialize`) is about *code execution* from
+a crafted blob. flattr's version is the milder, more common one: not RCE
+(JSON can't carry code), but **integrity/availability** — a malformed blob
+breaking the consumer. The reason it still ranks highest *here* is base-rate:
+there's no attacker needed. A bad copy, a build that changed the `Graph` shape
+without re-bundling, a partial write — all produce the same crash, and they're
+*likely* in a project where the artifact and the schema (`types.ts`) evolve
+independently.
 
-This connects directly to file 01: both are trust-boundary findings, and
-both fail the same way (silent corruption / crash, not breach). The
-difference is the gate — file 01 has a leaky one (`MAX_GRADE_PCT`), this has
-none. Read `.aipe/study-data-modeling/` for the `Graph` schema's shape and
-`.aipe/study-system-design/` for why the build-time/runtime artifact split
-exists in the first place (it's a deliberate architecture call — the security
-cost is just the un-gated load).
+The root cause is shared with `01`: TypeScript's types are erased at runtime, so
+trusting `as T` on external data is trusting a guarantee that doesn't exist past
+`tsc`. The industry answer is *schema-first deserialization* — Zod, io-ts,
+Valibot, or hand-rolled guards — where the schema is the single source of truth
+and the static type is *derived from it* (`type Graph = z.infer<typeof
+GraphSchema>`), so the type and the runtime check can't drift.
+
+Read next: `01` (the network version of this gap), and `study-data-modeling`
+for the `Graph` schema that a validator would encode.
 
 ---
 
 ## Interview defense
 
-**Q: You load a 544 KB JSON and cast it `as unknown as Graph`. What's the
-risk?** The cast is a compile-time promise with no runtime check, so the
-byte→object boundary has no validation gate. If the artifact ships malformed
-— a dangling edge reference, a string where a number belongs — nothing
-catches it until the routing engine dereferences a missing field and the app
-white-screens. It's not a breach (it's my own build), but the blast radius is
-every install, and the existing try/catch only covers a missing file, not a
-malformed one.
+**Q: What's the single biggest security risk in this codebase?** Not a breach —
+there's nothing to steal. It's the unvalidated artifact load at
+`loadGraph.ts:10`: `graph.json` is cast `as unknown as Graph` with no runtime
+check. If the artifact is malformed or schema-drifted, the app either crashes
+deep inside A* with a cryptic `TypeError` or — worse — silently produces a wrong
+route. It's the highest *availability/integrity* risk because it needs no
+attacker: a bad copy or a schema change triggers it.
 
 ```
-  bytes ─parse─► object ─`as Graph`─► [NO GATE] ─► engine ─► deref ─► crash
-                                       ▲
-                          validation belongs here; cast skips it
+  the sketch I'd draw
+
+  graph.json ──► [as unknown as Graph]  ──► A*
+   (any bytes)    ↑ a cast, not a check        │
+                  │                            ▼
+   fix: schema.parse() throws HERE   ...else TypeError deep in router
+        caught by MapScreen try/catch       (or silent NaN route)
 ```
 
-*Anchor:* "the cast is a promise to the compiler, not a check at runtime."
+**Anchor:** *"`as unknown as Graph` is the compiler being told to trust data it
+can't prove. The fix is to parse at the boundary so failure is local and
+loud."*
 
-**Q: It's your own data — why bother validating?** Because "my own data"
-lowers the odds, not the blast radius. The load-bearing skeleton part people
-forget is the **validate** step between parse and use — drop it and the first
-property access becomes your validator, crashing deep in A* on a user's phone
-instead of at startup with a named bad field. One `GraphSchema.parse` moves
-the failure from worst-place to best-place.
+**Q: Why is the existing `try/catch` at MapScreen not enough?** Because the cast
+doesn't throw. The `try/catch` at `MapScreen.tsx:28` only catches a throw *at
+load* — it'd catch JSON that fails to parse, but the `as` cast on
+already-parsed-by-the-bundler data never throws, so silent drift (a missing
+field) sails past it and surfaces later, inside A*, outside the `try`. A schema
+`.parse()` would move the throw *to* the load line, *inside* the existing
+`try/catch` — reusing the net that's already there.
 
-```
-  parse ─► [validate ◄ the omitted step] ─► use
-              │
-              └─ without it, "use" validates by crashing
-```
-
-*Anchor:* "skip validation and the first deref becomes the validator."
-
----
-
-## Validate
-
-**Reconstruct.** Write the three-part validated-load skeleton (parse /
-validate / use) and mark which step `loadGraph.ts:10` omits.
-
-**Explain.** Why does `as unknown as Graph` compile when `as Graph` alone
-doesn't, and why does neither check the runtime shape? (Single cast: types
-don't overlap; double cast routes through `unknown`; both are erased at
-runtime.)
-
-**Apply to a scenario.** A pipeline change renames `gradePct` to `grade` and
-you regenerate `graph.json`. Does the bundle build? Does `loadGraph` throw?
-Where does the app actually break, and does the `MapScreen.tsx:28` try/catch
-save it? (Builds yes; throws no; breaks in cost math / GeoJSON as `undefined`;
-try/catch does not save it.)
-
-**Defend the decision.** Argue for adding a zod schema at `loadGraph.ts:10`
-vs leaving the cast and relying on the build being correct. What's the
-one-time cost, and what specifically does validating
-`edge.toNode ∈ nodes` buy that the current code lacks?
+**Q: Load-bearing part people forget?** Fail-*closed*. People remember to add
+validation but let it *warn and continue*. For a graph, continuing on a missing
+field gives you a silent wrong route — arguably worse than a crash, because a
+hiker trusts the grade. Validation must throw, not warn.
 
 ---
 
 ## See also
 
-- `01-external-data-trust-boundary.md` — the same trust-boundary failure mode
-  with a leaky gate instead of no gate; the NaN-finiteness check belongs in
-  both fixes.
-- `audit.md` lens 3 (input-validation) and lens 1 (trust-boundaries).
-- `.aipe/study-data-modeling/` — the `Node`/`Edge`/`Graph` schema and its
-  referential invariants (the things a validator would check).
-- `.aipe/study-system-design/` — the build-time/runtime artifact split as an
-  architecture decision.
+- `01-external-data-trust-boundary.md` — same "TS types ≠ runtime guarantees"
+  root cause, at the network fetch instead of the file load.
+- `audit.md` lens 1, 3, 8 — boundary map, injection, and the red-flag checklist
+  (this is the HIGH row).
+- Siblings: `study-data-modeling` (the `Graph` schema to validate against),
+  `study-debugging-observability` (why a deep-in-A* crash is a debugging tax,
+  and how a boundary throw fixes the locality), `study-system-design` (the
+  build-time→runtime artifact handoff).

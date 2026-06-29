@@ -1,99 +1,73 @@
-# flattr — the whole system in one frame
+# System Design — Overview
 
-*One-page orientation. The map you return to.*
+flattr is a grade-aware router for self-powered travel — "optimized for flat,
+not fast." The defining architectural decision is a **build-time / runtime
+split**: a Node pipeline turns OpenStreetMap geometry plus elevation samples
+into a static `graph.json` artifact, and an Expo / React Native app reads that
+artifact and routes over it with **no backend and no database**. The same
+TypeScript engine (`features/`, `pipeline/`, `lib/`) runs in both places —
+build-time on a laptop, and again *on-device* when the user pans past the
+prebuilt coverage.
 
-flattr answers one question — "give me a route that avoids what *I* can't
-comfortably climb, and show me where the flat is" — and the entire architecture
-bends around one design decision: **do the heavy graph work once, offline, and
-ship a static artifact the app only reads.** That's the build-time/runtime
-split, and it's the thing to understand before anything else.
-
-Here's the system end to end. Two phases, one artifact between them, and — the
-finding that surprises everyone — a *third* path where the runtime quietly
-re-runs the build pipeline on the phone.
+The whole system in one frame:
 
 ```
-  flattr — full system map (as built, 2026-06)
+  flattr — the whole system, build-time and runtime
 
-  ┌─ BUILD TIME · offline Node/tsx · run rarely ──────────────────────────┐
-  │                                                                        │
-  │  Overpass API ──► overpass.ts ──► osm.ts ──► split.ts ──► elevation.ts │
-  │  (OSM streets)    fetch+retry    parse      densify+      Open-Meteo/  │
-  │                                  walkable   snap nodes    Google DEM   │
-  │                                  ways        │                │        │
-  │                                              ▼                ▼        │
-  │                                      build-graph.ts ──► grade.ts       │
-  │                                      (orchestrate)      rise/length/   │
-  │                                              │          signed grade%  │
-  │                                              ▼                         │
-  │                                   data/graph.json  (544 KB)            │
-  │                              run-build.ts · `npm run build:graph`      │
-  └───────────────────────────────────┬────────────────────────────────────┘
-                                       │  copy artifact into the app bundle
-                                       ▼
-  ┌─ THE ARTIFACT · immutable, no DB, no server ─────────────────────────┐
-  │   mobile/assets/graph.json   { city, bbox, nodes, edges, adjacency } │
-  └───────────────────────────────────┬───────────────────────────────────┘
-                                       │  import at startup
-                                       ▼
-  ┌─ RUN TIME · Expo RN · on the phone ──────────────────────────────────┐
+  ┌─ BUILD TIME (laptop, Node via tsx) ──────────────────────────────────┐
   │                                                                       │
-  │  loadGraph.ts ──► baseGraph (prefix "base")                           │
-  │        │                                                              │
-  │        ▼                                                              │
-  │  useTileGraph.ts ── stitch(merge[base, corridor?, view?]) ──► graph   │
-  │        │                          ▲                                   │
-  │        │                          │  ★ THE LEAK ★                      │
-  │        │              on pan / on route, the runtime RE-RUNS          │
-  │        │              the SAME pipeline (overpass→build-graph→         │
-  │        │              elevation) for the viewport / corridor bbox     │
-  │        ▼                                                              │
-  │  MapScreen.tsx                                                        │
-  │    ├─ graphToGeoJSON ──► MapLibre heatmap (color by absGradePct)      │
-  │    ├─ tap/geocode ──► startPt/endPt ──► nearestNode ──► startId/endId │
-  │    └─ directedAstar(graph, startId, endId, userMax) ──► route line    │
-  │         (A* + signed-grade cost + haversine heuristic, ALL on-device) │
-  └───────────────────────────────────────────────────────────────────────┘
+  │  Overpass API ──► osm.ts ──► split.ts ──► elevation.ts ──► grade.ts   │
+  │  (OSM streets)    parse      densify+     sample DEM       signed %    │
+  │                              snap @12m    (3 providers)    per edge    │
+  │                                  │                                     │
+  │                                  ▼                                     │
+  │                         build-graph.ts ──► run-build.ts                │
+  │                         (assemble +        (writes data/graph.json)    │
+  │                          buildAdjacency)            │                  │
+  └────────────────────────────────────────────────────┼─────────────────┘
+                                                         │ copied to
+                                                         ▼ mobile/assets/graph.json
+  ┌─ RUNTIME (device, Expo RN, NO backend / NO DB) ──────────────────────┐
+  │                                                                       │
+  │  loadGraph.ts ──► baseGraph (static, Capitol Hill slice)              │
+  │       │                                                               │
+  │       │   pan past base?  route past base?                           │
+  │       ▼          │              │                                     │
+  │  useTileGraph.ts ◄─────────────┘                                     │
+  │   RE-RUNS THE SAME PIPELINE on-device for the viewport / corridor    │
+  │   (fetchOverpass → openMeteoProvider → buildGraph → prefix → stitch) │
+  │       │                                                               │
+  │       ▼                                                               │
+  │  mergeGraphs(base, corridor, view) ──► directedAstar(userMax) ──► UI │
+  │       │                                  (features/routing/astar.ts)  │
+  │       ▼                                                               │
+  │  elevCache.ts (AsyncStorage) — survives restarts, kills re-fetches   │
+  └───────────────────────────────────────────────────────────────────── ┘
 
-  External deps (all free-tier, all over HTTP, all from BOTH phases now):
-    Overpass (streets) · Open-Meteo (elevation) · Nominatim (geocode)
-    OpenFreeMap (basemap tiles, runtime only)
+  external deps: Overpass (overpass-api.de), Open-Meteo / Google elevation,
+                 Nominatim (geocode). All best-effort, all degradable.
 ```
 
 ## Legend — what each component is, owns, and talks to
 
 | Component | What it is | Owns | Talks to |
 |---|---|---|---|
-| `pipeline/overpass.ts` | Overpass QL query + fetch | bbox → raw OSM JSON; retry on 429/5xx | Overpass API |
-| `pipeline/osm.ts` | OSM parser | walkable-way filtering (`WALKABLE`), coord resolution | — |
-| `pipeline/split.ts` | mesh construction | densify long edges to ≤`maxSegM`, snap coincident vertices to shared node ids | — |
-| `pipeline/elevation.ts` | pluggable elevation sampler | `ElevationProvider` interface; Open-Meteo / Google / fixture adapters; cell-dedup | Open-Meteo / Google |
-| `pipeline/grade.ts` | grade computer | signed `gradePct`, `riseM`, `lengthM`, clamp coarse-DEM noise | — |
-| `pipeline/build-graph.ts` | pipeline orchestrator | the stage DAG; **no `node:fs`** so it bundles for the phone | the four stages above |
-| `pipeline/run-build.ts` | build-time CLI | pick elevation source, write `data/graph.json` | `build-graph`, `node:fs` |
-| `data/graph.json` → `mobile/assets/graph.json` | the artifact | the single source of truth; immutable at runtime | imported by `loadGraph` |
-| `mobile/src/loadGraph.ts` | artifact loader | typed import of the bundled graph | — |
-| `mobile/src/useTileGraph.ts` | runtime coverage | viewport + corridor expansion; **re-runs the pipeline on-device**; merge/stitch; one-build-at-a-time pump | `pipeline/*`, `features/map/tiles` |
-| `features/map/tiles.ts` | graph composition | `prefixGraph` (id namespacing), `mergeGraphs` (union), `stitchGraph` (seam connectors) | — |
-| `features/routing/astar.ts` | the search engine | one parametric `search()`; Dijkstra→A\*→grade→directional as `(cost, heuristic)` choices | `pqueue`, `cost`, `graph` |
-| `features/routing/cost.ts` | the domain cost | signed directed-grade penalty; `BLOCKED` as large-finite | `graph.directedGrade` |
-| `features/routing/pqueue.ts` | priority queue | hand-rolled lazy-deletion binary min-heap | — |
-| `mobile/src/MapScreen.tsx` | the runtime composition point | React state, endpoints-as-coords, render orchestration | everything above |
+| `pipeline/run-build.ts` | build-time entrypoint (`npm run build:graph`) | the build sequence + serialization to `data/graph.json` | Overpass, elevation providers, `build-graph.ts` |
+| `pipeline/build-graph.ts` | the assembly orchestrator | the stage order parse→split→sample→grade→adjacency | `osm`, `split`, `elevation`, `grade`, `features/routing/graph` |
+| `pipeline/elevation.ts` | `ElevationProvider` interface + 3 impls | the elevation-sampling contract, batching, dedupe | Google / Open-Meteo HTTP APIs |
+| `data/graph.json` → `mobile/assets/graph.json` | the static build artifact | the base coverage (one Capitol Hill bbox) | nobody — it is read-only data |
+| `mobile/src/loadGraph.ts` | the static-import loader | turning the bundled JSON into a `Graph` | nobody (synchronous import) |
+| `mobile/src/useTileGraph.ts` | the on-device pipeline re-run | viewport + corridor coverage beyond the base | `fetchOverpass`, `openMeteoProvider`, `buildGraph`, `tiles.ts`, `elevCache` |
+| `mobile/src/elevCache.ts` | persistent elevation cache | the `cell→meters` map, debounced AsyncStorage writes | AsyncStorage |
+| `features/routing/astar.ts` | the router | A* / Dijkstra / directed-grade search | `cost.ts`, `pqueue.ts`, `graph.ts` |
+| `features/routing/cost.ts` | the cost model | the signed directed-grade penalty + `BLOCKED` | `graph.ts` |
+| `features/map/tiles.ts` | the tile algebra | `prefixGraph` / `mergeGraphs` / `stitchGraph` | nobody (pure functions) |
+| `mobile/scripts/sync-engine.mjs` | the build-time copy step | mirroring `features/`+`lib/`+`pipeline/` into `mobile/.engine/` | filesystem |
 
-## The three things to take away
+## How to read this guide
 
-1. **The split is the architecture.** Build once, read forever. No live DB, no
-   server state, no per-request compute on a backend — because there is no
-   backend. The `Graph` object is the entire contract between the two phases.
-   → `01-build-time-runtime-split.md`
-
-2. **The split leaks at runtime — on purpose.** To cover more than the bundled
-   bbox, `useTileGraph.ts` imports `pipeline/build-graph` and runs the *whole
-   offline pipeline on the phone* for the panned viewport and the route
-   corridor. The "thin runtime that only reads" is, as built, a runtime that can
-   also *build*. → `03-on-device-pipeline.md`
-
-3. **It's scoped to one small bbox today, honestly.** `BBOX` in
-   `pipeline/config.ts` is a ~0.7 km × 0.7 km Capitol Hill slice. The spec's
-   multi-city, Netlify-Blobs-served, optionally-server-side-A\* target is
-   **`not yet exercised`**. The audit names every gap. → `audit.md`
+Start with `audit.md` — it walks all 8 system-design lenses and tells you,
+honestly, what flattr exercises and what it does not. Then read the five
+pattern files in order; each is a deep dive into one architectural decision
+that carries real weight. See `README.md` for the reading order and
+cross-links to neighboring guides.

@@ -1,276 +1,196 @@
-# 05 — HTTP semantics, caching, and CORS
-### methods, status codes, headers, caching, cookies, CORS, and browser policy
-**Industry name:** HTTP application semantics — *Industry standard*
+# 05 — HTTP Semantics, Caching, and CORS
 
-═════════════════════════════════════════════════
-ZOOM OUT, THEN ZOOM IN
-═════════════════════════════════════════════════
+**Methods, status codes, headers, caching, CORS** · *Industry standard*
 
-This is the layer where flattr makes actual choices. Below it (TCP, TLS, DNS) flattr just takes platform defaults. At the HTTP layer, flattr decides methods, sends specific headers, and *reads status codes to drive control flow* — the 429 that triggers a retry is an HTTP decision. This is the richest networking layer in the repo.
+## Zoom out, then zoom in
+
+This is the layer flattr actually writes code against. DNS, TCP, and TLS are all delegated — but the HTTP *method*, the request *body* and *headers*, the interpretation of *status codes*, and the *caching* are all flattr's own decisions, spread across three modules.
 
 ```
-  Zoom out — where HTTP semantics sit
+  Zoom out — HTTP is the layer flattr authors
 
-  ┌─ App / Build layer ──────────────────────────────┐
-  │  ★ flattr chooses: method, headers, status logic ★│ ← we are here
-  │  fetch(url, { method, headers, body })            │
-  │  if (res.ok) ... if (res.status === 429) retry    │
-  └─────────────────────────┬─────────────────────────┘
-  ┌─ TLS layer ──────────────▼────────────────────────┐
-  │  encrypts the HTTP request/response               │
-  └────────────────────────────────────────────────────┘
+  ┌─ flattr code ────────────────────────────────────────────┐
+  │  ★ chooses method · builds body/headers · reads status ★  │ ← we are here
+  │     interprets 429/5xx · caches responses                 │
+  └────────────────────────┬─────────────────────────────────┘
+                           │ over delegated TLS/TCP/DNS
+  ┌─ platform fetch ────────▼────────────────────────────────┐
+  │  sends bytes, returns Response{ status, ok, json() }      │
+  └────────────────────────┬─────────────────────────────────┘
+  ┌─ providers ─────────────▼────────────────────────────────┐
+  │  200 / 429 / 5xx + JSON body                              │
+  └───────────────────────────────────────────────────────────┘
 ```
 
-Zoom in: HTTP semantics is "what method, what headers, and what does this status code *mean for my control flow?*" flattr uses GET and POST, sends a `User-Agent` (and one `Content-Type`), and branches on `res.ok` and specific status codes. There's no caching layer flattr owns, no cookies, and no CORS in the app as built.
+Zoom in: flattr uses exactly two methods (POST for Overpass, GET for everything else), reads two status families (`ok` vs retryable error codes), sends one custom header (User-Agent), and runs **two caches** — but neither is HTTP caching. There are no cookies and no CORS, and the reason why is itself a lesson.
 
-═════════════════════════════════════════════════
-THE STRUCTURE PASS
-═════════════════════════════════════════════════
+## Structure pass
 
-**Layers.** Request shaping (method + headers + body) → Response handling (status code → control flow) → Body parsing (`.json()`). One axis runs through all three.
+**Layers.** Method/headers (flattr authors) → status interpretation (flattr authors) → caching (flattr authors, app-level). All three are flattr's, unusually — this is the one concept where flattr is mostly *above* the platform floor.
 
-**Axis — failure (where does it originate, propagate, get contained?).** Status codes are *the* failure signal at this layer:
+**Axis = guarantees (what does each status code promise, and how does flattr treat it?).** Trace it: `res.ok` (2xx) → success, parse JSON. `429/502/503/504` → transient, retry. Any other non-ok → fatal, throw. The same status axis produces three different behaviors, and the split is where the contracts live.
 
 ```
-  Axis "how is failure signaled and handled?" — across HTTP handling
+  axis traced: how does flattr treat each status class?
 
-  ┌──────────────────────────────────────────────────┐
-  │ Request: shaped politely (UA header)              │ → pre-empts failure
-  └──────────────────────────────────────────────────┘
-      ┌──────────────────────────────────────────────┐
-      │ Status: res.ok? 429? 5xx?                     │ → FAILURE DECISION
-      └──────────────────────────────────────────────┘
-          ┌──────────────────────────────────────────┐
-          │ Body: .json() — assumed well-formed       │ → unchecked
-          └──────────────────────────────────────────┘
-
-  the status-code check is where failure becomes a control-flow branch
+  ┌─ 2xx ────────┐   ┌─ 429/5xx (set) ─┐   ┌─ other non-ok ─┐
+  │ ok → json()  │   │ retry w/ backoff │   │ throw → fatal  │
+  └──────────────┘   └──────────────────┘   └────────────────┘
+       success            transient              permanent
+   each module draws the "retryable" boundary slightly differently → seam
 ```
 
-**Seams.** The load-bearing seam is `res.ok` / `res.status`. Above it the request is just bytes going out; at this seam the response's status code becomes a *decision* — return the body, retry, or throw. Every provider module flips behavior here, and they flip it *differently* (Overpass retries a status set, Open-Meteo retries only 429, Nominatim retries nothing). That divergence is the most interesting thing at this layer.
+**Seam.** The retryable/fatal boundary is the load-bearing seam, and it's drawn *differently per module*: Overpass treats `{429,502,503,504}` as retryable (`overpass.ts:18`); Open-Meteo treats *only* `429` as retryable (`elevation.ts:114`); geocode treats *nothing* as retryable — any non-ok throws immediately (`geocode.ts:24`). Same axis (status → action), three different contracts. That's the seam worth studying.
 
-═════════════════════════════════════════════════
-HOW IT WORKS
-═════════════════════════════════════════════════
+## How it works
 
-#### Move 1 — the mental model
+### Move 1 — the mental model
 
-You know how you check `if (res.ok)` after a `fetch` and branch on it — success path vs error path? flattr does exactly that, but the *error* branch is where the intelligence lives: a 429 means "back off and retry," a 5xx means "transient, retry," a 4xx means "my request is wrong, give up." The status code isn't just an error flag; it's a routing instruction for what to do next.
+You know `fetch` gives you a `Response` with `.ok`, `.status`, and `.json()`. flattr's whole HTTP semantics layer is a set of decisions about those three: which method to send, what `.status` values to retry vs throw on, and what to do with the parsed `.json()`. Everything is request/response — ask, get an answer, done. No long-lived state, no streaming, no cookies.
 
 ```
-  Pattern — status code drives the next move
+  Pattern — the request/response decision flattr makes per call
 
-   fetch ──► response
-              │
-        ┌─────┴───────────────────────┐
-        │ res.ok (2xx)?               │ → parse body, return
-        │ status in RETRYABLE set?    │ → sleep, retry
-        │ status === 429?             │ → back off, retry
-        │ everything else (4xx)       │ → throw, give up
-        └─────────────────────────────┘
+   build request (method + headers + body/query)
+                │
+                ▼
+        await fetch ──► Response
+                │
+        ┌───────┼────────────────┐
+        ▼       ▼                ▼
+     res.ok   retryable        other
+     parse    backoff+retry    throw
+     json()   (per-module set)
 ```
 
-#### Move 2 — walking the HTTP semantics
+### Move 2 — walk the HTTP decisions
 
-**Methods: GET for reads, POST for the one big query.** Overpass is the only POST in the codebase (`pipeline/overpass.ts:34`) — because the Overpass QL query is large and goes in the request body as form-encoded data, not the URL. Everything else is GET: elevation, geocoding, reverse-geocoding, tiles. The method choice is semantic, not arbitrary: GET for idempotent reads with params in the URL, POST when the "query" is a body too big or structured for a query string.
+**Decision 1 — method: POST for Overpass, GET for the rest.** Overpass is the only POST, because Overpass QL queries are large and go in a form-encoded body:
 
-```
-  Method inventory
-
-  POST  overpass-api.de/api/interpreter   body: data=<QL query>
-  GET   api.open-meteo.com/v1/elevation   params in query string
-  GET   nominatim.../search · /reverse    params in query string
-  GET   tiles.openfreemap.org/...         MapLibre fetches
-```
-
-**Headers: the polite-client headers, deliberately.** flattr sends two kinds of request headers, both load-bearing for being a good guest on free APIs:
-
-- **`User-Agent`** on Overpass (`pipeline/overpass.ts:37`) and Nominatim (`pipeline/geocode.ts:22`, `:48`, `:65`). This isn't cosmetic — Nominatim's usage policy *requires* an identifying User-Agent and will block requests without one. flattr sends `"flattr/0.1 (grade-aware routing)"`. Drop it and Nominatim can 403 you.
-- **`Content-Type: application/x-www-form-urlencoded`** on the Overpass POST (`pipeline/overpass.ts:36`) — because the body is form-encoded `data=...`, and Overpass parses the QL out of that field.
-
-```
-  Layers-and-hops — the headers that matter
-
-  ┌─ flattr ─────┐  POST + UA + Content-Type   ┌─ Overpass ──────┐
-  │ fetchOverpass│ ──────────────────────────► │ needs form body │
-  │              │                              └─────────────────┘
-  │ geocode      │  GET + User-Agent            ┌─ Nominatim ─────┐
-  │              │ ──────────────────────────► │ REQUIRES UA or  │
-  │              │                              │ 403s you        │
-  └──────────────┘                              └─────────────────┘
+```ts
+// overpass.ts:30,33-40 — POST with form-encoded body
+const body = "data=" + encodeURIComponent(buildOverpassQuery(bbox));
+const res = await fetchImpl(endpoint, {
+  method: "POST",
+  headers: { "Content-Type": "application/x-www-form-urlencoded",
+             "User-Agent": "flatr/0.1 ..." },
+  body,
+});
 ```
 
-**Status codes drive control flow — and each module reads them differently.** This is the part to internalize. Three modules, three status-handling policies:
+The `Content-Type: application/x-www-form-urlencoded` and the `data=` prefix are the Overpass API's required shape — the QL query is one big form field. Everything else (elevation, geocode) is a GET with the query in the URL, because those inputs are small (coordinates, an address string).
+
+**Decision 2 — the User-Agent header is mandatory, not optional.** Every request sends a `User-Agent` identifying flattr:
 
 ```
-  Status-handling policy per provider
-
-  Overpass    res.ok → return · {429,502,503,504} → retry · else → throw
-  Open-Meteo  res.ok → return · 429 ONLY → retry      · else → throw
-  Nominatim   res.ok → return · anything else → throw (NO retry)
-  Google      json.status !== "OK" → throw (a BODY field, not HTTP status!)
+  overpass.ts:38    "flatr/0.1 (grade-aware routing graph builder)"
+  geocode.ts:22     "flattr/0.1 (grade-aware routing)"
 ```
 
-Note the Google oddity: it returns HTTP 200 with an error *in the JSON body* (`json.status !== "OK"`, `pipeline/elevation.ts:77`), so flattr checks the body status, not the HTTP status. That's a real API-semantics trap — a 200 that isn't a success — and flattr handles it correctly by inspecting the body.
+This isn't cosmetic. Nominatim's usage policy *requires* a real User-Agent and bounces requests without one (`geocode.ts:2` comment). Overpass and Open-Meteo are friendlier, but flattr identifies itself everywhere as good free-tier citizenship. *(Note the spelling drift — `flatr` in overpass vs `flattr` in geocode; harmless but real, `overpass.ts:38` vs `geocode.ts:22`.)*
 
-**Body parsing assumes well-formed JSON.** Every module calls `await res.json()` and immediately uses the shape (`pipeline/overpass.ts:41`, `pipeline/elevation.ts:111`, `pipeline/geocode.ts:25`). There's no schema validation, no try/catch around the parse. If a provider returned a 200 with an HTML error page (which Overpass mirrors sometimes do under load), `.json()` throws and the error propagates up — caught by the retry loop's caller or `useTileGraph`'s try/catch, but not specifically handled.
+**Decision 3 — status interpretation, drawn per module.** This is the seam from the structure pass, in code:
 
-**Caching: none flattr owns; one cache flattr leans on by accident.** flattr sets no `Cache-Control`, reads no `ETag`, stores no response cache. The *only* caching is the build-time bake: `graph.json` is effectively a permanent cache of the Overpass+elevation responses, but it's a file flattr writes, not HTTP caching. The elevation dedup (`dedupePrecision`, `pipeline/elevation.ts:42-50`) is a *request-collapsing* optimization — multiple nodes in one DEM cell share one query — which is cache-like but happens before the request, not on the response.
-
-**Cookies: none.** No `Set-Cookie` is read, no cookie is sent, no session. Every request is stateless and anonymous (except Google's URL key).
-
-**CORS: not exercised — and correctly so.** CORS is a *browser* same-origin policy. flattr runs in two non-browser environments: Node at build time (no same-origin policy at all) and React Native at runtime (a native runtime, no browser, no CORS preflight). So no `OPTIONS` preflight, no `Access-Control-*` headers, no CORS errors — ever. The spec's *proposed* Next.js web frontend (`docs/flattr-spec.md` §8) would hit CORS the moment it called Overpass/Nominatim from browser JS; the app as built sidesteps it entirely by not being a browser.
-
-```
-  Comparison — CORS: built vs proposed
-
-  AS BUILT (RN + Node)          PROPOSED (Next.js web, spec §8)
-  ──────────────────            ─────────────────────────────
-  no browser → no CORS          browser fetch → preflight OPTIONS
-  direct fetch to provider      provider must send Access-Control-*
-  works today                   OR proxy through your own server
+```ts
+// overpass.ts:18,42-46 — retryable SET, then throw
+const RETRYABLE = new Set([429, 502, 503, 504]);
+if (res.ok) return (await res.json()) as OverpassResponse;
+if (RETRYABLE.has(res.status) && attempt < retries) { await sleep(...); continue; }
+throw new Error(`Overpass request failed: ${res.status}`);
 ```
 
-#### Move 3 — the principle
+```ts
+// elevation.ts:110-118 — only 429 retried, else throw
+if (res.ok) { json = await res.json(); break; }
+if (res.status === 429 && attempt < retries) { await sleep(...); continue; }
+throw new Error(`Open-Meteo elevation: ${res.status}`);
+```
 
-The status code is a protocol-level instruction, not just an error flag — `429` says "back off," `503` says "I'm overloaded, try later," `400` says "fix your request." Reading them precisely is what separates a polite, resilient client from one that hammers a struggling server or gives up on a transient blip. flattr reads them precisely in two of four modules; the inconsistency (Nominatim's zero-retry, the two backoff curves) is the thing to clean up.
+```ts
+// geocode.ts:24 — no retry at all
+if (!res.ok) throw new Error(`Geocode failed: ${res.status}`);
+```
 
-═════════════════════════════════════════════════
-PRIMARY DIAGRAM
-═════════════════════════════════════════════════
+Why the difference? Overpass's public servers commonly return `502/503/504` under load (`overpass.ts:17` comment), so those join the retry set. Open-Meteo's only transient signal is `429` (quota), so that's the only one retried. Geocode is debounced in the UI and a failed suggestion is harmless, so it doesn't bother retrying — it throws and the UI's `catch` ignores it (`MapScreen.tsx:85`). The contract matches the failure mode of each specific API.
 
-The full HTTP-semantics picture — request shaping, the status-code decision, body parsing.
+**Decision 4 — caching, but NOT HTTP caching.** flattr runs two caches, neither of which uses HTTP cache headers:
 
 ```
-  flattr HTTP semantics — request → status decision → body
+  cache 1 — in-request dedup (elevation.ts:42-59)
+     same ~90m cell → one query, not one per node
+     scope: a single sample() call
 
-  ┌─ Request shaping (flattr decides) ─────────────────────────┐
-  │  GET (reads) or POST (Overpass QL body)                    │
-  │  headers: User-Agent (Overpass, Nominatim) ·               │
-  │           Content-Type (Overpass POST)                     │
-  └────────────────────────────┬───────────────────────────────┘
-                               │  over HTTPS
-  ┌─ Response: STATUS-CODE DECISION (the seam) ─▼──────────────┐
-  │  res.ok → parse + return                                   │
-  │  429 → back off + retry (Overpass, Open-Meteo)             │
-  │  5xx → retry (Overpass only)                               │
-  │  4xx / other → throw                                       │
-  │  Google: HTTP 200 but body status !== OK → throw           │
-  └────────────────────────────┬───────────────────────────────┘
-                               │
-  ┌─ Body parse ─▼─────────────────────────────────────────────┐
-  │  await res.json() — assumed well-formed, no schema check   │
+  cache 2 — persistent elevation cache (elevCache.ts + useTileGraph.ts:38)
+     AsyncStorage, survives restarts, keyed by ~90m DEM cell
+     scope: the whole app, forever (DEM values never change)
+```
+
+There is no `Cache-Control`, no `ETag`, no `If-None-Match`, no `Last-Modified` handling anywhere. flattr ignores HTTP caching entirely and instead does *application-level* caching, because the cache key it cares about (a 90m elevation cell) isn't a URL — many different URLs map to the same cell. HTTP caching keys on the URL; flattr keys on the *semantic* unit. That's why it rolled its own.
+
+```
+  Layers-and-hops — cache check before the network, per elevation point
+
+  ┌─ flattr cachedElevation (useTileGraph.ts:38) ──┐
+  │ for each point: getElev(cellKey)               │
+  │   hit  → use it, NO request                    │
+  │   miss → collect into missPts[]                │
+  └──────────────────────┬─────────────────────────┘
+            hop: only misses cross the network
+                         ▼
+  ┌─ Open-Meteo ──────────────────────────────────┐
+  │  GET elevation for miss cells only             │
+  └──────────────────────┬─────────────────────────┘
+            hop: results written back
+                         ▼
+  ┌─ AsyncStorage (elevCache.ts:35 putElev) ───────┐
+  │  persist real values (debounced 4s, batched)   │
+  └────────────────────────────────────────────────┘
+```
+
+**Decision 5 — CORS and cookies: not exercised, and correctly so.** No `fetch` sets `credentials`, no response is read for `Set-Cookie`, no `mode: 'cors'`. CORS is a *browser* same-origin policy; flattr runs in Node (build time) and React Native (runtime), neither of which enforces CORS — there's no browser origin to protect. So flattr never hits a preflight, never needs `Access-Control-Allow-Origin`. *(This is why the spec's proposed Next.js web frontend would change the picture: a browser would suddenly enforce CORS on these same calls. The app as built sidesteps it entirely.)*
+
+### Move 3 — the principle
+
+When your cache key isn't a URL, HTTP caching can't help you — and rolling an application-level cache keyed on the *semantic* unit (here, a DEM cell) is the right move, not a workaround. The deeper rule: match the retry contract to each API's actual failure modes rather than sharing one helper. flattr's three different retryable-status sets look inconsistent until you see each mirrors its API's real behavior.
+
+## Primary diagram
+
+The full HTTP picture — methods, the per-module status seam, the two app-level caches.
+
+```
+  flattr HTTP semantics — complete
+
+  ┌─ requests flattr authors ──────────────────────────────────┐
+  │  POST overpass  (form body, User-Agent)                     │
+  │  GET  open-meteo / nominatim / google  (query, User-Agent)  │
+  └────────────────────────┬───────────────────────────────────┘
+                           ▼  Response.status
+  ┌─ status seam (per module) ─────────────────────────────────┐
+  │  Overpass  retry {429,502,503,504}   else throw            │
+  │  Open-Meteo retry {429}              else throw            │
+  │  Geocode   retry {}                  always throw          │
+  └────────────────────────┬───────────────────────────────────┘
+                           ▼  on 2xx
+  ┌─ app-level caching (NOT HTTP caching) ─────────────────────┐
+  │  in-request dedup (cell)  +  persistent AsyncStorage (cell)│
+  │  no Cache-Control · no ETag · no cookies · no CORS         │
   └─────────────────────────────────────────────────────────────┘
-   no flattr-owned cache · no cookies · no CORS (non-browser runtime)
 ```
 
-═════════════════════════════════════════════════
-IMPLEMENTATION IN CODEBASE
-═════════════════════════════════════════════════
+## Elaborate
 
-**Use cases.** HTTP semantics are reached on every call. The decisions are most visible in the Overpass fetch (method, headers, status-driven retry all in one function) and the Google body-status check (a 200-isn't-success case).
+The absence of HTTP caching here is a feature, not a gap. HTTP caching shines when one URL = one resource you fetch repeatedly. flattr's elevation problem is the opposite: thousands of nearby coordinates collapse to one DEM cell, and that collapse can't be expressed in a URL cache. The app-level cache encodes domain knowledge (90m DEM resolution) that HTTP caching structurally can't. For the AI-engineering pivot, the same pattern recurs: caching LLM responses by *semantic* key (normalized prompt, embedding bucket) beats caching by exact URL/string — same lesson, different layer.
 
-**Request shaping + status decision in one place** — `pipeline/overpass.ts` (lines 32-47):
+## Interview defense
 
-```
-  pipeline/overpass.ts  (lines 32-47)
+**Q: Why do the three APIs retry on different status codes?**
+Because each set mirrors that API's real failure modes. Overpass's public servers throw `502/503/504` under load, so those are retryable (`overpass.ts:18`); Open-Meteo's only transient signal is quota `429` (`elevation.ts:114`); geocode is debounced and a dropped suggestion is harmless, so it retries nothing and just throws (`geocode.ts:24`). Anchor: *the retryable set is per-API, matched to its actual transient errors.*
 
-  const res = await fetchImpl(endpoint, {
-    method: "POST",                                ← POST: QL too big for URL
-    headers: {
-      "Content-Type": "application/x-www-form-urlencoded", ← form body
-      "User-Agent": "flatr/0.1 (...)",             ← polite-client identity
-    },
-    body,                                          ← "data=" + encoded QL
-  });
-  if (res.ok) return (await res.json()) ...;       ← 2xx → parse + return
-  if (RETRYABLE.has(res.status) && attempt < retries) { ← 429/5xx → retry
-    await sleep(delayMs * (attempt + 1));
-    continue;
-  }
-  throw new Error(`Overpass request failed: ${res.status}`); ← else give up
-        │
-        └─ every HTTP decision lives here: method, headers, status branch.
-           RETRYABLE = {429,502,503,504} is the set that means "transient"
-```
+**Q: Does flattr use HTTP caching? CORS?**
+Neither. It caches at the application level keyed on a 90m DEM cell (`elevCache.ts`), because many URLs map to one cell and HTTP caching keys on the URL. CORS doesn't apply — flattr runs in Node and React Native, not a browser, so there's no same-origin policy to satisfy. Anchor: *semantic-key cache, not URL cache; no browser, no CORS.*
 
-**A 200 that isn't success** — `pipeline/elevation.ts` (lines 75-78):
+## See also
 
-```
-  pipeline/elevation.ts  (lines 75-78)
-
-  const res = await fetchImpl(url);
-  const json = (await res.json()) as { status: string; results: ... };
-  if (json.status !== "OK")                        ← check BODY status,
-    throw new Error(`Google Elevation API: ${json.status}`); │ not HTTP status
-        │
-        └─ Google returns HTTP 200 even on quota/auth errors; the real
-           status is in the body. Checking res.ok alone would miss it.
-           This is the API-semantics trap flattr handles correctly.
-```
-
-**Nominatim's zero-retry — the inconsistency** — `pipeline/geocode.ts` (lines 21-25):
-
-```
-  pipeline/geocode.ts  (lines 21-25)
-
-  const res = await fetchImpl(`${ENDPOINT}?${params}`, {
-    headers: { "User-Agent": "flattr/0.1 (...)" },  ← UA: required by Nominatim
-  });
-  if (!res.ok) throw new Error(`Geocode failed: ${res.status}`); ← throw, no retry
-        │
-        └─ one shot. A transient 429/503 here fails the geocode outright,
-           unlike Overpass/Open-Meteo which retry. The caller (MapScreen)
-           catches and shows "not found" — see 07 for the consequence
-```
-
-═════════════════════════════════════════════════
-ELABORATE
-═════════════════════════════════════════════════
-
-The HTTP status code vocabulary is the original distributed-systems failure protocol — `4xx` = "you (client) messed up, don't retry," `5xx` = "I (server) messed up, retrying might help," `429` = "you're going too fast." flattr's retry sets encode exactly that semantics: it retries `5xx` and `429` (server-side / rate) but not `4xx` (client-side, retrying won't help). The general theory of which failures are retryable — idempotency, transient vs permanent — lives in `.aipe/study-distributed-systems/`. The thing flattr gets right is *not* retrying 4xx; the thing it gets inconsistent is *which* transient codes each provider retries and *how* it backs off (`07`).
-
-═════════════════════════════════════════════════
-INTERVIEW DEFENSE
-═════════════════════════════════════════════════
-
-**Q: "Walk me through how you handle HTTP status codes."**
-
-Answer: "Status code drives control flow. 2xx, I parse and return. For Overpass I retry a set — 429, 502, 503, 504 — because those are transient or rate-limit signals; for Open-Meteo I retry only 429. Anything 4xx I throw immediately, because retrying a client error won't fix it. The trap I handle is Google Elevation: it returns HTTP 200 even on errors, with the real status in the body, so I check `json.status`, not `res.ok`. The gap is consistency — Nominatim has no retry at all, and my two retrying modules use different backoff curves."
-
-```
-  2xx → parse · 429/5xx → retry · 4xx → throw
-  Google: 200 + body.status !== OK → throw (200 isn't success)
-  gap: Nominatim no retry; two backoff curves
-```
-
-Anchor: *the status code is a protocol instruction — 4xx vs 5xx tells you whether retrying can possibly help.*
-
-**Q: "Do you have to worry about CORS?"**
-
-Answer: "No — and that's a property of the runtime, not luck. CORS is a browser same-origin policy. flattr builds in Node and runs in React Native; neither is a browser, so there's no preflight and no `Access-Control` requirement. The catch is that the spec proposes a Next.js web frontend — the moment that calls Overpass or Nominatim from browser JS, it'd hit CORS and need either provider CORS headers or a proxy. The native app sidesteps it entirely."
-
-```
-  RN + Node = no browser = no CORS
-  proposed web app = browser fetch = CORS preflight problem
-```
-
-Anchor: *CORS is a browser policy; flattr isn't a browser, so it's not exercised — but the proposed web version would face it.*
-
-═════════════════════════════════════════════════
-VALIDATE
-═════════════════════════════════════════════════
-
-1. **Reconstruct:** Which method does each provider use and why is Overpass the only POST? (`pipeline/overpass.ts:34`)
-2. **Explain:** Why does flattr check `json.status` instead of `res.ok` for Google Elevation? (`pipeline/elevation.ts:77`)
-3. **Apply:** Nominatim starts returning transient 503s under load. Trace what happens today (`pipeline/geocode.ts:24`) and what you'd change to match the Overpass policy.
-4. **Defend:** Why is it correct that flattr retries 5xx but not 4xx? What would break if you retried 400s?
-
-═════════════════════════════════════════════════
-SEE ALSO
-═════════════════════════════════════════════════
-
-- `07-timeouts-retries-pooling-and-backpressure.md` — the retry/backoff mechanics behind the status branches.
-- `04-tls-and-trust-establishment.md` — the API key header/param and where it can leak off the wire.
-- `08-networking-red-flags-audit.md` — the unchecked `.json()` parse and the retry inconsistency, ranked.
-- `.aipe/study-distributed-systems/` — retryable-vs-not as a general correctness problem.
+- `07-timeouts-retries-pooling-and-backpressure.md` — the retry curves behind these status sets, in depth
+- `06-websockets-sse-streaming-and-realtime.md` — why responses are read whole, never streamed
+- `.aipe/study-performance-engineering/` — the cache hit-rate as a latency/throughput lever

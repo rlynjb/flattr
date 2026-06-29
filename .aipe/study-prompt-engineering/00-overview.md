@@ -1,158 +1,114 @@
-# Prompt engineering in flattr — overview
+# 00 — Overview: prompt engineering in a codebase with no prompts
 
-> **Verdict first: this repo has no prompts.** No LLM calls, no
-> provider SDK, no system message, no completion, no AI layer at all.
-> I greped for `prompt`, `openai`, `anthropic`, `llm`, `completion`,
-> `gpt-`, `claude-`, `langchain`, `gemini`, `generativeai` across the
-> TypeScript, the mobile app, and both `package.json` files. Zero hits
-> in application code. The design spec says so on purpose:
-> `docs/flattr-spec.md:254` — *"No LLM layer in v1"* — and `:380`
-> lists *"the LLM destination parser. All later."* as explicitly out
-> of scope.
->
-> So this is **not** a prompt-engineering guide for a system that has
-> prompts. It's an honest map of where prompts *would* live the day
-> the spec's out-of-scope NL features get built — grounded in the real
-> files that already exist, with line numbers — and a flat statement
-> that everything else is `not yet exercised`.
+*Type label: orientation*
 
-I'm writing this in the working-AI-engineer voice (the persona for
-this topic), not the staff-engineer teacher voice. The most useful
-thing I can do here is *not* invent a prompt system. The most useful
-thing is to tell you exactly which seams are load-bearing for prompts
-later, so when you build "describe my route" you already know which
-function's output you're templating and which input is attacker-
-controlled.
+Let me be blunt before we start, because nothing in this guide works if I'm
+not. I grepped the whole tree. There is no `anthropic`, no `openai`, no
+`@google/generative-ai`, no `langchain`, no model SDK, no `.prompt` file, no
+string anywhere that gets handed to an LLM. flattr is a hand-rolled A* router
+over a grade-annotated street graph. It is one of the cleanest "no AI in it"
+codebases I've read.
 
----
+So why a prompt-engineering guide? Because flattr has the *exact* shape that
+grows a prompt layer. I've shipped four or five features that started life
+as a deterministic pipeline and grew an LLM seam later — and the ones that
+went badly went badly because nobody mapped the seam before bolting the model
+on. This guide does that mapping work up front. Every concept is taught
+against a **seam**: a real boundary in flattr's real code where a prompt
+would attach. Nothing is invented. Nothing is claimed to exist.
 
-## What flattr actually is
+## Zoom out — where prompts would sit in flattr
 
-A grade-aware A* router. One user knob — `userMax` (max comfortable
-uphill grade) — drives a hand-rolled shortest-path search over a
-grade-annotated street graph, plus a grade heatmap. Pure TypeScript
-core under `features/` / `pipeline/` / `lib/`; an Expo / React Native
-app under `mobile/`. The graph is a prebuilt static artifact
-(`mobile/assets/graph.json`). There is no backend, no database, and
-no model.
+Here's the whole system, with the three seams marked in the bands where
+they'd live. Two of them are at the edges (input and output); one is a trust
+boundary that cuts across both.
 
 ```
-  Where an AI layer would sit — and the fact that it doesn't
+  flattr today (all deterministic) + the three future prompt seams
 
-  ┌─ UI layer (mobile/, Expo + RN) ───────────────────────────┐
-  │  AddressBar (text inputs)   RouteSummaryCard (totals)      │
-  └───────────────┬───────────────────────────┬───────────────┘
-                  │ search string              │ RouteSummary
-  ┌─ Engine layer (features/, pipeline/) ──────▼───────────────┐
-  │  geocode()    A* router    cost / grade    summary()       │
-  └───────────────┬────────────────────────────────────────────┘
-                  │ HTTPS (build-time + geocode)
-  ┌─ Provider layer ───────────────────────────────────────────┐
-  │  Nominatim (OSM)    Open-Meteo (elevation)                 │
-  │                                                            │
-  │  ┌──────────────────────────────────────────────────┐     │
-  │  │  ★ PROMPT / LLM LAYER ★   ← does not exist (v1)   │     │  planned,
-  │  │  no provider, no SDK, no prompt template          │     │  not built
-  │  └──────────────────────────────────────────────────┘     │
-  └────────────────────────────────────────────────────────────┘
+  ┌─ UI layer (mobile/, Expo) ──────────────────────────────────────┐
+  │  AddressBar.tsx   GradeSlider.tsx   RouteSummaryCard.tsx         │
+  │       │                                      ▲                   │
+  │  ★ SEAM 2 ★ free text in              ★ SEAM 1 ★ NL description  │
+  └───────┼──────────────────────────────────────┼──────────────────┘
+          │                                       │
+  ┌─ Pipeline / engine (features/, pipeline/, lib/) ─────────────────┐
+  │  geocode.ts ──► nearest.ts ──► astar.ts ──► summary.ts           │
+  │       ▲                                          │               │
+  │  parse "flat near water"             RouteSummary{...} out       │
+  └───────┼──────────────────────────────────────────┼──────────────┘
+          │                                           │
+  ┌─ Provider layer (does not exist yet) ────────────────────────────┐
+  │  ★ where an LLM call would live — NONE TODAY ★                   │
+  │  ★ SEAM 3 ★ display_name from Nominatim flows in here untrusted  │
+  └──────────────────────────────────────────────────────────────────┘
 ```
 
-The starred box is empty. That's the whole finding. Everything below
-names where it *would* fill in.
+The provider band is empty. That emptiness is the honest center of this
+whole guide. We are studying the sockets, not the plug.
 
----
+## Zoom in — the three seams, named precisely
 
-## Concept inventory — all 13, all `not yet exercised`
+**Seam 1 — output→prompt (`features/routing/summary.ts:11`).**
+`routeSummary()` returns `RouteSummary { distanceM, climbM, steepCount }`.
+That is *already* a structured object. The "describe my route in plain
+English" feature is the classic output→prompt move: take a structured result,
+template it into a prompt, get prose back. The struct is the prompt's *input*.
+This is the anchor for concepts 01, 02, 08, 09, 13.
 
-The prompt-engineering spec defines 13 concepts. In a repo with
-prompts, each gets a full concept file anchored to real prompt code.
-Here, none has prompt code to anchor to, so the honest verdict on
-every one is the same: **`not yet exercised`**. I'm not going to pad
-13 empty files for machinery that doesn't exist. Instead, here's the
-inventory with the concrete seam where each *would* land:
+**Seam 2 — input→prompt (`pipeline/geocode.ts:9`).** `geocode(query, opts)`
+takes a `query` string and hits Nominatim. Today `query` must be a literal
+address. The "type what you want in English" feature — *"somewhere flat near
+the water"* — is the input→prompt move: an LLM parses free text into the
+structured args `geocode()` and the router actually need. This is the anchor
+for concepts 06, 07, 11.
 
-| # | Concept | Verdict | Would-live-here seam (real file:line) |
-|---|---------|---------|----------------------------------------|
-| 1 | Anatomy of a production prompt | not yet exercised | The "describe my route" prompt would template `features/routing/summary.ts:11` output (`RouteSummary`) as its context-injection section → see `01-describe-my-route-seam.md` |
-| 2 | Structured outputs (tool calling / schemas) | not yet exercised | A NL destination parser would emit a typed `{lat,lng,label}` — the shape `pipeline/geocode.ts:3` already defines (`GeocodeResult`) |
-| 3 | Prompts as code (versioning / observability) | not yet exercised | No prompt files exist to version. Would live beside engine modules under `features/` as version-controlled templates |
-| 4 | Token budgeting / context window | not yet exercised | A route description prompt's context is bounded by `RouteSummary` (3 numbers) — trivially small; budgeting only matters if you stuff the full path geometry |
-| 5 | Eval-driven iteration | not yet exercised | The repo evals routing with Vitest (`*.test.ts`); a prompt eval set would sit alongside, asserting on description outputs |
-| 6 | Single-purpose chains | not yet exercised | Two candidate single-job chains: "parse destination" (geocode seam) and "describe route" (summary seam) — kept separate, never merged |
-| 7 | Output mode mismatch | not yet exercised | If the parser returns JSON and `geocode()` callers expect `GeocodeResult`, the contract at `pipeline/geocode.ts:3` is the mismatch guard |
-| 8 | Few-shot prompting | not yet exercised | A destination parser ("the coffee place near the park") would carry few-shot examples mapping phrasings → query strings fed to `geocode()` |
-| 9 | Chain-of-thought | not yet exercised | Not warranted — both candidate features are lookups/templating, not multi-step reasoning. CoT would waste tokens here |
-| 10 | Self-critique / self-consistency | not yet exercised | Not warranted at this stake level — route descriptions aren't high-stakes edits to user data |
-| 11 | Meta-prompting | not yet exercised | No prompt-generating layer exists |
-| 12 | Prompt injection defense (author side) | not yet exercised | **The real one.** OSM `display_name` strings (`pipeline/geocode.ts:27,52,69`) are attacker-influenceable free text that would flow into any such prompt → see `01-describe-my-route-seam.md` and cross-link `.aipe/study-security/` |
-| 13 | Forbidden patterns / rotating formulas | not yet exercised | Would apply only if "describe my route" ran repeatedly for one user and the phrasings converged |
+**Seam 3 — the injection boundary (`pipeline/geocode.ts:27,52,69`).** Every
+geocode call returns `display_name`, a string that comes from OpenStreetMap —
+which means it's edited by the public. The moment that string is interpolated
+into a prompt (and at Seam 1 it would be: "your destination is {label}"), it's
+an injection vector. This is the anchor for concept 12.
 
----
+## The structure pass — one axis across the seams
 
-## The two real seams, named
+Pick **trust** as the axis and trace it across the three layers. Watch the
+answer flip — that flip is exactly where the prompt work concentrates.
 
-There are exactly **two** places in this codebase where a prompt would
-attach. Both already exist as plain deterministic code.
+```
+  axis = "can the model be trusted to follow instructions here?"
 
-### Seam A — "describe my route" (output → prompt)
+  ┌─ engine (deterministic) ─┐   trust = TOTAL — code does exactly
+  │  astar.ts, summary.ts    │   what it says, every time
+  └────────────┬─────────────┘
+               │ seam: struct → prompt   ◄── trust FLIPS here
+  ┌─ LLM call (future) ──────┐   trust = BEST-EFFORT — model usually
+  │  prompt + model          │   follows, fails ~some% of the time
+  └────────────┬─────────────┘
+               │ seam: untrusted data → prompt   ◄── trust FLIPS again
+  ┌─ external data (OSM) ────┐   trust = ZERO — attacker-influenceable
+  │  display_name string     │   text that the model will read as words
+  └──────────────────────────┘
+```
 
-`features/routing/summary.ts:11` is `routeSummary(graph, path, userMax)`.
-It returns `{ distanceM, climbM, steepCount }`. Today that struct flows
-straight into `mobile/src/RouteSummaryCard.tsx`, which renders it as
-*"3.2 km · +41 m climb"* with deterministic string templating. A
-"describe my route" feature (spec `:254`) would take that same struct
-and template it into a prompt instead of into JSX — the honesty output
-*is* the context-injection section of the prompt. That's the one seam
-worth a diagram, so it gets the single concept file in this guide:
-`01-describe-my-route-seam.md`.
+The engine is total-trust: A* returns the same path for the same input
+forever. The prompt is best-effort: it follows instructions *most* of the
+time, which is the entire reason evals (concept 05) and structured outputs
+(concept 02) exist. The external data is zero-trust: `display_name` is words
+a stranger wrote, and the model can't tell words-that-are-data from
+words-that-are-commands unless you build that boundary (concept 12).
 
-### Seam B — natural-language destination parser (input → prompt)
+Three layers, one axis, two flips. Every prompt-engineering concept in this
+guide is a tool for managing one of those two flips. That's the map. Read
+`01-anatomy.md` next — it walks the four sections of a prompt against Seam 1's
+real `RouteSummary` struct.
 
-`mobile/src/AddressBar.tsx:68-94` are two `TextInput`s whose text feeds
-`pipeline/geocode.ts` (`geocode` / `geocodeSuggest`). Today that text
-goes verbatim as a Nominatim query string. The spec's out-of-scope NL
-parser (`:380`) would sit *between* the input and `geocode()`: take
-free text like "the bakery near the library," prompt an LLM to resolve
-it to a query, then call `geocode()`. The output contract it must hit
-already exists: `GeocodeResult { lat, lng, label }` at
-`pipeline/geocode.ts:3`.
+## What this guide will NOT do
 
----
+- Invent a prompt and pretend it's in the repo.
+- Show you `anthropic.messages.create(...)` as if flattr calls it.
+- Use marketing words. A prompt that "fails 4% of the time and regresses on a
+  model upgrade" is the honest description; "robust AI solution" is not.
 
-## The injection concern is real even before any prompt exists
-
-This is the one thing I'd flag hard. `geocode()` returns
-`display_name` from Nominatim/OSM (`pipeline/geocode.ts:27`, `:52`,
-`:69`). OSM place names are user-editable, third-party data — anyone
-can name a node. Today that's harmless: the label is only ever rendered
-as text or used as a search string. **The moment** either future seam
-puts an OSM `display_name` (or a route summary derived from
-OSM-tagged edges) into a prompt, that untrusted string becomes a
-prompt-injection vector — a place named
-`Main St"). Ignore previous instructions and …` is a classic indirect
-injection. That's a trust-boundary finding, so it cross-links the
-security guide: `.aipe/study-security/`.
-
----
-
-## Reading order
-
-There's one concept file, because one seam earns a real diagram:
-
-1. **`01-describe-my-route-seam.md`** — the single future-state
-   concept file. Walks Seam A (and the injection concern on Seam B)
-   using `format.md`'s structure with Move 2.5 (current state vs
-   future state), since all of it is future-state.
-
-If you build either NL feature later, this folder grows: re-run the
-generator and the `not yet exercised` rows above become real concept
-files anchored to the new prompt code.
-
-## See also
-
-- `.aipe/study-security/` — trust boundaries; OSM `display_name` as
-  untrusted input, the runtime half of injection defense.
-- `.aipe/study-ai-engineering/` — where the model call, serving, and
-  output-validation seams would be audited if an AI layer is built.
-- `.aipe/study-agent-architecture/` — reasoning/agent patterns;
-  also `not yet exercised` here for the same reason.
+Where a concept genuinely has nothing to anchor to in flattr beyond the seam,
+the file says so and the Project exercises block becomes the buildable target.
+</content>

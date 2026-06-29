@@ -1,55 +1,79 @@
-# Study — AI Engineering (flattr)
+# study-ai-engineering — flattr
 
-**Verdict up front: this repo has no AI layer of any kind.** No LLM, no
-embeddings, no vector store, no RAG, no agents, no prompts, no model SDKs, no
-ML. The product spec says so on purpose (`docs/flattr-spec.md:254` — *"No LLM
-layer in v1"*; §13 names the NL destination parser as out of scope).
+AI engineering + ML study guide, generated against the **flattr** repo
+(grade-aware self-powered routing: hand-rolled A* over a grade-annotated
+street graph, plus an Expo/React Native map app).
 
-This guide is therefore an **honest map of seams**, not a description of running
-AI. It records each AI-engineering concern as `not yet exercised` and names the
-exact file + line where it *would* attach if the spec's out-of-scope NL features
-were built. Everything here is future-state.
+## Read this first
+
+**flattr has no AI and no ML.** No LLM, no embeddings, no vector store,
+no RAG, no trained model, no inference runtime. The dependency tree is
+`tsx` / `typescript` / `vitest` (engine) and `maplibre-react-native` /
+`expo` / `react-native` (mobile). Nothing else. The grep for
+`openai|anthropic|langchain|embedding|llm|gpt-|claude-|rag|mediapipe|onnx`
+returns zero real hits — the only `vector` in the tree is MapLibre's
+*vector tiles*, which is cartography, not ML.
+
+So this guide does two things, and only these two:
+
+1. **States honestly what AI/ML work the repo does NOT contain.** That's
+   the job of [`ai-features-in-this-codebase.md`](ai-features-in-this-codebase.md)
+   and [`ml-features-in-this-codebase.md`](ml-features-in-this-codebase.md).
+   Read those two first — they are the load-bearing files.
+
+2. **Maps the concrete seams where AI *would* attach**, anchored to real
+   flattr files with `file:line` grounding. There are exactly three worth
+   naming, and they're covered in the honesty files and revisited in the
+   concept sub-sections:
+   - **output→prompt seam** — `features/routing/summary.ts:11`
+     (`routeSummary` → a "describe my route" LLM call)
+   - **input→prompt seam** — `pipeline/geocode.ts:9` (`geocode` →
+     natural-language destination parsing)
+   - **injection vector** — OSM `display_name` flows untrusted into any
+     future prompt (`pipeline/geocode.ts:27`, `:52`, `:69`)
+
+The numbered sub-section directories below teach the AI/ML *concepts* as
+study material. Every concept's "in this codebase" block says
+**not yet exercised** and points at the attachment seam. The concepts are
+real; flattr's use of them is zero. Both halves are stated without flinching.
 
 ## Reading order
 
-1. **`00-overview.md`** — start here. The no-AI verdict, the verification grep,
-   and the full concern walk: every AI/ML area marked `not yet exercised` with
-   its real would-attach seam (file + line range).
-2. **`01-describe-route-llm-context-seam.md`** — concept file: the "describe my
-   route" data-to-text seam off `features/routing/summary.ts`. The cleanest,
-   most likely first LLM call flattr would ever make. Safe seam (payload is
-   pure numbers).
-3. **`02-nl-destination-parse-seam.md`** — concept file: the natural-language
-   destination parser off `pipeline/geocode.ts` + `mobile/src/AddressBar.tsx`.
-   Heuristic-first / LLM-fallback; and where untrusted OSM text would become a
-   prompt-injection vector.
-4. **`ai-features-in-this-codebase.md`** — the honest per-repo file: there are
-   none, stated and verified.
-5. **`ml-features-in-this-codebase.md`** — same, for ML.
+```
+1. ai-features-in-this-codebase.md   ← what AI flattr does NOT do + the 3 seams
+2. ml-features-in-this-codebase.md   ← what ML flattr does NOT do + where it'd attach
+3. 00-overview.md                    ← the whole map in one diagram
+4. 01-llm-foundations/ … 09-…/       ← concepts as study material (all "not yet exercised")
+```
 
-The two concept files follow `format.md`'s 11-block structure and lean on
-Move 2.5 (current state vs future state) throughout, since everything is
-future-state.
+## Sub-sections
 
-## Why only two concept files
-
-Per the generator instructions: don't build dozens of fully-fleshed concept
-files for machinery that doesn't exist. The overview's concern walk does the
-honest enumeration. Only two seams are genuinely interesting enough to warrant a
-real diagram and a full walkthrough — the two above. Both are grounded in real
-files; both attach without rewriting the engine.
+| dir | topic | flattr status |
+|-----|-------|---------------|
+| `01-llm-foundations/` | what an LLM is, tokens, sampling, structured output, streaming, cost, heuristic-before-LLM, provider abstraction, override locks | not exercised |
+| `02-context-and-prompts/` | context window, lost-in-the-middle, prompt chaining | not exercised |
+| `03-retrieval-and-rag/` | embeddings, chunking, vector DBs, hybrid, rerank, RAG, GraphRAG | not exercised |
+| `04-agents-and-tool-use/` | agents vs chains, tool calling, ReAct, routing, memory, recovery | not exercised |
+| `05-evals-and-observability/` | eval sets, eval methods, LLM-as-judge, observability | not exercised |
+| `06-production-serving/` | caching, cost optimization, prompt injection, rate limiting, retry | not exercised (injection seam is real) |
+| `07-system-design-templates/` | search/ranking, support chatbot — interview reframes | n/a |
+| `08-machine-learning/` | supervised pipeline, features, train/val/test, on-device inference, drift, retraining | not exercised |
+| `09-ml-system-design-templates/` | recommender, anomaly detection, object detection | n/a |
 
 ## Cross-links to sibling guides
 
-- `.aipe/study-security/` — owns the **prompt-injection-via-OSM-data** thread.
-  This guide names the vector (`pipeline/geocode.ts:52`, the OSM `display_name`
-  label); that guide hardens it.
-- `.aipe/study-testing/` — the **Dijkstra-vs-A\* oracle** and the `bench/`
-  harness, the deterministic analog an LLM-judge eval would be built from.
-- `.aipe/study-performance-engineering/` — the `bench/` measurement harness in
-  depth (the eval-harness shape).
-- `.aipe/study-prompt-engineering/` · `.aipe/study-agent-architecture/` —
-  query-rewriting, tool-wrapping, and agent-loop mechanics referenced by the
-  two seam files.
-- `.aipe/study-system-design/` — `summary.ts` and the geocode/search flow as
-  part of the routing system.
+flattr's real engineering is graphs, routing, and a build pipeline — not AI.
+For the substance, read these siblings:
+
+- `study-dsa-foundations/` — the A*, binary heap, bidirectional search that
+  are the actual point of this repo
+- `study-system-design/` — build-time pipeline → static `graph.json` → mobile reader
+- `study-runtime-systems/`, `study-performance-engineering/` — the routing hot path
+- `study-networking/`, `study-security/` — the Nominatim/Overpass/Open-Meteo
+  HTTP boundaries (where the `display_name` injection vector also lives)
+- `study-prompt-engineering/`, `study-agent-architecture/` — the AI siblings;
+  same conclusion (no AI here), same seams referenced
+- `study-data-modeling/`, `study-database-systems/`, `study-software-design/`,
+  `study-frontend-engineering/`, `study-testing/`,
+  `study-debugging-observability/`, `study-distributed-systems/` — round out
+  the repo

@@ -1,82 +1,108 @@
-# Overview — the testing surface, one page
+# 00 — Overview: how flattr proves it works
 
-*The coverage map and the verdict, before any detail.*
+One page. The shape of the suite, the single question it's organized around,
+and the verdict on what's strong and what's missing.
 
-## Zoom out — where the tests sit relative to the code
+---
 
-flattr is split into three code layers and one untested app. The tests
-cling tightly to the first three; the fourth is bare.
+## Zoom out — where the tests sit
 
-```
-  flattr — code layers vs test coverage
-
-  ┌─ Engine (features/) ─────────────────────────────────────┐
-  │  routing/  astar · pqueue · cost · graph · nearest        │ ████ HEAVY
-  │  grade/    classify · zones                               │ ████ HEAVY
-  │  map/      geojson · tiles                                │ ███  GOOD
-  │            → 14 test files, the correctness core          │
-  └───────────────────────────────────────────────────────────┘
-  ┌─ Pipeline (pipeline/) BUILD-TIME ────────────────────────┐
-  │  osm · split · grade · elevation · overpass · geocode     │ ████ HEAVY
-  │  build-graph · config                                     │      (all
-  │            → 8 test files, all external calls mocked      │      mocked)
-  └───────────────────────────────────────────────────────────┘
-  ┌─ lib + bench ────────────────────────────────────────────┐
-  │  lib/geo (haversine) · bench/report (table fmt)           │ ██   THIN
-  └───────────────────────────────────────────────────────────┘
-  ┌─ Mobile (mobile/src/) Expo app ──────────────────────────┐
-  │  MapScreen · useTileGraph · loadGraph · AddressBar ·      │ ░░░░ NONE
-  │  GradeSlider · Legend · RouteSummaryCard                  │  not yet
-  │            → 0 test files                                 │  exercised
-  └───────────────────────────────────────────────────────────┘
-```
-
-The verdict up front: **the engine is the project, and the engine is the
-thing that's tested.** That's the correct priority. The hand-rolled A* /
-priority-queue / cost-function core — the part the spec says is "the point of
-the project" — carries the heaviest test load, including an algorithmic
-oracle and property tests. The mobile UI that renders the result carries
-none.
-
-## The numbers (real, from `npx vitest run`, 2026-06-19)
+The whole system is a build-time pipeline that bakes a static `graph.json`, and
+a runtime router over it. Tests bracket the parts that have a *checkable*
+answer.
 
 ```
-  Test Files  22 passed (22)
-       Tests  130 passed (130)
-    Duration  282ms
+  flattr — where the 130 tests land
+
+  ┌─ BUILD-TIME pipeline (Node, run once) ──────────────────────┐
+  │  OSM fetch → split → grade → elevation → build-graph         │
+  │  ★ tested with INJECTED fetch (no real network) ★            │ ← tested
+  └───────────────────────────────┬─────────────────────────────┘
+                                  │ emits graph.json
+  ┌─ RUNTIME engine (pure TS) ────▼─────────────────────────────┐
+  │  pqueue → dijkstra → astar → gradeAstar → directedAstar      │
+  │  → bidirectional   ★ proven by OPTIMALITY ORACLE ★           │ ← tested
+  └───────────────────────────────┬─────────────────────────────┘
+                                  │ consumed by
+  ┌─ MOBILE app (Expo / React Native) ──────────────────────────┐
+  │  MapScreen, GradeSlider, useTileGraph (on-device rerun)      │
+  │  ✗ ZERO tests ✗                                              │ ← gap
+  └─────────────────────────────────────────────────────────────┘
 ```
 
-282ms for 130 tests means every test is a pure-function unit or an
-in-memory integration test. Nothing waits on I/O. That speed is *why* the
-suite is worth running on every save — and it's a direct consequence of the
-network-isolation discipline (`03-injected-fetch-network-isolation.md`).
+The pure middle layer is tested to the hilt. The two ends — the live network
+on one side, the UI on the other — are where coverage thins or vanishes.
 
-## What's strong, what's missing
+---
 
-**Strong:**
-- The Dijkstra-vs-A* optimality oracle (`astar.test.ts:37-53`) — the single
-  best test in the repo.
-- Property/invariant testing on the binary heap (`pqueue.test.ts:23-78`):
-  50-seed sorted-order oracle plus a 2000-step heap-invariant check.
-- Total network isolation: every Overpass / Open-Meteo / Nominatim call goes
-  through an injected `fetch`, so the suite never hits the rate-limited
-  Open-Meteo API the project memory warns about.
-- Error/edge paths tested, not just happy paths: `null` on disconnected,
-  throw on empty graph, divide-by-zero guarded, NaN priority rejected.
+## The one axis: how is correctness *proven*?
 
-**Missing (`not yet exercised`):**
-- Mobile components — zero tests across all of `mobile/src/`.
-- `pipeline/run-build.ts` orchestrator and `mobile/scripts/sync-engine.mjs`
-  — the glue scripts have no tests.
-- CI: no `.github/workflows`. The green bar is local-only.
-- Coverage tooling: no `@vitest/coverage-*` dependency; coverage is eyeballed,
-  not measured.
-- No LLM / AI feature anywhere → the AI-eval seam is entirely absent (which
-  is fine — there's nothing to eval).
+Pick one question and trace it across the suite. The answer changes by layer,
+and that contrast is the whole lesson.
 
-## How to use the rest of this folder
+```
+  axis = "what makes the assertion trustworthy?"
 
-Read `audit.md` for the lens-by-lens walk. Then the five pattern files,
-each of which takes one technique flattr uses *on purpose* and teaches it as
-a reusable skill you can carry to the next codebase — because that's the
-point: the oracle pattern survives even if you swap A* for Bellman-Ford.
+  pqueue       → INVARIANT + ORACLE   heap property holds after 2000 random
+                                      ops; pops match a sorted array (50 seeds)
+  astar        → ORACLE               A* cost EQUALS Dijkstra cost (the gate)
+  bidirectional→ ORACLE               matches Dijkstra / directedAstar cost
+  cost/grade   → CLOSED-FORM          assert the exact penalty formula value
+  pipeline     → FIXTURE + FAKE FETCH known input, injected response, known out
+  fixtures     → HAND-COMPUTED        diamond's S→A→G = 200, baked in by hand
+```
+
+Three proof strategies show up, in rough order of strength:
+
+1. **Oracle** — compute the answer a *second, independent* way and demand
+   agreement. Strongest. You don't have to know the answer; you only have to
+   trust that two methods can't both be wrong the same way. → `01`.
+2. **Invariant** — assert a property that must hold for *any* input, then throw
+   thousands of random inputs at it. → `02`.
+3. **Hand-computed expectation** — you worked out the answer yourself and pinned
+   it (`lengthM).toBe(200)`). Cheapest, most brittle, fine for tiny fixtures.
+
+The router uses #1 and #2 precisely because #3 doesn't scale to a 144-node grid
+where no human knows the optimal cost.
+
+---
+
+## Verdict — strong, with two honest holes
+
+**What's strong (rank order):**
+
+- **The optimality oracle** (`features/routing/astar.test.ts:38`). A* must
+  return the *same cost* as Dijkstra on a 12×12 grid. This is the single most
+  load-bearing test in the repo — it's the only thing standing between a
+  plausible-looking wrong path and a correct one. If you change `cost.ts`, this
+  test is what catches an inadmissible heuristic.
+- **Property tests on the heap** (`features/routing/pqueue.test.ts:67`). 2000
+  random push/pop ops, invariant checked every step; plus a 50-seed sorted-order
+  oracle. The hand-rolled heap is the foundation under Dijkstra — a silent bug
+  here corrupts every route.
+- **Network isolation by injected fetch** (`pipeline/*.test.ts`). Every I/O
+  function takes a `fetch` parameter; tests pass `vi.fn()`. The suite never
+  touches the real Overpass/Open-Meteo/Nominatim APIs. 307ms, zero flake.
+- **Finite-`BLOCKED` discipline** (`features/routing/cost.test.ts:55`,
+  `astar.test.ts:82`). The repo's most subtle correctness rule — "too steep" is
+  a large *finite* number, not `Infinity` — is pinned by tests on both the cost
+  function and the router that honors it.
+
+**What's missing (rank order):**
+
+- **Mobile/UI: zero tests.** `mobile/src/` (`MapScreen.tsx`, `GradeSlider.tsx`,
+  `AddressBar.tsx`, `RouteSummaryCard.tsx`, `useTileGraph.ts`) has no test at
+  all. No component test, no hook test, no render test.
+- **The on-device rerun path is untested.** `mobile/src/useTileGraph.ts` (290
+  lines) holds the live viewport-fetch, the flat-elevation fallback, and the
+  self-heal retry loop. It re-runs the *same* pipeline functions the build uses
+  — which *are* tested — but the orchestration around them (degraded state,
+  cache, retry timing) has no coverage.
+- **No e2e.** Nothing exercises geocode → route → render end to end.
+
+The gaps are at the edges (live network behavior, UI), not in the core
+algorithm. For a project whose stated point is "the graph work is the point,"
+that's the right place to have spent the test budget — but the mobile hole is
+real and growing as `useTileGraph` accretes logic.
+
+→ Full lens-by-lens detail in `audit.md`. The techniques in `01`–`05`.
