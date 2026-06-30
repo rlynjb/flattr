@@ -1,69 +1,68 @@
-# Chains vs agents — the boundary, and where flattr sits
+# Chains vs agents — the boundary
 
-**Industry name(s):** workflow/chain vs autonomous agent · "static control
-flow vs model-decided control flow." **Type label:** Industry standard.
+**Industry names:** workflow vs agent · static control flow vs autonomous
+loop. **Type:** Industry standard.
+
+> The entry point to the whole reasoning-pattern family. The one question:
+> *did the engineer write the steps, or does the decider write them at
+> runtime?* flattr answers "engineer wrote them" twice over — `pipeline/`
+> is a chain, and even the router loop decides with code, not a model.
 
 ---
 
 ## Zoom out, then zoom in
 
-This is the entry point to the whole reasoning-pattern family. Before you ask
-*what kind* of agent something is, ask the prior question: **is there an
-autonomous loop at all, or did an engineer write the steps?** flattr answers
-this cleanly — every step in flattr is written by the engineer, and most of
-them don't even involve a model.
+**Zoom out.** flattr has two control-flow shapes, and neither is an agent:
 
 ```
-  Zoom out — control flow ownership across flattr
+  Zoom out — flattr's two control flows, both engineer-written
 
-  ┌─ BUILD TIME (pipeline/) ─────────────────────────────────┐
-  │  run-build.ts: a FIXED chain, engineer-written order      │
-  │  osm → split → elevation → grade → build-graph → graph.json│ ← engineer
-  │       (no model fills any slot — pure transforms)          │   decides
-  └───────────────────────────────────────────────────────────┘
-  ┌─ RUNTIME (features/routing/) ────────────────────────────┐
-  │  search(): a LOOP, but CODE decides each step (A* rule)   │ ← engineer
-  │       (a control loop, not an autonomous agent)           │   decides
-  └───────────────────────────────────────────────────────────┘
-
-  Nowhere in flattr does a MODEL choose what happens next.
+  ┌─ Build-time chain (pipeline/) ─────────────────────────────┐
+  │  osm → elevation → split → grade → build-graph             │ ← a CHAIN
+  │  fixed order, engineer wrote every step, no decider        │
+  └────────────────────────────────────────────────────────────┘
+  ┌─ Run-time loop (features/routing/astar.ts) ────────────────┐
+  │  pop → expand → decide(g+h) → loop or stop                 │ ← a LOOP
+  │  but CODE decides each step, not a model                   │   (not an agent)
+  └────────────────────────────────────────────────────────────┘
 ```
 
-Zoom in: a **chain** is a control flow the engineer writes — Input → Step 1 →
-Step 2 → Output, where each step is fixed and (in an LLM chain) a model fills
-a slot but never chooses what comes next. An **agent** is a loop where the
-model chooses the next step at runtime. flattr's build pipeline is a chain
-*without even the LLM-fills-a-slot part*; flattr's router is a control loop
-where code, not a model, decides. Neither is an agent.
+**Zoom in.** A **chain** is steps the engineer wrote: input → step 1 →
+step 2 → output. A model, if present, fills a slot but never chooses
+what comes next. An **agent** is a loop where the *decider* writes the
+steps at runtime. flattr's pipeline is a textbook chain. Its router is a
+loop — but the decider is arithmetic, so it's still not an agent. The
+distinction this file draws is: *is there an autonomous loop?* The next
+file (`02-agent-loop-skeleton.md`) answers *what's in the loop.*
 
 ---
 
-## Structure pass
+## The structure pass
 
-**Layers.** Two of flattr's subsystems sit on different sides of an
-imaginary line — but both are firmly on the "engineer decides" side.
-
-**Axis — "who writes the steps?"**
+**The axis: who writes the sequence of steps?**
 
 ```
-  "who writes the steps?" — traced across the spectrum
+  One question — "who writes the next step?"
 
-  chain                  control loop            agent
-  ─────                  ────────────            ─────
-  engineer writes        engineer writes the     model writes
-  EVERY step in order    loop; CODE decides      the steps at
-                         each iteration          runtime
-       ▲                      ▲                      ▲
-  pipeline/run-build.ts  features/routing/      (not in flattr)
-  (fixed sequence)       astar.ts (A* rule)
+  ┌─ chain (pipeline/) ──────────┐  → ENGINEER, at code-time
+  │  run-build.ts calls each      │     (fully fixed)
+  │  stage in a fixed order       │
+  └───────────────────────────────┘
+  ┌─ flattr's loop (astar.ts) ───┐  → ENGINEER wrote the loop;
+  │  the g+h rule picks neighbors │     CODE picks within it
+  └───────────────────────────────┘     (fixed rule, data-driven path)
+  ┌─ an agent (not in flattr) ───┐  → MODEL, at run-time
+  │  LLM picks the next action    │     (the path is unknown until run)
+  └───────────────────────────────┘
 ```
 
-**Seam — the line flattr does not cross.** The load-bearing boundary is
-between "control loop where code decides" and "agent where model decides."
-flattr's `search()` sits *right at that line on the code side* — it has a
-loop, but the decision is `g + h`, not a model. That's exactly the seam the
-agent-loop-skeleton file walks. The contract is "given state, pick the next
-move"; flattr fills it with code, an agent fills it with a model.
+**The seam.** The boundary that matters is between "the path is known
+before you run" (chain) and "the path depends on what the decider finds"
+(agent). flattr's router straddles it interestingly: the *path through
+the graph* is unknown until you run (data-driven, like an agent), but the
+*rule* that picks it is fixed (like a chain). That's why it's a loop but
+not an agent — autonomy is about who writes the *rule*, not whether the
+output varies.
 
 ---
 
@@ -71,154 +70,129 @@ move"; flattr fills it with code, an agent fills it with a model.
 
 ### Move 1 — the mental model
 
-You write React components two ways: an imperative script that runs
-top-to-bottom (`fetch` then `parse` then `setState` — you wrote the order),
-versus a state machine that decides its own next transition based on input. A
-chain is the script; an agent is the self-driving state machine. flattr is
-all script.
+You've shipped both shapes. A `.then()` chain of single-purpose functions
+is a chain — the order is in your code. A `while` loop that picks its next
+move from a rule is the loop shape. The agent is the loop shape with the
+*rule* replaced by a model.
 
 ```
-  Chain (engineer writes the steps):
+  Chain:   Input → [Step 1] → [Step 2] → [Step 3] → Output
+                    (order fixed by the engineer; a model, if any,
+                     fills a slot but never picks what comes next)
 
-  Input → Step 1 → Step 2 → Step 3 → Output
-          (each step fixed; if a model is involved it fills
-           a slot, it does NOT choose what comes next)
-
-  Agent (model writes the steps at runtime):
-
-  ┌─────────────────────────────────────┐
-  │  Reason  → model decides next action │
-  │  Act     → call a tool               │
-  │  Observe → read result               │
-  │     └──── loop or stop ──────────────│
-  └─────────────────────────────────────┘
+  Agent:   ┌─────────────────────────────────────────┐
+           │  Reason → Act → Observe → (loop or stop) │
+           │  the MODEL picks each next action        │
+           └─────────────────────────────────────────┘
 ```
 
-### Move 2 — the walkthrough
+### Move 2 — walkthrough against flattr
 
-#### flattr's build pipeline is a chain (no model at all)
+#### The chain: `pipeline/`
 
-`pipeline/run-build.ts` runs a fixed sequence. The engineer wrote the order;
-nothing chooses it at runtime, and crucially **no LLM fills any slot** — each
-step is a deterministic transform (fetch OSM, split ways, fetch elevation,
-compute grade, assemble graph). This is a chain that doesn't even reach the
-"LLM fills a slot" version of a chain. It's pure dataflow.
+flattr's build pipeline is a chain. `pipeline/run-build.ts` drives a
+fixed sequence — fetch OSM ways (`overpass.ts`), fetch elevation
+(`elevation.ts`), split into segments (`split.ts`), compute grade
+(`grade.ts`), assemble the graph (`build-graph.ts`). The order is in the
+code. No step decides what comes next; `grade.ts` always follows
+`elevation.ts`.
 
 ```
-  Layers-and-hops — the build chain (build-time only)
+  pipeline/ — a chain (layers-and-hops, build-time)
 
-  ┌─ Provider ──┐ fetch ┌─ pipeline ──┐ transform ┌─ Storage ──┐
-  │ Overpass /  │ ────► │ osm→split→   │ ────────► │ graph.json │
-  │ Open-Meteo  │       │ elevation→   │           │ (artifact) │
-  └─────────────┘       │ grade→build  │           └────────────┘
-                        └──────────────┘
-   fixed order, engineer-written, no runtime decision, no model
+  ┌─ Network ─┐  ways    ┌─ pipeline/ ─────────────────────────────┐
+  │ Overpass   │ ───────► │ overpass → elevation → split → grade →  │
+  │ Open-Meteo │ elev     │ build-graph                             │
+  └────────────┘ ───────► └────────────────────┬────────────────────┘
+                                                │ writes
+                          ┌─ Data ──────────────▼───────────────────┐
+                          │ mobile/assets/graph.json (static artifact)│
+                          └──────────────────────────────────────────┘
 ```
 
-#### flattr's router is a control loop, not an agent
+What makes it a chain and not an agent: the sequence is written, not
+chosen. If elevation fails, the next step doesn't *reason* about what to
+do — it just propagates (per the project's external-data caveat, the
+Open-Meteo 429 is handled by checking quota, not by a decider rerouting).
 
-`search()` (`astar.ts:48`) *does* loop, and it *does* decide the next step
-each iteration — but the decider is the A* cost rule, code, not a model. This
-is the subtle case worth getting right: **a loop where code decides is still
-not an agent.** "Agent" requires the *model* to own the runtime decision.
-flattr's loop is fully covered in `02-agent-loop-skeleton.md` precisely
-because it's the deterministic twin of the agent loop.
+#### The loop that isn't an agent: `search()`
 
-#### The decision rule
-
-Use a chain when you know the steps in advance. Use an agent when the steps
-depend on what the model finds at runtime. flattr knows its steps in advance
-on both axes: the build order is fixed, and the routing decision is a
-closed-form cost comparison. There is no point in flattr where "the next step
-depends on what a model just discovered," so there is no reason for an agent.
-The cost of an agent — variable step count, variable cost, harder
-debugging — would buy flattr nothing.
+The router *is* a loop (`astar.ts:48`), and the path it produces is
+unknown until it runs — that feels agent-like. But the decision rule is
+fixed: `g + h`, every time, deterministically. There's no model, no
+runtime-chosen strategy. It's a loop with a hard-coded step. See
+`02-agent-loop-skeleton.md` for the full walk.
 
 ### Move 3 — the principle
 
-The chains-vs-agents line is about *control ownership*, not about whether an
-LLM is present. A pipeline with an LLM in every slot can still be a chain (the
-engineer owns the order); a loop with no LLM at all can still be agent-shaped
-in skeleton (flattr's router). The question that sorts them is the only one
-that matters: **at runtime, who picks the next step — your code, or the
-model?**
+Use a chain when you know the steps in advance — flattr's build does, so
+it's a chain. Use an agent when the steps depend on what the decider
+finds *and* you're willing to pay for a model to decide. flattr never
+needs the model to decide, so it never crosses into agent territory. The
+cost of an agent is unpredictability: variable step count, variable cost,
+harder debugging — all the things flattr's deterministic loop is free of.
 
 ---
 
 ## Primary diagram
 
 ```
-  WHERE FLATTR SITS — the control-ownership spectrum
+  flattr's two control flows vs an agent — one frame
 
-  ┌──────────────┬──────────────────┬───────────────┬──────────┐
-  │ pure chain   │ LLM-slot chain   │ control loop  │ agent     │
-  │ (dataflow)   │ (model fills     │ (code decides │ (model    │
-  │              │  slots, eng      │  each step)   │  decides  │
-  │              │  owns order)     │               │  steps)   │
-  ├──────────────┼──────────────────┼───────────────┼──────────┤
-  │ ★ pipeline/  │   (none)         │ ★ features/   │  (none)   │
-  │ run-build.ts │                  │ routing/      │           │
-  │              │                  │ astar.ts      │           │
-  └──────────────┴──────────────────┴───────────────┴──────────┘
-   engineer owns control ◄─────────────────────► model owns control
-
-   flattr lives entirely on the LEFT half. No model owns any
-   runtime decision anywhere in the repo.
+  CHAIN (pipeline/, build-time)   LOOP (router, run-time)   AGENT (absent)
+  ───────────────────────────     ──────────────────────    ──────────────
+  fixed order, engineer-written   fixed rule (g+h),          model-written
+  osm→elev→split→grade→graph      data-driven path           steps at runtime
+       │                               │                          │
+       ▼                               ▼                          ▼
+  graph.json                      a Path                     (would call
+  (no decider)                    (code decides each step)    search/geocode
+                                                              as tools)
 ```
 
 ---
 
 ## Elaborate
 
-The chain/agent distinction was sharpened by Anthropic's "Building Effective
-Agents" framing (workflows vs agents) and LangChain's chain-vs-agent split.
-The durable insight from that body of work: *most production "AI" systems
-should be chains, not agents,* because chains are predictable, cheap, and
-debuggable, and you only reach for an agent when the task genuinely can't be
-expressed as a fixed sequence. flattr is the extreme version of that
-advice — it doesn't even need the LLM-slot chain, because its decisions are
-deterministic. Read `02-agent-loop-skeleton.md` next for the loop that sits
-right at the boundary.
+The chain/agent line is the most-confused boundary in agent
+architecture, because output that *varies* feels autonomous. flattr is
+the clean counterexample: its router's output varies wildly with input,
+yet it's not an agent, because the *decision rule* is fixed. Autonomy is
+about who authors the rule, not whether the result is dynamic. Most
+production "agents" should be chains — the decision tree is known, and a
+chain is cheaper and debuggable. Reach for the loop only when the path
+genuinely can't be written down in advance.
 
 ---
 
 ## Interview defense
 
-**Q: "Is flattr an agent system?"**
+**Q: flattr's router produces a different path for every input — isn't
+that an agent?**
 
-No — and not even close. Two subsystems, both engineer-controlled: the build
-pipeline is a fixed chain of pure transforms (no model in any slot), and the
-router is a control loop where the A* cost rule, not a model, decides each
-step. "Agent" requires the model to own the runtime control flow, and nothing
-in flattr does that.
+No — autonomy is about who writes the *rule*, not whether the output
+varies. The router's rule is fixed: `g + h`, deterministically, every
+expansion. A model never decides anything. It's a loop with a hard-coded
+step, not an agent. The build pipeline is even clearer — a fixed-order
+chain, `osm→elevation→split→grade→graph`.
 
 ```
-  pipeline = chain   |   router = control loop   |   agent = (none)
-  eng owns order        eng owns the loop           model owns steps
+  varies(output) ≠ autonomous(rule)
+  flattr: output varies, rule fixed → loop, not agent
 ```
 
-Anchor: *"flattr lives on the left half of the control-ownership spectrum.
-The router is the interesting case — it's loop-shaped but code-decided, which
-is exactly why it's the cleanest place to teach the agent loop by contrast."*
-
-**Q: "When would you turn flattr's chain into an agent?"**
-
-When a step's next action depends on what a model just discovered. Concretely:
-a "plan me a flat afternoon with three coffee stops" feature — the model
-doesn't know which stops or in what order until it reasons about the request,
-so it would loop, calling `search()` and `geocode()` as tools. That's the one
-flattr feature that would justify an agent. (Mapped in
-`agent-patterns-in-this-codebase.md`.)
-
-Anchor: *"The trigger is runtime uncertainty about the next step. flattr's
-current features have none — the build order and the routing rule are both
-known in advance."*
+Anchor: *"`astar.ts` picks a different path per input, but the picking
+rule never changes — that's a chain's determinism wearing a loop's
+shape, not an agent."*
 
 ---
 
 ## See also
 
-- `02-agent-loop-skeleton.md` — the control loop that sits at the boundary
-- `../03-multi-agent-orchestration/01-when-not-to-go-multi-agent.md` — the next escalation gate
-- `agent-patterns-in-this-codebase.md` — the one feature that would cross the line
-- `study-system-design` — the pipeline and router as system boundaries
+- `02-agent-loop-skeleton.md` — what's inside the loop (the contrast)
+- `07-routing.md` — where flattr could grow a real agent
+- `../03-multi-agent-orchestration/03-sequential-pipeline.md` — the
+  pipeline shape, when each stage is an agent
+- `../agent-patterns-in-this-codebase.md`
+- Cross-ref: `study-ai-engineering`'s
+  `04-agents-and-tool-use/01-agents-vs-chains.md` (the mechanics)

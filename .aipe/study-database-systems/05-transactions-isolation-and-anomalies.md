@@ -1,261 +1,233 @@
 # Transactions, isolation, and anomalies
 
-**Industry name(s):** ACID transactions / isolation levels / read & write
-anomalies · **Type:** Industry standard.
+**Industry names:** transaction · atomicity · ACID · isolation level ·
+anomaly (dirty/non-repeatable/phantom) — *type label: Industry standard.*
 
-> **Status in flattr: `not yet exercised`.** There is no multi-statement atomic
-> unit anywhere in the repo, and no concurrent durable mutation. This file
-> teaches the mechanism in full and names the *exact* trigger that would force it
-> in — because the day flattr's storage stops being read-only, this is the first
-> thing it needs.
+**Status in flattr: not yet exercised.** There is no transactional boundary
+anywhere in the repo. This file teaches the mechanism against its absence
+and names the exact trigger that would make it relevant.
 
 ## Zoom out, then zoom in
 
-```
-  Zoom out — transactions wrap the write path (which flattr barely has)
+A transaction is the promise that **a group of writes happens all-or-nothing
+and doesn't interleave badly with other writers.** flattr has neither
+property to protect: the graph never writes, and the cache writes one key at
+a time with one writer. So there's no transaction. But the *seam* where one
+would appear is visible — it's the cache write — and that's worth putting on
+the map.
 
-  ┌─ App layer ──────────────────────────────────────────────┐
-  │  graph reads (RO)        elevCache.putElev (the 1 writer) │
-  └────────────────────────────┬─────────────────────────────┘
-  ┌─ Transaction layer ────────▼─────────────────────────────┐
-  │  ★ BEGIN … COMMIT / ROLLBACK ★   ← NOT PRESENT in flattr  │ ← we'd be here
-  │     (atomicity · isolation · the all-or-nothing boundary) │
-  └────────────────────────────┬─────────────────────────────┘
-  ┌─ Storage layer ────────────▼─────────────────────────────┐
-  │  graph.json (RO) · AsyncStorage blob (single-writer)     │
-  └───────────────────────────────────────────────────────────┘
+```
+  Zoom out — where a transaction WOULD live (but doesn't)
+
+  ┌─ Storage layer ─────────────────────────────────────────────┐
+  │                                                             │
+  │  in-memory graph   → read-only → no writes → no txn needed  │
+  │                                                             │
+  │  ★ elevCache write ★  putElev → debounced setItem          │ ← the only
+  │     ONE key, ONE writer → "transaction" = one setItem      │   candidate seam
+  │     no multi-write atomicity (none needed today)            │
+  └─────────────────────────────────────────────────────────────┘
 ```
 
-Zoom in. A transaction is a *boundary that makes a group of operations behave as
-one* — all of them happen or none do (atomicity), and concurrent transactions
-don't see each other's half-finished work (isolation). flattr needs neither today
-because (a) the graph is never written at runtime and (b) the only writer, the
-elevCache, is a single in-process writer that re-serializes the whole blob at once
-(`02`). So there's nothing to make atomic and no one to isolate from. But that's a
-property of flattr's *current* shape, not a law — and the trigger that breaks it
-is concrete and named below.
+Zoom in. The reason to study this *now*, before flattr needs it: the moment
+the app grows a second piece of persistent state that must stay consistent
+with the first — say, a list of saved routes plus an index of them — you
+inherit the atomicity problem instantly. Knowing the shape now means you
+recognize the trigger when it arrives instead of shipping a half-write bug.
 
 ## The structure pass
 
-**Layers** (the ACID guarantees, as nested promises):
-1. **Atomicity** — all-or-nothing.
-2. **Consistency** — invariants hold across the boundary.
-3. **Isolation** — concurrent txns don't interfere.
-4. **Durability** — committed = survives a crash (owned by `07`).
+**Layers.** Two write surfaces, neither transactional: the graph (never
+writes) and the cache (one key, one `setItem`).
 
-**Axis traced — "if this fails halfway, what state are we left in?"**
+**Axis — what's the unit of atomicity?** Trace it:
 
 ```
-  axis — "what happens on a mid-operation crash?" — flattr vs a txn DB
+  Axis: "what's guaranteed all-or-nothing?"
 
-  ┌─ flattr elevCache write ────────────────┐
-  │  setItem is ONE call → whole blob lands  │  atomic by accident (one op)
-  │  crash before setItem → lose the batch   │  but no rollback, no partial state
-  └────────────────────┬─────────────────────┘
-       seam ═══════════╪═══════  (the moment a write spans >1 record/store)
-  ┌─ a multi-step write (hypothetical) ─────┐
-  │  "add node + add its edges + reindex"    │  crash midway → CORRUPT graph
-  │  without a txn: partial, inconsistent     │  with a txn: rolled back, clean
-  └───────────────────────────────────────────┘
+  ┌─ graph ─────────────────────┐  → nothing writes → N/A
+  └─────────────────────────────┘
+  ┌─ elevCache.persistNow ──────┐  → ONE setItem of the whole blob
+  │  one key overwrite          │     (atomic by the KV store, not by flattr)
+  └─────────────────────────────┘
+  ┌─ (hypothetical) saved routes┐  → would need MULTI-write atomicity
+  │  route row + index entry    │     = the first real transaction
+  └─────────────────────────────┘
+
+  the unit is "one key" today; the trigger is "two keys that must agree"
 ```
 
-The axis-answer is benign today *only because every write is a single operation*.
-The elevCache's whole-blob `setItem` is "atomic" the way a single assignment is
-atomic — not because anything guarantees it, but because there's no second step to
-be caught between. The seam is the moment a write needs **two** steps that must
-both land or neither — that's when you need a real transaction, and flattr has no
-mechanism for it.
+**Seam.** The load-bearing boundary is **single-write vs. multi-write
+durability**. Below it (one key), atomicity is whatever AsyncStorage gives
+you for one `setItem` — effectively atomic, no transaction logic in flattr.
+Above it (two keys that must agree), you need a transaction and flattr has no
+primitive for one. The seam is currently on the safe side. The trigger moves
+it.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You've felt the failure this prevents. Picture a `fetch` that does two PATCHes —
-update the user, then update their billing — and the second one fails. Now the
-user's changed but billing isn't. Half-applied. A transaction is the wrapper that
-says "treat these two PATCHes as one: if the second fails, undo the first." The
-database makes that promise for *durable* state, which is far harder than undoing
-two HTTP calls.
+You know optimistic UI updates: you mutate local state, fire the request,
+and roll back if it fails. A transaction is that rollback made a *guarantee*
+at the storage layer — either every write in the group lands, or none does,
+and a reader never sees the half-done middle. flattr's cache write is the
+degenerate case: a group of size one, so "all-or-nothing" is automatic.
 
 ```
-  the pattern — a transaction is an all-or-nothing bracket
+  The transaction kernel — what every txn is
 
   BEGIN
-   ├─ write A   ┐
-   ├─ write B   ├─ all visible together, or none at all
-   └─ write C   ┘
-  COMMIT   → A,B,C become durable + visible atomically
-  ─────  or  ─────
-  ROLLBACK / crash → A,B,C never happened (state == before BEGIN)
+    write A   ┐
+    write B   │  ← either ALL of these commit…
+    write C   ┘
+  COMMIT  ────► durable, visible together
+     │
+     └─ on failure → ROLLBACK → none of A/B/C ever happened
+
+  flattr today: the group is {write the blob} — size 1, trivially atomic
 ```
 
-The bracket is the kernel. Everything else — isolation levels, locks, MVCC — is
-about what *other* transactions see *while* this one is mid-bracket.
+### Move 2 — the parts, and where flattr stands on each
 
-### Move 2 — isolation levels and the anomalies they stop
+**Atomicity — all-or-nothing.** The guarantee that a multi-write group can't
+partially apply. flattr's only write is one blob overwrite
+(`elevCache.ts:53`, a single `setItem`), so there's no group to make atomic.
+What breaks without atomicity, *if* you had two writes: a crash between them
+leaves the store inconsistent (route saved, index not updated → orphan).
+flattr can't hit this because it never issues two related writes.
 
-Isolation is the dial. Crank it up and concurrent transactions are more separated
-but slower; crank it down and they're faster but can see each other's mess. Each
-level is defined by *which anomaly it permits*.
+**Consistency — invariants hold across the txn.** The data satisfies its
+rules before and after. flattr's graph invariants (adjacency matches edges,
+grades signed correctly) are enforced at *build time* in `pipeline/`, not at
+write time — because there are no runtime writes to violate them. The
+invariant is frozen into the artifact.
 
-```
-  isolation levels vs anomalies (SQL standard)
+**Isolation — concurrent txns don't see each other's middle.** flattr is
+single-threaded JS (file `06`), and the only writer is the debounced
+`persistNow`. Two `persistNow` calls can't truly interleave mid-write
+because JS doesn't preempt. So isolation is *free* — there's effectively one
+serial writer. The one subtlety: `persistNow` is `async`, and between its
+`await setItem` and completion, another `putElev` can mutate `mem`
+(`elevCache.ts:35-40`). That's the closest flattr comes to an isolation
+concern, and it's benign because `putElev` only *adds* keys and the next
+debounce re-persists. (Walked in `06`.)
 
-  level              dirty read  non-repeatable  phantom   write skew
-  ─────────────────  ──────────  ──────────────  ───────   ──────────
-  READ UNCOMMITTED   ALLOWED     allowed         allowed   allowed
-  READ COMMITTED     prevented   ALLOWED         allowed   allowed
-  REPEATABLE READ    prevented   prevented       allowed*  allowed
-  SERIALIZABLE       prevented   prevented       prevented prevented
-                                                 (*Postgres MVCC stops phantoms here)
-```
+**Durability — committed writes survive a crash.** Covered in `07`. flattr's
+durability is best-effort and debounced, not a committed-means-safe
+guarantee.
 
-**Dirty read** — you read another txn's *uncommitted* write, and it then rolls
-back. You acted on data that never existed.
-
-**Non-repeatable read** — you read a row twice in one txn and get different values
-because another txn committed an UPDATE in between.
-
-**Phantom** — you run the same `WHERE` twice and the second time new rows match,
-because another txn INSERTed.
-
-**Write skew** — two txns each read an overlapping set, each decides independently,
-both commit, and together they violate an invariant neither would alone. (Classic:
-two doctors each go off-call after checking "someone else is on call" — both see
-the other, both leave, nobody's on call.)
-
-**Where flattr would meet these — the concrete trigger.** Today: never (single
-writer, single op). The trigger is **multi-device sync writing to a shared
-store** — exactly the shape you built in `buffr` (SQLite local + Supabase mirror)
-and `dryrun` (GitHub-as-backend). The moment two devices write the same user's
-data to one backend, every anomaly above is live:
+**The anomalies (the reader people forget).** Isolation levels exist to
+trade safety for speed by *permitting* specific anomalies:
 
 ```
-  the trigger — when flattr would need isolation
+  The anomaly ladder — what each isolation level permits
 
-  Phase A (now):                    Phase B (sync, the trigger):
-  ┌─────────────┐                   ┌─────────┐     ┌─────────┐
-  │ one device  │                   │ phone A │     │ phone B │
-  │ one writer  │                   └────┬────┘     └────┬────┘
-  │ no shared   │                        │  shared store  │
-  │ durable     │                        ▼               ▼
-  │ mutation    │                   ┌───────────────────────┐
-  └─────────────┘                   │ writes interleave →    │
-   NO anomalies                     │ dirty/lost/skew NOW    │
-   possible                         │ live → need isolation  │
-                                    └───────────────────────┘
+  READ UNCOMMITTED  → dirty read     (see another txn's uncommitted write)
+  READ COMMITTED    → non-repeatable  (same row, two reads, two values)
+  REPEATABLE READ   → phantom         (a range gains/loses rows mid-txn)
+  SERIALIZABLE      → (none)          (as if txns ran one at a time)
+
+  flattr permits ALL of them vacuously — there are no concurrent txns
+  to produce any anomaly. The ladder is empty because the workload is.
 ```
 
-**The one near-miss flattr has today.** The elevCache's read-modify-write has a
-*lost-update shape* even single-process. `putElev` (`elevCache.ts:35`) checks
-`mem.has(key)` then sets — but two concurrent `cachedElevation.sample` calls
-(`useTileGraph.ts` runs one build at a time via `busyRef`, so this is *currently*
-serialized) could both miss the same cell and both fetch+put. **Inference:** the
-`busyRef` single-flight in `useTileGraph.ts:113` is what *prevents* this — it's a
-hand-rolled mutual exclusion standing in for the isolation a transaction would
-give. Remove the single-flight and you'd get duplicate elevation fetches (wasted
-API calls, the exact throttling the cache exists to avoid). So flattr *does* lean
-on an isolation-like guarantee — it just enforces it with an application-level
-lock, not a transaction. `06` walks that lock.
+flattr sits *above* SERIALIZABLE for free, not because it's careful but
+because it has one serial writer and no readers of in-flight writes. Naming
+this honestly is the point: flattr isn't solving isolation well, it's
+*avoiding* the problem by design.
 
-### Move 2.5 — current vs future
+### Move 2.5 — current vs. future (the trigger)
 
 ```
-  Phase A: no transactions          Phase B: real txns (post-sync / post-Postgres)
-
-  writes: single-op, single-writer  writes: multi-row, multi-writer
-  atomicity: accidental (1 op)      atomicity: BEGIN…COMMIT bracket
-  isolation: app-level single-flight isolation: a chosen level (likely READ
-             (busyRef)                          COMMITTED for an app like this)
-  anomalies: impossible             anomalies: possible → level must be chosen
-  what carries over: the graph stays read-only; only the sync/user-data path
-                     needs txns. The routing engine never does.
+  Phase A (now) — no transaction        Phase B (saved routes ship)
+  ┌──────────────────────────────┐      ┌──────────────────────────────┐
+  │ one writer (persistNow)      │      │ save route = TWO writes:     │
+  │ one key (the cache blob)     │      │   1. route record            │
+  │ group size 1 → atomic free   │      │   2. routes-index entry      │
+  │ no anomaly possible          │      │ crash between → orphan/drift │
+  │ VERDICT: no txn needed       │      │ VERDICT: need atomicity NOW  │
+  └──────────────────────────────┘      └──────────────────────────────┘
 ```
 
-The cheap insight: even after migration, flattr's *read-only graph* never needs a
-transaction. Only a future *writable user-data* path (saved routes, sync) does.
-Knowing which data is mutable is what tells you where transactions belong.
+**The trigger is concrete:** the first time flattr persists two pieces of
+state that must agree (saved routes + an index of them, or user prefs + a
+schema version). At that point you either adopt a store with transactions
+(SQLite via `expo-sqlite` gives you `BEGIN/COMMIT`) or you hand-roll
+all-or-nothing by writing one combined blob (the cache's current trick,
+which scales to "everything in one key" but no further). What *doesn't*
+change: the read store. The graph stays immutable and transaction-free
+forever.
 
 ### Move 3 — the principle
 
-A transaction trades throughput for the ability to *reason about partial failure
-as if it can't happen.* You pick an isolation level by naming the cheapest anomaly
-you can tolerate, not the strongest guarantee you can buy — SERIALIZABLE is
-correct and slow; most apps run READ COMMITTED and handle the rest in application
-logic. flattr needs none of this today, but recognizing *why* (single writer, no
-shared durable mutation) is exactly the recognition that tells you the instant a
-sync feature flips the switch.
+A transaction is **insurance against partial failure across multiple
+writes.** You pay for it (locks, logs, latency) only when you have multiple
+writes that must agree. flattr has exactly one write, so it correctly pays
+nothing. The skill isn't "always use transactions" — it's recognizing the
+*instant* your write count crosses from one to two-that-must-agree, because
+that's when the insurance stops being optional.
 
 ## Primary diagram
 
 ```
-  the transaction bracket and the anomaly ladder — what flattr would adopt
+  flattr's transaction story — empty, by design
 
-  ┌─ a write transaction ────────────────────────────────────────┐
-  │  BEGIN ─► write ─► write ─► (COMMIT durable+atomic | ROLLBACK)│
-  └──────────────────────────────┬────────────────────────────────┘
-              isolation level decides what CONCURRENT txns see:
-  ┌──────────────────────────────▼────────────────────────────────┐
-  │ READ UNCOMMITTED → dirty reads                                 │
-  │ READ COMMITTED   → non-repeatable reads        ← typical app   │
-  │ REPEATABLE READ  → phantoms (mostly)                           │
-  │ SERIALIZABLE     → nothing; full isolation, slowest            │
-  └────────────────────────────────────────────────────────────────┘
-   flattr today: none of this. Trigger = multi-device sync to a shared store.
-   flattr's stand-in today: busyRef single-flight in useTileGraph (see 06).
+  ┌─ READ STORE (graph) ────────────────────────────────────────┐
+  │  no writes → no txn → invariants frozen at build time        │
+  └─────────────────────────────────────────────────────────────┘
+  ┌─ WRITE STORE (elevCache) ───────────────────────────────────┐
+  │  ┌─ "transaction" = one setItem ──────────────────────────┐ │
+  │  │ persistNow → JSON.stringify(mem) → setItem(key, blob)  │ │
+  │  │ group size 1 → atomic (by the KV store)                │ │
+  │  │ isolation: free (single serial writer)                 │ │
+  │  │ anomalies: none possible (no concurrent txns)          │ │
+  │  └─────────────────────────────────────────────────────────┘ │
+  └─────────────────────────────────────────────────────────────┘
+       TRIGGER → second piece of state that must stay consistent
+                 → first real BEGIN/COMMIT (reach for expo-sqlite)
 ```
 
 ## Elaborate
 
-ACID is the relational contract; the NoSQL wave traded pieces of it for scale
-(eventual consistency, `08`'s territory) and the industry has been clawing back
-toward "ACID where it matters" ever since (Spanner, CockroachDB, FaunaDB offer
-serializable distributed transactions). The deepest practical lesson is that
-**isolation level is a per-transaction *choice*, not a database-wide setting** —
-you pay for SERIALIZABLE only on the transactions that need it. Your `AdvntrCue`
-Postgres instance defaults to READ COMMITTED; its session-memory writes
-(`MemoRAG`) are exactly the kind of single-row write that's safe there.
-
-The anomaly that catches senior engineers off guard is **write skew**, because
-each transaction individually looks correct — it's only the *combination* that
-breaks an invariant, and only SERIALIZABLE (or an explicit lock) stops it. If
-flattr ever adds "max N saved routes per free user" enforced by read-then-insert,
-that's a write-skew waiting to happen under concurrent inserts.
+ACID was invented for exactly the failure flattr doesn't have: many writers
+hitting shared mutable state, where a crash or a bad interleave corrupts
+invariants. The reason a read-mostly app like flattr can skip it entirely is
+the same reason CRDTs and event logs are popular — *if you never update in
+place, you never need a transaction to protect the update.* flattr's graph
+is immutable (append-nothing, update-nothing); its cache is
+insert-only-then-overwrite. Both dodge the in-place-update that makes
+transactions necessary. When you read about isolation levels, anchor them to
+this: every level is a different answer to "what may another writer see
+mid-update?" — and flattr's answer is "there is no other writer."
 
 ## Interview defense
 
-**Q: "Does flattr use transactions?"**
-
-> No — and it doesn't need them yet. The graph is read-only, and the only writer,
-> the elevCache, does single-operation whole-blob writes, so there's nothing to
-> make atomic and no concurrent writer to isolate from. The trigger that would
-> force transactions in is multi-device sync to a shared store — the `buffr`/
-> `dryrun` shape — where interleaved writes make dirty reads, lost updates, and
-> write skew suddenly possible.
+**Q: flattr persists an elevation cache. Does it need transactions?**
+No — and naming *why* is the signal. There's exactly one writer
+(`persistNow`) and it writes exactly one key (the whole cache blob in one
+`setItem`). A transaction protects multi-write atomicity across concurrent
+writers; flattr has neither multiple writes-that-must-agree nor concurrent
+writers. It sits above SERIALIZABLE for free because the workload is empty,
+not because it's careful.
 
 ```
-  now: single writer, single op → atomic by accident
-  trigger: shared store + 2 writers → anomalies live → need BEGIN…COMMIT
+  group size 1 + one serial writer → atomicity & isolation are free
 ```
+*Anchor: no transaction because there's no multi-write group and no second
+writer — the trigger is the first two-keys-that-must-agree.*
 
-Anchor: *flattr is transaction-free because it has no shared durable mutation;
-sync is the exact feature that ends that.*
-
-**Q: "How would you pick an isolation level for flattr-with-sync?"**
-
-> Name the cheapest anomaly I can tolerate, not the strongest guarantee. For
-> saved-route sync, READ COMMITTED is almost certainly enough — last-write-wins on
-> a route is acceptable. I'd only reach for SERIALIZABLE on an invariant-enforcing
-> write like a per-user quota, where write skew is real. Default low, escalate per
-> transaction.
-
-Anchor: *isolation level is a per-transaction choice keyed to the anomaly you
-can't tolerate — escalate, don't default high.*
+**Q: When would you add transactions, and how?**
+The moment two persistent things must stay consistent — saved routes plus an
+index, say. A crash between the two writes orphans one. I'd move that state
+into `expo-sqlite` and wrap the pair in `BEGIN/COMMIT`, or keep the
+cache's trick of writing everything in one key so the group stays size one.
+The read store never changes — the graph stays immutable and txn-free.
+*Anchor: trigger = two keys that must agree; fix = SQLite BEGIN/COMMIT or
+one combined blob.*
 
 ## See also
 
-- `06-locks-mvcc-and-concurrency-control.md` — how isolation is *enforced*; the busyRef lock
-- `07-wal-durability-and-recovery.md` — the D in ACID; the elevCache durability gap
-- `08-replication-and-read-consistency.md` — anomalies across replicas
-- `../study-system-design/` — the sync architecture that triggers all this
-- `../study-distributed-systems/` — multi-writer coordination under partial failure
+- `06-locks-mvcc-and-concurrency-control.md` — why isolation is free here.
+- `07-wal-durability-and-recovery.md` — the durability half of ACID.
+- `study-data-modeling` — the schema that a saved-routes feature would add.

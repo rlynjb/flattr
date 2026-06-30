@@ -1,258 +1,283 @@
-# Filesystem, Streams & Resource Lifecycle
+# Filesystem, Streams, and Resource Lifecycle — handles and cleanup
 
-**Industry name(s):** file handles · static build artifact · persistent KV store
-· timer handles as resources · resource cleanup. **Type:** Industry standard.
+**Industry name:** resource lifecycle / I/O handles / persistence — *Industry standard*.
 
 ## Zoom out, then zoom in
 
-flattr touches durable resources in exactly three places, and they're cleanly
-split by runtime. Build time owns a `node:fs` handle that writes one file. Run
-time owns an AsyncStorage-backed cache and a fistful of timer handles. There are
-**no streams** anywhere — all I/O is whole-body request/response.
+flattr touches durable storage in exactly two places, and they couldn't be more different:
+the pipeline writes one file once and exits; the app reads-modifies-writes a debounced
+key-value store. Here's where they sit.
 
 ```
-  Zoom out — durable & OS resources, by runtime
+  Zoom out — the two durable-storage touchpoints
 
-  ┌─ BUILD time · Node ──────────────────────────────────────┐
-  │  node:fs → mkdirSync + writeFileSync(data/graph.json)    │ ← write-once
-  │  network sockets → Overpass, Open-Meteo (closed by fetch)│   artifact
-  └────────────────────────┬──────────────────────────────────┘
-                           │ ships graph.json (544 KB) into the bundle
-  ┌─ RUN time · Hermes ─────▼────────────────────────────────┐
-  │  bundled asset: graph.json (read-only, via import)       │ ← we are
-  │  AsyncStorage: "flattr.elevCache.v1" (read/write KV)     │   here
-  │  timer handles: timerRef, retryRef, persistTimer,        │
-  │   suggestTimer ── must be cleared or they leak/double-fire│
-  └──────────────────────────────────────────────────────────┘
+  ┌─ BUILD TIME (Node fs) ───────────────────────────────────────┐
+  │  run-build.ts → writeFileSync("data/graph.json")  (once)     │
+  └───────────────────────────────┬──────────────────────────────┘
+                                  │ artifact bundled into the app
+  ┌─ RUN TIME (Hermes) ──────────▼───────────────────────────────┐
+  │  loadGraph(): read bundled JSON once                         │
+  │  ★ elevCache → AsyncStorage: debounced read-modify-write ★   │ ← we are here
+  └───────────────────────────────────────────────────────────────┘
 ```
 
-Zoom in: the question is **what resources are acquired, and who's responsible for
-releasing them?** Files and sockets are short-lived and self-closing. The
-durable resource is AsyncStorage. The *leakable* resources — the ones a careless
-edit would mishandle — are the timers.
+Zoom in: the question is **"what resources does flattr open, and what guarantees they're
+cleaned up?"** The honest answer is that flattr opens almost nothing that needs cleanup —
+no long-lived file descriptors, no streams, no sockets it manages by hand. The one resource
+*lifecycle* worth studying is the AsyncStorage cache: load-once, batched debounced writes,
+FIFO cap. Trace that, and note all the descriptor-heavy machinery flattr deliberately
+doesn't have.
 
-## Structure pass
+## Structure pass — layers, one axis, the seams
 
-**Layers.** Three resource classes: (1) the build artifact — a file written once,
-then read-only forever; (2) the persistent cache — a single AsyncStorage key
-holding the whole elevation Map as JSON; (3) ephemeral OS handles — `setTimeout`
-IDs and the network sockets `fetch` opens and closes.
-
-**Axis traced — "who releases this, and what leaks if they don't (failure)?"**
+**The layers:** build-time fs → bundled read → runtime key-value store. **The axis: "what
+opens a handle, and who closes it?"**
 
 ```
-  One axis — "who releases it / what leaks?" — across resources
+  Axis: "handle ownership — who opens, who closes?"  — traced down
 
-  graph.json (fs)      → process exit releases handle; no leak (write-once)
-  fetch sockets        → fetch closes them; await res.json() drains the body
-  AsyncStorage key     → no handle to release; debounced write, capped size
-  setTimeout IDs       → ★ YOU must clearTimeout ★ or stale callbacks fire / pile up
+  ┌─ build fs write ─────────────────────────────┐
+  │  writeFileSync                                │  → Node opens + closes the fd
+  └────────────────────────────────────────────────┘    synchronously, internally
+      ┌─ bundled read ───────────────────────────┐
+      │  import graph from "graph.json"           │  → no runtime handle: inlined by
+      └────────────────────────────────────────────┘    the bundler at build time
+          ┌─ AsyncStorage R/M/W ─────────────────┐
+          │  getItem / setItem                    │  → native owns the handle;
+          └────────────────────────────────────────┘    you get a Promise, not an fd
 ```
 
-**Seam — the import boundary on `graph.json`.** At build time it's a mutable file
-behind a `node:fs` handle. After bundling, the *same bytes* are a frozen
-read-only `import` (`loadGraph.ts:7`). The axis flips: writable file →
-immutable in-memory object. That seam is the whole "static artifact" model —
-`06`'s reason to exist. → also `01-runtime-map.md`.
+The answer is the same at every layer: **flattr never holds a raw handle.** Node closes the
+fd inside `writeFileSync`; the bundler erases the runtime read; AsyncStorage hides the
+descriptor behind a promise. **The seam that needs care isn't a handle — it's the
+read-modify-write race on the cache.** Hand off to How it works.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You know the lifecycle from any resource you've used: acquire → use → release,
-and the release is the part that bites. A `fetch` is self-releasing once you read
-the body. A file handle releases on process exit. But a `setTimeout` is a
-resource you *must* release by hand — its handle outlives the function that made
-it, and if you don't `clearTimeout`, the callback fires later against stale
-state, or a new one stacks on the old.
+You've used `localStorage` in a web app: `getItem`/`setItem`, no file handles, no cleanup —
+the browser owns the storage. AsyncStorage is the React Native version, just promise-based
+because it's off the JS thread. flattr's whole persistence story is "load the blob once into
+a `Map`, mutate the `Map` in memory, flush the whole blob back occasionally." The strategy:
+**no handles to leak — treat durable storage as a load-once / flush-occasionally key-value
+blob, and batch writes so you're not serializing JSON on every cache put.**
 
 ```
-  Pattern — resource lifecycle, and who owns the release
+  Resource-lifecycle kernel — load once, mutate in mem, flush batched
 
-   resource        acquire            release             leak if not
-   ────────        ───────            ───────             ───────────
-   file            writeFileSync      process exit        (none)
-   socket          fetch()            await res.json()    held connection
-   AsyncStorage    setItem            (no handle)         stale data only
-   timer  ★        setTimeout → id    clearTimeout(id)    callback fires/stacks
+   loadElevCache()  ──getItem──► parse blob ──► fill mem Map  (once)
+        │
+   putElev(k,v) ──► mem.set ──► mark dirty ──► schedule flush (debounced)
+        │
+   persistNow() ──► serialize mem ──► setItem (whole blob)  (every ~4s if dirty)
 ```
 
-### Move 2 — the walkthrough
+### Move 2 — the parts, one at a time
 
-**Part 1 — the build artifact: acquire fs, write once, exit.** The entire
-filesystem footprint of flattr:
+**Part 1 — the build-time write: fire-and-forget, self-closing.** The pipeline writes the
+artifact with a synchronous call that opens and closes the descriptor internally:
 
 ```ts
-// pipeline/run-build.ts:11-13, 47-48
-function writeGraph(graph, path) { writeFileSync(path, JSON.stringify(graph)); }
-...
-mkdirSync("data", { recursive: true });   // ensure dir
-writeGraph(graph, "data/graph.json");      // synchronous write, handle auto-closed
-```
-
-`writeFileSync` opens, writes, and closes the handle in one call — no descriptor
-to track. The process then returns from `main()` and exits. Nothing leaks because
-there's nothing held open. Note `build-graph.ts` itself has **no** `node:fs`
-(header comment line 2) — fs lives only in the CLI entry, so the build logic
-bundles for Hermes.
-
-**Part 2 — the static artifact becomes a read-only import.** On the phone the same
-bytes are loaded by the module system, not the filesystem:
-
-```ts
-// mobile/src/loadGraph.ts:7-11
-import graph from "../assets/graph.json"; // bundled at build; in memory at startup
-export function loadGraph(): Graph { return graph as unknown as Graph; }
-```
-
-There's no file open here — the bundler inlined `graph.json` into the JS bundle.
-It's a frozen object held for the app's lifetime (via the `baseGraph` `useMemo`).
-The lifecycle is trivial precisely because it's immutable: acquire at startup,
-never release, never mutate.
-
-**Part 3 — AsyncStorage: a single-key KV store with debounced, capped writes.**
-This is the one read/write durable resource:
-
-```ts
-// mobile/src/elevCache.ts:17-29, 38-39, 42-57
-export async function loadElevCache() {       // acquire: read the whole blob once
-  if (loaded) return; loaded = true;
-  const raw = await AsyncStorage.getItem(STORAGE_KEY);
-  if (raw) for (const k in JSON.parse(raw)) if (!mem.has(k)) mem.set(k, obj[k]);
-}
-export function putElev(key, value) {
-  ...
-  if (!persistTimer) persistTimer = setTimeout(persistNow, PERSIST_DEBOUNCE_MS); // ④ debounce
-}
-async function persistNow() {                  // release: write the whole blob back
-  persistTimer = null; if (!dirty) return; dirty = false;
-  ... AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(Object.fromEntries(entries)));
+// pipeline/run-build.ts:11-13 — writeFileSync opens, writes, and closes the fd itself
+function writeGraph(graph: Graph, path: string): void {
+  writeFileSync(path, JSON.stringify(graph));   // ← no handle escapes; nothing to close
 }
 ```
 
-The lifecycle: load-once (guarded by `loaded`), accumulate in memory, and
-write-back debounced 4 s after the last `putElev` (④). The whole Map is one JSON
-blob under one key — read-modify-write the entire thing, not per-entry. Why
-debounce: a build samples hundreds of cells in a burst; without it, each `putElev`
-would re-serialize and re-write the whole blob. The boundary condition: on a hard
-crash within the 4 s window, the unflushed entries are lost — acceptable, since
-they're just a re-fetchable cache.
+```
+  Build write lifecycle — handle never escapes the call
 
-**Part 4 — timers are the leakable resource, and every one is paired with a
-clear.** This is where resource hygiene actually matters in the run-time process.
-Four distinct timer handles, each cleared before re-arming:
+  writeGraph()
+    └─ writeFileSync: open fd → write bytes → close fd   (all inside one sync call)
+  main() returns → process exits   (no open handles to leak)
+```
+
+What breaks if you used a manual `open`/`write`/`close`? You'd own the fd and have to close
+it in a `finally`. `writeFileSync` removes that burden entirely. This is why `build-graph.ts`
+has a comment (`build-graph.ts:2`) noting it imports *no* `node:fs` — keeping fs out of the
+shared module so it bundles for the app; only the CLI entrypoint touches disk.
+
+**Part 2 — the runtime read: erased by the bundler.** `loadGraph` looks like a file read but
+isn't — Metro inlines the JSON at build time (`05`):
 
 ```ts
-// mobile/src/useTileGraph.ts:254-255 (debounce)
-if (timerRef.current) clearTimeout(timerRef.current);     // release old
-timerRef.current = setTimeout(() => queueViewport(bounds), DEBOUNCE_MS); // acquire new
-
-// mobile/src/useTileGraph.ts:211-212 (retry)
-if (retryRef.current) clearTimeout(retryRef.current);
-retryRef.current = setTimeout(() => { ...; pump(); }, RETRY_MS);
-
-// mobile/src/MapScreen.tsx:74 (autocomplete suggest)
-if (suggestTimer.current) clearTimeout(suggestTimer.current);
+// mobile/src/loadGraph.ts:7-11 — a static import; no runtime fd, no async, no failure path
+import graph from "../assets/graph.json";
+export function loadGraph(): Graph {
+  return graph as unknown as Graph;   // ← already in memory; zero I/O at runtime
+}
 ```
 
-The clear-before-set idiom is what keeps a fast pan from leaving five debounce
-timers armed — each new event cancels the prior pending one. The
-`persistTimer` is managed differently: it's set only when *not* already pending
-(`if (!persistTimer)`, `elevCache.ts:39`) and nulled inside `persistNow`, so at
-most one persist is ever scheduled.
+There's no descriptor, no stream, no read error to handle (beyond the try/catch at
+`MapScreen.tsx:28-34`). The "file" is just a module.
+
+**Part 3 — the AsyncStorage cache: the one real lifecycle.** This is the only resource with
+load → use → cleanup phases. Walk them:
+
+*Load once.* `loadElevCache` is idempotent — a `loaded` flag makes repeat calls no-ops:
+
+```ts
+// mobile/src/elevCache.ts:17-29 — load-once guard; merges blob into the in-mem Map
+export async function loadElevCache(): Promise<void> {
+  if (loaded) return;                 // ← idempotent: safe to call on every mount
+  loaded = true;
+  try {
+    const raw = await AsyncStorage.getItem(STORAGE_KEY);
+    if (raw) {
+      const obj = JSON.parse(raw) as Record<string, number>;
+      for (const k in obj) if (!mem.has(k)) mem.set(k, obj[k]);   // ← don't clobber live values
+    }
+  } catch { /* corrupt/unavailable → start from memory */ }
+}
+```
+
+*Mutate in memory, schedule a flush.* `putElev` never writes immediately — it marks dirty
+and arms a single debounce timer:
+
+```ts
+// mobile/src/elevCache.ts:35-40 — write to mem now; schedule ONE batched flush
+export function putElev(key: string, value: number): void {
+  if (mem.has(key)) return;           // ← dedupe: never re-write a known cell
+  mem.set(key, value);
+  dirty = true;
+  if (!persistTimer) persistTimer = setTimeout(persistNow, PERSIST_DEBOUNCE_MS); // 4s, one timer
+}
+```
 
 ```
-  State — a debounce timer's lifecycle across two fast events
+  Batched-write lifecycle — many puts, one flush
 
-   ┌────────┐  event 1   ┌──────────┐  event 2 (clearTimeout)  ┌──────────┐
-   │  idle  │ ─────────► │ pending  │ ──────────────────────►  │ pending' │
-   │ no id  │            │ id set   │  old id cancelled,       │ new id   │
-   └────────┘            └────┬─────┘  new id set              └────┬─────┘
-        ▲                     │ fires (or cleared)                  │ fires
-        └─────────────────────┴─────────────────────────────────────┘
-   only ONE timer ever armed → no stacking, no stale double-fire
+  putElev × 200  (during a build)
+    └─ all mem.set immediately, dirty=true
+    └─ first put arms a 4s timer; subsequent puts DON'T re-arm (if (!persistTimer))
+                                   └──4s──► persistNow(): serialize ALL 200, one setItem
 ```
 
-**The gap:** none of these timers are cleared on unmount via a `useEffect`
-cleanup. For `useTileGraph` that's low-risk (the hook lives for the app's life),
-but it's the kind of resource-release a reviewer would flag — a fired-after-unmount
-`setState` warning is the symptom. Noted in the audit.
+What breaks if you wrote on every `putElev`? You'd serialize the entire cache to JSON and
+hit disk hundreds of times during one graph build — the debounce collapses that to one
+write per ~4s. The `if (!persistTimer)` guard is what makes it *one* timer, not 200.
+
+*Flush with a FIFO cap, retry on failure.* `persistNow` trims to the 50k ceiling (`05`) and,
+critically, restores the dirty flag if the write throws so the next put retries:
+
+```ts
+// mobile/src/elevCache.ts:42-57 — flush; cap to 50k; re-dirty on failure for retry
+async function persistNow(): Promise<void> {
+  persistTimer = null;
+  if (!dirty) return;
+  dirty = false;
+  try {
+    let entries = [...mem.entries()];
+    if (entries.length > MAX_ENTRIES) { /* keep newest 50k, rebuild Map (05) */ }
+    await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(Object.fromEntries(entries)));
+  } catch {
+    dirty = true;   // ← write failed → re-dirty so the next putElev re-arms the flush
+  }
+}
+```
+
+What breaks without the `catch { dirty = true }`? A failed write would silently lose the
+batch and never retry — the cache would persist nothing until the next *successful* arming.
+Re-dirtying turns a transient write failure into a retry-on-next-put. This is the resource
+lifecycle's durability guarantee.
+
+**Part 4 — the read-modify-write "race" that isn't.** `loadElevCache` reads, `persistNow`
+writes the whole blob. Could a flush mid-load clobber the loaded data? No — same reason as
+`04`: both run on the one JS thread, and neither yields between read and the mem-mutation
+that matters. The `if (!mem.has(k))` in load (`elevCache.ts:24`) further guards against
+overwriting a value already sampled this session. *This is cooperative-single-thread safety,
+not a lock.*
+
+**Streams, descriptors, graceful close — not yet exercised.** flattr has no Node streams, no
+`ReadableStream`/`WritableStream`, no manual `fs.open`/`close`, no socket lifecycle it
+manages. Network responses are read whole (`.json()` buffers the entire body —
+`overpass.ts:41`, `elevation.ts:111`), never streamed. *Trigger for streams:* a response too
+large to hold in memory, or wanting to render partial graph as it arrives. *Trigger for
+manual descriptors:* anything beyond `writeFileSync`/AsyncStorage — e.g., appending to a log
+file or holding a DB connection.
 
 ### Move 3 — the principle
 
-Resources fall into two camps: self-releasing (files, sockets — the runtime or the
-API closes them) and you-release (timers — the handle outlives its creator).
-flattr's file and socket lifecycle is trivial because they self-close; its real
-discipline is the clear-before-set timer idiom, which is the manual release the
-runtime won't do for you. Get that idiom wrong and you don't crash — you get
-stale callbacks firing against state that moved on, the subtlest class of bug.
+The cleanest resource lifecycle is the one with no handle to clean up: flattr uses
+self-closing primitives (`writeFileSync`, AsyncStorage's promise API, bundler-inlined
+imports) so there's nothing to leak. Where it *does* manage state over time — the cache — the
+pattern is **load-once, mutate-in-memory, flush-batched-with-retry**, which is the
+durable-cache shape behind everything from browser IndexedDB wrappers to write-back CPU
+caches. The discipline isn't "remember to close things"; it's "pick primitives that close
+themselves, and batch the one write path so you're not hammering the slow resource."
 
 ## Primary diagram
 
-```
-  All durable & OS resources, acquire → release, fully labelled
+The full storage picture — both touchpoints, the cache lifecycle, what's absent.
 
-  ┌─ BUILD · Node ───────────────────────────────────────────┐
-  │  fetch(Overpass/Open-Meteo) ─ socket ─ closed by res.json()│
-  │  writeFileSync(graph.json) ─ fs handle ─ closed in-call    │
-  │  → process exits, all handles gone                         │
-  └────────────────────────┬───────────────────────────────────┘
-                           │ graph.json bundled (read-only)
-  ┌─ RUN · Hermes ─────────▼─────────────────────────────────┐
-  │  import graph.json ─ in-memory, immutable, app lifetime   │
-  │  AsyncStorage[elevCache.v1] ─ load-once, debounced write, │
-  │                               capped 50k, whole-blob       │
-  │  timers: debounce/retry/persist/suggest                   │
-  │   ─ clear-before-set ─ at most one armed each ─ NO unmount │
-  │     cleanup ◄─ minor gap                                  │
-  └──────────────────────────────────────────────────────────┘
+```
+  flattr resource lifecycle — two touchpoints, one managed cache
+
+  ┌─ BUILD (Node fs) ────────────────────────────────────────────┐
+  │  writeFileSync("data/graph.json")  → fd opened+closed inside  │
+  │  process exits → no leaked handles                           │
+  └───────────────────────────────┬──────────────────────────────┘
+                          bundled into app
+  ┌─ RUN (Hermes) ───────────────▼───────────────────────────────┐
+  │  loadGraph(): import → in memory, zero runtime I/O           │
+  │                                                              │
+  │  elevCache lifecycle:                                        │
+  │   loadElevCache (once) ──getItem──► mem Map                  │
+  │   putElev × N ──► mem.set + dirty ──► 1 debounce timer (4s)  │
+  │   persistNow ──► cap 50k ──► setItem ──► catch → re-dirty    │
+  │                                                              │
+  │  NOT PRESENT: streams · raw fds · socket lifecycle ·         │
+  │               graceful close                                 │
+  └───────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-The "static artifact + read-only client" file model is the same one in
-`01-runtime-map.md` and is the SSG pattern. The AsyncStorage usage is a classic
-*whole-blob KV cache*: one key, serialize the entire map, debounce the writes —
-simple and correct when the blob is small (50k number entries), but it's a
-read-modify-write of the *whole* store on every flush, which wouldn't scale to a
-large cache (you'd move to per-key storage or SQLite). The timer-handle hygiene is
-the run-time analog of closing file descriptors — different resource, identical
-discipline. Cross-link `.aipe/study-database-systems/` for the KV-store angle.
+flattr's cache is a **write-back cache** in the classic sense — mutations land in fast
+storage (the in-memory `Map`) immediately and propagate to slow storage (AsyncStorage)
+lazily and in batches, exactly like a CPU write-back cache or a database buffer pool flushing
+dirty pages. The debounce-timer + dirty-flag pair is the minimal write-back machinery: dirty
+tracks "needs flushing," the timer decides "when." The re-dirty-on-failure is the durability
+backstop that turns a lossy flush into an eventually-consistent one. The deliberate absence
+of streams is the right call for flattr's data sizes (a viewport of OSM is KB-to-low-MB, fits
+in memory) — streams earn their complexity only when data exceeds memory or latency demands
+incremental processing. For the cache's memory-side cap and FIFO eviction, see `05`; for the
+network reads that feed it, see `03` and `study-networking`.
 
 ## Interview defense
 
-**Q: What durable resources does the app manage, and how are they cleaned up?**
+**Q: "What resources does this app open, and how are they cleaned up?"**
 
-Three. The build artifact `graph.json` — written once with `writeFileSync`,
-handle auto-closed, then read-only on the phone. AsyncStorage — a single-key
-elevation cache, loaded once and written back debounced (`elevCache.ts`). And
-timers — the leakable one, handled with clear-before-set so only one of each is
-ever armed.
+Almost none that need manual cleanup. The pipeline writes the graph with `writeFileSync`,
+which opens and closes the fd internally, then the process exits. The app reads the graph as
+a bundler-inlined import — no runtime handle. The only managed resource is the AsyncStorage
+elevation cache, and that's a key-value store with no descriptor to leak.
 
 ```
-  the cleanup story, ranked by risk
-
-  file/socket → self-close            (no risk)
-  AsyncStorage → debounced, capped    (lose <4s on crash, re-fetchable)
-  timers → clear-before-set ★         (the one you can get wrong)
-           but: no unmount cleanup    (minor leak surface)
+  writeFileSync (self-closing) · import (no handle) · AsyncStorage (promise, no fd)
 ```
 
-Anchor: *"The clear-before-set idiom at `useTileGraph.ts:254` is the real resource
-discipline — without it, fast panning leaves a pile of armed debounce timers all
-firing stale `queueViewport` calls. The gap is no `useEffect` cleanup to clear
-them on unmount."*
+*Anchor:* "Nothing holds a raw handle — the cleanest lifecycle is the one with no handle to
+clean up."
 
-**Q: Are there any streams?**
+**Q: "Walk the cache write path. What stops it from hammering disk?"**
 
-No — `not yet exercised`. Every I/O is whole-body: `await res.json()` reads the
-entire response, `JSON.stringify` writes the entire cache. That's fine at this
-data size; it becomes a problem only if a response is too big to hold in memory,
-at which point you'd reach for a `ReadableStream` and chunked parsing.
+`putElev` writes the in-memory `Map` immediately and arms a single 4-second debounce timer;
+subsequent puts don't re-arm it. After 4s, `persistNow` serializes the whole cache once,
+caps it at 50k entries, and writes one `setItem`. If the write throws, it re-sets the dirty
+flag so the next put retries.
+
+```
+  put×200 → mem + dirty → 1 timer → persistNow → cap → 1 setItem → (fail? re-dirty)
+```
+
+*Anchor:* "Write-back cache: mutate in memory now, flush batched later, re-dirty on failure
+— the dirty flag plus one timer is the whole mechanism."
 
 ## See also
 
-- `01-runtime-map.md` — the `graph.json` build→run seam in context.
-- `05-memory-stack-heap-gc-and-lifetimes.md` — the cache's in-memory side.
-- `07-backpressure-bounded-work-and-cancellation.md` — timers as the cancellation substitute.
-- `.aipe/study-database-systems/` — AsyncStorage as a persistent KV store.
+- `05-memory-stack-heap-gc-and-lifetimes.md` — the cache's 50k FIFO cap and in-memory growth.
+- `04-shared-state-races-and-synchronization.md` — why the read-modify-write isn't a race.
+- `03-event-loop-and-async-io.md` — the debounce timers and whole-body buffered reads.
+- `study-data-modeling` (sibling) — the graph.json artifact's schema.

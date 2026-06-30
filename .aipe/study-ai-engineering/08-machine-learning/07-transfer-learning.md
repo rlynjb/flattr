@@ -1,80 +1,180 @@
-# Transfer Learning
+# Transfer learning — new ground, no real flattr home
 
-*Industry name: transfer learning — reusing pretrained weights for a new task.*
+**Industry name(s):** transfer learning / fine-tuning / pretraining.
+**Type:** Industry standard (dominant in deep learning, rare in tabular).
 
-## Zoom out
+## Zoom out — nothing to transfer FROM or TO in flattr
+
+Transfer learning reuses a model trained on one task as the starting
+point for another — load pretrained weights, fine-tune on your data.
+flattr has no model and no weights, so there's nothing to transfer. The
+faint analog is reusing a *cost fit on city A* as the warm start for
+*city B* — but that's a stretch for a tiny tabular cost, and the honest
+answer is usually "you'd just retrain." This file teaches the concept as
+new ground.
 
 ```
-DON'T START FROM ZERO
-┌────────────────────────┐        ┌──────────────────────┐
-│ PRETRAINED model        │  ───►  │ YOUR task             │
-│ (millions of examples,  │ reuse  │ (a few hundred labels)│
-│  generic features)      │ layers │ fine-tune the top     │
-└────────────────────────┘        └──────────────────────┘
+  Zoom out — transfer learning needs a source model (flattr has none)
+
+  ┌─ SOURCE model (does not exist) ─┐
+  │ pretrained weights on big data   │
+  └────────────┬─────────────────────┘
+               │ transfer / fine-tune
+  ┌─ TARGET task ─▼─────────────────┐
+  │ flattr's learned cost (also none)│
+  └──────────────────────────────────┘
+  reality: no source, no target → nothing transfers
 ```
 
-Transfer learning is the single biggest reason small teams can ship ML: take a model
-someone else trained on a giant dataset, keep its learned general features, and adapt only
-the last bit to your task with *far* less data. **You've already done this** — contrl ran a
-**pretrained MediaPipe pose model** you never trained. That's transfer learning at its
-purest: reuse the pretrained landmark detector, build your rep-counter on top.
+## Structure pass
+
+- **Layers:** pretrained source → frozen/fine-tuned layers → target-task
+  head → target data.
+- **Axis — train-from-scratch vs transfer.** Transfer wins when target
+  data is scarce and a related source model exists. flattr's would-be cost
+  has *neither* a source model nor enough data to need one.
+- **Seam:** there is none in flattr. The nearest hook is initializing a
+  city-B cost from a city-A fit (see Move 2.C), which is warm-starting,
+  not true transfer learning.
 
 ## How it works
 
-### Move 1 — the mental model: borrow the eyes, retrain the verdict
+### Move 1 — the mental model
+
+You already used transfer learning without training it: contrl's
+MediaPipe pose model is a *pretrained* network Google trained on millions
+of images; you consumed its landmark outputs. That's transfer at the
+consumption layer — reuse someone's learned representation instead of
+training one. Transfer *learning* proper goes one step further: you
+fine-tune those pretrained weights on your own data.
 
 ```
-PRETRAINED NET (frozen)              YOUR HEAD (trained)
-[ early layers: edges, shapes ] ──► [ task layer: "is this a rep?" ]
-       generic, reusable                 specific, cheap to fit
+  Pattern — transfer learning
+
+  big pretrained model ──► freeze early layers
+                           fine-tune late layers on YOUR small data
+                           = strong model from little data
 ```
 
-Early layers learn generic structure (edges, textures, body landmarks) that transfer
-across tasks. Only the final layer(s) are task-specific. So you freeze the bottom and train
-a small head — minutes and hundreds of examples, not weeks and millions.
+### Move 2 — the walkthrough (as new ground)
 
-### Move 2 — the spectrum, and the contrl anchor
+**Sub-step A — when it's the right tool.**
 
 ```
-FEATURE EXTRACTION  ◄──────────────────────────►  FULL FINE-TUNE
-freeze everything,    unfreeze top layers,         retrain all weights
-train a new head      train head + a few layers     (needs most data)
-↑ contrl is HERE      ↑ more data, more drift risk   ↑ rarely worth it small
-(MediaPipe frozen,
- rep logic on top)
+  Transfer wins when…
+
+  target data is SMALL        (can't train from scratch)
+  a related SOURCE exists     (vision, language, audio backbones)
+  the representation reuses    (edges/textures, grammar, phonemes)
 ```
 
-- **contrl (your shipped case):** MediaPipe outputs pose landmarks; you wrote the
-  rep-counting logic on top. The heavy model was frozen and pretrained — you transferred
-  its "understanding of a human body" for free.
-- **A flattr version (hypothetical):** suppose someone pretrained a general
-  grade→cost / terrain-comfort model on dozens of cities. flattr could **fine-tune** it on
-  a few hundred Seattle labels instead of training from scratch — directly addressing the
-  domain gap (file 06). The catch carries over from file 04: after fine-tuning, the
-  resulting `f` for `cost.ts` still must be **≥0 and monotone in grade**, so you'd constrain
-  the fine-tune (or wrap the output), not let it drift free.
+This is deep-learning territory — vision, NLP, audio. Tabular models like
+flattr's would-be cost rarely transfer; there's no rich learned
+representation to reuse in a 5-feature regression.
+
+**Sub-step B — why flattr's cost doesn't qualify.**
+
+```
+  Why no transfer for the flattr cost
+
+  it's tabular & tiny (grade, length, surface) → no representation
+  no pretrained "routing cost" backbone exists  → no source
+  retraining from scratch is cheap              → no need to transfer
+```
+
+**Sub-step C — the only faint analog: warm-starting city B from city A.**
+
+```
+  Faint analog — NOT transfer learning, just initialization
+
+  city A cost (k1=0.5, k2=1.1, fit)  ──► city B starts from those
+  then refit on city B's data        ──► drifts to B's distribution
+  this is "warm start", a footnote, not transfer learning
+```
+
+Even this is shaky: a 2-parameter cost refits so fast that the warm start
+saves nothing. Call it warm-starting and move on; don't dress it up as
+transfer learning.
 
 ### Move 3 — the principle
 
-**Reuse generic representations; learn only what's specific to you.** The less you train,
-the less data and compute you need — and the less you can break the pretrained model's
-hard-won general structure. The trade: transferred features assume the new domain *resembles*
-the source domain; too big a gap (file 06) and transfer stops helping.
+Transfer learning earns its place when you have little target data and a
+rich pretrained representation worth reusing. flattr's prospective cost is
+small, tabular, and cheap to refit — none of the preconditions hold. The
+mature answer is to recognize that and not reach for transfer learning
+where retraining-from-scratch is simpler. The discipline is matching the
+technique to the situation, and here the situation says "no."
 
-## In this codebase
+## Primary diagram
 
-**NOT YET EXERCISED — flattr has no model, pretrained or otherwise.** There is nothing to
-transfer *from* and nothing to transfer *into*. The honest anchor is **contrl, not flattr**:
-your MediaPipe pipeline is the transfer-learning experience to draw on. flattr's equivalent
-would only exist if a learned **`features/routing/cost.ts`** started from a pretrained
-multi-city terrain model rather than from random weights.
+```
+  Transfer learning vs flattr (no home)
 
-`features/grade/classify.ts` has no weights at all — there is nothing pretrained to reuse;
-its thresholds are constants, not transferred parameters.
+  TRANSFER LEARNING (deep, data-scarce)
+  pretrained backbone ──► fine-tune head ──► strong small-data model
+        │ requires: a source model + a reusable representation
+        ▼ flattr has neither
+
+  flattr's reality
+  ┌─ tiny tabular cost ─┐  refit from scratch is cheap
+  │ grade,len,surface    │  warm-start city→city = footnote, not TL
+  └──────────────────────┘
+```
+
+## Elaborate
+
+The contrl connection is worth holding onto because it's the *correct*
+shape of "transfer" in your portfolio: you consumed a pretrained model
+rather than training a representation from scratch. If flattr ever grew a
+component that needed a learned representation — say, predicting surface
+type from a street-level image — *that* would be a transfer-learning home
+(fine-tune a vision backbone). But flattr has no camera and no image input
+(unlike contrl), so even that door is closed. The honest map: transfer
+learning is for rich representations and scarce data; flattr's cost has
+neither.
+
+## Project exercises
+
+### TL.1 — warm-start vs scratch refit comparison (honest negative result)
+
+- **Exercise ID:** TL.1
+- **What to build:** if a learned cost ever exists, an experiment that
+  fits city B's cost two ways — from scratch and warm-started from city
+  A's parameters — and reports that the difference is negligible for a
+  tiny tabular model (the expected honest result).
+- **Why it earns its place:** documenting *why a technique doesn't help*
+  is as valuable as using one; it stops you reaching for transfer learning
+  reflexively.
+- **Files to touch:** (hypothetical) `pipeline/cost-train.ts` — add a
+  warm-start init path and log convergence steps both ways.
+- **Done when:** the experiment shows warm-start saves <1 iteration on the
+  2-parameter cost, confirming transfer learning is unjustified here.
+- **Estimated effort:** half a day (only if a learned cost exists).
+
+## Interview defense
+
+**Q: Would transfer learning help flattr?** Answer: no, and being able to
+say why is the point. Transfer learning reuses a rich pretrained
+representation when target data is scarce — vision and language
+backbones. flattr's would-be cost is a tiny tabular regression over
+grade, length, and surface; there's no representation to reuse and
+retraining from scratch is cheap. I consumed a pretrained model in contrl
+(MediaPipe pose), which is the consumption flavor of transfer, but flattr
+has no image input and no source model. Forcing transfer learning here
+would be cargo-culting a deep-learning technique into a place it doesn't
+fit.
+
+```
+  transfer learning needs: scarce data + rich pretrained backbone
+  flattr cost: cheap to refit + no backbone → retrain from scratch
+```
+
+Anchor: *"contrl consumed a pretrained pose model — that's the only
+transfer-shaped thing in my portfolio, and flattr has no image input to
+repeat it."*
 
 ## See also
 
-- `06-domain-gap.md` — why you'd fine-tune (close the city gap) instead of training fresh
-- `12-on-device-inference.md` — contrl's on-device serving of the transferred model
-- `13-quantization.md` — shrinking a transferred model to fit on the phone
-</content>
+- [06-domain-gap.md](06-domain-gap.md) — the across-city problem transfer would *try* to solve.
+- [04-model-selection.md](04-model-selection.md) — why the cost is tiny and tabular.
+- [11-cold-start.md](11-cold-start.md) — the real flattr answer to "no data yet": rules, not transfer.

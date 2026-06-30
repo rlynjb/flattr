@@ -1,174 +1,231 @@
-# Skeptical Reviewer Questions — flattr
+# Skeptical Reviewer Questions
 
-> The review-room questions, the answer that holds, the trap, and a one-line
-> anchor for each. Coach posture: "say this, not that." The recurring move is
-> the same one this whole book is built on — own the EVIDENCE/INFERENCE split
-> before the reviewer forces it. Never fake demand.
-
-## The discovery questions to answer before investing
-
-Before the Q&A, here are the open questions this book cannot answer from the repo
-— the things the discovery slice exists to resolve. A reviewer respects you more
-for listing these than for pretending they're settled.
-
-```
-  open discovery questions — unanswered by the repo
-
-  1. Does any real self-powered traveler feel grade-pain
-     strongly enough to change tools?              ← the whole premise
-  2. Shown both routes, do they CHOOSE the flat one
-     for the grade (not for distance/familiarity)? ← the switching test
-  3. Is free Open-Meteo elevation accurate enough
-     that the colors don't lie?                    ← spec §11.A / §12 crux
-  4. Is the differentiator (personalized userMax)
-     actually felt vs. AccessMap's fixed bands?    ← spec §12 overlap risk
-  5. Which neighborhoods do validated users actually
-     travel — i.e. where would coverage pay off?   ← answer AFTER Q1-2
-```
-
-Now the pressure test.
+This is the review room. Coach posture: for each question you get the
+sharp version, the answer that holds, the diagram you'd sketch while you
+talk, and a one-line anchor. The rule throughout — **never defend an
+inference as if it were evidence.** The strongest answers concede the
+gap and name the cheap experiment.
 
 ---
 
-## Q1. "Isn't this a solution looking for a problem? Defend the demand."
+## Q1. "AccessMap already does hill-avoidance for pedestrians. Why does this exist?"
 
-**The honest answer holds; a faked one collapses.**
-
-> "Yes — and I'll name it before you do. The repo proves the problem is
-> *technically solvable*: oracle-checked optimal routing, a measured algorithm
-> progression, honest fallback, all on free data, on device. It proves *nothing*
-> about demand — there are no users, no interviews, no analytics. The §3 user
-> table in the spec is a hypothesis I wrote, not a finding. So the correct next
-> investment isn't another feature — it's the cheapest experiment that turns that
-> hypothesis into evidence: one neighborhood, five real travelers, A→B in flattr
-> vs. Google Maps, measure which they pick and why."
+The incumbent question. The spec itself names AccessMap (§1, §12) — don't
+pretend it doesn't exist.
 
 ```
-  the answer's shape — own both columns
+  AccessMap vs flattr — where the wedge is (asserted)
 
-  "it WORKS"  ──┐
-  (evidence,    ├──►  "...and demand is UNMEASURED.
-   point at      │      here's the experiment that measures it."
-   astar.test)  ─┘            ▲
-                              └── this sentence is what reads as senior
+  ┌─ AccessMap ───────────┐      ┌─ flattr ──────────────┐
+  │  fixed pedestrian      │      │  user-set max grade    │
+  │  grade thresholds      │  vs  │  (userMax) drives BOTH │
+  │  one threshold for all │      │  routing cost AND map  │
+  │                        │      │  colors off one number │
+  └────────────────────────┘      └────────────────────────┘
+   incumbent, real users           the wedge — UNVALIDATED
 ```
 
-- **Trap:** inventing a user count or "lots of people hate hills." The moment
-  you assert demand you can't source, you've lost.
-- **Anchor:** *"Proven solvable, unproven wanted — discovery is the next dollar."*
+**The answer that holds:** "The asserted wedge is personalization — a
+kick scooter's tolerable grade is far lower than a hiker's, and flattr
+keys both the router and the map colors off one user-set number
+(`userMax`, spec §2). That's a real *design* difference — `cost.ts:16-22`
+parameterizes the penalty on `userMax`. But whether that difference
+*matters to users* versus AccessMap's fixed thresholds is an
+**inference**, not something the repo proves. AccessMap has users; I have
+an oracle-correct router and zero users. The honest move is to test the
+wedge against AccessMap directly with one real walker before claiming
+it's better."
 
-## Q2. "Why build the engine before validating the problem?"
+**Anchor:** "The wedge is real in code, unproven with humans — and I'd
+test it head-to-head, not assert it."
 
-> "Honestly, the build order was backwards for a *product* — and right for a
-> *portfolio piece*. The engine is the DSA artifact: hand-rolled A*, admissible
-> heuristic, the Dijkstra-oracle gate. If flattr's goal is to show I can build
-> routing from the graph up, it's done. If the goal is a product, then I'm now at
-> the point where the next move is discovery, not more code — which is exactly
-> what `03` Option B recommends."
+---
 
-- **Trap:** pretending the build order was demand-driven. It wasn't; the spec is
-  engineering-first (§14, §15). Own it.
-- **Anchor:** *"Engine-first was right for the portfolio, and now discovery is
-  the next move."*
+## Q2. "90m DEM smooths exactly the short steep pitches that matter most. Isn't your core data too coarse to trust?"
 
-## Q3. "Google Maps and AccessMap exist. Why does flattr get to exist?"
-
-> "Google Maps optimizes distance/time and hides per-block grade in a smoothed
-> curve — verifiable. AccessMap shows grade but with fixed pedestrian thresholds.
-> flattr's claimed wedge is personalization: the route and the colors both key
-> off one user-set ceiling, so a kick scooter's 'red' starts far below a hiker's.
-> But — and this is the honest part — I have *not* validated that this
-> personalization is a felt difference. Spec §12 already flags the AccessMap
-> overlap as a risk. Whether the wedge matters to a real user is discovery
-> question 4."
-
-- **Trap:** overclaiming the differentiator as proven value. It's a plausible
-  wedge, not a measured one.
-- **Anchor:** *"The wedge is personalized grade; whether it's felt is unproven —
-  it's a discovery question."*
-
-## Q4. "What if elevation data is too coarse and the map lies?"
-
-> "That's the load-bearing risk, and the spec names it first — §11.A calls
-> elevation accuracy make-or-break, §12 says coarse data makes a map 'worse than
-> nothing.' The pipeline runs on free Open-Meteo, which 429s under load and is
-> resolution-limited. So route plausibility (metric 1c) is only as good as that
-> data. The mitigation is in the slice: validate on *known-hilly* blocks where I
-> can ground-truth the grade — if the colors disagree with reality there, I learn
-> it before I scale."
-
-- **Trap:** claiming accuracy is solved. It isn't; it's gated by the free-tier
-  constraint.
-- **Anchor:** *"Accuracy gates everything; I validate it on ground-truthable
-  blocks first."*
-
-## Q5. "Why not just add bidirectional A* / k-routes / city coverage next?"
-
-> "Because all of those spend hours on the column that's already full. The engine
-> works; demand is zero. `03` lays this out — Options C and D improve proven
-> things and leave demand exactly as unknown. The only option that buys
-> information about the unknown is the discovery slice. The senior move is to
-> invest against the uncertainty, and the uncertainty is entirely on the demand
-> side."
-
-- **Trap:** treating more engine as obviously the next step because it's the fun,
-  comfortable side.
-- **Anchor:** *"Spend hours where the uncertainty is — that's demand, not the
-  engine."*
-
-## Q6. "What does success even look like here? Give me a number."
-
-> "Two buckets. Available now, from the repo: A* equals Dijkstra on cost,
-> expands fewer nodes, returns plausibly flatter routes on hilly pairs, and
-> distinguishes 'no flat way' from 'no way.' Those prove the engine. The demand
-> numbers — adoption, switching, trust — I deliberately won't fake; there's no
-> product live, so there's no funnel. The first real number comes from the slice:
-> of five travelers shown both routes, how many choose flattr *for the grade*.
-> Three of five is my bar to consider investing further."
-
-- **Trap:** producing a DAU/retention/market-size number. There's no product —
-  any such number is fabricated.
-- **Anchor:** *"Engine metrics now; demand metrics only after the five-traveler
-  slice — and I won't invent the rest."*
-
-## Q7. "When is the right call to just stop?"
-
-> "If the slice comes back negative — travelers shrug, or pick the default route,
-> or don't trust the colors — that's a *successful* experiment that says stop or
-> pivot. And `03` Option A is legitimate even now: if flattr is explicitly a
-> portfolio artifact, it's already done its job and there's nothing left to
-> validate. The failure mode isn't stopping; it's pouring more solo-dev hours into
-> a product premise no one tested."
-
-- **Trap:** treating "stop" as failure. A cheap negative result is a win.
-- **Anchor:** *"A cheap 'no' is a successful experiment; the real failure is
-  building past an untested premise."*
-
-## The meta-move under every answer
+The sharpest technical objection, and the spec concedes it (§12: "grade
+accuracy is the whole product").
 
 ```
-  the recovery pattern when pressed on demand
+  The DEM resolution problem — what gets smoothed
 
-  reviewer pushes on "who wants this?"
-            │
-            ▼
-  DON'T invent a user / number / market   ← instant credibility loss
-            │
-            ▼
-  DO: "I don't have that evidence. Here's
-       the experiment that would produce it,
-       and the bar I'd hold it to."        ← reads as senior judgment
+  real terrain:   ___/▔▔\___/▔▔▔\__   short steep pitches
+  90m DEM sample: ___╱▔▔▔▔▔▔▔▔▔╲___   pitches averaged out
+                       ▲
+              a 30m-long 12% ramp can read as 4% — the user
+              hits a wall the map painted green
 ```
 
-"I don't know yet — here's how I'd find out" beats a confident fabrication every
-single time in a senior review.
+**The answer that holds:** "Correct, and it's the biggest real risk to
+the product. Open-Meteo's 90m DEM (`pipeline/elevation.ts`) averages
+elevation across a span longer than many of the pitches that actually
+stop a kick scooter. I mitigate at the edges — the pipeline splits ways
+to ~12m segments before sampling, so I'm not assigning one grade to a
+whole block — but I can't recover detail the source doesn't have. This is
+option D in my options analysis: harden accuracy with a finer DEM, almost
+certainly paid, which breaks the free-tier constraint. I'd only spend
+that *after* a user tells me distrust of the colors — not lack of
+interest — is what stops them. Otherwise I'd be buying precision nobody
+asked for."
 
-## See also
+**Anchor:** "Grade accuracy is the whole product and 90m is coarse — I'd
+fix it only when a user proves trust is the blocker."
 
-- `00-overview.md` — the EVIDENCE/INFERENCE split every answer leans on.
-- `03-options-and-opportunity-cost.md` — the `do nothing` / discovery reasoning
-  behind Q5 and Q7.
-- `04-success-metrics-and-feedback-loop.md` — the two-bucket metric story behind
-  Q6.
-- `docs/flattr-spec.md` §12, §15.1 — the spec's own honest-caveat framing this
-  book extends from scale to demand.
+---
+
+## Q3. "You dropped your own central slider for three presets (b24797c) before a single user touched it. Didn't you just walk back your core thesis?"
+
+The question that proves the reviewer read the git log. Don't get
+defensive — this is your most useful piece of free signal.
+
+```
+  b24797c — the walk-back, named honestly
+
+  THESIS (spec §2)          SHIPPED (b24797c)
+  ┌────────────────┐        ┌────────────────┐
+  │ "one slider,    │       │  🛴 5%          │
+  │ everyone sets   │  ──►   │  🚶 8%          │
+  │ where red       │       │  🏔️ 15%         │
+  │ begins"         │        │  3 fixed presets│
+  │ 14 settings     │        │  "Per request"  │
+  └────────────────┘        └────────────────┘
+   continuous personalization → quantized to 3 buckets
+```
+
+**The answer that holds:** "Yes — partially, and I'd flag it as exactly
+that. The thesis was continuous personalization: one slider, your number.
+`b24797c` quantized it to three presets, and the commit says 'Per
+request.' That's a narrowing of the central wedge, made before any user
+asked for the granularity. Two honest reads: either continuous control
+was overkill and three named buckets (scooter / walking / any) are
+clearer — which would be a *finding*, if a user had produced it — or I
+simplified the UX to feel shippable and quietly shrank the differentiator.
+I can't tell which, because there's no user behind 'Per request.' Note
+that the underlying engine still takes a continuous `userMax`
+(`cost.ts`), so the thesis is intact in code; only the input got
+quantized. Reversing it is a one-component change. This is precisely the
+kind of decision I'd want a real user to drive instead of a vibe."
+
+**Anchor:** "It's a real partial walk-back of the wedge, the engine still
+supports the full thesis, and it's the kind of call a user should make,
+not me."
+
+---
+
+## Q4. "One 0.35 km² neighborhood. How does proving anything there generalize?"
+
+The scope-skeptic question.
+
+```
+  One neighborhood — what it does and doesn't prove
+
+  PROVES (EVIDENCE)              DOESN'T PROVE (INFERENCE)
+  ─────────────────              ────────────────────────
+  router is correct here ✓       it scales to a city
+  honest fallback fires  ✓       demand exists anywhere
+  grade constrains paths ✓       free-tier survives scale
+  (Capitol Hill is steep
+   on purpose — config.ts)
+```
+
+**The answer that holds:** "It proves the *mechanism*, not the *market*.
+Capitol Hill was chosen because it's steep (`pipeline/config.ts`) — a
+flat neighborhood would make the product invisible, so this is the
+hardest validating ground, not the easiest. Correctness generalizes: the
+oracle and bench run on synthetic grids of any size, and the algorithm
+doesn't care about the bbox. What does *not* generalize from one
+neighborhood is demand — and scaling coverage (option C) is weeks of work
+against the free-tier rate limit and the offline bundle-size constraint.
+I deliberately don't pay that cost until the one-walker test says people
+want it where they live."
+
+**Anchor:** "One steep neighborhood proves the mechanism; generality of
+demand is unproven and I won't buy coverage before signal."
+
+---
+
+## Q5. "Where are your users? Show me one piece of demand evidence."
+
+The question the whole book is built to answer. Do not flinch, do not
+fabricate.
+
+```
+  The demand question — answered with honesty, not a TAM slide
+
+  ┌─ what I have ─────────────┐   ┌─ what I don't ──────────┐
+  │ oracle-correct router  ✓  │   │ users              ✗    │
+  │ bench-measured A*      ✓  │   │ telemetry          ✗    │
+  │ shipped on a city      ✓  │   │ research / surveys ✗    │
+  │ honest fallback        ✓  │   │ adoption numbers   ✗    │
+  └───────────────────────────┘   └─────────────────────────┘
+        Claim A: PROVEN              Claim B: UNPROVEN
+```
+
+**The answer that holds:** "I have none, and I won't invent any. There's
+no analytics SDK in `mobile/package.json`, no telemetry, no deployment —
+I checked. What I have is proof the problem is *technically* solvable:
+a hand-rolled directional A*, an A*==Dijkstra optimality oracle in CI,
+bench numbers showing 3.9–7.4× fewer expansions than Dijkstra, an honest
+finite-BLOCKED fallback that distinguishes 'no flat route' from 'no
+route,' and a working Expo app on a real Seattle neighborhood. What I
+*don't* have is any evidence a human wants it. The cheapest way to get
+that is one self-powered traveler, one route they know, one question:
+'is this the path you'd actually take?' I'd run that before writing
+another line — and if the answer is no, do-nothing and 'this is a strong
+algorithm artifact' are both real, honest landing spots."
+
+**Anchor:** "Technically solvable: proven. Worth solving: unproven. I'd
+spend one afternoon, not one month, to find out which."
+
+---
+
+## Q6. "Why hand-roll the router at all? Valhalla or OSRM would route in a weekend."
+
+The build-vs-buy challenge.
+
+```
+  Hand-rolled vs off-the-shelf — the constraint behind it
+
+  ┌─ buy (Valhalla/OSRM) ─┐      ┌─ build (this repo) ───┐
+  │ routes in a weekend    │      │ graph + A* from        │
+  │ but it's a black box   │  vs  │ scratch — the WORK is  │
+  │ for grade-cost tuning  │      │ the artifact (spec §14)│
+  └────────────────────────┘      └────────────────────────┘
+```
+
+**The answer that holds:** "Deliberate, and it's a constraint, not an
+oversight (spec §14: no Valhalla/OSRM/GraphHopper — the graph work is the
+point). Two reasons hold. First, the product's whole value is a custom
+directional grade-penalty cost function (`cost.ts:16-22`) — off-the-shelf
+routers don't expose cost tuning at that granularity cleanly. Second,
+this is a portfolio repo for a frontend-to-AI/systems pivot; a
+hand-rolled, oracle-verified, benchmarked A* is the artifact. If demand
+validated and scale became the bottleneck, swapping to a hardened engine
+is a defensible later move — but that's option C territory, after a user
+says yes."
+
+**Anchor:** "Hand-rolling is the point of the artifact and the cost
+function needs the control — buying is a post-validation option."
+
+---
+
+## The review room, in one frame
+
+```
+  Every answer collapses to the same honest spine
+
+  ┌────────────────────────────────────────────────────────┐
+  │  EVIDENCE (file:line)        →  defend hard, it's proven │
+  │  INFERENCE (about humans)    →  concede, name the cheap  │
+  │                                 experiment, keep         │
+  │                                 do-nothing live          │
+  │                                                          │
+  │  the move that wins the room: refuse to launder an       │
+  │  inference into a fact. one walker, one route, one       │
+  │  question — before another line of code.                │
+  └────────────────────────────────────────────────────────┘
+```
+
+That's the book. The engine is built and provably correct. Whether it's
+worth more of your time is one honest afternoon away — and you don't get
+to skip it.

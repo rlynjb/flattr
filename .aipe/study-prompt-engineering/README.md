@@ -1,79 +1,69 @@
-# Prompt Engineering — flattr
+# Prompt Engineering — flattr study guide
 
-> **Honest framing up front.** flattr has **zero prompts and zero LLM
-> calls** today. No `anthropic`, no `openai`, no model SDK anywhere in the
-> tree. This is a pure-TypeScript grade-aware router. So this guide is not a
-> tour of prompts that exist — it's a **map of the three seams where prompts
-> WOULD live** if flattr grew a natural-language layer, anchored to the
-> real files those prompts would attach to, and a working through of the 13
-> prompt-engineering concepts using those seams as the anchor.
->
-> Every concept file labels its content **future / seam**, never "present."
-> Nothing here claims flattr does something it doesn't.
+13 concepts in a working-AI-engineer voice, anchored to real flattr files. Generated per `study-prompt-engineering.md`.
 
-## The three seams (the spine of this whole guide)
+> **Read `00-overview.md` first.** It states the load-bearing honesty up front: **flattr has no prompts and no LLM calls.** This guide maps the three future *seams* where prompts would attach, anchored to real, tested code. Everything is labeled seam/future, not present. Nothing is invented.
 
-```
-  flattr's three prompt seams — none built, all anchored to real files
+## The three seams (every file references these)
 
-  ┌─ SEAM 1: output → prompt ───────────────────────────────────────┐
-  │  features/routing/summary.ts  →  RouteSummary{distanceM,         │
-  │  climbM, steepCount}  ──would be templated into──►  prompt       │
-  │  ──►  LLM  ──►  "A mostly flat 3.2 km route along the water..."  │
-  │  STRUCTURED OUTPUT becomes the INPUT to a prompt.                │
-  └─────────────────────────────────────────────────────────────────┘
-
-  ┌─ SEAM 2: input → prompt ────────────────────────────────────────┐
-  │  "somewhere flat near the water"  ──►  LLM parse  ──►            │
-  │  structured geocode args  ──►  pipeline/geocode.ts geocode()     │
-  │  FREE TEXT becomes STRUCTURED INPUT via a prompt.                │
-  └─────────────────────────────────────────────────────────────────┘
-
-  ┌─ SEAM 3: injection boundary ────────────────────────────────────┐
-  │  Nominatim display_name (attacker-influenceable OSM string)      │
-  │  ──would flow into──►  any prompt at Seam 1 or 2                 │
-  │  UNTRUSTED DATA crossing into a prompt = injection vector.       │
-  └─────────────────────────────────────────────────────────────────┘
-```
+| Seam | Direction | Anchor | What it would do |
+|---|---|---|---|
+| **1 — describe my route** | output → prompt | `features/routing/summary.ts:5` (`RouteSummary`) + `types.ts:36` (`Path.steepEdges`) | template a structured route summary into a prompt for a natural-language description |
+| **2 — NL-destination parse** | input → prompt | `pipeline/geocode.ts:9` (`geocode(query)`) | parse free text ("flat near the water") into structured geocode input via an LLM |
+| **3 — injection defense** | trust boundary | `pipeline/geocode.ts:27` (`display_name`) | defend against attacker-edited OSM place names interpolated into a prompt |
 
 ## Reading order
 
-Operational discipline first, then the specific techniques.
+Operational discipline first, then specific techniques. New to the discipline? Read top to bottom.
 
-| #  | File | One line |
-|----|------|----------|
-| 00 | [00-overview.md](00-overview.md) | The three seams, the no-prompts-today reality, the map |
-| 01 | [01-anatomy.md](01-anatomy.md) | The four sections of a prompt — mapped onto Seam 1's template |
-| 02 | [02-structured-outputs.md](02-structured-outputs.md) | Schema-enforced output — `RouteSummary` is already the schema |
-| 03 | [03-prompts-as-code.md](03-prompts-as-code.md) | Versioned prompts — where a `prompts/` dir would live |
-| 04 | [04-token-budgeting.md](04-token-budgeting.md) | Token counting — flattr's tiny payloads make this a teaching case |
-| 05 | [05-eval-driven-iteration.md](05-eval-driven-iteration.md) | Evals before iteration — `fixtures.ts` is the eval substrate |
-| 06 | [06-single-purpose-chains.md](06-single-purpose-chains.md) | One chain, one job — the pipeline is already this shape |
-| 07 | [07-output-mode-mismatch.md](07-output-mode-mismatch.md) | JSON-vs-prose contract breaks across stages |
-| 08 | [08-few-shot.md](08-few-shot.md) | Examples constrain harder than instructions |
-| 09 | [09-chain-of-thought.md](09-chain-of-thought.md) | Reasoning prompts — and when they waste tokens |
-| 10 | [10-self-critique.md](10-self-critique.md) | Self-critique / self-consistency for high-stakes output |
-| 11 | [11-meta-prompting.md](11-meta-prompting.md) | LLMs writing prompts for other LLM calls |
-| 12 | [12-prompt-injection-defense.md](12-prompt-injection-defense.md) | Seam 3 — defending the `display_name` injection vector |
-| 13 | [13-forbidden-patterns.md](13-forbidden-patterns.md) | Stopping every route description sounding identical |
+### Operational foundations (read first)
+
+| # | File | One line |
+|---|---|---|
+| 00 | `00-overview.md` | The honesty, the three seams, the real anchors |
+| 01 | `01-anatomy.md` | A prompt is four sections with two lifetimes — constant vs per-call |
+| 02 | `02-structured-outputs.md` | Declare schema → provider enforces → you validate → retry (Seam 2) |
+| 03 | `03-prompts-as-code.md` | Version the prompt+model *pair*; log which produced which (like `graph.json`) |
+| 04 | `04-token-budgeting.md` | The `Edge.geometry` polyline trap; `routeSummary` is the compressor |
+| 05 | `05-eval-driven-iteration.md` | `fixtures.ts` is a golden set; iterate against it, not vibes |
+
+### Composition
+
+| # | File | One line |
+|---|---|---|
+| 06 | `06-single-purpose-chains.md` | One chain, one job — like `osm→elevation→split→grade` |
+| 07 | `07-output-mode-mismatch.md` | JSON-vs-prose mismatch at a chain boundary breaks the parser |
+
+### Techniques
+
+| # | File | One line |
+|---|---|---|
+| 08 | `08-few-shot.md` | Examples out-constrain instructions; source them from `fixtures.ts` |
+| 09 | `09-chain-of-thought.md` | `penalty()`-shaped multi-step decisions; reasoning in a thinking field |
+| 10 | `10-self-critique.md` | Check the description against `routeSummary` ground truth |
+| 11 | `11-meta-prompting.md` | Use a model to draft prompts; human edit returns authorship |
+| 12 | `12-prompt-injection-defense.md` | `display_name` is attacker-editable; hierarchy + delimiters + schema cage |
+| 13 | `13-forbidden-patterns.md` | Stop every route description sounding identical (repeated generation only) |
+
+## Real anchors used as teaching substrate
+
+These exist today and do real work; the files borrow them honestly:
+
+- `features/routing/summary.ts:5` — `RouteSummary {distanceM, climbM, steepCount}` → Seam 1, few-shot, CoT, self-critique
+- `features/routing/types.ts:10,31,36` — `Edge`/`Path`/`steepEdges` → token trap, output-mode contracts
+- `pipeline/geocode.ts:9,27` — `geocode(query)` / `display_name` → Seam 2, injection (Seam 3)
+- `features/routing/fixtures.ts:46` — golden graphs → eval set + few-shot source + meta-prompt grounding
+- `features/routing/cost.ts:16` — `penalty(g, max, k1, k2)` → CoT multi-step decision shape
 
 ## Cross-links to sibling guides
 
-- **`.aipe/study-security/`** — Seam 3 is the author-side of a trust
-  boundary; the runtime-side (never let LLM output trigger side effects,
-  output validation) lives there.
-- **`.aipe/study-ai-engineering/`** — the production-serving seam: where
-  these prompts would actually be invoked, retried, and logged.
-- **`.aipe/study-agent-architecture/`** — if Seam 2 grew into a planning
-  loop ("find me a flat loop that passes a coffee shop").
-- **`.aipe/study-system-design/`** — the pipeline / request-flow shape the
-  chains would slot into.
-- **`.aipe/study-data-modeling/`** — `RouteSummary` and `Edge` are the
-  structured shapes the prompts read and write.
-- **`.aipe/study-testing/`** — `fixtures.ts` and the eval seam.
-- **`.aipe/study-networking/`** — the Nominatim HTTP call that produces the
-  untrusted `display_name`.
-- **`.aipe/study-performance-engineering/`** — token cost as a latency and
-  dollar budget.
-</content>
-</invoke>
+- `study-ai-engineering` — runtime serving side of these seams (where the LLM call executes, retries, streams)
+- `study-agent-architecture` — if Seam 2's parse grows into a tool-calling loop
+- `study-security` — the runtime-side trust-boundary audit that Seam 3 complements
+- `study-system-design` — where these seams sit in flattr's pipeline/runtime split
+- `study-testing` — the eval seam (`05`) as the AI-correctness counterpart to flattr's Vitest suite
+- `study-data-modeling` — the `Graph`/`Edge`/`Path` types these seams contract against
+
+## A standing reminder
+
+Every concept here is **future/seam, not present**. flattr ships a router, not a prompt. The value of the guide is showing exactly *where* and *how* a prompt would attach to this real code — so when the feature lands, the discipline is already understood.

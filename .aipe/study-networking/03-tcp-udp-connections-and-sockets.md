@@ -1,138 +1,227 @@
-# 03 — TCP/UDP, Connections, and Sockets
+# TCP/UDP, connections, and sockets
 
-**Transport, sockets, connection lifecycle** · *Industry standard*
+**Industry name(s):** transport layer / connection lifecycle / sockets. **Type:** Industry standard.
 
 ## Zoom out, then zoom in
 
-Underneath every `fetch` is a TCP connection — a socket opened to the provider's IP on port 443, three-way handshake, bytes flowing, then a close. flattr opens dozens of these over a session and never names a single one. The socket is entirely below flattr's floor.
+Under every `await fetch(...)` in flattr is a TCP connection: a three-way handshake, an
+ordered byte stream, a teardown. flattr never names a socket, never picks TCP over UDP,
+never sets a pool size. It sits two layers above the socket and lets the runtime own all
+of it.
 
 ```
-  Zoom out — where the connection sits
+  Zoom out — the transport flattr stands on but never touches
 
-  ┌─ App ────────────────────────────────────────────┐
-  │  fetch(...)  → Promise<Response>                   │ ← we are here (above the socket)
-  └───────────────────────┬──────────────────────────┘
-                          │ HTTP request
-  ┌─ ★ Transport (TCP, OS-managed) ★ ────────────────┐
-  │  open socket · handshake · send · recv · close    │
-  └───────────────────────┬──────────────────────────┘
-                          │ IP packets
-  ┌─ Network ────────────────────────────────────────┐
-  │  routers, the internet                            │
-  └──────────────────────────────────────────────────┘
+  ┌─ flattr code ───────────────────────────────────────────┐
+  │  await fetchImpl(url, { method, headers, body })         │ ← flattr's floor
+  └───────────────────────────────┬──────────────────────────┘
+                                  │ HTTP request object
+  ┌─ Runtime HTTP client ─────────▼──────────────────────────┐
+  │  ★ open/reuse TCP socket · write bytes · read response ★  │ ← THIS CONCEPT
+  │  (Node undici connection pool / RN native stack)          │
+  └───────────────────────────────┬──────────────────────────┘
+                                  │ TCP segments
+  ┌─ OS network stack ────────────▼──────────────────────────┐
+  │  3-way handshake · ordered reliable stream · FIN teardown │
+  └───────────────────────────────────────────────────────────┘
 ```
 
-Zoom in: flattr makes exactly **one transport-relevant decision** — HTTP over TCP, implicitly, by using `fetch` and `https://` URLs. No UDP, no raw sockets, no WebSocket upgrade. So this concept is short and honest: the transport is TCP, flattr never touches the socket, and the one thing worth studying is *how flattr serializes its requests above the socket layer* — because that's the only connection-lifecycle control it actually has.
+Zoom in. The concept is the **connection lifecycle**: handshake → send → receive →
+close (or keep-alive for reuse). flattr exercises it entirely through `fetch`, so the
+lesson is about **what TCP gives flattr for free** (ordering, reliability) and **what
+flattr gives up by not touching it** (no socket timeout, no pool control).
 
-## Structure pass
+## The structure pass
 
-**Layers.** Request (flattr) → connection (TCP, OS) → packet (IP). flattr operates only at the request layer.
+**Layers.** flattr → runtime HTTP client → OS TCP stack. The socket lives two floors
+below flattr's lowest line of code.
 
-**Axis = state (who owns the connection's lifetime?).** The OS owns it. flattr never holds a socket handle, never sees connect/close, never pools deliberately. flattr's only "connection state" is the application-level `busyRef` flag — a boolean that means "one build is in flight," which is *not* a socket, just a gate above the socket.
+**Axis traced: who owns the connection's lifetime?**
 
 ```
-  axis traced: who owns connection lifetime?
+  Axis: "who decides when the socket opens, lives, and dies?"
 
-  ┌─ flattr ───────────┐  seam  ┌─ OS transport ────────────┐
-  │ owns: busyRef gate │ ══╪══► │ owns: socket open/close,   │
-  │ (app-level)        │ flips  │ keep-alive, pooling, RTT   │
-  └────────────────────┘        └────────────────────────────┘
+  ┌─ flattr ────────────────┐  decides only WHEN to call fetch
+  │  await fetch()           │  (and how many at once — the pump)
+  └──────────┬───────────────┘
+  ┌─ runtime ▼───────────────┐  opens, pools, keep-alives, reuses,
+  │  HTTP client / agent      │  and closes the socket — all of it
+  └──────────┬───────────────┘
+  ┌─ OS ─────▼───────────────┐  the actual handshake + byte stream
+  │  TCP segments             │
+  └──────────────────────────┘
+  flattr owns *request rate*; the runtime owns *connection lifetime*
 ```
 
-**Seam.** The `fetch` call is the floor. Above it, flattr controls *whether and when* a request is issued (the pump gate). Below it, the platform controls *how* the bytes move. The axis flips hard at this seam: flattr owns scheduling, the OS owns transport.
+**Seam.** `fetch` → runtime is the seam. The axis flips: above it flattr controls *how
+many requests* (the single-in-flight pump, `useTileGraph.ts:166`); below it the runtime
+controls *how many sockets and for how long*. flattr's only lever on the transport is
+request rate — and that lever is `07`'s whole story.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You know `fetch` returns a Promise that resolves when the response arrives. What you don't see is that resolving that Promise required opening a TCP socket, doing a handshake, and (probably) reusing a kept-alive connection from a pool the platform manages. flattr lives entirely in the Promise world and never descends to the socket. Its only transport-adjacent move is making sure it doesn't open *too many* sockets at once.
+You know a `fetch` "opens a connection" — you just never see the socket. The transport
+pattern is a **reliable ordered pipe**: TCP guarantees the bytes you send arrive in order
+or the connection errors. flattr leans entirely on that guarantee — it never reassembles,
+never dedupes packets, never handles out-of-order delivery, because TCP already did.
 
 ```
-  Pattern — flattr's only connection control: the single-flight gate
+  The pattern — TCP gives flattr an ordered reliable byte pipe
 
-   request A ──► busyRef? ──busy──► queued (one slot)
-   request B ──► busyRef? ──busy──► queued (corridor jumps line)
-                    │ free
-                    ▼
-              fetch(...)  ──► [OS opens/reuses ONE socket] ──► done
-                    │
-                    └─ busyRef released ─► drain next queued
+  flattr: fetch ──┐
+                  │   SYN ─────────────────►  } 3-way
+                  │   ◄───────────── SYN-ACK  } handshake (runtime+OS)
+                  │   ACK ─────────────────►  }
+                  │   request bytes ───────►
+                  │   ◄──────── response bytes  (in order, reliable)
+                  │   FIN / keep-alive
+  flattr: await resolves ◄─ JSON parsed
 ```
 
-That gate is not transport — it's an application scheduler. But it's the only lever flattr has that affects how many connections exist at a time, so it's where the connection story actually lives.
+### Move 2 — the step-by-step walkthrough
 
-### Move 2 — walk the transport facts
+**flattr always picks TCP — implicitly, by using HTTP.** Every call is HTTP/HTTPS, and
+HTTP runs on TCP. flattr never touches UDP. There's no QUIC config, no datagram socket,
+no raw socket anywhere in the repo. The transport choice is made *by choosing HTTP*, not
+by any flattr code. **UDP is not yet exercised** and wouldn't be unless flattr added
+something like a custom realtime protocol — which it has no reason to.
 
-**Fact 1 — it's TCP, always, implicitly.** Every URL is `https://`, every call is `fetch`. HTTPS rides TCP (HTTP/1.1 or HTTP/2 — see below). There is no `dgram`, no UDP, no `net.Socket`, no `ws` anywhere in the repo (confirmed: no socket libraries in either `package.json`). flattr never *chose* TCP; it chose `fetch`, and `fetch` chose TCP.
-
-**Fact 2 — flattr never holds a socket.** No connection object is stored, inspected, or closed in flattr code. The lifecycle (SYN → SYN-ACK → ACK → data → FIN) happens entirely inside the platform's HTTP client. The closest flattr comes to "lifecycle" is awaiting the Promise:
-
-```ts
-// overpass.ts:33-41 — flattr sees a Response, never a socket
-const res = await fetchImpl(endpoint, { method: "POST", headers: {...}, body });
-if (res.ok) return (await res.json()) as OverpassResponse;
-```
-
-`await fetchImpl(...)` is "connection established + request sent + response headers received." `await res.json()` is "response body fully read off the socket." Two awaits, two phases of the socket's life, and flattr names neither.
-
-**Fact 3 — connection reuse (pooling) is the platform's, not flattr's.** When the build samples elevation in batches of 100 (`elevation.ts:85,102`), it issues many sequential GETs to the same host. The platform *almost certainly* reuses one kept-alive TCP connection across them rather than reopening per request — that's standard HTTP/1.1 keep-alive / HTTP/2 behavior. flattr neither enables nor configures this; it's the default. *(Inference, from platform defaults — flattr sets no keep-alive header and no pool size. Covered as "not exercised" in `07`.)*
+**flattr relies on TCP ordering and never re-checks it.** Look at how Open-Meteo's
+response is consumed — flattr trusts that `elevation[i]` lines up with the i-th point it
+sent, because TCP delivered the whole body intact and in order:
 
 ```
-  Layers-and-hops — 100-point elevation batch loop, sockets reused
-
-  ┌─ flattr (elevation.ts:102) ─┐
-  │  for each 100-pt batch:      │
-  │    await fetch(GET ...)      │
-  └──────────────┬───────────────┘
-       hop: HTTP request         (flattr issues N sequential requests)
-                 ▼
-  ┌─ OS transport ──────────────┐
-  │  ONE kept-alive TCP socket   │ ← reused across the loop (platform default)
-  │  reused across all batches   │   flattr never opens/closes it
-  └──────────────────────────────┘
+  pipeline/elevation.ts:100-120 — relying on ordered, complete delivery
+  ┌──────────────────────────────────────────────────────────────┐
+  │ const res = await fetchImpl(url);          // TCP stream done  │
+  │ json = (await res.json());                 // whole body, ordered│
+  │ for (const e of json.elevation) out.push(e);                  │
+  │              └─ trusts elevation[] order matches the points    │
+  │                 we batched — TCP + HTTP guarantee a complete,  │
+  │                 in-order body, so no reassembly in flattr      │
+  └──────────────────────────────────────────────────────────────┘
 ```
 
-**Fact 4 — the single-flight gate caps concurrent connections at runtime.** `pump()` holds `busyRef = true` for the duration of one build (`useTileGraph.ts:166-167,182`), so at runtime there's at most one Overpass-plus-elevation build's worth of sockets open at a time. This isn't socket management — it's request scheduling — but it's *why* flattr never opens a flood of connections that would trip rate limits or exhaust the pool.
+If TCP didn't guarantee ordering and completeness, this `for` loop would be a bug — you'd
+need sequence numbers in the payload. flattr doesn't, because the transport handles it.
+
+**Connection reuse (keep-alive) is the runtime's call, not flattr's.** When the build
+loops over Open-Meteo batches (`elevation.ts:102`), each batch is a separate `fetch`.
+Whether those reuse one keep-alive socket or open a fresh one each time is **entirely up
+to the runtime's HTTP client** — Node's undici keeps a connection pool by default; React
+Native's stack manages its own. flattr writes no `Agent`, no `keepAlive: true`, no pool
+size. **Connection pooling is not yet exercised at flattr's layer** — it happens, but
+flattr neither configures nor observes it.
+
+```
+  Layers-and-hops — batch loop, runtime decides socket reuse
+
+  ┌─ flattr (elevation.ts:102) ─┐         ┌─ Open-Meteo ─┐
+  │ for each batch:             │ batch 1 │              │
+  │   await fetch(url)  ────────┼────────►│  reuse the   │
+  │   await sleep(delayMs)      │ batch 2 │  same socket │
+  │   await fetch(url)  ────────┼────────►│  OR a new one│
+  │                             │         │  — runtime's │
+  │  flattr controls the PACING │ batch 3 │  decision    │
+  │  not the SOCKET REUSE  ─────┼────────►│              │
+  └─────────────────────────────┘         └──────────────┘
+```
+
+**The one transport lever flattr does pull: how many connections exist at once.** flattr
+can't size a pool, but it *can* cap concurrency to one — and it does, deliberately. The
+`busyRef` gate in the pump means at most one Overpass+elevation build is in flight at a
+time (`useTileGraph.ts:167`):
+
+```
+  mobile/src/useTileGraph.ts:166-167 — capping in-flight connections to 1
+  ┌──────────────────────────────────────────────────────────────┐
+  │ const pump = useCallback(() => {                              │
+  │   if (busyRef.current) return;   // ◄ already one build live; │
+  │                                  //   don't open a second set │
+  │   ...                            //   of Overpass/elevation   │
+  │   busyRef.current = true;        //   connections             │
+  └──────────────────────────────────────────────────────────────┘
+```
+
+This isn't a pool size — it's a concurrency cap of one, the bluntest possible
+backpressure (`07`). It exists for rate limits, but the *side effect* is that flattr never
+has more than one set of these sockets open, so it never needs pool tuning.
+
+**The socket's failure modes are invisible until they aren't.** Because flattr sets no
+socket timeout (`07`), a connection that opens but never delivers (server accepts the SYN,
+then hangs) leaves the `await fetch` pending **indefinitely**. TCP itself will eventually
+time out at the OS level (minutes), but flattr has no faster path. This is the transport
+consequence of the no-timeout gap.
 
 ### Move 3 — the principle
 
-When an app uses `fetch` and `https://` exclusively, its transport story is "TCP, delegated." The only connection-lifecycle decision left to make is *application-level concurrency* — how many requests you let fly at once. flattr makes exactly that one decision (single-flight via `busyRef`) and delegates everything below it. That's the correct division of labor: scheduling is yours, the socket is the platform's.
+The value of TCP is that flattr's code reads `json.elevation[i]` and trusts it — ordering
+and reliability are abstracted away. The cost of delegating the *whole* connection is that
+the two things you'd actually want to control at the socket — **timeout and pool size** —
+are exactly the two flattr can't reach without an `AbortController` or an agent. The
+principle: **the transport gives you correctness for free and takes control of failure
+timing in exchange.** flattr took the trade and paid for it in `08`'s top finding.
 
 ## Primary diagram
 
-The full transport picture — flattr's scheduling above, the OS socket below.
-
 ```
-  flattr transport — scheduling (flattr) over sockets (OS)
+  flattr transport — what's delegated vs what flattr keeps
 
-  ┌─ flattr scheduling layer ───────────────────────────────┐
-  │  pump() single-flight gate (busyRef)                     │
-  │  corridor > viewport priority                            │
-  │  sequential batch loop (elevation, 100/req)              │
-  └────────────────────────┬────────────────────────────────┘
-                           │ await fetch(...)  ← the floor
-  ┌─ OS transport layer (TCP, delegated) ───────────────────┐
-  │  socket open → handshake → send → recv → keep-alive →    │
-  │  reuse → eventual close   (flattr never sees any of it)  │
-  └─────────────────────────────────────────────────────────┘
-     not exercised: UDP · raw sockets · WebSocket upgrade ·
-                    manual pool sizing · explicit keep-alive
+  ┌─ flattr ──────────────────────────────────────────────────┐
+  │  KEEPS:  request rate  (pump caps in-flight to 1)          │
+  │          await fetch() · trusts ordered/complete body      │
+  └──────────────────────────────┬─────────────────────────────┘
+                                 │ seam: fetch → runtime
+  ┌─ Runtime HTTP client ────────▼─────────────────────────────┐
+  │  OWNS:   socket open/close · keep-alive · pool · reuse      │
+  │          (Node undici / RN native — flattr configures none) │
+  └──────────────────────────────┬─────────────────────────────┘
+  ┌─ OS TCP ─────────────────────▼─────────────────────────────┐
+  │  3-way handshake · ordered reliable stream · FIN           │
+  │  NO UDP · NO QUIC config · OS-level timeout only            │
+  └─────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-The reason flattr can ignore the socket entirely is that all its traffic is short, idempotent-ish request/response — perfect for `fetch`. The moment that would change is realtime (a live position stream, server-pushed traffic updates): then you'd want a long-lived connection (WebSocket/SSE), and *that's* when socket lifecycle becomes your problem — reconnect, heartbeat, backoff. flattr has none of that (see `06`), which is exactly why this concept is one page.
+TCP's handshake-and-stream model is the substrate the entire web sits on; HTTP is "just"
+a request/response framing on top of it. flattr is a textbook case of an app that benefits
+from never thinking about the socket — until the day a server hangs mid-connection, at
+which point the missing `AbortController` becomes the bug. Where you *would* drop to the
+socket: a high-throughput service tuning keep-alive and pool size for connection reuse, or
+a realtime app picking UDP/QUIC for latency. flattr is neither, so **the socket stays the
+runtime's problem** — correctly, with one named cost. Read `04`: before any request bytes
+flow on HTTPS hosts, TLS negotiates on top of this TCP connection.
 
 ## Interview defense
 
-**Q: What transport does flattr use, and where does it configure the socket?**
-TCP, via HTTPS over `fetch`, and it configures nothing — no socket handle is ever held. The only connection-adjacent control is the `pump()` single-flight gate (`useTileGraph.ts:166`), which caps concurrent requests at the application layer. Anchor: *scheduling is flattr's; the socket is the OS's.*
+**Q: TCP or UDP, and who decides?**
+> TCP, always — chosen implicitly by using HTTP. flattr writes no socket code at all; the
+> runtime and OS own the handshake, ordering, and teardown. flattr relies on TCP's ordered
+> delivery so hard that `elevation[i]` is trusted to match the i-th point sent with no
+> sequence checking — if TCP didn't guarantee order, that'd be a bug.
 
-**Q: When the build samples 100-point elevation batches in a loop, is it opening a connection per batch?**
-Almost certainly not — the platform reuses a kept-alive TCP connection to the same host across the loop. flattr sets no keep-alive header and no pool size, so this is the platform default, not a flattr decision. Anchor: *N requests, one reused socket, zero flattr config.*
+```
+  HTTP ⇒ TCP (implicit) ⇒ ordered reliable stream ⇒ no reassembly in flattr
+```
+> Anchor: *flattr never picks the transport — it picks HTTP, and HTTP picks TCP.*
+
+**Q: Does flattr do connection pooling?**
+> Not at flattr's layer — not yet exercised. The runtime (undici/RN) pools by default;
+> flattr configures no agent or pool size. The one transport lever flattr pulls is a
+> concurrency cap of **one** in-flight build (`useTileGraph.ts:167`), for rate-limit
+> reasons — which incidentally means pooling never matters.
+
+```
+  pump: busyRef gate ⇒ ≤1 build's worth of sockets live at once
+```
+> Anchor: *flattr controls request rate, the runtime controls socket lifetime.*
 
 ## See also
 
-- `04-tls-and-trust-establishment.md` — the handshake that rides on this TCP connection
-- `07-timeouts-retries-pooling-and-backpressure.md` — pooling-not-exercised + the single-flight gate as backpressure
-- `06-websockets-sse-streaming-and-realtime.md` — the long-lived-connection case flattr doesn't have
+- `02-dns-routing-and-addressing.md` — resolution that precedes the handshake.
+- `04-tls-and-trust-establishment.md` — TLS layered on this TCP connection.
+- `07-timeouts-retries-pooling-and-backpressure.md` — the concurrency cap and the missing socket timeout.
+- `study-runtime-systems` — the event loop beneath the suspended `await fetch`.

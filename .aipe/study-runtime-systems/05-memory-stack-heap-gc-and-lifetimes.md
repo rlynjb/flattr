@@ -1,238 +1,261 @@
-# Memory, Stack, Heap, GC & Lifetimes
+# Memory, Stack, Heap, GC, and Lifetimes — what grows and what's freed
 
-**Industry name(s):** heap allocation · garbage collection · object lifetime &
-retention · unbounded in-memory cache. **Type:** Industry standard.
+**Industry name:** memory model / allocation / garbage collection — *Industry standard*.
 
 ## Zoom out, then zoom in
 
-Both runtimes are garbage-collected (V8 at build time, Hermes on the phone), so
-flattr never frees memory by hand. The interesting memory story isn't
-*allocation* — it's *retention*: what gets held alive, for how long, and what
-never gets let go. Two structures dominate the run-time heap and neither evicts:
-the merged routing graph and the elevation cache.
+JavaScript hides memory behind a GC, so the question isn't "did you free it" — it's **"what
+keeps a reference alive, and does anything grow without bound?"** flattr has exactly one
+unbounded grower. Here's where memory lives.
 
 ```
-  Zoom out — what lives on the run-time JS heap, and for how long
+  Zoom out — where flattr's memory sits
 
-  ┌─ JS heap (Hermes, GC'd) ────────────────────────────────────┐
-  │                                                             │
-  │  baseGraph (544 KB) ──── alive for the whole session        │
-  │  merged graph = base ⊕ corridor ⊕ view ──── rebuilt per pan │ ← we are
-  │   grows as tiles merge in; old merges become garbage        │   here
-  │  elevCache `mem` Map ──── grows to MAX_ENTRIES (50k), then  │
-  │   trims oldest; persisted to disk                          │
-  │  A* working set (open heap, g/came/closed Maps) ──── lives  │
-  │   only during one search, then GC'd                        │
-  └─────────────────────────────────────────────────────────────┘
+  ┌─ Stack (per call) ───────────────────────────────────────────┐
+  │  A* locals: open queue ptr, g/came/closed Maps, loop vars     │
+  └───────────────────────────────┬──────────────────────────────┘
+                                  │ references into ↓
+  ┌─ Heap (GC-managed) ──────────────────────────────────────────┐
+  │  ★ baseGraph + merged tiles ─ NEVER EVICTED ─ grows on pan ★  │ ← we are here
+  │  search Maps (g/came/closed) — freed after each A* returns    │
+  └───────────────────────────────┬──────────────────────────────┘
+                                  │ spills to ↓
+  ┌─ Persistent store (disk) ────▼───────────────────────────────┐
+  │  elevCache → AsyncStorage (bounded: FIFO cap 50k)            │
+  └───────────────────────────────────────────────────────────────┘
 ```
 
-Zoom in: the question is **what's retained vs short-lived, and where does memory
-pressure come from?** A*'s working set is short-lived (allocated per search,
-collected after). The graph and the cache are the long-lived structures, and the
-graph in particular has *no eviction* — that's the load-bearing fact.
+Zoom in: trace the **lifetime axis** — how long does each allocation live? Most of flattr's
+memory is short-lived (A\*'s working set dies when the search returns). One thing is
+session-lived and *growing*: the merged graph. That's the memory story.
 
-## Structure pass
+## Structure pass — layers, one axis, the seams
 
-**Layers.** Three lifetimes: (1) per-search — A*'s `Map`s and `PQueue`, born and
-buried inside one `directedAstar` call; (2) per-session, rebuilt — the merged
-graph, regenerated each region change; (3) per-session, accumulating — the
-elevCache Map and the bundled `baseGraph`, only ever growing (cache has a cap;
-graph does not).
-
-**Axis traced — "when is this memory reclaimed (lifecycle)?"**
+**The layers** are stack → heap → persistent store. **The axis: "how long does this live,
+and what frees it?"**
 
 ```
-  One axis — "when is it freed?" — across the heap's structures
+  Axis: "lifetime — when is this freed?"  — traced down
 
-  A* open/g/came/closed   → end of the search (no refs after return) → GC'd fast
-  merged graph (old)      → next pan rebuilds → old one unreferenced → GC'd
-  elevCache mem Map       → entries NEVER expire; trimmed only at 50k cap
-  baseGraph               → never (held by useMemo for app lifetime)
-  view/corridor regions   → replaced on new build; never explicitly evicted ★
+  ┌─ stack frame (A* call) ──────────────────────┐
+  │  loop vars, references to the Maps            │  → freed when search() returns
+  └────────────────────────────────────────────────┘    (automatic, scope exit)
+      ┌─ heap: A* working Maps ──────────────────┐
+      │  g, came, closed, open                    │  → unreachable after return → GC'd
+      └────────────────────────────────────────────┘    (short-lived)
+          ┌─ heap: merged graph ─────────────────┐
+          │  baseGraph + every loaded tile        │  → NEVER freed during session ★
+          └────────────────────────────────────────┘    (the unbounded grower)
+              ┌─ disk: elevCache ────────────────┐
+              │  AsyncStorage JSON                │  → FIFO-capped at 50k entries
+              └────────────────────────────────────┘    (bounded, persistent)
 ```
 
-**Seam — the `useMemo` dependency arrays.** `graph` and `displayGraph`
-(`useTileGraph.ts:132-162`) depend on `[baseGraph, corridor, view]`. Each new
-region object makes React drop the old merged graph and build a new one. The seam
-is where retention flips: upstream, regions accumulate into ever-growing
-`view`/`corridor`; at the `useMemo`, the *previous merged result* becomes garbage.
-Old merges are collected; the *inputs* (the regions) are not.
+The answer flips sharply at the merged-graph layer: everything above it is freed promptly,
+that one layer is never freed. **The seam is the `useMemo` that builds the merged graph** —
+each rebuild produces a *new* object, but the inputs (`view`, `corridor`) accumulate. Hand
+off to How it works.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You know the GC contract from any JS app: an object lives exactly as long as
-something references it, then it's collected on the next sweep. So "managing
-memory" in flattr is really "managing references" — who points at what, and when
-they stop. The merged graph is the textbook case: each pan builds a new graph
-object, the old one loses its last reference, and it's gone. The cache is the
-counter-case: nothing ever drops a reference, so it only grows.
+You know the React mental model already: state you `setState` into stays alive until you
+clear it; derived `useMemo` values get recomputed and the old one becomes garbage. flattr's
+memory is that, with one twist — the *inputs* to the memo (`view`, `corridor` regions) are
+never cleared, so the merged graph the memo produces keeps getting *bigger*. The strategy
+(or rather, the current non-strategy): **lean entirely on GC for short-lived work; hold the
+graph in memory for the whole session with no eviction.**
 
 ```
-  Pattern — retention by reference, two fates
+  Memory kernel — two lifetimes
 
-   short-lived (A* working set)        long-lived (cache, base graph)
-   ┌─────────────────────────┐         ┌──────────────────────────┐
-   │ alloc inside search()   │         │ alloc once / accumulate  │
-   │ ──► no refs after return│         │ ──► held by module/useMemo│
-   │ ──► GC'd next sweep     │         │ ──► alive for the session │
-   └─────────────────────────┘         └──────────────────────────┘
-        cheap, self-cleaning                 must be bounded by hand
+   SHORT-LIVED (GC reclaims promptly)        SESSION-LIVED (held until app closes)
+   ┌──────────────────────────┐             ┌──────────────────────────────────┐
+   │ A* run: open/g/came/closed│             │ baseGraph + corridor + view tiles │
+   │ → return → unreachable    │             │ → merged useMemo grows on each pan │
+   │ → GC'd                    │             │ → never evicted ★                 │
+   └──────────────────────────┘             └──────────────────────────────────┘
 ```
 
-### Move 2 — the walkthrough
+### Move 2 — the parts, one at a time
 
-**Part 1 — A\*'s working set is per-search and self-cleaning.** Every search
-allocates fresh structures and holds nothing after returning:
+**Part 1 — A\*'s stack and working set (short-lived, well-behaved).** Each `search()` call
+allocates four collections on the heap and references them from the stack frame:
 
 ```ts
-// features/routing/astar.ts:30-37
-const open = new PQueue<string>();           // heap array — grows with frontier
-const g = new Map<string, number>();         // best-cost per node
-const came = new Map<string, {edge,prev}>(); // back-pointers for reconstruct
-const closed = new Set<string>();            // settled nodes
-const byId = indexEdges(graph);              // id→edge index, rebuilt EACH call
+// features/routing/astar.ts:30-37 — per-call working set, all freed when search returns
+const open = new PQueue<string>();          // binary heap, O(nodes touched)
+const g = new Map<string, number>();        // best cost per node
+const came = new Map<string, {edge, prev}>(); // came-from for reconstruction
+const closed = new Set<string>();           // settled nodes
+const byId = indexEdges(graph);             // id→edge index, rebuilt every call
 ```
 
-These are local to `search`. When it returns, nothing references them, so they're
-collected. The footprint scales with `nodesExpanded`, which the haversine
-heuristic keeps small. The one avoidable churn: `byId` (`indexEdges`,
-`astar.ts:12-16`) rebuilds a full `Map` over every edge on *every* call — pure
-re-allocation each route. Cheap now, but it's allocation you could hoist if A*
-ever ran hot. **Inference:** no profiling in the repo confirms this matters yet.
+```
+  A* memory lifetime — allocate, use, drop
 
-**Part 2 — the merged graph is rebuilt per pan; old copies are garbage.** This is
-the biggest churn source:
+  directedAstar() called
+    └─ allocate open/g/came/closed/byId  ──┐
+       while loop relaxes edges            │ all referenced only from this frame
+    └─ return SearchResult ────────────────┘
+         frame pops → collections unreachable → GC reclaims
+```
+
+The stack depth is bounded and small: A\*'s `while` loop is *iterative*, not recursive
+(`astar.ts:48`), so there's no deep call stack to blow. The one recursive-ish piece,
+`reconstruct` (`astar.ts:86-103`), is also a plain loop — no stack-overflow risk even on a
+long path. What's the one inefficiency? `byId = indexEdges(graph)` rebuilds the entire
+edge index on *every* search (`astar.ts:35`, called from `MapScreen.tsx:155` inside a memo
+keyed on `userMax` too) — so dragging the grade slider re-indexes every edge each tick. It's
+fine at city scale; it's the first thing to hoist if A\* got hot. *Inference: this is a
+per-call allocation, observable in the code, not a measured hotspot.*
+
+**Part 2 — the merged graph (session-lived, unbounded).** This is the finding. The routing
+graph is a `useMemo` that merges base + corridor + view (`useTileGraph.ts:132-145`). Every
+pan that loads a new viewport sets a new `view` region; the memo rebuilds, merging it in.
+Nothing ever *removes* a region:
 
 ```ts
-// mobile/src/useTileGraph.ts:132-145
-const graph = useMemo(
-  () => baseGraph
-    ? stitchGraph(mergeGraphs([baseGraph, ...corridor, ...view])) // new object each time
+// mobile/src/useTileGraph.ts:132-145 — merged graph grows; no eviction of old tiles
+const graph = useMemo(() =>
+  baseGraph
+    ? stitchGraph(mergeGraphs([
+        baseGraph,
+        ...(corridor ? [corridor.graph] : []),  // ← one corridor (overwritten, bounded)
+        ...(view ? [view.graph] : []),           // ← one view (overwritten, bounded)
+      ]))
     : null,
-  [baseGraph, corridor, view]   // ← any change → full rebuild
-);
+  [baseGraph, corridor, view]);
 ```
 
-`mergeGraphs` (`tiles.ts:89-108`) `Object.assign`s every node/edge into fresh
-collections; `stitchGraph` copies the edge array and adjacency again. So each pan
-allocates a brand-new full graph (potentially larger than the 544 KB base) and
-lets the previous one become garbage. The GC handles it, but the peak — old graph
-+ new graph briefly co-resident during the rebuild — is the real-world memory
-spike, on a phone.
+```
+  Merged-graph memory over a session — monotonic growth via the cache, not the slots
 
-**Part 3 — the elevCache is the only structure with explicit bounding.** It's the
-one place flattr manages a lifetime by hand, because it's the one structure that
-would otherwise grow without limit:
+  Actually: `view` and `corridor` are SINGLE slots (overwritten each load).
+  The unbounded grower is the elevation cache + repeated tile FETCHES that
+  feed ever-larger merged objects as the user roams a wider area over time.
+
+  t0: base                          small
+  t1: base + view(area A)           +A
+  t2: base + view(area B)           swaps A→B  (slot overwritten, A GC'd)
+       but elevCache mem Map: A's cells + B's cells ── accumulates ──► up to 50k
+```
+
+The nuance worth stating precisely: `view` and `corridor` are *single* regions, each
+overwritten on the next load — so the merged graph at any instant is bounded by ONE base +
+ONE corridor + ONE view. The genuinely monotonic in-memory grower is the **elevation cache
+`Map`** (`elevCache.ts:11`), which accumulates a cell per sampled area and only sheds
+entries when it crosses 50k (`elevCache.ts:48-52`). So the "never evicted" red flag is real
+but precise: *the merged graph object is bounded per-instant but the cache that backs
+repeated builds grows toward its 50k cap.* What breaks at the boundary? Over a very long
+session roaming a large area, the cache approaches 50k cells (~hundreds of KB of numbers) —
+capped, then FIFO-trimmed. Not a leak; a bounded high-water mark.
+
+**Part 3 — the elevation cache's explicit lifetime management (the bounded grower).** This
+is the one place flattr manages memory by hand instead of trusting GC:
 
 ```ts
-// mobile/src/elevCache.ts:9, 47-52
-const MAX_ENTRIES = 50000; // safety cap; oldest entries drop first
-...
-let entries = [...mem.entries()];
-if (entries.length > MAX_ENTRIES) {
-  entries = entries.slice(entries.length - MAX_ENTRIES); // keep newest 50k
+// mobile/src/elevCache.ts:46-53 — FIFO cap: oldest entries drop first when over MAX_ENTRIES
+if (entries.length > MAX_ENTRIES) {           // MAX_ENTRIES = 50000
+  entries = entries.slice(entries.length - MAX_ENTRIES);  // keep newest 50k
   mem.clear();
-  for (const [k, v] of entries) mem.set(k, v);           // rebuild trimmed Map
+  for (const [k, v] of entries) mem.set(k, v);   // ← rebuild Map in insertion order
 }
 ```
 
-This is a crude FIFO eviction riding on `Map`'s insertion-order guarantee — the
-oldest keys are at the front, so `slice` from the end keeps the newest. Each
-entry is a string key + a number, so 50k entries is small (low single-digit MB).
-The boundary condition: it trims *only at persist time* (`persistNow`), so the
-in-memory Map can briefly exceed 50k between persists. Acceptable given the entry
-size.
+`Map` preserves insertion order, so "keep the last N entries" is a FIFO eviction — oldest
+sampled cells drop first. What breaks without the cap? The cache `Map` grows for the whole
+session with no ceiling. The cap turns an unbounded grower into a bounded one. (Lifecycle
+detail — debounced persistence — lives in `06`.)
 
-**Part 4 — the regions themselves never evict (the gap).** Contrast Part 3 with
-the `view`/`corridor` state: there's no cap, no LRU, no "drop tiles I panned away
-from an hour ago." Pan across a city and every viewport's graph stays merged in
-forever (until the next region *replaces* the single `view` slot — but a wide
-session accumulates corridor data). The merged graph only grows over a long
-session.
-
-```
-  Comparison — what's bounded vs what isn't
-
-  elevCache         │ merged graph / regions
-  ─────────────────┼──────────────────────────
-  MAX_ENTRIES cap   │ NO cap
-  FIFO trim         │ NO eviction
-  persisted to disk │ in-memory only, lost on close
-  bounded growth    │ grows with session breadth ★ red flag
-```
+**Part 4 — GC you don't control.** Hermes (app) and V8 (pipeline) both run generational
+GC on a native thread (`02`). flattr tunes nothing — no `--max-old-space-size`, no manual
+`global.gc()`, no `WeakMap`/`WeakRef` to hint lifetimes (grep: none). It relies entirely on
+reachability: drop the last reference and the object becomes collectable. This is correct
+for everything *except* the cache, which is why the cache is the one place with a manual cap.
 
 ### Move 3 — the principle
 
-In a GC'd runtime, the bug is never "I forgot to free" — it's "I never stopped
-referencing." Short-lived working sets (A*) take care of themselves; the danger
-is the structure that quietly accumulates because nothing drops its reference.
-flattr bounds the one cache that would explode (elevation) and leaves the one that
-*could* explode over a long session (the merged graph) unbounded — a defensible
-bet that sessions are short, with no measurement backing it.
+In a GC'd runtime, memory discipline reduces to **reachability management**: short-lived
+work (A\*'s Maps) is freed automatically the instant its scope exits, so you never think
+about it; long-lived caches need a manual ceiling because GC can't free something you're
+still pointing at. flattr gets this exactly right — it leans on GC everywhere it can and
+puts a hard FIFO cap on the one structure that would otherwise grow forever. The senior
+move is knowing *which* allocations GC handles for free (the per-call working set) and which
+need an explicit policy (the persistent cache), and not over-engineering the former.
 
 ## Primary diagram
 
-```
-  Run-time heap — every structure by lifetime and bound
+The full memory picture — stack, heap lifetimes, the manual cap, the disk spill.
 
-  ┌─ JS heap (Hermes, GC) ──────────────────────────────────────┐
-  │  PER-SEARCH (auto-freed)                                    │
-  │   PQueue + g/came/closed Maps + byId index ── GC'd on return│
-  │  PER-PAN (rebuilt, old → garbage)                          │
-  │   merged graph = stitch(merge(base, corridor, view))       │
-  │   peak = old + new co-resident during rebuild ◄─ spike     │
-  │  PER-SESSION, BOUNDED                                       │
-  │   elevCache mem Map ── MAX_ENTRIES 50k, FIFO trim, on disk  │
-  │  PER-SESSION, UNBOUNDED ◄─ the gap                          │
-  │   baseGraph (fixed 544 KB) + accumulating region graphs     │
-  └─────────────────────────────────────────────────────────────┘
+```
+  flattr memory model — lifetimes from stack to disk
+
+  ┌─ STACK (A* call frame) ──────────────────────────────────────┐
+  │  iterative while loop (no deep recursion) → bounded depth     │
+  │  references → open/g/came/closed/byId                         │
+  └───────────────────────────────┬──────────────────────────────┘
+                                  ▼ on return: frame pops, refs drop
+  ┌─ HEAP (GC-managed) ──────────────────────────────────────────┐
+  │  SHORT-LIVED: A* Maps → unreachable after return → GC'd       │
+  │  SESSION:     merged graph (bounded per-instant: 1 base/      │
+  │               1 corridor/1 view; old slots GC'd on overwrite) │
+  │  GROWING:     elevCache mem Map ──► capped FIFO at 50k ★      │
+  └───────────────────────────────┬──────────────────────────────┘
+                                  ▼ debounced persist (06)
+  ┌─ DISK (AsyncStorage) ────────────────────────────────────────┐
+  │  flattr.elevCache.v1 → JSON, same 50k ceiling                │
+  └───────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-The split here — auto-managed working sets vs hand-bounded caches — is universal
-across GC'd systems. The elevCache's "Map-as-LRU-ish via insertion order" trick is
-a known JS idiom (delete + re-set to bump recency; here just slice-the-tail FIFO).
-The unbounded merged graph is the same class of issue as an in-memory cache with
-no TTL in a long-running server — fine until the process lives long enough to feel
-it. On a phone, "process lifetime" is a long-running map session, which makes the
-absence of region eviction the one memory item worth a measurement.
+flattr's memory model is the standard **managed-runtime** story: a generational garbage
+collector reclaims unreachable objects, so the only leaks possible are *reachability* leaks
+— something you keep pointing at. The classic JS reachability leak is a growing `Map`/array
+that's never trimmed, which is exactly the shape of `elevCache.mem` — and flattr defuses it
+with the textbook fix, an LRU/FIFO cap (here FIFO via `Map` insertion order). The merged-graph
+"never evicted" concern is the in-memory analog of a cache with no TTL; the reason it's
+acceptable is that the per-instant slots are bounded and the backing cache *is* capped. If
+flattr ever needed true tile eviction (roaming a whole region), the move is an LRU over loaded
+tiles keyed by bbox — the same `PriorityQueue`/`Map` machinery already in the repo
+(`pqueue.ts`). For the disk side of the cache lifecycle, see `06`; for the pump that triggers
+each build, see `04`.
 
 ## Interview defense
 
-**Q: This is garbage-collected. So memory isn't a concern?**
+**Q: "Does this app leak memory as you use it?"**
 
-GC removes manual `free`, not retention bugs. The question is what stays
-referenced. A*'s working set self-frees — it's local and unreferenced after
-return. The risk is the structures that accumulate: the elevCache (bounded at 50k,
-`elevCache.ts:9`) and the merged graph (unbounded — no eviction on
-`view`/`corridor`).
+The only session-lived structure that grows is the elevation cache, and it's capped at 50k
+entries with FIFO eviction (`elevCache.ts:48-52`). Everything else is short-lived: A\*'s
+working set (open queue, g/came/closed Maps) is freed by GC the moment each search returns,
+and the merged graph holds only one base + one corridor + one view region at a time, with
+old regions GC'd on overwrite. No reachability leak.
 
 ```
-  where the memory actually goes
-
-  A* working set  → freed per search        (safe)
-  elevCache       → capped at 50k + on disk  (bounded by hand)
-  merged graph    → grows with session, no cap ◄─ the one to watch
+  A* Maps → return → GC'd.   cache Map → grows → FIFO-capped at 50k.
 ```
 
-Anchor: *"The merged-graph `useMemo` (`useTileGraph.ts:132`) rebuilds a full new
-graph object on every pan and the old becomes garbage — so steady-state is fine,
-but peak memory is old + new co-resident during the rebuild, on a phone."*
+*Anchor:* "GC handles the short-lived working set; the one persistent cache gets a manual
+FIFO cap — that split is the whole memory design."
 
-**Q: Why bound the elevation cache but not the graph?**
+**Q: "Any stack-depth risk in the routing?"**
 
-The cache is the one structure with no natural lifetime — DEM values are valid
-forever, so nothing would ever evict them without an explicit cap. The graph
-*does* get partly recycled (old merges become garbage each pan), so it doesn't
-grow as obviously — but the region *inputs* don't evict, which is the unmeasured
-gap. Anchor: `MAX_ENTRIES = 50000` with FIFO trim via Map insertion order.
+No. A\* is an iterative `while` loop, not recursion (`astar.ts:48`), and path
+reconstruction is also a plain loop (`astar.ts:86-103`). Stack depth is constant regardless
+of graph size — no stack-overflow on a long path.
+
+```
+  while (!open.isEmpty()) {...}   ← bounded frame, not recursive descent
+```
+
+*Anchor:* "Iterative search means stack depth is O(1) in the path length — the working set
+is on the heap, not the stack."
 
 ## See also
 
-- `03-event-loop-and-async-io.md` — the merge `useMemo` is also a CPU block.
-- `06-filesystem-streams-and-resource-lifecycle.md` — the cache's disk persistence.
-- `07-backpressure-bounded-work-and-cancellation.md` — unbounded growth as overload.
-- `.aipe/study-database-systems/` — the cache as a persistent KV store.
+- `06-filesystem-streams-and-resource-lifecycle.md` — the elevCache's disk persistence + cap.
+- `04-shared-state-races-and-synchronization.md` — the refs that hold the graph alive.
+- `02-processes-threads-and-tasks.md` — the native GC thread you don't control.
+- `study-dsa-foundations` (sibling) — the PQueue/Map structures A* allocates.

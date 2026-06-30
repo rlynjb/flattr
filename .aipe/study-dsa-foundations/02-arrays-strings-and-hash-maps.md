@@ -1,347 +1,293 @@
 # Arrays, Strings & Hash Maps
 
-**Industry names:** hash table, hash map, hash set, associative array,
-adjacency list, dynamic array. **Type:** Industry standard.
+**Industry names:** dynamic array / contiguous sequence · hash map (`Map`) ·
+hash set (`Set`) · adjacency list. **Type:** Industry standard.
 
----
+## Zoom out, then zoom in
 
-## Zoom out — where this concept lives
-
-Hash maps are the unglamorous layer that makes A* fast. The search
-algorithm gets the glory; the `Map`s and `Set` are what turn every lookup
-inside the loop from `O(V)` into `O(1)`. Without them, A* is just an
-expensive Dijkstra.
-
-```
-  Zoom out — the bookkeeping layer inside search()
-
-  ┌─ Search engine (astar.ts) ──────────────────────────────────┐
-  │                                                              │
-  │   open: PQueue ──────► the frontier (file 03)               │
-  │                                                              │
-  │   ★ g:       Map<id, number>      best cost so far ★        │ ← we are here
-  │   ★ came:    Map<id, {edge,prev}> back-pointers   ★        │
-  │   ★ closed:  Set<id>              finalized nodes  ★        │
-  │   ★ byId:    Map<id, Edge>        edge index       ★        │
-  │   ★ adjacency: Record<id, id[]>   the graph itself ★        │
-  │                                                              │
-  │   loop: pop → check closed → relax → update g/came → push   │
-  └──────────────────────────────────────────────────────────────┘
-```
-
-**Zoom in.** Five hash structures and one array-of-edges carry the entire
-state of the search. This file walks each one by *what it answers in O(1)*
-— and what would break if you swapped it for a linear scan.
-
----
-
-## Structure pass — one axis across the structures
-
-These aren't layers; they're co-equal state. The right axis is **what
-question does each answer, and how fast?**
+`search()` is a graph algorithm, but underneath it's four hash structures and
+one array doing all the actual bookkeeping. The frontier is a heap built on an
+array. `g`, `came`, and `closed` are a `Map`, a `Map`, and a `Set`. The
+adjacency is a `Record` of arrays. The edge index is a `Map`. Strip the graph
+vocabulary away and what's left is: *amortized-O(1) lookups everywhere, because
+the search touches each of these structures on every single edge relaxation.*
 
 ```
-  Axis: "what O(1) question does this structure answer?"
+  Zoom out — the hash/array structures inside one search() call
 
-  g          → "what's the cheapest cost to node X I've found?"
-  came       → "how did I get to X?"            (reconstruction)
-  closed     → "is X already finalized?"        (skip stale)
-  byId       → "give me the Edge for this id"   (O(1), not O(E) scan)
-  adjacency  → "which edges touch node X?"      (the graph shape)
+  ┌─ Algorithm layer (astar.ts:30-34) ────────────────────────┐
+  │  open   : PQueue<string>          ← array-backed heap      │ ★
+  │  g      : Map<string, number>     ← best cost to a node    │ ★
+  │  came   : Map<string, {edge,prev}>← reconstruction trail   │ ★
+  │  closed : Set<string>             ← finalized node ids     │ ★
+  │  byId   : Map<string, Edge>       ← O(1) edge resolution   │ ★
+  └────────────────────────────┬──────────────────────────────┘
+                               │ reads
+  ┌─ Structure layer (graph.ts) ──▼───────────────────────────┐
+  │  adjacency : Record<string, string[]>  ← node → edge ids   │ ★
+  │  nodes     : Record<string, Node>      ← node id → Node    │ ★
+  └────────────────────────────────────────────────────────────┘
 ```
 
-The seam is the one place flattr *doesn't* use O(1): `graph.edges` is a
-plain array, and `edgeById()` in `graph.ts:3-7` does a linear `.find()`.
-The search engine refuses to pay that cost in its hot loop — so it builds
-`byId` once up front (`indexEdges`). That contrast — array scan vs
-pre-built index — is the lesson of this file.
+Zoom in: why these and not, say, arrays indexed by integer? Because node ids
+are *strings* (`"0,0"`, `"11,11"`, `"S"`, `"meet"`), so you need key→value
+lookup, not positional. That's the whole reason this is a hash-map story and
+not an array-indexing story.
 
----
+## The structure pass
+
+Two layers; trace the **state-ownership** axis across them.
+
+```
+  Axis: who owns this state, and how is it keyed?
+
+  structure   keyed by        owns                       mutable?
+  ─────────   ─────────────   ────────────────────────   ────────
+  adjacency   node id (str)   graph topology             no (frozen build)
+  nodes       node id (str)   coordinates + elevation    no
+  byId        edge id (str)   per-search edge index      no (rebuilt/run)
+  g           node id (str)   best-cost-so-far           yes (relaxation)
+  came        node id (str)   predecessor edge           yes (relaxation)
+  closed      node id (str)   finalized flag             yes (grows only)
+```
+
+**The seam:** between the *immutable graph* (`adjacency`, `nodes`, `byId` —
+read-only for the whole search) and the *mutable search state* (`g`, `came`,
+`closed` — rewritten every relaxation). The graph is shared and never touched;
+the search state is born and dies with one `search()` call. That separation is
+why you can run Dijkstra and A* on the same graph object back-to-back in the
+optimality test (`astar.test.ts:39-44`) without one corrupting the other.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You reach for a `Map` over an array the moment you need lookup-by-key
-instead of lookup-by-position. A todo app keying tasks by id, a form
-keying inputs by field name — same primitive. A hash map trades a little
-memory for `O(1)` average access by running the key through a hash
-function to compute a slot.
+You already build with all of these daily. A `Map<string, number>` is the same
+shape as a lookup object you'd keep in React state to remember "which row is
+selected." A `Set<string>` is the dedup structure you reach for to answer "have
+I seen this id?" An adjacency list is just "for each node, an array of the edges
+touching it" — a `Record` whose values are arrays.
 
 ```
-  The hash map shape
+  The adjacency list — node id → array of incident edge ids
 
-  key "11,5" ──hash──► slot 3 ──► { cost: 880 }
-  key "0,0"  ──hash──► slot 7 ──► { cost: 0   }
-  key "4,9"  ──hash──► slot 3 ──► collision! chain or probe
-                          │
-                          ▼
-              O(1) average, O(N) worst (all collide)
+  adjacency = {
+    "S": ["sa", "sb", "sd"],   ← node S touches 3 edges
+    "A": ["sa", "ag", "ac"],   ← edge "sa" appears under BOTH endpoints
+    "G": ["ag", "bg", "dg"],     (undirected: stored once per endpoint)
+    ...
+  }
+
+  to expand node S:  for edgeId of adjacency["S"]  → O(deg(S))
 ```
 
-In the search loop, every one of those lookups happens *per edge*. If
-they were `O(V)` array scans, the search would be `O(E·V)` instead of
-`O(E log V)`. The hash maps are why the log is a log.
+The key insight from `graph.ts`: edges are stored **undirected** — each edge id
+lands in the array of *both* its endpoints. Direction is derived at traversal
+time, not stored twice.
 
-### Move 2 — the five structures, one at a time
+### Move 2 — the walkthrough
 
-#### `g` — the distance map (best-known cost)
+#### The adjacency list — building it
 
-This is the array you'd call `dist[]` in a textbook Dijkstra, but keyed by
-string id instead of integer index — because flattr's nodes are
-`"row,col"` strings, not 0..N integers.
+Bridge: you've built adjacency lists in reincodes (`Graph.ts`,
+`Graph2.ts`). flattr's is the `Record`-of-arrays flavor. Here's the builder,
+`graph.ts:22-29`:
 
 ```ts
-// features/routing/astar.ts:31, 44, 68-69
-const g = new Map<string, number>();
-g.set(startId, 0);
-// inside the loop, per edge:
-const tentative = g.get(current)! + costFn(edge, current, userMax);
-if (tentative < (g.get(next) ?? Infinity)) { ... }
-```
-
-```
-  Relaxation reads and writes g in O(1)
-
-  g.get(current)  ── O(1) ──► 200      current best cost to `current`
-       + cost(edge)             80      this edge's cost
-       = tentative             280
-  g.get(next) ?? Infinity ─────► 999    old best to `next`
-  280 < 999  → g.set(next, 280)  O(1)   found a cheaper way
-```
-
-**The `?? Infinity` is load-bearing.** A node never seen has no entry;
-`?? Infinity` makes "unvisited" compare as "infinitely expensive," so the
-first path to it always wins. Drop it and `g.get(next)` is `undefined`,
-and `tentative < undefined` is `false` — the node would never be relaxed.
-
-#### `came` — the back-pointer map (how reconstruction works)
-
-`came` stores, for each node, the edge and previous node that gave it its
-current best cost. It's a linked list threaded through a hash map.
-
-```ts
-// features/routing/astar.ts:32, 71
-const came = new Map<string, { edge: Edge; prev: string }>();
-came.set(next, { edge, prev: current });
-```
-
-```
-  came forms a reverse linked list to the start
-
-  goal ──prev──► N3 ──prev──► N2 ──prev──► N1 ──prev──► start
-   ▲                                                      │
-   └──────────── walk this backward to rebuild path ──────┘
-```
-
-It stores the **exact edge**, not just the previous node — that's the
-detail file 07 (reconstruction) hangs on. Two parallel edges between the
-same pair of nodes would be indistinguishable by node-pair alone, so
-storing the edge is what keeps `steepEdges` correct.
-
-#### `closed` — the visited set
-
-A `Set` answering one question: "have I already finalized this node?"
-
-```ts
-// features/routing/astar.ts:33, 51, 61, 67
-const closed = new Set<string>();
-if (closed.has(current)) continue;   // stale duplicate, skip
-closed.add(current);
-if (closed.has(next)) continue;      // don't re-expand
-```
-
-```
-  closed-set skip — the lazy-deletion partner
-
-  pop "X" (priority 280)
-     closed.has("X")? ── yes ──► continue (this is a stale copy)
-                      └─ no  ──► closed.add("X"), expand it
-```
-
-**What breaks without it:** on a cyclic graph (every street graph), the
-search revisits nodes forever. `closed` is BFS/DFS's visited set wearing
-an A* hat. It's also half of the lazy-deletion scheme — the heap can hold
-several stale copies of a node; `closed` is how the search ignores all but
-the first pop. (File 03 walks the heap side.)
-
-#### `byId` — the edge index (the anti-pattern fix)
-
-This is the structure that exists *specifically to avoid* the `O(E)` scan
-in `edgeById`.
-
-```ts
-// features/routing/astar.ts:11-16
-export function indexEdges(graph: Graph): Map<string, Edge> {
-  const m = new Map<string, Edge>();
-  for (const e of graph.edges) m.set(e.id, e);
-  return m;
-}
-```
-
-```
-  Build-once index vs per-lookup scan
-
-  graph.edges (array)        byId (Map, built once: O(E))
-  ┌──────────────────┐       ┌─────────────────────────┐
-  │ [e0, e1, ... eE] │  ──►  │ "e0"→e0  "e1"→e1  ...   │
-  └──────────────────┘       └─────────────────────────┘
-  edgeById: O(E) find         byId.get(id): O(1)
-  (graph.ts:3-7)              (used in the hot loop)
-```
-
-The comment on `indexEdges` says it plainly: *"so expansions are O(1) per
-edge, not O(E)."* Pay `O(E)` once before the loop to make every in-loop
-lookup `O(1)`. This is the same move as `g` and `came` — trade setup cost
-for hot-path speed.
-
-#### `adjacency` — the graph as a hash map of arrays
-
-The graph itself is an adjacency list: a `Record` mapping each node id to
-an **array** of incident edge ids. This is where arrays and hash maps meet.
-
-```ts
-// features/routing/graph.ts:22-29
+// graph.ts:22-29 — every edge registered under both endpoints
 export function buildAdjacency(edges: Edge[]): Record<string, string[]> {
   const adj: Record<string, string[]> = {};
   for (const e of edges) {
-    (adj[e.fromNode] ??= []).push(e.id);   // undirected: both ends
-    (adj[e.toNode] ??= []).push(e.id);
+    (adj[e.fromNode] ??= []).push(e.id);   // register under fromNode
+    (adj[e.toNode]   ??= []).push(e.id);   // AND under toNode (undirected)
   }
   return adj;
 }
 ```
 
-```
-  Adjacency list — hash map of arrays (undirected)
+The `??=` does the "create the array if this is the first edge for this node"
+in one line. The cost: one `O(E)` pass, and every edge stored twice (once per
+endpoint). The payoff: `adjacency[nodeId]` is `O(1)`, and iterating a node's
+edges is `O(deg)` — exactly the work A* needs at `astar.ts:64`.
 
-  "0,0" ──► [ "e0", "e1" ]        node → its incident edge ids
-  "0,1" ──► [ "e0", "e2", "e3" ]
-  "1,0" ──► [ "e1", "e4" ]
-            └──────┬──────┘
-            iterate these to expand a node (astar.ts:64)
-```
+**Where it breaks:** if an edge id appeared under only one endpoint, the search
+could traverse it one direction but not the other — you'd silently lose half
+your routes. Storing under both endpoints is the load-bearing part.
 
-**The undirected choice is deliberate.** Each edge is stored once but
-listed under *both* endpoints. Direction isn't baked into storage — it's
-*derived at traversal* by `directedGrade(edge, fromNodeId)` (`graph.ts:17`)
-and `otherEnd(edge, nodeId)` (`graph.ts:10`). One edge serves both
-directions; the cost function decides which way you're going. That's why
-the same graph can answer both "S→G" and "G→S" without storing reversed
-edges. (File 05 walks this in full.)
+#### Direction derived, not stored — otherEnd and directedGrade
 
-#### Strings as composite keys
+Here's the elegant bit. The edge is undirected in storage, but the search needs
+to know "which way am I going across it?" Two helpers do that, `graph.ts:9-19`:
 
-flattr's node ids are strings like `"11,5"` (`fixtures.ts:111`) and
-`zones.ts` builds bucket keys as `"col,row"` (`zones.ts:38`). This is the
-one string technique in the repo: **encode a 2D coordinate as a string to
-use it as a hash key**, then `key.split(",").map(Number)` to decode
-(`zones.ts:46`).
+```ts
+// graph.ts:10-14 — the endpoint opposite the one you arrived from
+export function otherEnd(edge: Edge, nodeId: string): string {
+  if (nodeId === edge.fromNode) return edge.toNode;
+  if (nodeId === edge.toNode)   return edge.fromNode;
+  throw new Error(...);   // nodeId isn't an endpoint — a bug, fail loud
+}
 
-```
-  Composite string key — 2D coord → hashable key → back
-
-  (col=3, row=5) ──`${col},${row}`──► "3,5" ──map key──► [grades]
-                                        │
-                  "3,5".split(",").map(Number) ──► [3, 5]
+// graph.ts:17-19 — signed grade in the direction of travel
+export function directedGrade(edge: Edge, fromNodeId: string): number {
+  return fromNodeId === edge.fromNode ? edge.gradePct : -edge.gradePct;
+}
 ```
 
-It works, but it's the slow path: string hashing and `split` per access.
-A typed `Map<number, ...>` with a `row*N+col` integer key would be
-faster. For a build-time heatmap (`zones.ts` runs in the pipeline, not
-the hot route loop) the readability wins. Naming that tradeoff is the
-point.
+```
+  One stored edge, two directions — derived at traversal
+
+  stored:  edge "xy"  fromNode=X  toNode=Y  gradePct=+8
+
+  arrive from X →  otherEnd = Y       directedGrade = +8  (uphill)
+  arrive from Y →  otherEnd = X       directedGrade = −8  (downhill, free)
+
+  one Edge object, no duplication — the SIGN carries direction
+```
+
+This is why a single edge can cost differently each way (`cost.ts:32-33` uses
+`directedGrade`), without storing two edges. The directed-A* test
+(`astar.test.ts:74-80`) proves it: `X→Y` detours around the climb, `Y→X` takes
+the direct downhill — same edge, asymmetric cost.
+
+#### g, came, closed — the three search maps
+
+These three are the heart of the bookkeeping. Each is keyed by node-id string.
+From `astar.ts:31-33`:
+
+```
+  Layers-and-hops — what each map answers, per relaxation
+
+  ┌─ relaxing edge (current → next) at astar.ts:68-73 ────────┐
+  │                                                            │
+  │  g.get(current)        → cost to reach current   [read]    │
+  │  + costFn(edge,…)      → edge cost                          │
+  │  = tentative                                                │
+  │                                                            │
+  │  tentative < g.get(next) ?? Infinity ?   [read, default]   │
+  │     │ yes                                                   │
+  │     ├─ g.set(next, tentative)            [write best cost] │
+  │     ├─ came.set(next, {edge, prev})      [write trail]     │
+  │     └─ open.push(next, tentative + h)    [enqueue]         │
+  └────────────────────────────────────────────────────────────┘
+
+  closed.has(next) ?  → skip already-finalized (astar.ts:67)
+```
+
+- **`g`** — "cheapest cost found so far to reach this node." The `?? Infinity`
+  at `astar.ts:69` is the "I've never seen this node" default: any real cost
+  beats `Infinity`, so the first time you reach a node it always relaxes.
+- **`came`** — "which edge did I arrive on, and from where." This is the
+  reconstruction trail; `02`'s sibling file `07` covers how `reconstruct()`
+  walks it backward.
+- **`closed`** — "this node is finalized, don't touch it again." A `Set`, not a
+  `Map`, because you only need membership, not a value.
+
+**The boundary condition people miss:** `g` stores the *value*, `closed`
+stores the *fact of finalization*. They're separate because a node can have a
+`g` entry (reached, in the frontier) long before it's `closed` (popped and
+finalized). Conflating them — using `closed` membership as "have I seen it" —
+would break the lazy-deletion logic.
+
+#### The byId index — string keys, O(1) resolution
+
+Covered for complexity in `01`; here's the data-structure read. The graph
+stores edges as an *array* (`graph.edges`), but the search needs them by *id*.
+`indexEdges` (`astar.ts:12-16`) builds the `Map<string, Edge>` once so
+`byId.get(edgeId)` at `astar.ts:65` is `O(1)`. Without it you'd
+`graph.edges.find(...)` — a linear scan of an array — on every edge.
+
+```
+  Array → Map, so id lookups stop being linear scans
+
+  graph.edges = [ {id:"sa",…}, {id:"ag",…}, {id:"sb",…}, … ]
+                        │ indexEdges, one O(E) pass
+                        ▼
+  byId = Map { "sa"→{…}, "ag"→{…}, "sb"→{…}, … }
+                        │
+  byId.get("ag")  →  O(1)   (vs edges.find → O(E))
+```
 
 ### Move 3 — the principle
 
-Hash maps are how you buy `O(1)` lookups in an algorithm whose whole
-speed claim rests on not scanning. The pattern repeats five times in one
-function: any time the search needs to ask a question about a node — its
-cost, its parent, whether it's done, its edges — there's a hash structure
-standing by to answer in constant time. The one array scan that survives
-(`edgeById`) is the exception that proves the rule: the search refuses to
-use it in the loop and builds `byId` instead.
-
----
+The graph is a topology, but the *implementation* is hash structures. The
+recurring move: when your keys are strings (or any non-dense identifier), reach
+for `Map`/`Set`/`Record`, not positional arrays — you trade a hash computation
+for the ability to key by meaningful identity. flattr keys everything by node
+id and edge id, which is why it can store edges undirected and derive direction
+on the fly. The deeper lesson is the immutable-graph / mutable-search-state
+split: shared read-only structure plus per-call scratch state is how you run
+the same algorithm twice on one graph without interference.
 
 ## Primary diagram
 
-Every hash structure in `search()` and the question it answers, in one
-frame.
+Every array/hash structure in a search, and who reads/writes it.
 
 ```
-  search() — the hash-map bookkeeping (astar.ts:30-78)
+  The data structures of one search() call
 
-  ┌─ built once, before the loop ───────────────────────────────┐
-  │  byId = indexEdges(graph)   Map<edgeId, Edge>      O(E)     │
-  │  adjacency (from graph)     Record<nodeId, edgeId[]>        │
-  └───────────────────────────┬──────────────────────────────────┘
-                              │  the loop, per popped node:
-  ┌─ per-node state (O(1) each) ────────────────────────────────┐
-  │  closed.has(current)?  ──► skip if stale                    │
-  │  for edgeId in adjacency[current]:                          │
-  │      edge = byId.get(edgeId)        O(1) (not O(E) scan)    │
-  │      next = otherEnd(edge, current)                         │
-  │      tentative = g.get(current)! + cost                     │
-  │      if tentative < (g.get(next) ?? Infinity):              │
-  │          g.set(next, tentative)     O(1)                    │
-  │          came.set(next, {edge, prev: current})  O(1)        │
-  │          open.push(...)             O(log V)                │
-  └──────────────────────────────────────────────────────────────┘
+  IMMUTABLE (shared, read-only for the whole search)
+  ┌──────────────────────────────────────────────────────────┐
+  │ nodes    Record<id, Node>      coordinates + elevation    │
+  │ adjacency Record<id, string[]> node → incident edge ids   │
+  │ byId     Map<id, Edge>         edge id → Edge  (O(1))      │
+  └──────────────────────────────────────────────────────────┘
+                          read ▼
+  MUTABLE (born and dies with this search() call)
+  ┌──────────────────────────────────────────────────────────┐
+  │ open    PQueue<string>   frontier, ordered by f = g + h   │
+  │ g       Map<id, number>  best cost so far  (?? Infinity)  │
+  │ came    Map<id, {edge}>  reconstruction trail             │
+  │ closed  Set<id>          finalized nodes (membership)     │
+  └──────────────────────────────────────────────────────────┘
 ```
-
----
 
 ## Elaborate
 
-Adjacency-list-as-hash-map is the standard sparse-graph representation —
-street graphs are sparse (each intersection touches 2-4 streets), so the
-alternative (adjacency *matrix*, `O(V²)` space) would be mostly zeros.
-You've built this exact structure in reincodes (`Graph.ts`, adjacency
-list with BFS/DFS). flattr's twist is the undirected storage with
-derived direction — most textbook graphs store directed edges explicitly.
-The `?? Infinity` default-on-miss idiom is worth internalizing; it's the
-JS-idiomatic way to express "unvisited = infinitely far" without
-pre-filling the map. Read file 03 next — the one structure here that
-*isn't* a hash map is the heap.
+Adjacency lists vs adjacency matrices is the classic graph-representation
+tradeoff: lists are `O(V+E)` space and great for sparse graphs (a street
+network is *very* sparse — each intersection touches a handful of streets); a
+matrix is `O(V²)` and only wins for dense graphs or `O(1)` edge-existence
+checks. flattr's street graph is sparse, so the list is correct. The
+string-keyed `Map` over an integer-indexed array is the other deliberate
+choice — node ids like `"11,11"` carry meaning (grid coordinates), and the
+hash cost is worth the readability and the freedom from a dense id space.
 
----
+Read next: `03` (the array-backed heap that `open` actually is) and `05`
+(the search that drives all these structures).
 
 ## Interview defense
 
-**Q: Why a `Map<string, number>` for `g` instead of an array?**
+**Q: Why store edges undirected and derive direction, instead of two directed
+edges?**
+
+Half the memory and a single source of truth. One `Edge` object lives in the
+arrays of both endpoints (`buildAdjacency`, `graph.ts:22`); `otherEnd` and
+`directedGrade` (`graph.ts:10,17`) compute the traversal direction from which
+endpoint you arrived at. The sign of `gradePct` carries direction, so one edge
+costs `+8%` one way and `−8%` (free, downhill) the other.
 
 ```
-  array dist[]      requires integer indices 0..V-1
-  Map<string,n>     keys are "row,col" strings → no index remap
+  edge "xy" (X→Y, +8%)   arrive from X → +8 uphill (penalized)
+                         arrive from Y → −8 downhill (free)
+  one object, two costs, no duplication
 ```
 
-*Model answer:* "The nodes are string ids (`'11,5'`), not dense integers,
-so an array would need a separate id→index mapping. A `Map` keys directly
-on the id, still `O(1)` average. The cost is hashing strings instead of
-indexing an array — fine here because the ids are short and the lookup
-count is bounded by the edge count."
+Anchor: "direction is a *function of arrival endpoint*, not a stored fact."
 
-*Anchor:* string-keyed maps because nodes aren't integer-indexed.
+**Q: Why is `closed` a Set but `g` a Map?**
 
-**Q: Why build `byId` when there's already `graph.edges`?**
+`closed` only needs membership — "is this node finalized, yes or no" — so a
+`Set` is exactly right (`astar.ts:33`). `g` needs the *value* — the best cost
+to compare against at `astar.ts:69` — so it's a `Map`. Using the wrong one
+would either waste a value you never read or lose the value you need.
 
-*Model answer:* "`graph.edges` is an array; `edgeById` does an `O(E)`
-`.find()`. Inside the search loop you look up an edge per neighbor — that
-would make expansion `O(E)` per node, `O(V·E)` overall. `indexEdges`
-pays `O(E)` once to build a `Map`, making every in-loop lookup `O(1)`.
-The comment literally says 'so expansions are O(1) per edge, not O(E).'"
-
-*Anchor:* build-once index to keep the hot loop `O(1)`.
-
----
+Anchor: "`Set` for membership, `Map` for membership-plus-value."
 
 ## See also
 
-- `03-stacks-queues-deques-and-heaps.md` — the one structure here that's
-  a tree, not a hash: the PQueue.
-- `05-graphs-and-traversals.md` — how `adjacency` + `closed` + `g` drive
-  the traversal.
-- `07-recursion-backtracking-and-dynamic-programming.md` — how `came`
-  reconstructs the path.
-- sibling **data-modeling** — owns the `Graph`/`Node`/`Edge` schema.
+- `03-stacks-queues-deques-and-heaps.md` — `open` is an array-backed heap.
+- `05-graphs-and-traversals.md` — the search that drives g/came/closed.
+- `07-recursion-backtracking-and-dynamic-programming.md` — `reconstruct()`
+  walks the `came` map.
+- `04-trees-tries-and-balanced-indexes.md` — where a spatial index *would*
+  replace the `nodes` linear scan in `nearestNode`.

@@ -1,242 +1,266 @@
-# Shared State, Races & Synchronization
+# Shared State, Races, and Synchronization — the single-flight "lock"
 
-**Industry name(s):** shared mutable state · data races · cooperative
-synchronization · refs-as-mutable-cells vs state-as-snapshot. **Type:** Industry
-standard.
+**Industry name:** concurrency control / single-flight / cooperative mutual exclusion — *Industry standard*.
 
 ## Zoom out, then zoom in
 
-Real data races need two threads touching one memory location. flattr has one JS
-thread per runtime, so the classic race — torn reads, lost updates, needing a
-lock — **is not yet exercised**. What flattr *does* have is a subtler, very real
-concurrency concern: async tasks interleaving on one thread, and a deliberate
-split between mutable `useRef` cells and immutable `useState` snapshots.
+With one JS thread (`02`) and no preemption (`03`), flattr can't have a *data* race — two
+threads writing one variable at the same instant simply can't happen. But it absolutely has
+a *logical* concurrency problem: multiple async builds racing to be the "current" graph.
+Here's where the synchronization lives.
 
 ```
-  Zoom out — the two kinds of "shared" state in the run-time process
+  Zoom out — shared mutable state and its guard
 
-  ┌─ JS thread (one thread, no true parallelism) ──────────┐
-  │                                                        │
-  │  useRef cells (mutable, read NOW)      useState (snapshot, │
-  │  ┌───────────────────────────┐         for render)         │
-  │  │ busyRef, viewRef,         │        ┌──────────────────┐ │
-  │  │ pendingViewRef, retryRef  │        │ view, corridor,  │ │ ← we are
-  │  │ ★ the "shared" mutable    │        │ loadingStep      │ │   here
-  │  │   state across async      │        │ (drives UI)      │ │
-  │  │   continuations ★         │        └──────────────────┘ │
-  │  └───────────────────────────┘                            │
-  │  module-level: elevCache `mem` Map (shared across calls)  │
-  └──────────────────────────────────────────────────────────┘
+  ┌─ UI ─────────────────────────────────────────────────────────┐
+  │  pan, route → fire async work concurrently                   │
+  └───────────────────────────────┬──────────────────────────────┘
+                                  │ both want to mutate ↓
+  ┌─ Shared state (useTileGraph refs) ───────────────────────────┐
+  │  busyRef · pendingViewRef · pendingCorridorRef · viewRef     │ ← we are here
+  │  ★ pump() = the single-flight guard over all of it ★         │
+  └───────────────────────────────┬──────────────────────────────┘
+                                  │ produces
+  ┌─ Derived state (useMemo graphs) ─────────────────────────────┐
+  │  merged graph + display graph (recompute on ref change)      │
+  └───────────────────────────────────────────────────────────────┘
 ```
 
-Zoom in: the question is **what mutable state is shared across overlapping async
-work, and what keeps it consistent without a lock?** The answer is the
-single-threaded model plus a disciplined ref/state split — not mutexes.
+Zoom in: the question is **"what's shared and mutable, and what keeps concurrent async
+tasks from corrupting it?"** flattr's answer is a hand-rolled single-flight pattern built
+from `useRef` flags — `busyRef` plays the role of a lock, but it isn't one. It works
+*because* of the event loop, not because of any atomic primitive. That dependency is the
+whole lesson.
 
-## Structure pass
+## Structure pass — layers, one axis, the seams
 
-**Layers.** Three holders of mutable state: (1) `useRef` cells in
-`useTileGraph` — read at the moment a continuation resumes, never stale; (2)
-`useState` values — frozen per render, intentionally stale within a render;
-(3) module-level mutable singletons — the `mem` Map in `elevCache.ts` and the
-`dirty`/`loaded` flags, shared across every call.
-
-**Axis traced — "can two pieces of work observe an inconsistent value
-(guarantees)?"**
+**The layers:** UI events (concurrent sources) → mutable refs (shared state) → the `pump()`
+guard → derived `useMemo` graphs. **The axis: "who can be mid-write when another task
+starts?"**
 
 ```
-  One axis — "can this be observed inconsistent?" — across holders
+  Axis: "can a second task interleave with a write?"  — traced down
 
-  useRef (busyRef etc.)   → NO inconsistent read: single thread, no preemption
-                            mid-statement. Race-free by construction.
-  useState (view/corridor)→ "stale" by DESIGN: a render sees one snapshot;
-                            that's React's model, not a bug.
-  elevCache mem Map       → check-then-act (getElev → putElev) is NOT atomic
-                            across awaits — but collisions only re-fetch, never corrupt.
+  ┌─ UI events ──────────────────────────────────┐
+  │  pan + route fire whenever                    │  → YES, concurrent SOURCES
+  └────────────────────────────────────────────────┘
+      ┌─ ref writes (busyRef = true, etc.) ──────┐
+      │  set synchronously, no await between them │  → NO — runs to completion,
+      └────────────────────────────────────────────┘    can't be interleaved (no preempt)
+          ┌─ the async build body ───────────────┐
+          │  await fetch / await build            │  → YES — yields, so a SECOND
+          └────────────────────────────────────────┘    pump() could start... unless guarded
 ```
 
-**Seam — the ref/state boundary.** The same logical value (the current region)
-exists twice: `viewRef.current` (mutable, for logic) and `view` (snapshot, for
-render). Why both? Because the async `pump` continuation must read the *latest*
-region when it resumes, but React must render a *stable* one. The axis flips here:
-refs answer "what's true now," state answers "what was true when this frame
-rendered." Getting this split wrong is the most likely place a real bug would
-hide.
+The answer flips between the *synchronous* ref-setting (safe by construction) and the
+*async* build body (the real hazard — it yields, so re-entrancy is possible). The guard
+sits exactly at that flip.
+
+**The seam — `pump()`'s entry check:**
+
+```
+  The single-flight seam — busyRef gates re-entry
+
+  call pump() ──► busyRef.current?  ──yes──► return (drop this call)
+                       │ no
+                       ▼
+                  busyRef = true  ═╪═►  [async build yields here, but re-entry is blocked]
+                       │
+                  finally: busyRef = false ─► pump() again (drain next)
+```
+
+That one boolean check is the entire mutual-exclusion mechanism. Hand off to How it works.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You've hit this in React already: a `setInterval` closure that reads a stale
-`count` from `useState`, fixed by stashing it in a `useRef`. Same primitive here.
-A `ref` is a mutable box whose `.current` is always the live value; `state` is a
-value photographed at render time. flattr uses refs for everything the async
-scheduler must read *now*, and state for everything the UI must render
-*consistently*.
+You've written this exact guard without calling it concurrency control: the
+`if (loading) return;` at the top of a submit handler so a double-click doesn't fire two
+requests. That `loading` flag *is* a single-flight lock. flattr's `busyRef` is the same
+idea, scaled to a queue: one build runs at a time, and new requests don't queue infinitely —
+they overwrite a single "pending" slot. The strategy: **a boolean guards the critical
+section; a single-slot pending ref coalesces bursts; the event loop's no-preemption rule
+makes the boolean safe without an atomic.**
 
 ```
-  Pattern — ref (live cell) vs state (snapshot), one logical value twice
+  Single-flight kernel — one in-flight, one pending slot per kind
 
-   logic path (async pump)              render path (React)
-   ┌──────────────────┐                 ┌──────────────────┐
-   │ viewRef.current  │  same region    │ view (snapshot)  │
-   │ always LATEST    │ ◄─────────────► │ frozen per frame │
-   │ read on resume   │   written       │ stable for paint │
-   └──────────────────┘   together      └──────────────────┘
-        used by pump()                       used by useMemo/JSX
+   in-flight:  [ build running ]  ◄── busyRef = true
+   pending:    corridor slot ─┐
+               view slot ─────┤  ◄── new requests overwrite, don't queue
+                              │
+   on finish: busyRef=false → pump() → take corridor first, else view
 ```
 
-### Move 2 — the walkthrough
+### Move 2 — the load-bearing skeleton
 
-**Part 1 — refs are the cross-continuation shared state.** `busyRef` is read and
-written across the async boundary inside `pump`. Set true before the `await`,
-flipped false in `finally` after it:
+This is a kernel concept, so name each part by what breaks without it.
+
+**Part 1 — `busyRef`: the lock. Remove it → re-entrant builds.** Without the guard, every
+`pump()` call would start a fresh async build; two `fetchOverpass`/`buildGraph` chains would
+run concurrently, both writing `viewRef`/`setView`, and the *last to resolve* wins
+non-deterministically — plus you'd hammer the rate-limited APIs in parallel.
 
 ```ts
-// mobile/src/useTileGraph.ts:166, 182, 221-224
+// mobile/src/useTileGraph.ts:166-182 — busyRef is the lock; the early return is the guard
 const pump = useCallback(() => {
-  if (busyRef.current) return;       // read — could be set by a prior pump()
-  ...
-  busyRef.current = true;            // write before awaiting
-  (async () => { try { ...await... } finally {
-    busyRef.current = false;         // write after awaiting (different tick!)
-  }})();
+  if (busyRef.current) return;          // ← LOCK HELD: drop this call, the running build will re-pump
+  let kind, req;
+  if (pendingCorridorRef.current) { kind = "corridor"; req = pendingCorridorRef.current; pendingCorridorRef.current = null; }
+  else if (pendingViewRef.current) { kind = "view"; req = pendingViewRef.current; pendingViewRef.current = null; }
+  else return;
+  busyRef.current = true;               // ← ACQUIRE: set synchronously, before any await
 ```
 
-Why this is race-free: between the read on line 167 and the write on line 182
-there is **no `await`** — it's a synchronous run, and a single-threaded loop can't
-interleave another task into the middle of it. No other task can squeeze a second
-`busyRef = true` in. If there were an `await` between the check and the set, *that*
-would be a check-then-act race even on one thread. There isn't, so it's safe.
+The acquire (`busyRef = true`) happens **synchronously**, before the first `await`. That
+ordering is load-bearing: because no task can preempt mid-statement (`03`), no second
+`pump()` can slip between the `if (busyRef.current) return` check and the
+`busyRef.current = true` set. *In a multithreaded world this would be a textbook
+check-then-act race needing a real mutex.* Here the event loop provides the atomicity for
+free — which is exactly why moving A\* or builds to a worker (`02`) would *break* this and
+force a real lock.
 
-**Part 2 — the dual write keeps ref and state in sync.** Every region update
-writes both:
+**Part 2 — the single pending slot: coalescing. Remove it → unbounded queue.** New requests
+don't append — they overwrite `pendingViewRef` / `pendingCorridorRef`:
 
 ```ts
-// mobile/src/useTileGraph.ts:199-205
-if (kind === "corridor") {
-  corridorRef.current = region;   // live cell — pump() reads this on next call
-  setCorridor(region);            // snapshot — useMemo(graph) reads this for render
-} else {
-  viewRef.current = region;
-  setView(region);
-}
+// mobile/src/useTileGraph.ts:239 — overwrite, not enqueue: only the LATEST view matters
+pendingViewRef.current = { bbox: [w - px, s - py, e + px, n + py], silent: false };
+pump();
 ```
 
-Read the contrast: `covers(viewRef.current, bounds)` (line 234) runs in the *logic*
-path and must see the just-written region immediately — so it reads the ref. The
-`graph` `useMemo` (line 132) runs in the *render* path and depends on `view` (state)
-so React re-renders when it changes. Same data, two readers, two access modes. The
-boundary condition: forget to write *both* and they drift — the scheduler thinks an
-area is covered while the map still shows the old graph, or vice versa.
+If you pan five times during one build, only the fifth viewport survives to run next — the
+intermediate ones are stale and worthless. A FIFO queue would dutifully run all five. The
+single slot *is* the "only the latest matters" policy, encoded as a data structure. What
+breaks without it: a backlog that takes minutes to drain after a fast pan.
 
-**Part 3 — the elevCache Map is a module-level singleton with non-atomic
-check-then-act.** This is the closest thing to a "shared resource" across calls:
+**Part 3 — priority: corridor over view. Remove it → routes starve behind pans.** When both
+slots are full, `pump()` always takes corridor first (`useTileGraph.ts:170-177`). A route
+in progress can't be starved by background pan loads.
+
+```
+  Drain order — corridor (route) beats view (pan)
+
+  pending: corridor=[A] view=[B]
+  pump() ──► take corridor [A] ──► run ──► finally pump() ──► take view [B]
+            (route never waits behind panning)
+```
+
+**Part 4 — the `finally` re-pump: liveness. Remove it → permanent deadlock.** Releasing the
+lock and re-pumping happens in `finally`, so it runs even if the build throws:
 
 ```ts
-// mobile/src/elevCache.ts:11, 31-40
-const mem = new Map<string, number>();     // module-global, every sample() shares it
-export function getElev(key) { return mem.get(key); }
-export function putElev(key, value) {
-  if (mem.has(key)) return;                // check
-  mem.set(key, value); dirty = true;       // ...act (not atomic across awaits)
-}
+// mobile/src/useTileGraph.ts:219-225 — release + drain, guaranteed even on error
+  } catch {
+    // Overpass failed — keep last region; a later pan retries.
+  } finally {
+    busyRef.current = false;   // ← RELEASE the lock
+    if (!silent) setLoadingStep(null);
+    pump();                    // ← drain the next pending request
+  }
 ```
 
-And in `cachedElevation` (`useTileGraph.ts:43-58`), the sequence is: read all
-hits from `mem`, `await p.sample(missPts)`, then `putElev` the misses. Two
-overlapping builds covering the same cell could both miss, both fetch, both put.
-**Is that a race?** Technically a benign one: the worst case is a duplicate
-fetch, never corruption — `putElev` is idempotent (`if (mem.has) return`) and DEM
-values are immutable. But note the single-flight `pump()` (file 02) makes even
-this nearly impossible: only one build runs at a time, so two concurrent
-`sample()` calls hitting the same cell basically don't happen.
+What breaks if release is in `try` instead of `finally`? A thrown build leaves `busyRef`
+stuck `true` forever — every future `pump()` returns at the guard, and the app never loads
+another tile. The `finally` is the liveness guarantee. This is the single part people forget
+when hand-rolling a lock: **the unlock must be unconditional.**
 
-```
-  Pattern — why the only "race" is harmless
-
-  two builds, same cell        but: pump() = single-flight
-  ┌──────┐    ┌──────┐         ┌──────────────────────────┐
-  │ get→ │    │ get→ │  ──X──► │ only ONE build runs at a  │
-  │ miss │    │ miss │         │ time → no overlap → no    │
-  │ put  │    │ put  │         │ double-put possible        │
-  └──────┘    └──────┘         └──────────────────────────┘
-  even IF they overlapped: put is idempotent + DEM immutable = benign
-```
+**Part 5 — the refs-vs-state duplication.** Note that state lives twice: as React state
+(`view`, `corridor` via `setView`/`setCorridor`, which trigger re-render) *and* as refs
+(`viewRef`, `corridorRef`, which `pump` reads synchronously). The refs exist because
+`pump`'s closure would otherwise capture stale state. The retry logic reads
+`viewRef.current?.degraded` (`useTileGraph.ts:213`) — the live value, not the render-time
+snapshot. What breaks if you read state instead of refs inside `pump`? You'd act on a stale
+graph because the closure captured an old render. This isn't a *race* — it's the classic
+React stale-closure trap, solved with refs.
 
 ### Move 3 — the principle
 
-On a single thread, "synchronization" means *don't put an `await` between a check
-and the act that depends on it*. There's no lock to forget because there's no
-preemption — the only way to create a race is to yield the loop mid-decision.
-flattr's `busyRef` is safe precisely because its check-then-set is synchronous;
-its elevCache is safe because the only check-then-act that spans an `await` is
-idempotent. The discipline that replaces locks here is: keep the consistency-
-critical window free of yields.
+In a single-threaded runtime, synchronization isn't about *atomicity* (the event loop gives
+you that free) — it's about *logical coordination of async tasks*: making sure one runs at
+a time, that bursts coalesce, that the right one wins, and that the lock always releases.
+flattr builds all four from a boolean and two ref slots, with zero locking primitives,
+because the runtime guarantees no two of its writes interleave. The deep lesson: **a
+single-flight flag is a real lock *only* as long as the code stays on one thread** — the day
+you move the guarded work off-thread, the boolean stops being atomic and you need the real
+thing. Knowing *why* the cheap version is currently sufficient is the senior signal.
 
 ## Primary diagram
 
-```
-  All mutable state in the run-time process, by access mode
+The full synchronization picture — sources, the guard, the slots, the release.
 
-  ┌─ JS thread ─────────────────────────────────────────────────┐
-  │                                                             │
-  │  LIVE CELLS (useRef) — read by async logic, always latest   │
-  │   busyRef ──── single-flight lock (sync check-then-set: safe)│
-  │   viewRef / corridorRef ──── coverage checks in pump()      │
-  │   pendingViewRef / pendingCorridorRef ──── the work slots   │
-  │   retryRef / timerRef / retryCountRef ──── timer handles    │
-  │            │ written together with ↓                        │
-  │  SNAPSHOTS (useState) — read by render, frozen per frame    │
-  │   view / corridor / loadingStep ──── drive useMemo + JSX    │
-  │                                                             │
-  │  MODULE SINGLETON — shared across all calls                 │
-  │   elevCache mem Map ──── check-then-act benign (idempotent) │
-  └─────────────────────────────────────────────────────────────┘
-   no thread → no lock; safety = no await inside a check-then-act window
+```
+  flattr single-flight — boolean lock + coalescing slots, on one thread
+
+  ┌─ UI (concurrent sources) ────────────────────────────────────┐
+  │  pan ──► queueViewport          route ──► ensureBbox          │
+  └──────────────┬───────────────────────────────┬───────────────┘
+                 ▼ overwrite                       ▼ overwrite
+        pendingViewRef                     pendingCorridorRef
+                 └───────────────┬───────────────┘
+                                 ▼
+                    pump():  busyRef? ──yes──► drop
+                                │ no
+                          busyRef = true (sync, pre-await) ★ acquire
+                                │ corridor first, else view
+                          ┌─────▼─────┐
+                          │ async build│  fetchOverpass → buildGraph
+                          │ (yields)   │  (re-entry blocked by busyRef)
+                          └─────┬──────┘
+                          finally: busyRef = false ★ release → pump() (drain)
+                                │
+                                ▼  writes viewRef/corridorRef + setView/setCorridor
+                       useMemo graphs recompute (merged + display)
 ```
 
 ## Elaborate
 
-The ref-vs-state split is React's answer to a problem older than React: the
-difference between *current value* and *value-at-a-point-in-time*. In threaded
-languages you'd reach for `volatile`, a memory barrier, or a snapshot under a
-lock. React gives you `useRef` for "live" and `useState` for "snapshot" and makes
-you pick per-use. flattr picks correctly throughout `useTileGraph` — refs for the
-scheduler's decisions, state for what the screen shows — which is why a hook this
-concurrency-heavy has no visible races.
+This is the **single-flight** pattern (Go's `singleflight` package is the canonical named
+version: collapse concurrent duplicate work into one in-flight call). flattr's twist is the
+*single pending slot* — a "keep only the latest" coalescing queue, the same shape as a
+debounced state update or RxJS `switchMap` (drop the in-flight, take the newest). The
+no-lock-needed property comes from JavaScript's **run-to-completion** semantics, the same
+guarantee that lets Redux reducers be plain functions and lets you mutate a ref in an event
+handler without a mutex. The moment that guarantee is broken — a worker, a shared
+`SharedArrayBuffer` — you're back to needing `Atomics` or a real mutex, none of which the
+repo has (grep: zero). For *when* you'd cross that line, see `02`'s worker trigger; for the
+debounce that feeds these slots, see `03`.
 
 ## Interview defense
 
-**Q: This hook runs overlapping async work. Where are the data races?**
+**Q: "This app fires async graph builds from panning and routing simultaneously. How does
+it avoid corrupting the current graph?"**
 
-There are none, and the reason is structural: one JS thread, and every
-check-then-act that matters is synchronous. `busyRef` is checked and set with no
-`await` between them (`useTileGraph.ts:167`→`182`), so no other task can
-interleave into that window.
+A single-flight guard. `pump()` checks a `busyRef` boolean — if a build is running, the
+call is dropped, and new requests overwrite a single pending slot rather than queueing. One
+build runs at a time, corridor (route) before view (pan). The lock releases in `finally`, so
+a failed build doesn't deadlock it.
 
 ```
-  the safety argument
-
-  race needs:  check ──[YIELD]──► act   (another task slips in at YIELD)
-  flattr:      check ───────────► act   (no yield → no interleave → safe)
+  pump(): busyRef? ─yes─► drop.  ─no─► busyRef=true → build → finally busyRef=false → pump()
 ```
 
-Anchor: *"The one check-then-act that does span an `await` is the elevCache
-miss→fetch→put, and it's deliberately idempotent — `putElev` bails if the key
-exists, and single-flight `pump()` means two builds rarely overlap anyway. Worst
-case is a wasted fetch, never corruption."*
+*Anchor:* "It's a single-flight lock built from a boolean — and the unlock is in `finally`,
+which is the part people forget."
 
-**Q: Why keep both `viewRef` and `view` for the same region?**
+**Q: "Is that boolean safe? Couldn't two calls both pass the check?"**
 
-Because the async scheduler must read the *latest* region the instant a
-continuation resumes (use the ref), while React must render a *stable* region per
-frame (use the state). One value, two access requirements. Write both together or
-they drift.
+Not on one JS thread. The check and the set are synchronous with no `await` between them, so
+no task can interleave — run-to-completion gives it atomicity for free. The catch: that's
+*only* true while the work stays on one thread. Move the build to a worker and the boolean
+stops being a real lock; then you'd need an actual mutex or atomics.
+
+```
+  if (busyRef) return;  busyRef = true;   ← no await between → uninterruptible on one thread
+```
+
+*Anchor:* "It's a real lock exactly as long as it stays single-threaded — that's the
+condition I'd flag before anyone moves work off-thread."
 
 ## See also
 
-- `02-processes-threads-and-tasks.md` — `busyRef` as the single-flight lock.
-- `03-event-loop-and-async-io.md` — why single-threading removes preemption races.
-- `05-memory-stack-heap-gc-and-lifetimes.md` — the elevCache Map's lifetime.
-- `.aipe/study-frontend-engineering/` — the React ref-vs-state model in depth.
+- `03-event-loop-and-async-io.md` — the no-preemption rule that makes the boolean atomic.
+- `02-processes-threads-and-tasks.md` — the worker trigger that would break this guard.
+- `07-backpressure-bounded-work-and-cancellation.md` — the pump as bounded work + the missing cancel.
+- `study-testing` (sibling) — how single-flight behavior is verified deterministically.

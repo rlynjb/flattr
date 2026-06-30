@@ -1,134 +1,169 @@
-# Success Metrics and Feedback Loop — flattr
+# Success Metrics and the Feedback Loop
 
-> Two buckets, kept strictly apart: metrics you can produce **today** from the
-> repo (engine truth) and metrics that **need users** (demand truth). The
-> dishonest move is to dress an available-now metric up as proof of demand. This
-> file refuses to do that.
+The trap with metrics is reporting the easy ones as if they answered the
+hard question. flattr can compute a lot about itself — correctness,
+node-expansion counts, route plausibility — none of which tells you
+whether a human wants the route. **Split metrics into "available now"
+(provable from the repo) and "needs users" (impossible to fake), and
+never let the first stand in for the second.**
 
-## The split that keeps you honest
+---
 
-```
-  flattr metrics — two buckets, never conflated
-
-  ┌─ AVAILABLE NOW (engine truth) ──────────┐   ┌─ NEEDS USERS (demand truth) ──────┐
-  │ measurable from the repo, today          │   │ measurable only with the           │
-  │                                          │   │ discovery slice (02)               │
-  │ • A* == Dijkstra optimality (oracle)     │   │ • adoption: do people use it twice?│
-  │ • node-expansion ratio (bench harness)   │   │ • switching: flattr route chosen   │
-  │ • route plausibility (gentler than the   │   │     over the default route?        │
-  │     straight line on known-hilly A→B)    │   │ • trust: do they believe the       │
-  │ • honest-fallback correctness            │   │     colors / climb number?         │
-  │     (flat-flag vs. null)                  │   │                                    │
-  └──────────────────────────────────────────┘   └────────────────────────────────────┘
-        proves the thing WORKS                          proves the thing is WANTED
-        (you have this)                                  (you do NOT have this)
-```
-
-A green left bucket tells you the engine is correct. It tells you **nothing**
-about whether to keep building. Only the right bucket does.
-
-## Bucket 1 — available now (you can run these today)
-
-Each is producible from the repo with no users.
-
-### 1a. A* == Dijkstra optimality (the oracle metric)
-
-- **What:** for every fixed (start, goal) pair, A*'s path cost equals Dijkstra's,
-  and A* expands no more nodes than Dijkstra.
-- **Where it's already checked:** `features/routing/astar.test.ts:38`
-  (`toBeCloseTo` on cost) and `:47,:51` (`toBeLessThanOrEqual` on
-  `nodesExpanded`). Dijkstra is the ground-truth oracle.
-- **Pass bar:** equal cost to 6 digits; A* expansions ≤ Dijkstra on every pair.
-- **What it proves:** the heuristic is admissible and the router is optimal.
-  Nothing about demand.
-
-### 1b. Node-expansion / work ratio (the bench metric)
-
-- **What:** per (start, goal), per algorithm — `nodesExpanded`, `pushes`,
-  `pops`, `ms`, `cost`. The A*/Dijkstra expansion *ratio* is the headline.
-- **Where:** `bench/run.ts` runs the stages over interior pairs;
-  `bench/report.ts` `formatTable` prints the comparison. `npm run bench`.
-- **Pass bar:** A* expands materially fewer nodes than Dijkstra for the same
-  cost; bidirectional fewer still on the distance problem.
-- **What it proves:** the refinements pay off — the spec §15.2 progression story
-  is real and measured, not asserted.
-
-### 1c. Route plausibility (the domain-sanity metric)
-
-- **What:** on a *known-hilly* A→B, the grade-routed path has lower total climb
-  (`climbM`) than the shortest path, at the cost of some extra distance — i.e.
-  the router actually trades distance for flatness.
-- **Where:** `summary.ts` `routeSummary` returns `{distanceM, climbM,
-  steepCount}`; compare grade-routed vs. distance-only over the same pair.
-- **Pass bar:** grade route's `climbM` < distance route's `climbM` on pitches
-  that exceed `userMax`. This is the "Pike Place → Broadway returns a gentler
-  path" check from spec §10 Phase 2.
-- **Honesty caveat:** plausibility is gated by elevation accuracy. Spec §12 —
-  coarse elevation makes the map "lie about the steep blocks." So this metric is
-  only as trustworthy as the free Open-Meteo data feeding it. State that.
-
-### 1d. Honest-fallback correctness
-
-- **What:** an only-steep route returns a *flagged* path (not `null`); a
-  genuinely disconnected pair returns `null`.
-- **Where:** `cost.ts:6` `BLOCKED = 1e9` (finite) drives this; the distinction is
-  walked in `.aipe/study-system-design/04-honest-fallback-routing.md`.
-- **Pass bar:** the two states never collapse into one.
-
-## Bucket 2 — needs users (you cannot fake these)
-
-These require the discovery slice from `02`. Until it runs, every one of these is
-**unknown**, and saying otherwise is the dishonesty this book exists to prevent.
+## The two metric classes
 
 ```
-  the demand feedback loop — only the slice closes it
+  Zoom out — two columns, one wall between them
 
-  ┌─ show A→B in flattr + Google Maps ─┐
-  │  to a real self-powered traveler    │
-  └─────────────────┬───────────────────┘
-                    │  observe + ask
-                    ▼
-  ┌─ record 3 things ──────────────────┐
-  │  1. SWITCHING: which route chosen?  │
-  │  2. REASON: was "grade" the reason? │
-  │  3. TRUST: did they believe the     │
-  │     colors / climb number?          │
-  └─────────────────┬───────────────────┘
-                    │  repeat ×5 travelers
-                    ▼
-  ┌─ decide ───────────────────────────┐
-  │  ≥3/5 prefer flattr FOR the grade   │
-  │    → demand signal, consider more   │
-  │  <3/5 or "didn't care"              │
-  │    → premise weak, stop / pivot     │
-  └─────────────────────────────────────┘
+  ┌─ AVAILABLE NOW (the repo computes these) ─────────────┐
+  │  correctness · efficiency · route plausibility         │
+  │  → answer "does it work?"                              │
+  └────────────────────────────┬───────────────────────────┘
+                               │  the wall: no metric on the
+                               │  left answers a question on
+                               │  the right
+  ┌─ NEEDS USERS (only humans produce these) ──────────────┐
+  │  adoption · switching · trust · retention              │
+  │  → answer "do they want it?"                          │
+  └────────────────────────────────────────────────────────┘
 ```
 
-- **Adoption** — would they use it again for their real commute? (Binary,
-  per-person. No infrastructure needed — just ask.)
-- **Switching** — shown both routes, do they pick flattr's? This is *the* metric.
-  It directly tests the spec §1 premise that Google Maps under-serves them.
-- **Trust** — do they believe the colored grades and the climb number, or do they
-  override it with local knowledge? (If they don't trust it, accuracy — bucket
-  1c — is the real blocker.)
+Everything left of the wall is **EVIDENCE** today. Everything right of
+the wall is **INFERENCE** until the chapter-02 experiment runs. The wall
+is the honesty line of the whole brief.
 
-**Deliberately not invented:** no DAU/MAU, no retention curve, no conversion
-rate, no NPS, no market size. There is no product live, so there is no funnel.
-Putting a number on any of these now would be fabrication.
+---
 
-## The one rule for using these metrics
+## Available-now metrics (provable from the repo)
 
-When you present flattr, lead with bucket 1 framed as *"the engine is provably
-correct"* and bucket 2 framed as *"demand is unmeasured — here's exactly the
-experiment that would measure it."* Never let a green bucket-1 metric stand in
-for a bucket-2 answer. That conflation is the single trap a sharp reviewer is
-listening for.
+These you can report with a straight face today. They prove the engine,
+not the product.
 
-## See also
+### 1. Optimality oracle — the correctness gate
 
-- `02-scope-cuts-and-non-goals.md` — the slice that produces bucket-2 metrics.
-- `05-skeptical-reviewer-questions.md` — handling "your metrics don't prove
-  anyone wants this."
-- `.aipe/study-performance-engineering/02-heuristic-pruning.md` — the
-  node-expansion win behind metric 1b.
-- `.aipe/study-testing/` — where the oracle-gate tests (metric 1a) live.
+```
+  Oracle metric — A* must equal Dijkstra
+
+  ┌─ Dijkstra (uninformed) ─┐      ┌─ A* (informed) ──────┐
+  │  finds optimal cost C    │  ==  │  finds the SAME C    │
+  │  expands N nodes         │  ≤   │  expands ≤ N nodes   │
+  └──────────────────────────┘      └──────────────────────┘
+   astar.test.ts:38-44 (cost, 6dp)   astar.test.ts:47-52 (≤)
+```
+
+**The metric:** A* path cost equals Dijkstra path cost to 6 decimals, and
+A* expands ≤ Dijkstra's node count, on a 12×12 grid. Pass/fail, in CI.
+This is your strongest *available-now* number because it's a proof, not a
+sample. → `../study-testing/01-optimality-oracle.md`.
+
+### 2. Node-expansion efficiency — the bench
+
+```
+  Bench metric — fewer expansions = the heuristic works
+
+  scenario           dijkstra   astar   ratio
+  ───────────────    ────────   ─────   ─────
+  grid30 interior      203       32     ~6.3×
+  grid40 mid           1079      276    ~3.9×
+  grid40 short          74        10    ~7.4×
+```
+
+**The metric:** A* expands 3.9–7.4× fewer nodes than Dijkstra on interior
+pairs (`bench/run.ts`, `report.ts`). It measures that the admissible
+haversine heuristic actually prunes. → `../study-performance-engineering/01-heuristic-pruning.md`.
+
+### 3. Route plausibility — the eyeball check
+
+**The metric:** on the bundled Capitol Hill graph, does the colored path
+avoid the red blocks when a flatter alternative exists, and does the
+honest fallback fire ("⚠ flattest available + N steep blocks") when none
+does? This is qualitative and you run it yourself. It catches "the router
+returns a path that's obviously dumb" — but it does **not** tell you a
+user would take that path. It's a sanity gate, not a demand signal.
+
+---
+
+## Needs-users metrics (you cannot compute these)
+
+These require the chapter-02 experiment. The repo has *zero*
+infrastructure to produce them — no analytics SDK, no telemetry, no
+deployment. State that plainly; don't pretend a proxy exists.
+
+```
+  Needs-users metrics — and why the repo can't fake them
+
+  ┌─ adoption ────────► how many install / open it?         │
+  │  repo has: no app-store build, no analytics, no counter  │
+  ├─ switching ───────► do they leave Google Maps/AccessMap? │
+  │  repo has: no comparison study, no user, no trial        │
+  ├─ trust ───────────► do they believe the grade colors?    │
+  │  repo has: no feedback channel, no on-route validation    │
+  ├─ retention ───────► do they come back / use it twice?     │
+  │  repo has: no sessions, no identity, no history (offline) │
+  └──────────────────────────────────────────────────────────┘
+```
+
+**The single most important needs-users signal**, and the cheapest:
+*would this person take this route?* It's qualitative, it's one
+conversation, and it's the gate for every "build more" option in chapter
+03. You don't need a dashboard to get it. You need one walker and one
+honest question.
+
+---
+
+## The feedback loop
+
+Tie the two columns together: the available-now metrics keep the engine
+honest while you go get the needs-users signal.
+
+```
+  The loop — prove correctness, then go learn demand
+
+  ┌─ CI / bench (available now) ──────────────────────────┐
+  │  oracle stays green · bench ratios don't regress       │
+  │  → the engine you'd demo is provably correct           │
+  └────────────────────────┬───────────────────────────────┘
+                           │  with a trustworthy demo in hand,
+                           ▼
+  ┌─ chapter-02 experiment (needs users) ─────────────────┐
+  │  one real walker · one known route · one question:     │
+  │  "is this the path you'd actually take?"               │
+  └────────────────────────┬───────────────────────────────┘
+                           │  the answer routes you to:
+                           ▼
+  ┌─ next move (chapter 03) ──────────────────────────────┐
+  │  "yes, daily"        → expand coverage (C)             │
+  │  "yes but distrust"  → harden DEM accuracy (D)         │
+  │  "no, I'd go short"  → do nothing / reframe (A / E)    │
+  └────────────────────────────────────────────────────────┘
+```
+
+**Why the loop is built this way:** the left box is automatable and free
+— keep it green forever, it's table stakes. The right box is the
+expensive truth, and it's *qualitative first* because you don't have
+enough users for a quantitative read and faking one would be dishonest.
+A single good conversation outranks a fabricated funnel.
+
+---
+
+## What you must NOT claim
+
+```
+  Banned moves — laundering left-column into right-column
+
+  ┌────────────────────────────────────────────────────────┐
+  │  ✗ "the oracle passes, so the routing is good"          │
+  │     → correctness ≠ desirability                        │
+  │  ✗ "A* is 6× faster, so users will love it"             │
+  │     → speed ≠ adoption                                  │
+  │  ✗ "the demo looks great, so there's a market"          │
+  │     → one plausible route ≠ demand                      │
+  └────────────────────────────────────────────────────────┘
+```
+
+When a reviewer asks "how do you know it's working?" the honest answer is
+two sentences: "The engine is provably correct — oracle and bench, in CI.
+Whether anyone *wants* it is unmeasured; the cheapest test is one walker,
+one route, one question, and I haven't run it yet." That answer wins the
+room precisely because it doesn't overclaim.
+
+Next: `05-skeptical-reviewer-questions.md`.

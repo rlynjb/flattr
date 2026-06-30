@@ -1,326 +1,279 @@
-# Elevation Provider Fallback + Persistent Cache
+# Elevation provider fallback + persistent cache
 
-**Industry names:** provider abstraction / strategy pattern / cache-aside +
-circuit-style fail-open. **Type:** Industry standard (the provider interface),
-project-specific in how the fallback chain and the persistent cache compose.
+**Industry names:** provider abstraction / adapter pattern / best-effort with
+fallback / read-through persistent cache. **Type:** Industry standard.
 
 ---
 
 ## Zoom out, then zoom in
 
-Elevation is the one piece of data flattr can't compute itself — it has to come
-from an external DEM service. That makes it the system's weakest dependency:
-free elevation APIs rate-limit (the spec warns Open-Meteo 429s under heavy
-testing, `context.md`), and on a phone you might be offline entirely. flattr
-handles this with three composed layers: an *interface* so providers are
-swappable, a *fail-open wrapper* so a dead API never blocks a route, and a
-*persistent cache* so a sampled cell is never re-fetched.
+Elevation is the one input flattr can't compute itself — it comes from a DEM behind
+a rate-limited API. So the elevation layer is built to survive that API being slow,
+throttled, or down: one interface, three swappable providers, a best-effort wrapper
+that degrades to flat instead of failing the build, and a persistent cache so
+revisited areas never hit the network again.
 
 ```
-  Zoom out — where elevation handling lives
+  Zoom out — elevation sits inside every graph build, build-time and runtime
 
-  ┌─ BUILD + RUNTIME (shared engine) ────────────────────────────────────┐
-  │  ElevationProvider interface (elevation.ts:7-10)                      │
-  │     ├─ googleProvider     ─┐                                          │
-  │     ├─ openMeteoProvider  ─┤ pick one (run-build.ts:22-38)            │ ← here
-  │     └─ flat fixture        ┘                                          │
-  │            │ wrapped by:                                              │
-  │            ├─ cachedElevation  → elevCache (AsyncStorage)             │
-  │            └─ bestEffortElevation → flat 0m on error, flag degraded   │
-  └────────────────────────────────────────────────────────────────────── ┘
+  ┌─ Shared pipeline (build-time AND on-device) ────────────────┐
+  │  split → ★ ElevationProvider.sample() ★ → grade             │ ← we are here
+  │              │                                              │
+  │   build-time: Google | Open-Meteo | flat (run-build.ts)     │
+  │   runtime:    cached( bestEffort( Open-Meteo ) )            │
+  └───────────────┬─────────────────────────────────────────────┘
+                  ▼  cache miss
+        Open-Meteo / Google Elevation API  (rate-limited, can 429)
 ```
 
-Zoom in: the concept is **isolating a flaky external dependency behind one
-interface, then wrapping it so it caches aggressively and never fails the
-caller.** The question it answers: *how does a route still build when the
-elevation API is throttled or the phone is offline?*
+You've coded against an interface so you could swap the implementation in tests — a
+`fetch`-shaped dependency you inject. Same shape: `ElevationProvider` is one method,
+`sample(points) → number[]`, and everything else (Google, Open-Meteo, fixture-flat,
+the cache wrapper, the best-effort wrapper) is a different object satisfying it. The
+question it answers: *how does the system keep producing a usable graph when the one
+external data source it depends on fails?*
 
-## Structure pass
+---
 
-**Layers.** Three wrappers stack around the raw provider, each adding one
-property:
+## The structure pass
 
-```
-  the elevation stack — each layer adds one guarantee
+**Layers:** caller (`sampleElevations`) → cache wrapper → best-effort wrapper → real
+provider → network.
 
-  ┌─ bestEffortElevation ────────────────┐  → NEVER throws (fail-open)
-  │  ┌─ cachedElevation ──────────────┐  │  → skips fetched cells (cache-aside)
-  │  │  ┌─ openMeteoProvider ──────┐  │  │  → the raw HTTP call (can throw/429)
-  │  │  │  fetch open-meteo.com    │  │  │
-  │  │  └──────────────────────────┘  │  │
-  │  └────────────────────────────────┘  │
-  └──────────────────────────────────────┘
-   outermost = strongest guarantee, innermost = the risky part
-```
-
-**Axis — `failure` (where does an elevation error stop?).** Trace a 429 outward:
+**Axis = failure (where does an elevation failure stop, and what does the build get
+instead?).**
 
 ```
-  "what happens to a 429 from the elevation API?" — traced up the wrappers
+  One question down the layers: "what happens when elevation fetch fails?"
 
-  ┌──────────────────────────────────────┐
-  │ openMeteoProvider                     │  → THROWS after retries (elevation.ts:108-119)
-  └──────────────────────────────────────┘
-        │  error propagates up
-        ▼
-  ┌──────────────────────────────────────┐
-  │ cachedElevation                       │  → passes the error through (no swallow)
-  └──────────────────────────────────────┘
-        │
-        ▼
-  ┌──────────────────────────────────────┐
-  │ bestEffortElevation                   │  → CATCHES, returns flat 0m, flags degraded
-  └──────────────────────────────────────┘     (useTileGraph.ts:23-28)
+  ┌───────────────────────────────────┐
+  │ sampleElevations (caller)         │  → unaware; always gets number[]
+  └───────────────────────────────────┘
+      ┌─────────────────────────────────┐
+      │ cachedElevation                 │  → hits served free; misses passed down
+      └─────────────────────────────────┘
+          ┌─────────────────────────────┐
+          │ bestEffortElevation         │  → CATCHES, returns 0s, flags degraded
+          └─────────────────────────────┘
+              ┌─────────────────────────┐
+              │ openMeteoProvider        │  → 429 backoff, then THROWS
+              └─────────────────────────┘
 
-  the failure stops at the outermost wrapper — the caller never sees it
+  failure originates at the provider (throw), is CONTAINED at bestEffort (flatten)
 ```
 
-**Seam.** The `ElevationProvider` interface (`elevation.ts:7-10`) is the seam.
-Because it's a one-method contract (`sample(points) → number[]`), every wrapper
-*is* an `ElevationProvider` too — so they compose like middleware. The interface
-is what lets cache, fail-open, and the raw call nest cleanly.
+**Seam = `bestEffortElevation` (`useTileGraph.ts:20`).** The failure-containment
+boundary. Below it, `openMeteoProvider` throws on a non-retryable 429
+(`elevation.ts:118`). Above it, the caller only ever sees a `number[]`. The wrapper
+catches the throw, returns flat zeros, and flips the region's `degraded` flag — that
+flag is the seam's contract to the rest of the system (it drives the self-heal retry
+and the "approximate grades" note, → `04-honest-fallback-routing.md`).
+
+---
 
 ## How it works
 
-### Move 1 — the mental model
+#### Move 1 — the mental model
 
-You've wrapped a `fetch` before — a retry wrapper, a cache wrapper, an
-error-boundary wrapper. Each takes the same shape and returns the same shape, so
-they stack. flattr does exactly that with elevation: one interface, and each
-concern is a wrapper that takes a provider and returns a provider.
-
-The strategy in one sentence: **one provider interface, composed wrappers that
-each add caching or fail-open behavior without the inner layer knowing.**
+The shape is a stack of decorators around one interface. Each wrapper adds one
+behavior — caching, then best-effort — and the innermost real provider does the
+network work. Composition reads inside-out: `cached(bestEffort(openMeteo(...)))`.
 
 ```
-  The pattern — middleware composition over one interface
+  Pattern — decorator stack over one interface
 
-   provider = bestEffort( cached( openMeteo(fetch) ) )
-                  │          │         │
-                  │          │         └─ does the HTTP work, may 429
-                  │          └─ checks cache; fetches only misses
-                  └─ catches any throw → flat 0m + degraded flag
-
-   each layer: ElevationProvider in, ElevationProvider out  → they nest
+  sampleElevations
+        │ calls .sample(points)
+        ▼
+  ┌─ cachedElevation ──────────────────┐  serve hits, collect misses
+  │   ┌─ bestEffortElevation ────────┐ │  catch failures → flat + flag
+  │   │   ┌─ openMeteoProvider ────┐ │ │  batch, 429-backoff, throw
+  │   │   │   fetch → DEM          │ │ │
+  │   │   └────────────────────────┘ │ │
+  │   └──────────────────────────────┘ │
+  └─────────────────────────────────────┘
+        │ returns number[] (always — never throws to caller)
 ```
 
-### Move 2 — the walkthrough
+#### Move 2 — the walkthrough
 
-**Step 1 — the interface is one method.** That minimalism is what makes
-composition work:
+**One interface, three real providers.** The contract is a single method:
 
 ```ts
-// pipeline/elevation.ts:7-10
-export interface ElevationProvider {
-  /** Elevation in meters for each point, in the same order. */
-  sample(points: LatLng[]): Promise<number[]>;
+// pipeline/elevation.ts:7 — the whole interface
+export interface ElevationProvider { sample(points: LatLng[]): Promise<number[]>; }
+```
+Build-time picks one by environment, best to worst (`run-build.ts:22`): Google
+(paid, needs a key) → Open-Meteo (free, default, 90m DEM) → flat (offline testing).
+That's the *provider* fallback — a quality ladder chosen once per build.
+
+**`bestEffortElevation` contains the failure.** The runtime can't fail a build just
+because the API is throttled — the streets must still render and connect:
+
+```ts
+// mobile/src/useTileGraph.ts:20 — catch → flat → flag
+function bestEffortElevation(p, onFallback) {
+  return { async sample(points) {
+    try { return await p.sample(points); }     // happy path: real elevations
+    catch { onFallback(); return points.map(() => 0); }  // throttled → flat + flag degraded
+  }};
 }
 ```
+What breaks without this wrapper: a single 429 throws out of `buildGraph` and the
+whole region fails — no streets, "no route." With it, you get a connected graph with
+flat (bogus) grades, marked `degraded` so it self-heals later. **Connectivity over
+fidelity, named in the header** (`useTileGraph.ts:17`).
 
-Three implementations satisfy it: `googleProvider` (`elevation.ts:62+`, batches
-256), `openMeteoProvider` (`elevation.ts:85+`, batches 100, the free default),
-and a flat fixture (synthetic 0m, `run-build.ts:28`). The build picks one based
-on env (`run-build.ts:22-38`): Google if a key is set, flat if `FLAT_ELEVATION=1`,
-else Open-Meteo.
-
-**Step 2 — the raw provider already retries and backs off.** Before any
-wrapper, `openMeteoProvider` handles transient failures itself:
+**`cachedElevation` is read-through, keyed to the 90m DEM grid.** Hits cost nothing;
+only misses go down the stack:
 
 ```ts
-// pipeline/elevation.ts:108-119 (Open-Meteo, retry loop sketch)
-// batches of 100, 300ms between batches (free-tier friendly)
-// on 429: await sleep(delayMs * 2 ** (attempt + 1))   // exponential backoff
-// retries: 3 (default), then throws
+// mobile/src/useTileGraph.ts:38 — read-through cache wrapper
+points.forEach((pt, i) => {
+  const hit = getElev(cellKey(pt.lat, pt.lng));     // ~90m cell key
+  if (hit !== undefined) out[i] = hit;              // free
+  else { missPts.push(pt); missIdx.push(i); }       // collect misses
+});
+if (missPts.length) {
+  const got = await p.sample(missPts);              // ONE call for all misses (may throw)
+  got.forEach((e, j) => putElev(cellKey(...), e));  // cache only real values
+}
 ```
+Two design choices worth naming: misses are batched into one downstream call (not N
+calls), and *only successfully-fetched values are cached* — flat-fallback zeros
+never poison the cache, because they throw before reaching `putElev`.
 
-So the inner layer is already resilient to *transient* throttling. It only
-throws when retries are exhausted — a *sustained* outage. That's what the
-outer wrapper is for.
-
-**Step 3 — `cachedElevation` makes a sampled cell free forever.** This wrapper
-checks the persistent cache per DEM cell and only fetches the misses:
+**The cache persists across restarts, and never invalidates.** `elevCache.ts` mirrors
+the in-memory `Map` to AsyncStorage:
 
 ```ts
-// mobile/src/useTileGraph.ts:38-62 (cachedElevation), :36 (cellKey)
-const cellKey = (lat, lng) =>
-  `${Math.round(lat / DEDUPE)},${Math.round(lng / DEDUPE)}`;  // 36: ~90m cell
-// 45: hit?  getElev(cellKey(...)) → reuse
-// 52-57: miss → provider.sample(missingPoints), then putElev(...) each
+// mobile/src/elevCache.ts:3 — "DEM samples never change → valid forever"
+const STORAGE_KEY = "flattr.elevCache.v1";
+// :39 writes debounced 4s; :48 cap 50k entries, oldest dropped (Map insert order)
 ```
+No invalidation policy, on purpose — the underlying DEM is genuinely immutable, so
+TTLs or busting would be pure overhead (audit lens 4). The cap is a memory safety
+valve, not a freshness mechanism.
 
-The cache key is a ~90m grid cell (`DEDUPE = 0.0008`, `useTileGraph.ts:69`),
-matching the free DEM resolution — sampling finer than the data resolution is
-wasted. Revisited areas hit zero API calls.
-
-**Step 4 — the cache is persistent and survives restarts.** `elevCache.ts`
-mirrors the in-memory `Map` to a single AsyncStorage key, debounced:
+**Self-heal closes the loop.** A degraded region re-queues itself silently until real
+elevation lands or the budget runs out:
 
 ```ts
-// mobile/src/elevCache.ts:7-9, :35-40, :42-53
-const STORAGE_KEY = "flattr.elevCache.v1";       // 7
-const PERSIST_DEBOUNCE_MS = 4000;                // 8: batch writes
-const MAX_ENTRIES = 50000;                       // 9: LRU cap
-// putElev: set in memory, mark dirty, schedule debounced persist (39)
-// persistNow: slice to newest 50k, write JSON blob to AsyncStorage (49-53)
+// mobile/src/useTileGraph.ts:209 — bounded silent retry
+if (degraded && retryCountRef.current < MAX_RETRIES) {   // MAX_RETRIES = 6
+  retryCountRef.current += 1;
+  retryRef.current = setTimeout(() => { /* re-queue degraded bbox, silent */ pump(); }, RETRY_MS);
+}
+```
+`covers()` returning `false` for degraded regions (`:83`) is what makes the retry
+actually refetch instead of short-circuiting on coverage. The retry is `silent` so
+the loading overlay doesn't flash while grades catch up.
+
+The hops, drawn:
+
+```
+  Layers-and-hops — a sample() call through the stack
+
+  ┌─ caller ────────┐ hop1: sample(pts)   ┌─ cached ─────────┐
+  │ buildGraph      │ ──────────────────► │ hits→out         │
+  └─────────────────┘                     │ misses ▼         │
+                                          └────────┼─────────┘
+                            hop2: sample(misses)   ▼
+                                          ┌─ bestEffort ─────┐
+                                          │ try ▼  catch→0s  │──flag degraded──►
+                                          └────────┼─────────┘   (self-heal +
+                            hop3: fetch (may 429)   ▼             "approx" note)
+                                          ┌─ openMeteo ──────┐
+                                          │ backoff → throw  │──► Open-Meteo API
+                                          └──────────────────┘
 ```
 
-It loads once on mount (`useTileGraph.ts:126-128`), so a cell sampled in a prior
-session is instant *and free* this session. That's the real defense against the
-documented 429 problem — you mostly stop hitting the API at all.
+#### Move 3 — the principle
 
-```
-  Layers-and-hops — an elevation request through the stack
+Depend on an external source through an interface, then wrap that interface with the
+two behaviors every flaky dependency needs: a cache (so you call it as little as
+possible) and a best-effort fallback (so its failure degrades quality, not
+availability). The fallback's *flag* is as important as its *value* — flattr's
+`degraded` bit is what lets the system both keep working and tell the truth that it's
+working in a reduced mode.
 
-  ┌─ Hook: useTileGraph (on-device build) ───────────────────────────────┐
-  │  buildGraph(...) calls elev.sample(points)                           │
-  │            │ hop 1: bestEffort → cached.sample(points)               │
-  │            ▼                                                          │
-  │  cachedElevation: split into hits / misses (elevCache lookup)        │
-  │            │ hits → return from memory (NO network)                  │
-  │            │ misses ↓ hop 2: openMeteo.sample(misses)                │
-  └────────────┼────────────────────────────────────────────────────── ┘
-               │                                  ┌─ Open-Meteo API ────┐
-               │ hop 3 (misses only) ───────────► │ open-meteo.com      │
-               │ ◄─────────────────────────────── │ (429? retry+backoff)│
-               │   meters (or throw on outage)    └─────────────────────┘
-               ▼
-  ┌─ AsyncStorage ───────────────────────────────────────────────────────┐
-  │  hop 4: putElev(cell, meters) → debounced write of flattr.elevCache.v1│
-  └────────────────────────────────────────────────────────────────────── ┘
-```
-
-**Step 5 — `bestEffortElevation` makes failure impossible for the caller.**
-The outermost wrapper catches any throw and returns flat elevations, flagging
-the region so the rest of the system knows the grades are fake:
-
-```ts
-// mobile/src/useTileGraph.ts:20-28 (bestEffortElevation)
-return {
-  async sample(points) {
-    try { return await p.sample(points); }      // try the real provider
-    catch {
-      onFallback();                              // 26: mark region degraded
-      return points.map(() => 0);                // flat 0m — route still builds
-    }
-  }
-};
-```
-
-`onFallback` sets `degraded = true` (`useTileGraph.ts:195`), which (a) keeps the
-region out of the *display* graph so fake all-green grades don't paint over real
-ones (`useTileGraph.ts:150-162`), (b) triggers the 12s self-heal retry
-(`useTileGraph.ts:209-218`), and (c) drives the "Grades approximate — retrying"
-UI message (`MapScreen.tsx:375-376`). Connectivity is preserved (the region is
-still in the *routing* graph); only fidelity degrades.
-
-#### Move 2 variant — what breaks if you remove each layer
-
-The kernel is the interface plus two wrappers:
-
-1. **The `ElevationProvider` interface** (`elevation.ts:7-10`). Remove it and
-   the wrappers can't compose — caching and fail-open would each have to be
-   baked into every provider. *Breaks: swappability and composition.*
-2. **`cachedElevation`** (`useTileGraph.ts:38-62`). Remove it and every pan
-   re-fetches elevation it already has, hammering the free API straight into the
-   429 wall. *Breaks: staying under rate limits.*
-3. **`bestEffortElevation`** (`useTileGraph.ts:20-28`). Remove it and a 429 or
-   offline state throws out of `buildGraph`, the build fails, and the region
-   never loads. *Breaks: routing while the API is down.*
-
-Optional hardening: the inner retry/backoff (`elevation.ts:108-119`) handles
-*transient* throttling; the dedupe-by-cell (`elevation.ts:40-59` build-time,
-`cellKey` runtime) avoids sub-resolution waste. Both are tuning on top of the
-three load-bearing layers.
-
-### Move 3 — the principle
-
-The principle is **isolate the dependency you don't control behind one
-interface, then layer caching and fail-open around it as composable wrappers.**
-The single-method interface is what makes the layering possible — each concern
-(cache, fail-open) is independently testable and stacks without the others
-knowing. And the fail-open default is the right call for a *quality* signal like
-elevation: a route with approximate grades beats no route. Pair fail-open with an
-honest flag (`degraded`) so the system never *silently* serves bad data — it
-serves best-effort data, labeled.
+---
 
 ## Primary diagram
 
 ```
-  Elevation provider fallback + persistent cache — the full picture
+  Elevation provider fallback + cache — full pattern
 
-  ┌─ pick provider (run-build.ts:22-38) ─────────────────────────────────┐
-  │  Google (key set) | flat fixture (FLAT_ELEVATION=1) | Open-Meteo      │
-  │  all satisfy ElevationProvider.sample (elevation.ts:7-10)            │
-  └───────────────────────────────┬────────────────────────────────────── ┘
-                                   │ wrapped (outer → inner)
-                                   ▼
-  ┌─ bestEffortElevation (useTileGraph.ts:20-28) ────────────────────────┐
-  │  try inner; catch → flat 0m + degraded flag (never throws)           │
-  │  ┌─ cachedElevation (ts:38-62) ────────────────────────────────────┐ │
-  │  │  per ~90m cell: hit → memory (free) | miss → fetch + putElev     │ │
-  │  │  ┌─ openMeteoProvider (elevation.ts:85+) ───────────────────────┐│ │
-  │  │  │  batch 100, 300ms spacing, 429 → exp backoff, then throw     ││ │
-  │  │  └──────────────────────────────────────────────────────────────┘│ │
-  │  └──────────────────────────────────────────────────────────────────┘ │
-  └──────────────────┬─────────────────────────────────┬────────────────── ┘
-                     │ persist (debounced 4s, LRU 50k)  │ degraded → self-heal
-                     ▼                                   ▼ retry 12s + UI note
-            AsyncStorage flattr.elevCache.v1     (useTileGraph.ts:209-218)
+  build-time ladder:  GOOGLE_ELEVATION_KEY → Open-Meteo → FLAT   (run-build.ts:22)
+
+  runtime stack (useTileGraph.ts:191):
+  ┌─ cachedElevation ──────────────────────────────────────────┐
+  │  hit (90m cell, AsyncStorage-backed) → free                 │
+  │  miss ▼ (batched, one call)                                 │
+  │  ┌─ bestEffortElevation ────────────────────────────────┐  │
+  │  │  try → real elevations                                │  │
+  │  │  catch (429/down) → flat 0s + set degraded=true ──────┼──┼─► self-heal retry
+  │  │  ┌─ openMeteoProvider ──────────────────────────────┐ │  │   (≤6×, silent)
+  │  │  │ batch 100 · 429 exp-backoff · throw on give-up   │ │  │   + "approx" note
+  │  │  └──────────────────────────────────────────────────┘ │  │   in UI (04-)
+  │  └────────────────────────────────────────────────────────┘  │
+  │  cache only REAL values (zeros never stored)                │
+  └─────────────────────────────────────────────────────────────┘
 ```
+
+---
 
 ## Elaborate
 
-The provider interface is the classic Strategy pattern, and the wrapping is
-middleware composition — the same shape as Express middleware or React HOCs,
-applied to a data provider. The interesting design judgment is the *order* of
-the wrappers: cache inside fail-open means a cache hit never triggers the
-fail-open path, and the degraded flag only fires on a real outage, not on cached
-data. Flip them and you'd get spurious degraded flags on cached cells.
+This is the adapter + decorator pair you'd reach for around any third-party
+dependency: an interface to swap implementations, decorators to layer caching and
+resilience without touching the core. flattr's `fetchImpl` injection
+(`elevation.ts:65`, `:92`) is the same seam that lets tests run without network —
+the fixture provider is just another implementation of the one interface
+(`elevation.ts:13`).
 
-The persistent cache is the practical heart. The spec explicitly warns that
-Open-Meteo 429s under heavy use (`context.md`, "External-data caveat"), and the
-50k-entry AsyncStorage cache (`elevCache.ts:9`) is what turns a chronic problem
-into a first-visit-only one. Keying by ~90m cell rather than exact coordinate is
-the move that makes the cache dense — nearby points share a cell, so the hit rate
-is high. Read `04-honest-fallback-routing.md` for the routing side of the
-degraded flag and `02-on-device-pipeline-rerun.md` for where `sample` is called
-on-device.
+The `degraded` flag is the through-line to two other patterns: it drives the
+display-excludes-degraded merge (`03-tile-merge-stitch.md`) and the "Grades
+approximate" UI note (`04-honest-fallback-routing.md`). The HTTP-level retry/backoff
+and rate-limit mechanics on the wire → `study-networking`. The cache's
+debounce/persist runtime behavior → `study-runtime-systems` and
+`study-performance-engineering`.
+
+---
 
 ## Interview defense
 
-**Q: How does a route still build when the elevation API is down?**
-Three composed layers around one interface. `bestEffortElevation`
-(`useTileGraph.ts:20-28`) catches any provider error and returns flat 0m
-elevations, so `buildGraph` never fails — the route still computes, just with
-approximate grades, and the region is flagged `degraded` so the UI says "grades
-approximate, retrying" (`MapScreen.tsx:375`) and a 12s timer re-tries
-(`useTileGraph.ts:209-218`).
+**Q: Why not just fail the build when elevation is unavailable?**
+Because the streets and connectivity don't depend on elevation — only the grade
+*coloring* does. Failing the whole build would mean "no map, no route" for a
+transient 429. Best-effort returns flat grades + a degraded flag, so you get a
+working map now and real grades when the API recovers.
 
 ```
-  bestEffort( cached( openMeteo ) )
-       │         │        └─ may 429 / be offline → throws
-       │         └─ serves fetched cells from AsyncStorage (avoids most calls)
-       └─ catch → flat 0m + degraded flag → route survives, labeled
+  fail-closed:   429 → no graph → "no route"   (bad)
+  best-effort:   429 → flat graph + degraded flag → working map, self-heals  (chosen)
 ```
-Anchor: *fail-open with an honest degraded flag — best-effort data, never
-silent bad data.*
+Anchor: connectivity over fidelity; the flag carries the honesty.
 
-**Q: Why does this design avoid the documented 429 problem?**
-The persistent cache. Elevation per location is constant, so once a ~90m cell is
-sampled it's cached in memory and in AsyncStorage (`elevCache.ts`), surviving
-restarts (`useTileGraph.ts:126-128`). After the first visit to an area, those
-cells cost zero API calls — the app mostly stops hitting Open-Meteo, which is
-where the 429s came from.
+**Q: What's your cache invalidation strategy?**
+None — and that's correct. DEM elevation samples don't change between reads, so
+cached values are valid forever (`elevCache.ts:3`). The only eviction is a 50k-entry
+memory cap, dropping oldest first. A TTL would be overhead protecting against a
+change that can't happen.
+Anchor: immutable source → no invalidation needed, only a memory cap.
 
-**Q: The load-bearing part people forget?**
-The wrapper *order* — cache inside fail-open. It means a cache hit never trips
-the degraded flag and the flag only fires on a genuine outage. Reverse them and
-cached cells would spuriously mark regions degraded.
+**Q: Why cache only successful values?**
+Flat-fallback zeros are wrong data. If you cached them, a revisit would serve the
+bogus zeros forever and never self-heal. They throw before `putElev` is reached
+(`useTileGraph.ts:53`), so only real elevations persist.
+Anchor: never persist a fallback value, or it defeats the self-heal.
+
+---
 
 ## See also
 
-- `02-on-device-pipeline-rerun.md` — where `sample` runs on-device
-- `04-honest-fallback-routing.md` — the routing side of the degraded flag
-- `audit.md` §4 (caching), §6 (failure handling)
-- neighboring: **study-networking** (retry, backoff, batching on the wire),
-  **study-database-systems** (AsyncStorage key-value durability)
+- `02-on-device-pipeline-rerun.md` — where this stack runs on-device.
+- `03-tile-merge-stitch.md` — degraded regions excluded from the display graph.
+- `04-honest-fallback-routing.md` — the "approximate grades" UI surfacing.
+- `audit.md` lenses 4, 6 — caching/invalidation, reliability.
+</content>

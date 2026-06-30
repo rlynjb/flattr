@@ -1,300 +1,278 @@
 # Locks, MVCC, and concurrency control
 
-**Industry name(s):** concurrency control / two-phase locking / MVCC /
-optimistic vs pessimistic locking · **Type:** Industry standard.
+**Industry names:** lock (shared/exclusive) · pessimistic vs. optimistic
+concurrency · MVCC · two-phase locking · write-skew — *type label: Industry
+standard.*
 
-> **Status in flattr: mostly `not yet exercised` — with one real, hand-rolled
-> exception.** flattr has no database lock manager and no MVCC. But it *does* have
-> an application-level mutual-exclusion lock (`busyRef` in `useTileGraph.ts`)
-> standing in for the concurrency control a database would otherwise provide. This
-> file teaches the database mechanisms and anchors them to that one real lock.
+**Status in flattr: not yet exercised.** There are no locks, no MVCC, no
+version counters. flattr's concurrency control is *the JavaScript event
+loop* — one thread, no preemption. This file teaches the mechanisms and
+shows precisely why the single-threaded runtime hands flattr most of them
+for free, plus the one real (benign) race that does exist.
 
 ## Zoom out, then zoom in
 
-```
-  Zoom out — concurrency control guards the write path
+Concurrency control is the machinery that keeps **two writers from corrupting
+shared state when they overlap.** flattr's overlap surface is almost zero:
+the graph is read-only (infinite concurrent readers, no writers — the easy
+case), and the cache has one logical writer. The event loop serializes
+everything. So flattr replaces locks with "there's only one thread."
 
-  ┌─ App layer (mobile/) ────────────────────────────────────┐
-  │  pan/route events fire concurrently → graph builds        │
-  └────────────────────────────┬─────────────────────────────┘
-  ┌─ Concurrency-control layer ▼─────────────────────────────┐
-  │  ★ busyRef single-flight (REAL) ★                         │ ← we are here
-  │  ✗ DB locks / MVCC version chains  (not present)          │
-  └────────────────────────────┬─────────────────────────────┘
-  ┌─ Storage layer ────────────▼─────────────────────────────┐
-  │  elevCache Map + AsyncStorage · merged graph (RAM)       │
-  └───────────────────────────────────────────────────────────┘
+```
+  Zoom out — the concurrency surface
+
+  ┌─ Runtime (single-threaded JS event loop) ───────────────────┐
+  │                                                             │
+  │  graph reads   → many "concurrent" reads, ZERO writers      │
+  │                  → no lock needed (immutable)               │
+  │                                                             │
+  │  ★ elevCache  ★ → putElev (sync) + persistNow (async)      │ ← the only
+  │     one logical writer, serialized by the event loop        │   place to look
+  │     ONE async gap (await setItem) = the only "race"         │
+  └─────────────────────────────────────────────────────────────┘
 ```
 
-Zoom in. Concurrency control is the mechanism that *enforces* the isolation `05`
-promised — it's the "how" behind "concurrent transactions don't see each other's
-mess." Two families do it: **locks** (block conflicting access — pessimistic) and
-**MVCC** (let everyone read an old version, version writes — optimistic-ish).
-flattr has no transactions to isolate, but it *does* have a concurrency problem in
-the graph-build pipeline, and it solves it with the simplest tool in the family: a
-single-flight lock. Read that lock and you understand the whole family in
-miniature.
+Zoom in. A lock answers "who may touch this row right now?" MVCC answers
+"can readers proceed without waiting for writers?" Both solve problems born
+of *true parallelism* — multiple threads or processes hitting the same byte
+at the same instant. JavaScript has no true parallelism in this code (no
+workers touching `mem`), so the problems mostly don't exist. The job here is
+to know the mechanisms cold *and* to honestly locate the one cooperative-
+scheduling race flattr does have.
 
 ## The structure pass
 
-**Layers** (by what's being guarded):
-1. **The DB lock manager** — `not present`.
-2. **The MVCC version store** — `not present`.
-3. **The app-level lock** — `busyRef` (`useTileGraph.ts:113`), a boolean
-   mutex serializing graph builds. **Real.**
-4. **The implicit single-thread** — JS's event loop, which gives flattr a *lot*
-   of concurrency safety for free.
+**Layers.** Two access patterns: read-only graph access (trivially safe) and
+read-modify-write on the cache `Map` (the only mutable shared state).
 
-**Axis traced — "what stops two operations from clobbering each other?"**
+**Axis — what serializes access here?** Trace it:
 
 ```
-  axis — "what enforces mutual exclusion?" — across the layers
+  Axis: "what prevents a corrupting interleave?"
 
-  ┌─ Postgres (reference) ──────────────────┐
-  │  row locks + MVCC snapshots              │  engine-managed, per row
-  └────────────────────┬─────────────────────┘
-       seam ═══════════╪═══════  (flattr has neither)
-  ┌─ flattr graph build ───▼─────────────────┐
-  │  busyRef boolean: "a build is running"    │  hand-rolled, whole-pipeline mutex
-  └────────────────────┬─────────────────────┘
-       seam ═══════════╪═══════  (below the lock, single-threaded)
-  ┌─ flattr elevCache put ─▼─────────────────┐
-  │  JS event loop: no true parallelism       │  no two puts run AT THE SAME instant
-  └───────────────────────────────────────────┘
+  ┌─ graph reads ───────────────┐  → IMMUTABILITY (nothing to corrupt)
+  └─────────────────────────────┘
+  ┌─ putElev (sync) ────────────┐  → THE EVENT LOOP (runs to completion,
+  │  mem.set + schedule timer   │     no preemption mid-function)
+  └─────────────────────────────┘
+  ┌─ persistNow (async) ────────┐  → the event loop UNTIL `await`, then a
+  │  await setItem(blob)        │     yield point where mem can change
+  └─────────────────────────────┘
+
+  immutability, then cooperative scheduling, then one yield gap
 ```
 
-The axis-answer flips at two seams. flattr leans on the *bottom* seam hard: JS is
-single-threaded, so within one synchronous block nothing else runs — `putElev`'s
-check-then-set can't be torn by a parallel thread. The middle seam (`busyRef`) is
-where flattr *adds* exclusion the runtime doesn't give it: across `await` points,
-the event loop *can* interleave, so two async builds could overlap — `busyRef`
-prevents that. That single boolean is flattr's entire lock manager.
+**Seam.** The load-bearing boundary is **sync vs. async**. Synchronous code
+(`putElev`, `getElev`) is uninterruptible — the event loop runs each to
+completion, which is an implicit exclusive lock. The async `await setItem`
+inside `persistNow` is the *one* place control yields, so it's the only
+boundary where flattr's "lock" releases mid-operation. That seam is the only
+concurrency subtlety in the whole repo.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You know `await` yields. The instant you `await fetch(...)`, the event loop is
-free to run *other* code — including a second copy of the same function triggered
-by another tap. That's the only concurrency JS gives you, and it's enough to cause
-a lost update if two copies read-modify-write the same state across an await. A
-lock is the wall that says "second copy, wait your turn."
+You already rely on this every day: in React, a synchronous event handler
+runs to completion before any other handler — you never worry that two
+`onClick`s interleave mid-function, because JS doesn't preempt. That run-to-
+completion guarantee *is* an exclusive lock you didn't have to ask for.
+Concurrency control in a database is what you'd need if that guarantee
+*didn't* hold — if two threads could be halfway through `mem.set` at once.
 
 ```
-  the pattern — two concurrency-control strategies
+  The concurrency-control kernel — pick one
 
-  PESSIMISTIC (lock first):           OPTIMISTIC (check at commit):
-  acquire lock ─► read ─► write       read (note version) ─► write ─► 
-  ─► release                          commit IF version unchanged
-       ▲ blocks others up front            ▲ no blocking; retry on conflict
-  good when conflicts are common      good when conflicts are rare
+  PESSIMISTIC (locks)              OPTIMISTIC (MVCC / version check)
+  ┌──────────────────────┐         ┌──────────────────────────────┐
+  │ acquire lock         │         │ read row + its version       │
+  │ read-modify-write    │         │ compute new value            │
+  │ release lock         │         │ write IF version unchanged   │
+  │ others WAIT          │         │   else retry (others proceed)│
+  └──────────────────────┘         └──────────────────────────────┘
+   block to avoid conflict          assume no conflict, detect+retry
+
+  flattr uses NEITHER — the event loop is the lock
 ```
 
-flattr's `busyRef` is pessimistic single-flight: grab the flag, do the whole
-build, release. MVCC (Postgres's default) is the optimistic-ish opposite — readers
-never block writers because each sees a consistent *snapshot*.
+### Move 2 — the mechanisms, and flattr's stance on each
 
-### Move 2 — the mechanisms, one at a time
-
-**flattr's real lock: `busyRef` single-flight.** The whole concurrency-control
-story flattr actually ships:
+**Pessimistic locking — block until it's safe.** A writer takes an exclusive
+lock on a row; everyone else waits. What breaks without it under true
+parallelism: two writers read the same value, both increment, one update is
+lost (the lost-update anomaly). flattr never takes a lock because the event
+loop already serializes the read-modify-write in `putElev`:
 
 ```ts
-// mobile/src/useTileGraph.ts:113, 166-227 — the hand-rolled mutex
-const busyRef = useRef(false);                 // line 113: the "lock"
-const pump = useCallback(() => {
-  if (busyRef.current) return;                 // line 167: LOCK HELD → bail (don't start)
-  // …pick corridor or view request…
-  busyRef.current = true;                      // line 182: ACQUIRE
-  (async () => {
-    try { /* fetchOverpass + buildGraph (spans awaits) */ }
-    finally {
-      busyRef.current = false;                 // line 222: RELEASE
-      pump();                                   // line 224: hand off to the next waiter
-    }
-  })();
-}, []);
+// features/routing/../mobile/src/elevCache.ts:35-40 — uninterruptible RMW
+export function putElev(key: string, value: number): void {
+  if (mem.has(key)) return;          // ┐ this whole function runs to
+  mem.set(key, value);               // │ completion with NO yield point —
+  dirty = true;                      // │ no await → the event loop can't
+  if (!persistTimer)                 // │ interleave another putElev here
+    persistTimer = setTimeout(persistNow, PERSIST_DEBOUNCE_MS); // ┘
+}
 ```
 
-Line 167 is `tryLock` — if a build is running, the new request doesn't queue up a
-parallel build, it just returns (the request was already stashed in
-`pendingViewRef`/`pendingCorridorRef`, so it's not lost). Line 182 acquires, line
-222 releases in `finally` (so a thrown error still unlocks — the bug that *not*
-using `finally` would cause: a permanently stuck lock). Line 224 is the **fairness
-mechanism**: on release, immediately `pump()` the next pending request, with the
-corridor (route) prioritized over the viewport (pan). That's a tiny scheduler.
+There's no `await` in `putElev`, so it's atomic by construction. That's a
+free exclusive lock on `mem` for the duration of the function. Lost updates
+are impossible here.
 
-```
-  busyRef as a lock + queue (one build at a time)
+**Optimistic concurrency / MVCC — let readers run, version the writes.**
+MVCC keeps multiple versions of a row so readers see a consistent snapshot
+while a writer prepares the next version — readers never block writers.
+flattr has nothing like this because it has no concurrent readers-of-writes:
+the cache is read by the same single thread that writes it. The closest
+flattr gets to a version is the *key* `"flattr.elevCache.v1"` — a schema
+version, not a row version (`elevCache.ts:7`). What would force MVCC: a
+background worker reading the cache while the main thread rewrites it — which
+flattr doesn't do.
 
-  tap/pan ──► pendingViewRef    ─┐
-  route   ──► pendingCorridorRef ─┤
-                                  ▼
-                         ┌─ pump() ──────────────┐
-                         │ if busyRef: return     │  ← lock check
-                         │ else acquire, build,   │
-                         │      release, pump next │  ← corridor first
-                         └────────────────────────┘
-   guarantees: exactly ONE build in flight; never two overlapping
-   what it buys: no duplicate elevation fetches → stays under API throttle
-```
+**The one real race — the async persist gap.** Here's the honest finding.
+`persistNow` is `async` and yields at `await setItem`:
 
-What breaks without it: two builds for overlapping regions run at once, both miss
-the same elevation cells, both hit the throttled Open-Meteo API — defeating the
-cache's entire purpose (`useTileGraph.ts:6-7` comment says this explicitly: "One
-network build runs at a time… to stay under the free rate limits"). The lock isn't
-about data corruption here; it's about *not duplicating expensive work* — which is
-one of the two classic reasons to lock.
-
-**The lost-update flattr avoids by single-threading.** `putElev`
-(`elevCache.ts:35-40`) is a read-modify-write: check `mem.has(key)`, then `mem.set`
-+ flip `dirty`. In a multithreaded language this is a textbook race (two threads
-both see "absent," both set, both schedule a persist). In JS it's safe because the
-whole function is synchronous — no `await` inside it — so the event loop can't
-interleave another `putElev` between the check and the set. **Inference:** flattr
-relies on JS's single-threaded execution as an implicit lock here; it's correct,
-but it's correct *by accident of the runtime*, not by a chosen mechanism. Move
-`putElev` to a worker thread (Web Worker / Worklet — and note `contrl` in your
-portfolio uses Worklets) and the race returns.
-
-**Database locks (the reference flattr lacks).** A real engine guards *rows*, not
-the whole pipeline. **Two-phase locking (2PL)**: a transaction acquires locks as
-it touches rows (growing phase), holds them, and releases all at commit
-(shrinking phase) — never re-acquiring after the first release. That ordering is
-what makes serializability provable.
-
-```
-  2PL — the lock lifecycle a real DB uses (flattr has none)
-
-  growing phase            shrinking phase
-  acquire ─ acquire ─ acquire │ release ─ release ─ release
-  ───────────────────────────┘ (no acquire after first release)
-       ▲ this discipline is what guarantees serializable schedules
+```ts
+// mobile/src/elevCache.ts:42-57 — the only yield point in the write path
+async function persistNow(): Promise<void> {
+  persistTimer = null;
+  if (!dirty) return;
+  dirty = false;                                  // ← cleared BEFORE the await
+  try {
+    let entries = [...mem.entries()];             // snapshot of mem
+    // … cap to MAX_ENTRIES …
+    await AsyncStorage.setItem(STORAGE_KEY,        // ← YIELD: control returns to
+      JSON.stringify(Object.fromEntries(entries)));//   the event loop here
+  } catch {
+    dirty = true;                                  // failed → mark for retry
+  }
+}
 ```
 
-The cost: locks block, and blocking creates **deadlock** — txn A holds row 1 and
-wants row 2, txn B holds row 2 and wants row 1. Real engines detect the cycle and
-abort one. flattr's single lock can't deadlock (one lock, no cycle possible) —
-which is the upside of the dead-simple design.
-
-**MVCC (the reference flattr lacks).** Postgres's default. Instead of readers
-locking, every row carries version metadata (`xmin`/`xmax` — the txn that created
-and the txn that deleted it). A reader gets a *snapshot*: it sees the versions
-committed as of when its transaction started, ignoring newer ones. So **readers
-never block writers and writers never block readers** — only writer-writer
-conflicts on the same row need resolution.
+Trace the interleave at the `await`:
 
 ```
-  MVCC — readers see a snapshot, writers append versions (flattr has none)
+  Execution trace — putElev during an in-flight persist
 
-  row "x":  v1 (xmin=10) ──► v2 (xmin=20) ──► v3 (xmin=30)
-  reader started at txn 25 → SEES v2 (latest committed ≤ 25), ignores v3
-  writer creating v3 → does NOT block the reader on v2
-       ▲ the cost: dead versions pile up → VACUUM must reclaim them
+  time  event                              dirty  mem        persisting?
+  ────  ─────────────────────────────────  ─────  ─────────  ───────────
+  t0    persistNow: dirty=false            false  {a,b}      yes (await)
+  t1    putElev("c") runs (sync)           TRUE   {a,b,c}    yes
+  t2    setItem(blob of {a,b}) resolves    true   {a,b,c}    no
+  t3    no timer pending? putElev set one  true   {a,b,c}    scheduled
+  t4    next persistNow writes {a,b,c}     false  {a,b,c}    yes
+  ────────────────────────────────────────────────────────────────────
+  outcome: "c" is durable after the NEXT debounce — never lost
 ```
 
-Interesting flattr parallel: the **graph itself is naturally MVCC-ish.** Because
-`graph.json` is immutable, every reader sees the same consistent snapshot forever
-— no versioning needed because nothing ever creates a v2. flattr gets MVCC's
-"readers see a stable snapshot" guarantee *for free* by making the data read-only.
-That's the deepest point in this file: **immutability is the cheapest concurrency
-control there is.** No lock, no version chain, no vacuum — just never mutate.
+The snapshot `[...mem.entries()]` is taken *before* the await, so the
+in-flight write persists the old set, but `putElev` re-set `dirty = true` and
+scheduled another flush — so `"c"` lands on the next cycle. **No entry is
+lost; durability is just delayed by one debounce.** This is the entire
+concurrency story of flattr, and it's benign by construction. The reason it's
+safe: `mem` only ever *grows* (`putElev` no-ops on existing keys,
+`elevCache.ts:36`), so a stale snapshot can only miss new keys, never
+corrupt old ones.
 
-### Move 2.5 — current vs future
+**Two-phase locking, deadlock, write-skew — none present.** flattr never
+holds two locks (it holds zero), so there's no lock-ordering, no deadlock, no
+write-skew. Naming their absence is correct: these are problems of multiple
+locks under true parallelism, and flattr has neither.
+
+### Move 2.5 — current vs. future (the trigger)
 
 ```
-  Phase A (now)                      Phase B (writable / sync)
-
-  graph: immutable → free MVCC       graph user-data: mutable → real CC needed
-  builds: busyRef single-flight      writes: row locks OR MVCC snapshots
-  elevCache: JS single-thread safe   shared store: actual lock manager
-  deadlock: impossible (1 lock)      deadlock: possible → detection needed
-  carries over: the routing graph STAYS immutable; only new mutable data
-                (saved routes, sync) needs locks/MVCC.
+  Phase A (now)                        Phase B (true parallelism arrives)
+  ┌──────────────────────────────┐     ┌──────────────────────────────┐
+  │ one JS thread, no workers     │     │ a Worklet / native thread     │
+  │ event loop = implicit lock    │     │ touching the same store       │
+  │ async gap is benign (mem grows│     │ → real data race on mem       │
+  │   only)                       │     │ → need a lock or atomic store │
+  │ VERDICT: nothing to add       │     │ VERDICT: lock or move to SQLite│
+  └──────────────────────────────┘     └──────────────────────────────┘
 ```
+
+**The trigger:** the first piece of state written from *two* JS execution
+contexts at once — a `react-native-worklets` worklet (which `contrl` uses for
+the vision pipeline) writing a shared store, or two processes via a shared
+SQLite file. At that point the event-loop "lock" no longer covers both
+writers and you need a real one. What *doesn't* change: graph reads stay
+lock-free forever because the graph is immutable.
 
 ### Move 3 — the principle
 
-Concurrency control is the cost you pay to let multiple writers share state safely
-— and the cheapest version is to *not share mutable state at all.* flattr does
-exactly that for its main dataset (immutable graph = free snapshot isolation) and
-uses the smallest possible real lock (one boolean, single-flight) only where it
-genuinely has overlapping async work. When you read any system, find the mutable
-shared state first — that's the only place concurrency control can possibly be
-needed, and if there isn't any, the absence of locks is correct, not a gap.
+Concurrency control is only necessary when **two writers can be mid-operation
+on the same state at the same instant.** Single-threaded cooperative
+scheduling eliminates that for synchronous code — run-to-completion is a free
+exclusive lock — and immutability eliminates it for reads. flattr leans on
+both. The skill is spotting the *yield points* (`await`) where the free lock
+releases, and proving what can change across them. flattr has exactly one,
+and it's safe because the only mutation is append.
 
 ## Primary diagram
 
 ```
-  flattr's concurrency control — real lock, free snapshot, missing engine CC
+  flattr's concurrency control — the event loop is the lock
 
-  ┌─ REAL: busyRef single-flight (useTileGraph.ts:113) ──────────┐
-  │  pending requests ─► pump(): tryLock → build → unlock → next │
-  │  guarantees ONE build in flight; corridor prioritized        │
-  │  buys: no duplicate elevation fetches (under API throttle)   │
-  └───────────────────────────────────────────────────────────────┘
-  ┌─ FREE: immutable graph = snapshot isolation ─────────────────┐
-  │  graph.json never mutated → every reader sees one stable view │
-  │  no lock, no version chain, no vacuum needed                  │
-  └───────────────────────────────────────────────────────────────┘
-  ┌─ MISSING (not yet exercised): engine concurrency control ────┐
-  │  ✗ 2PL row locks   ✗ MVCC version chains   ✗ deadlock detect │
-  │  trigger: a writable, shared, multi-writer store (sync)      │
-  └───────────────────────────────────────────────────────────────┘
+  ┌─ graph (immutable) ─────────────────────────────────────────┐
+  │  many concurrent reads, zero writers → no lock needed        │
+  └─────────────────────────────────────────────────────────────┘
+  ┌─ elevCache mem (Map) — the only mutable shared state ───────┐
+  │                                                             │
+  │  putElev (SYNC)  ────────────► runs to completion           │
+  │    = implicit exclusive lock (no await, no interleave)      │
+  │                                                             │
+  │  persistNow (ASYNC) ─── await setItem ──► YIELD POINT       │
+  │    │                                       │                │
+  │    └─ snapshot taken BEFORE yield          └─ mem may grow  │
+  │       (so stale snapshot only MISSES new keys, never loses) │
+  │    dirty re-set by putElev → re-persisted next debounce     │
+  └─────────────────────────────────────────────────────────────┘
+       TRIGGER → a worklet/process writes mem too → real race → lock
 ```
 
 ## Elaborate
 
-The lock-vs-MVCC split is the central tradeoff in concurrency control. Pure 2PL
-(SQL Server's default historically) gives strong guarantees but readers and
-writers block each other, killing read throughput. MVCC (Postgres, Oracle, MySQL
-InnoDB) decouples them at the cost of version bloat and a vacuum process to reclaim
-dead rows. Most modern engines are MVCC because read-heavy workloads dominate —
-and flattr's workload is the read-heavy extreme, which is exactly why its
-"immutable data = free MVCC" instinct is the right one.
-
-Optimistic concurrency (read a version number, write only if it hasn't changed,
-retry on conflict) is the other lever — it's what you'd reach for in flattr-with-
-sync if conflicts are rare: each saved-route write carries a version, and a
-conflicting concurrent write triggers a client-side merge/retry rather than a
-server-side lock. It's the same pattern as an HTTP `If-Match` / ETag, which you've
-almost certainly used — optimistic concurrency *is* ETags for the database.
+MVCC (Postgres's default, via row versions + visibility rules) and 2PL
+(SQL Server's classic) are two answers to the same question: how do readers
+and writers coexist without one blocking the other into a stall. flattr
+sidesteps the question because its readers and writers are the same single
+thread — there's nothing to coordinate. This is the same reason
+single-threaded Redis needs no locks: serialize everything through one
+executor and concurrency control collapses into ordering. The lesson that
+transfers: before reaching for a lock, ask whether you can serialize the
+writers instead — a single-writer design deletes the entire problem class,
+which is exactly what flattr (and Redis, and an event-sourced log) do.
 
 ## Interview defense
 
-**Q: "Does flattr do any concurrency control?"**
-
-> One real piece: `busyRef` in `useTileGraph.ts` is a single-flight lock that
-> serializes graph builds so two overlapping async builds can't both hammer the
-> throttled elevation API. It acquires before the build, releases in `finally`,
-> and pumps the next pending request (corridor before viewport). Beyond that,
-> flattr leans on two free guarantees: JS's single thread protects the elevCache's
-> read-modify-write, and the immutable graph gives every reader a stable snapshot
-> with no locking at all.
+**Q: flattr writes a cache from an async function. Is there a race?**
+There's one yield point — `await setItem` in `persistNow`
+(`elevCache.ts:51`) — and it's benign. The snapshot of `mem` is taken before
+the await, so an in-flight persist writes the old set; but `putElev` running
+during the await re-sets `dirty` and schedules another flush, so the new key
+lands one debounce later. It's safe specifically because `mem` only grows
+(`putElev` no-ops on existing keys), so a stale snapshot misses new entries
+but never corrupts old ones. No lock needed.
 
 ```
-  busyRef: tryLock → build → finally release → pump next (one at a time)
-  immutable graph: free snapshot isolation (never mutated → no v2)
+  await setItem = the only yield; mem grows-only ⇒ stale snapshot is safe
 ```
+*Anchor: one yield point, append-only mem — the race exists but loses
+nothing.*
 
-Anchor: *immutability is the cheapest concurrency control — flattr's main dataset
-needs no locks because it's never written.*
-
-**Q: "What's the load-bearing part of that lock people forget?"**
-
-> Releasing in `finally`. The lock is set true before an async build that can
-> throw (Overpass 429, offline). If release weren't in `finally`, a thrown error
-> would leave `busyRef` stuck true forever and no build would ever run again —
-> a permanent deadlock from a single dropped exception. `useTileGraph.ts:222`
-> puts it in `finally` exactly so a failed build still unlocks.
-
-Anchor: *a lock's release must be exception-safe or one error wedges the whole
-system — the `finally` is the part that makes the mutex correct.*
+**Q: Why no locks or MVCC anywhere?**
+Because there's no true parallelism on shared mutable state. Graph reads are
+lock-free by immutability; the cache has one logical writer serialized by the
+event loop, which gives synchronous code a free exclusive lock
+(run-to-completion). Locks and MVCC solve problems born of two writers
+mid-operation at the same instant — flattr never has that until a worklet or
+second process touches the same store.
+*Anchor: the event loop IS the lock; immutability covers the reads; locks
+arrive with true parallelism.*
 
 ## See also
 
-- `05-transactions-isolation-and-anomalies.md` — the isolation this enforces
-- `07-wal-durability-and-recovery.md` — durability of the writes this guards
-- `02-records-pages-and-storage-layout.md` — the elevCache read-modify-write
-- `../study-runtime-systems/` — the JS event loop and single-flight pattern
-- `../study-distributed-systems/` — optimistic concurrency / version vectors at scale
+- `05-transactions-isolation-and-anomalies.md` — isolation, the sibling
+  guarantee.
+- `07-wal-durability-and-recovery.md` — what the persist actually guarantees.
+- `study-runtime-systems` — the event loop as the execution model.

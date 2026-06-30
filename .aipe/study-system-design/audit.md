@@ -1,244 +1,233 @@
-# System Design Audit — flattr
+# System-design audit — flattr
 
-Pass 1 of the two-pass study shape. This file walks the 8 system-design lenses
-against flattr as it actually stands. Each lens names what the codebase does
-with `file:line` grounding, or says `not yet exercised` honestly. Where a
-finding is load-bearing enough to deserve a deep walk, it cross-links to a
-Pass-2 pattern file.
-
-The one-sentence verdict: flattr is a **build-time/runtime-split, backend-less,
-local-first router** whose most interesting move is that the *same pipeline
-that builds the artifact offline re-runs on-device* to extend coverage past the
-prebuilt slice.
+Pass 1. Eight lenses, each walked against the codebase. Findings are grounded in
+`file:line`. Where a lens finds nothing, it says `not yet exercised` — flattr is a
+single-device app over a static artifact, so several distributed/scale lenses are
+honestly empty. Inferred behavior is labeled **[inference]**.
 
 ---
 
 ## 1. system-map-and-boundaries
 
-Two execution contexts, one shared engine.
+flattr has **two execution contexts and one trust boundary that matters**: the
+build-time pipeline (Node, your machine, `npm run build:graph`) and the runtime app
+(Expo / React Native, the phone). Between them sits a static artifact —
+`data/graph.json`, copied to `mobile/assets/graph.json` (544 KB on disk).
 
-**Build-time (Node, `tsx`).** `pipeline/run-build.ts:40-52` is the entrypoint
-(`npm run build:graph`). It fetches OSM for a fixed bbox
-(`pipeline/config.ts:10`, a Capitol Hill slice of Seattle), runs
-`buildGraph(...)` (`pipeline/build-graph.ts:12-30`), and writes a single JSON
-file (`pipeline/run-build.ts:11-13`, `JSON.stringify(graph)` to
-`data/graph.json`). No server is involved; this runs on a laptop.
+Major components and responsibilities:
 
-**Runtime (Expo / React Native).** `mobile/src/loadGraph.ts:7` statically
-imports `../assets/graph.json` — the build artifact, copied in by hand. The app
-reads it and routes. There is **no live backend and no database**
-(context.md confirms: "No live backend / DB"). State lives in React and in one
-AsyncStorage key.
+- **Build pipeline** (`pipeline/`) — owns turning OSM + elevation into a `Graph`.
+  Entry `pipeline/run-build.ts:40`; orchestration `pipeline/build-graph.ts:12`.
+- **Shared engine** (`features/`, `lib/`) — owns graph representation, cost, and
+  search. Used by *both* contexts; `pipeline/build-graph.ts:2` notes it imports no
+  `node:fs` precisely so it bundles for the app.
+- **Artifact** — `mobile/assets/graph.json`, read once at startup
+  (`mobile/src/loadGraph.ts:9`). This is the entire persisted state.
+- **Runtime coverage engine** (`mobile/src/useTileGraph.ts:96`) — owns fetching and
+  merging additional graph regions on-device.
+- **UI** (`mobile/src/MapScreen.tsx`) — owns routing invocation, display, and the
+  honesty card.
 
-**The shared engine.** `features/`, `lib/`, and `pipeline/` are framework-free
-TypeScript modules used by both contexts. Metro (the RN bundler) only watches
-files inside the project root, so `mobile/scripts/sync-engine.mjs:15-19` copies
-those three directories into `mobile/.engine/` at build time. That copy is the
-seam that lets the device run the build-time pipeline.
+**Trust / external boundaries.** Three stateless third-party APIs, all reached over
+HTTPS, none holding flattr state: Overpass (`pipeline/overpass.ts:4`), Open-Meteo /
+Google Elevation (`pipeline/elevation.ts:92`, `:65`), Nominatim geocode
+(`pipeline/geocode.ts:5`). Each is rate-limited and treated as untrusted-for-
+availability — every call has a fallback or a retry. No API keys ship in the app:
+Google requires `GOOGLE_ELEVATION_KEY` and is build-time only
+(`pipeline/run-build.ts:23`); the runtime uses keyless Open-Meteo.
 
-**Trust boundaries / external dependencies.** Three external HTTP services,
-all best-effort:
-- Overpass (`pipeline/overpass.ts:4`, `overpass-api.de`) — OSM street geometry.
-- Elevation — Google (`pipeline/elevation.ts:72`) or Open-Meteo
-  (`pipeline/elevation.ts:106`), selected at `pipeline/run-build.ts:22-38`.
-- Nominatim (`pipeline/geocode.ts:5`) — address → coordinates, used by the
-  `AddressBar`.
+The sharp boundary: **the artifact**. Everything above it is your build machine;
+everything below is the user's phone. → deep walk in `01-build-time-graph-artifact.md`.
 
-→ The build-time/runtime split is the whole architecture: see
-`01-build-time-graph-artifact.md`.
-→ The on-device re-run of the pipeline: see `02-on-device-pipeline-rerun.md`.
+---
 
 ## 2. request-response-and-data-flow
 
-There is no request/response in the classic web sense — no HTTP handlers, no
-API routes. The flows are (a) the build pipeline, run once offline, and (b) two
-on-device data-acquisition flows.
+There is no server request flow. The two flows that matter are both client-side.
 
-**Build flow** (`pipeline/build-graph.ts:21-29`), strictly sequential:
-parse OSM → split ways into ≤12m edges → sample elevation → compute signed
-grades → build adjacency → serialize. Each stage feeds the next; no parallel
-fan-out. The elevation stage is the slow one (network-bound,
-`pipeline/elevation.ts:96-115` throttles and backs off).
+**Flow A — cold start + route** (the happy path):
 
-**Viewport flow** (runtime). A map pan fires `onRegionDidChange`
-(`mobile/src/useTileGraph.ts:245-258`), debounced 600ms, which enqueues a
-viewport build and calls `pump()`. The pump runs the *same pipeline* for the
-panned bbox.
+```
+  loadGraph (bundled JSON)  ─►  baseGraph
+  tap From / To             ─►  setStartPt/setEndPt (coordinates, not node ids)
+  endpoints effect          ─►  ensureBbox(corridor)  ─► on-device pipeline build
+  graph (merge+stitch)      ─►  nearestNode re-snap   ─► directedAstar
+  result                    ─►  routeToGeoJSON + routeSummary + honest card
+```
 
-**Corridor flow** (runtime). When both route endpoints are set, an effect in
-`mobile/src/MapScreen.tsx:139-148` calls `ensureBbox(...)` over the bounding box
-of start+end, which builds the *entire corridor in one fetch* rather than
-per-tile. Corridor builds take priority over viewport builds in the pump
-(`mobile/src/useTileGraph.ts:170-177`).
+Grounded: `MapScreen.tsx:139` (endpoint effect → `ensureBbox`), `:133` (re-snap
+`nearestNode` against the *current* graph), `:151` (one `directedAstar` call). The
+deliberate move: endpoints are stored as **coordinates**, and the node id is
+re-derived every time the graph changes (`MapScreen.tsx:58`, `:133`) — so a closer
+node appearing mid-load re-snaps correctly.
 
-The handoff that makes this work: endpoints are stored as **coordinates, not
-node ids** (`mobile/src/MapScreen.tsx:57-60`), so `nearestNode` re-derives the
-snap target as new tiles load (`mobile/src/MapScreen.tsx:132-134`).
+**Flow B — pan to load grades** (`useTileGraph.ts`):
 
-→ Deep walk of the two single-fetch flows and how tiles stitch in:
-`03-tile-merge-stitch.md`.
+```
+  onRegionDidChange ─debounce 600ms─► queueViewport ─► pump (single-flight)
+       │                                                  │
+       │  gate: span ≤ MAX_LOAD_SPAN_DEG, grades toggled on
+       ▼                                                  ▼
+  fetchOverpass ─► buildGraph (cached+bestEffort elev) ─► prefixGraph ─► setView
+```
+
+Parallel vs serial: **deliberately serial.** Only one network build runs at a time
+(`busyRef`, `useTileGraph.ts:113`), with the route corridor prioritized over the
+viewport (`pump`, `:170`) so a pending route isn't starved by panning. This is a
+*throughput sacrifice to stay under free-tier rate limits* — named, not apologized
+for. → `02-on-device-pipeline-rerun.md`, `03-tile-merge-stitch.md`.
+
+---
 
 ## 3. state-ownership-and-source-of-truth
 
 | State | Owner | Where | Mutability |
-|---|---|---|---|
-| base coverage graph | the build artifact | `mobile/assets/graph.json` via `loadGraph.ts:7` | immutable at runtime |
-| viewport / corridor regions | `useTileGraph` hook | `useState` + refs, `useTileGraph.ts:107-120` | rebuilt on pan/route |
-| `userMax` (the one knob) | `MapScreen` | `useState`, `MapScreen.tsx:56` | user-controlled |
-| route endpoints | `MapScreen` | coordinates, `MapScreen.tsx:59-60` | user-controlled |
-| elevation samples | `elevCache` module | in-memory `Map` + AsyncStorage, `elevCache.ts` | append-only, LRU-capped |
+| --- | --- | --- | --- |
+| Base graph | the artifact | `mobile/assets/graph.json` via `loadGraph.ts` | immutable (rebuild to change) |
+| Viewport / corridor regions | `useTileGraph` | `view`/`corridor` React state + refs | mutable, rebuilt on pan/route |
+| Merged routing graph | derived | `useMemo` over base+corridor+view (`useTileGraph.ts:132`) | recomputed, never stored |
+| Endpoints | `MapScreen` | `startPt`/`endPt` as **coordinates** (`:59`) | user-set |
+| `userMax` (the one knob) | `MapScreen` | `useState` (`:56`) | user-set via slider |
+| Elevation cache | `elevCache` module | in-memory `Map` + AsyncStorage (`elevCache.ts:11`) | append-only, never invalidated |
 
-The source of truth for *geometry and grades* is the merged graph computed in
-`useTileGraph.ts:132-145` (`mergeGraphs([base, corridor, view])` then
-`stitchGraph`). Notice there are **two derived graphs**: a *routing* graph that
-includes degraded (flat-fallback) regions because connectivity matters more
-than grade fidelity (`useTileGraph.ts:132-145`), and a *display* graph that
-excludes degraded regions so fake all-green grades don't paint over real ones
-(`useTileGraph.ts:150-162`). That split is a deliberate source-of-truth call.
+The source-of-truth discipline worth noting: **node ids are derived, not stored.**
+The canonical endpoint is its lat/lng; the routable node id is re-derived from the
+live graph (`MapScreen.tsx:133`). This is what lets corridor tiles load without
+breaking an in-progress route. The single product knob, `userMax`, flows into the
+cost function (`cost.ts:16`) and the display bands (`classify.ts`) — one value,
+two consumers.
 
-`userMax` is the single global knob the whole product keys off — it flows into
-the cost function (`cost.ts:32-33`), the route summary (`summary.ts`), and the
-heatmap bands (`classify.ts:41-43`). One value, three consumers.
+---
 
 ## 4. caching-and-invalidation
 
-One real cache: the persistent elevation cache.
+One real cache, and a coverage check that acts like a second.
 
-`mobile/src/elevCache.ts` keeps an in-memory `Map` keyed by ~90m DEM cell
-(`useTileGraph.ts:36`, `cellKey`) and mirrors it to a single AsyncStorage key
-`flattr.elevCache.v1` (`elevCache.ts:7`). Writes are debounced 4s
-(`elevCache.ts:8,39`) and the store is LRU-capped at 50k entries
-(`elevCache.ts:9,47-51`). It loads once on mount (`useTileGraph.ts:126-128`),
-so areas fetched in a prior session have instant elevation and cost zero API
-calls.
+**Elevation cache** (`mobile/src/elevCache.ts`) — keyed by ~90m DEM cell
+(`useTileGraph.ts:36`), in-memory `Map` mirrored to AsyncStorage
+(`STORAGE_KEY = "flattr.elevCache.v1"`, `elevCache.ts:7`). Writes debounced 4 s and
+batched (`:8`, `:39`); a 50 000-entry cap drops oldest first (`:9`, `:48`).
+**Invalidation strategy: none, by design** — "DEM samples never change, so cached
+values are valid forever" (`elevCache.ts:3`). Only successfully-fetched values are
+cached; flat-fallback zeros are not (`useTileGraph.ts:52-58`). This is the right
+call: the underlying data is genuinely immutable, so an invalidation policy would
+be pure overhead. → `05-elevation-provider-fallback.md`.
 
-**Invalidation strategy: there isn't one, by design.** Elevation for a fixed
-location is effectively constant, so entries are never invalidated — only
-LRU-dropped under the 50k cap. The cache is keyed `v1` so a schema bump can
-abandon the old blob.
+**Coverage check as cache** — `covers()` (`useTileGraph.ts:82`) is a read-through
+guard: if the base graph or the current region already contains a requested bbox,
+skip the fetch entirely (`:233`, `:273`). The twist: a **degraded** region (built
+with flat-fallback elevation) reports `covers → false` so it gets refetched and
+upgraded once the API recovers (`:83`). Stale-grade behavior is explicit: degraded
+regions stay in the *routing* graph (flat grades still connect) but are excluded
+from the *display* graph so bogus all-green doesn't paint over real grades
+(`useTileGraph.ts:132` vs `:150`).
 
-The graph artifact itself is a build-time cache of OSM+elevation with **manual
-invalidation**: you re-run `npm run build:graph` and copy the file. There is no
-automatic freshness check.
-
-→ Deep walk of the provider fallback + this cache:
-`05-elevation-provider-fallback.md`.
-
-In-pipeline (build-time) caching is `not yet exercised` — each
-`npm run build:graph` re-fetches Overpass and elevation from scratch
-(`pipeline/overpass.ts:21-48` has no cache layer).
+---
 
 ## 5. storage-choice-and-durability-boundaries
 
-The defining choice: **no datastore at all.** The "database" is a static JSON
-file bundled into the app.
+**There is no datastore.** The entire persistent state is one JSON file. This is the
+defining architectural choice, so it deserves a clear statement of *why*:
 
-- **Build artifact** — `data/graph.json` (`run-build.ts:48`), copied to
-  `mobile/assets/graph.json`. Durability is "it's in the git tree / app
-  bundle." No write path at runtime.
-- **AsyncStorage** — one key, the elevation cache (`elevCache.ts:7`). This is
-  the only persistent runtime write. Durability is best-effort key-value on the
-  device; a failed write just retries on the next put (`elevCache.ts:55`).
+- The graph is read-only at runtime and rebuilt offline. A database would add a
+  server, a query layer, and an availability dependency to serve data that never
+  changes between builds. The file wins on cold-start latency (no network, no query)
+  and on operational cost (no server). → `01-build-time-graph-artifact.md`.
+- Durability is the build's problem, not the runtime's: `run-build.ts:11` does a
+  single `writeFileSync` of `JSON.stringify(graph)`. No atomic rename, no fsync — a
+  crash mid-write corrupts `data/graph.json`, but it's regenerable from a command, so
+  the durability bar is deliberately low. **[inference]** the on-disk
+  serialization/atomicity mechanics belong to `study-database-systems`; the schema
+  shape (`features/routing/types.ts`) belongs to `study-data-modeling`.
+- The runtime's only durable store is AsyncStorage for the elevation cache
+  (`elevCache.ts`), and that's a performance cache, not a source of truth — losing it
+  costs requests, not correctness.
 
-Why this works: the data is read-mostly, single-user, and small enough to
-bundle. There is no multi-user write contention to mediate, so there is nothing
-a relational engine would buy. Schema shape (the `Node`/`Edge` records) belongs
-to **study-data-modeling**; durability internals of AsyncStorage / SQLite-style
-engines belong to **study-database-systems**. Neither is exercised here beyond
-the key-value cache.
+---
 
 ## 6. failure-handling-and-reliability
 
-This is where flattr is unusually thoughtful for a small app. Three layered
-degradations:
+This is flattr's strongest system-design area. Every external dependency can fail,
+and each failure has a named, distinct degradation:
 
-**Elevation API down → flat fallback, not failure.**
-`useTileGraph.ts:20-31` (`bestEffortElevation`) wraps any provider; on a thrown
-error it returns flat (0m) elevations and flags the region `degraded = true`.
-A route still builds — connectivity over fidelity.
+- **Elevation API down/throttled** → `bestEffortElevation` catches and returns flat
+  0 m so the build still produces a connected graph; the region is flagged
+  `degraded` and silently re-queued up to `MAX_RETRIES = 6` to self-heal
+  (`useTileGraph.ts:20`, `:209`). The user sees "Grades approximate — elevation
+  unavailable, retrying" (`MapScreen.tsx:376`). → `05-elevation-provider-fallback.md`.
+- **Overpass fails** (offline / rate-limited) → the build's `catch` keeps the last
+  region; a later pan retries (`useTileGraph.ts:219`). The build-time fetch retries
+  429/502/503/504 with linear backoff (`overpass.ts:42`).
+- **No flat route vs no route at all** → the load-bearing reliability choice:
+  `BLOCKED = 1e9` is **large-finite, not Infinity** (`cost.ts:5`), so an only-steep
+  path is still returned and flagged, distinct from a disconnected "no route"
+  (`RouteSummaryCard.tsx` three states). → `04-honest-fallback-routing.md`.
+- **GPS denied** → camera falls back to the base-area center
+  (`MapScreen.tsx:43`, `:102`); the app still works.
+- **Single-flight + corridor priority** → guarantees one in-flight build and that a
+  route never starves behind panning (`useTileGraph.ts:166`).
 
-**Degraded regions self-heal.** When a build comes back degraded, a 12s timer
-(`useTileGraph.ts:71` `RETRY_MS`, lines 209-218) silently re-queues the build,
-up to 6 times (`useTileGraph.ts:65` `MAX_RETRIES`). The user sees "Grades
-approximate — elevation unavailable, retrying" (`MapScreen.tsx:375-376`) and
-the grades fill in when the API recovers.
+**Retries:** present at three layers — build-time Overpass backoff
+(`overpass.ts:42`), runtime elevation 429 backoff (`elevation.ts:114`), and the
+self-heal degraded-region re-queue (`useTileGraph.ts:209`). **Partial failure** is
+handled per-region, not globally: one degraded tile doesn't poison neighbors.
+Coordination mechanics across nodes → `study-distributed-systems` (mostly N/A here).
 
-**"No flat route" stays distinct from "no route."** The router's `BLOCKED`
-constant is **large-but-finite** (`cost.ts:5`, `1e9`), not `Infinity`. An
-over-max edge gets a huge penalty but is still traversable, so a path made
-entirely of too-steep edges is still *returned and flagged*
-(`astar.ts:126-127` collects `steepEdges`) rather than failing as
-disconnected. The card then says "⚠ Flattest available" with a steep-block
-count (`RouteSummaryCard.tsx:28-36`).
-
-**Retry/backoff on the network edges.** Overpass retries 3× with 2s spacing
-(`overpass.ts:27-28`); Open-Meteo retries with exponential backoff on 429s
-(`elevation.ts:108-119`). On-device Overpass failure keeps the last good region
-and lets a later pan retry (`useTileGraph.ts:220`).
-
-→ The honest-fallback routing design: `04-honest-fallback-routing.md`.
-→ The elevation degradation + cache: `05-elevation-provider-fallback.md`.
-
-Coordination across multiple writers / replicas is `not yet exercised` (single
-user, single device) — that's **study-distributed-systems** territory.
+---
 
 ## 7. scale-bottlenecks-and-evolution
 
-flattr is single-user and offline-capable, so "scale" means *coverage area* and
-*per-device work*, not concurrent traffic.
+What breaks first as the covered area or the user base grows:
 
-**What breaks first.** The on-device pipeline re-run is the bottleneck. Every
-viewport pan past the base can trigger an Overpass fetch + elevation sampling +
-`buildGraph` (`useTileGraph.ts:186-197`). The guards that hold it back:
-- viewport builds only when the heatmap is on (`useTileGraph.ts:253`),
-- nothing loads when zoomed out past ~2km (`useTileGraph.ts:249`,
-  `MAX_LOAD_SPAN_DEG`),
-- corridors wider than ~13km are refused (`useTileGraph.ts:272`,
-  `MAX_CORRIDOR_SPAN_DEG`),
-- ~20% viewport padding (`useTileGraph.ts:236-237`) absorbs small pans.
+- **At 10× area** — the bundled `graph.json` (544 KB for a Capitol Hill slice) grows
+  roughly linearly; a full-city graph would bloat the app bundle and the cold-start
+  parse. `config.ts:4` explicitly keeps the bbox small for this reason. **[inference]**
+  the fix the code already anticipates: ship a smaller base and lean harder on the
+  on-device pipeline rerun (`useTileGraph.ts`), or split the artifact into lazily-
+  loaded tiles.
+- **At 10× users** — flattr has *no shared backend*, so user count doesn't load any
+  flattr server. The bottleneck moves entirely onto the **third-party free tiers**:
+  Overpass and Open-Meteo rate limits are global, not per-user, so many users panning
+  uncovered areas would collectively exhaust quota. The serial single-flight pump and
+  the 90m dedup cache (`useTileGraph.ts:113`, `elevCache.ts`) are exactly the
+  throttle-avoidance levers — but they protect *one* device, not the fleet. This is
+  the real scale ceiling: it's an externality, not internal capacity.
+- **What stays stable** — routing itself. A* over a merged in-memory graph is
+  CPU-local and independent of user count.
+- **The change that forces rearchitecture** — moving elevation/OSM fetching server-
+  side (a cache proxy in front of Overpass/Open-Meteo) the moment the global free-tier
+  ceiling is hit. That introduces the first real backend, the first shared cache, and
+  the first distributed-systems concerns — none of which exist today.
 
-**At 10×** (a metro-wide route): the corridor build is one big Overpass query
-and a large elevation batch; the 13km cap (`useTileGraph.ts:272`) is the wall.
-Past it, the architecture would need to go back to *prebuilt tiles* served from
-somewhere — which is the build-time pipeline pointed at many bboxes.
-
-**At 100×** (many users): the bottleneck moves to the *external* APIs.
-Overpass and Open-Meteo are free public endpoints with rate limits; a popular
-app would hammer them. The fix is the same prebuild-and-serve move: turn the
-on-device pipeline back into an offline batch and ship tiles, which is exactly
-what `pipeline/` already is. The architecture is pre-shaped for that pivot —
-the same code runs in both places.
-
-**What stays stable.** The router (`astar.ts`), the cost model (`cost.ts`), and
-the tile algebra (`tiles.ts`) are pure and graph-size-bound; they don't care
-where the graph came from.
+---
 
 ## 8. system-design-red-flags-audit
 
-Ranked by real architectural risk, each grounded:
+Ranked by architectural risk, each grounded:
 
-1. **On-device Overpass dependency in the interactive path.** A pan or a route
-   triggers a live call to a free public OSM endpoint (`useTileGraph.ts:186`).
-   If `overpass-api.de` is slow or rate-limits, coverage extension stalls. The
-   try/catch keeps the last region (`useTileGraph.ts:220`), so it degrades
-   rather than crashes, but the UX is "grades just don't load." Mitigation
-   exists (debounce, padding, caps) but the hard dependency remains.
+1. **Free-tier rate limits are the whole reliability model** (`useTileGraph.ts`
+   single-flight + dedup + backoff; `overpass.ts`, `elevation.ts`). The app's
+   correctness under load depends on third parties whose limits are shared globally
+   and outside flattr's control. *Mitigation already present:* aggressive caching +
+   serialization + flat-fallback. *Real fix at scale:* a self-hosted proxy/cache.
+2. **`edgeById` is O(E) linear scan** (`features/routing/graph.ts:3`,
+   `Array.find`), called per edge in `routeSummary` (`summary.ts:14`) and
+   `geojson`. On the merged multi-region graph this is O(E²)-ish for summary. The
+   search engine avoids it (`indexEdges` builds an O(1) map, `astar.ts:12`), so the
+   pattern to copy already exists in the repo. *Mechanism-level perf →
+   `study-performance-engineering`.*
+3. **Non-atomic artifact write** (`run-build.ts:11`, bare `writeFileSync`). A crash
+   mid-write corrupts `graph.json`. Low blast radius (regenerable), but a temp-file +
+   rename would cost nothing.
+4. **`stitchGraph` re-scans all nodes on every merge** (`tiles.ts:45`), recomputed in
+   a `useMemo` keyed on base/corridor/view (`useTileGraph.ts:132`). For a few regions
+   this is fine; if region count grows it becomes the pan-latency cost.
+5. **No upper bound on merged-graph node count.** Each pan into new territory adds a
+   region and never evicts (`useTileGraph.ts` keeps `view`/`corridor`, base is
+   permanent). Long sessions over wide areas grow memory unbounded. **[inference]**
+   not yet a problem at the current bbox sizes; would need an LRU on regions to fix.
 
-2. **Manual artifact invalidation.** `graph.json` is rebuilt and copied by
-   hand (`loadGraph.ts:2-5` comment). There is no freshness check; the base
-   coverage can silently go stale relative to OSM. Acceptable for an MVP slice,
-   a real liability at coverage scale.
-
-3. **No backpressure on concurrent builds beyond a single boolean.** The pump
-   serializes builds with `busyRef` (`useTileGraph.ts:167,182`) and a 6-retry
-   cap, which is enough for one device — but rapid pan + route can queue a
-   corridor behind a viewport (corridor wins, `useTileGraph.ts:170`). Fine
-   today; the queueing is a single-slot pending ref, not a real queue.
-
-4. **Clamped grades hide DEM noise but also real cliffs.** Grades are clamped
-   to ±40% (`pipeline/grade.ts:10,30`) to reject coarse-DEM spikes. True `riseM`
-   is preserved for climb totals (`grade.ts:27`), so the honesty is partial,
-   but the displayed grade is a clamped value.
-
-None of these is a correctness bug; they are the deliberate costs of being
-backend-less and free-API-fed. Each has a named mitigation already in the code.
+None of these are blocking at the current scope — flattr is a small-bbox, single-
+device app and the code says so. They're the ordered list of what to harden *first*
+the moment the scope grows.
+</content>

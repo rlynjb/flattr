@@ -1,46 +1,41 @@
-# Study — Performance Engineering (flattr)
+# study-performance-engineering — flattr
 
-Measurement and optimization of flattr: what's measurably slow or expensive,
-why, and which change improves it without moving the bottleneck.
+The measurement-and-optimization view of flattr: what's measurably slow or
+expensive, why, and which change improves it without moving the bottleneck.
 
-This is an **audit-style** guide: one fixed audit walking 8 performance lenses,
-plus discovered-pattern files for the patterns flattr actually exercises.
+This is an **audit-style** guide. Pass 1 (`audit.md`) walks 8 fixed performance
+lenses across the repo. Pass 2 (`01-` … `06-`) is one concept file per
+performance pattern the repo actually exercises.
 
 ## Reading order
 
-1. **`00-overview.md`** — the verdict, the map, ranked findings, the one measured baseline.
-2. **`audit.md`** — Pass 1: the 8-lens audit, fully grounded in `file:line`.
-3. Pattern files (Pass 2), in dependency order:
-   - **`02-heuristic-pruning.md`** — A* vs Dijkstra; the measured win.
-   - **`03-lazy-deletion-heap.md`** — the binary heap; pops vs expanded as the decrease-key trigger.
-   - **`04-linear-nearest-node.md`** — O(N) snap; the latent scaling cliff; k-d tree fix.
-   - **`05-single-flight-pump.md`** — bounded concurrency / backpressure.
-   - **`06-percentile-via-sort.md`** — full sort for one percentile; quickselect upgrade.
-   - **`07-elevation-batching-and-cache.md`** — dedup + batch + persistent cache; the rate-limit defense.
-   - **`08-render-thread-search-and-debounce.md`** — debounce throttle + the JS-thread search risk.
+1. **`00-overview.md`** — the one-page map, the verdict, ranked findings,
+   `not yet exercised` notes.
+2. **`audit.md`** — Pass 1. The 8-lens audit, every claim grounded in `file:line`,
+   ending in a ranked red-flags ladder.
+3. **Pass 2 — discovered pattern files:**
+   - `01-heuristic-pruning.md` — A* vs Dijkstra, the one **measured** win
+     (3.9–7.4x fewer expansions, real bench numbers).
+   - `02-single-flight-pump.md` — concurrency=1 backpressure against free APIs.
+   - `03-linear-nearest-node-scan.md` — the O(N) snap, a latent scaling cliff.
+   - `04-zones-percentile-sort.md` — full sort where quickselect is O(n).
+   - `05-elevation-dedup-and-cache.md` — the real rate-limit defense.
+   - `06-debounced-throttled-fetch.md` — the debounce/throttle layer.
 
-## The 8 lenses (audit.md)
+## How to re-measure
 
-1. performance-budget — latent in constants, not stated as targets.
-2. measurement-baselines-and-profiling — one instrument (`bench/run.ts`); no profiling, no device timing.
-3. latency-throughput-and-tail-behavior — single-user; throughput `not yet exercised`.
-4. cpu-memory-and-allocation — A* CPU, per-tile graph re-allocation.
-5. io-network-and-database-bottlenecks — no DB; rate-limited free APIs are the bottleneck.
-6. caching-batching-and-backpressure — the strongest area: all three present.
-7. rendering-client-and-mobile-performance — JS-thread A*, unmeasured.
-8. performance-red-flags-audit — ranked risks, evidence named.
+```
+npm run bench    # tsx bench/run.ts — prints expanded/pushes/pops/ms per stage
+```
 
-## The honest headline
-
-flattr **measures its algorithm** (the bench) and **defends its rate limits**
-(cache + batch + backpressure) well. It does **not** measure on-device latency,
-has **no formal budgets**, and runs **no profiler**. The optimization half is
-strong; the measurement half is a named gap.
+All numbers in this guide come from running that on this machine. Re-run it; the
+ratios (A* vs Dijkstra) are stable, the absolute ms will vary by host.
 
 ## Cross-links to neighboring guides
 
-- **`study-runtime-systems`** — JS-thread execution, event loop, bounded work, cancellation.
-- **`study-system-design`** — tile-coverage architecture, build-time vs device-time split.
-- **`study-dsa-foundations`** — heap, A*, k-d tree, quickselect as standalone structures.
-- **`study-networking`** — the retry/backoff/throttle behavior against Open-Meteo, Overpass, Nominatim.
-- **`study-debugging-observability`** — the missing instrumentation this guide keeps flagging.
+- `study-runtime-systems` — the JS-thread execution model behind A*-in-`useMemo`.
+- `study-system-design` — the build-time/run-time split and single-flight boundary.
+- `study-dsa-foundations` — A*, binary heaps, k-d trees as algorithms.
+- `study-networking` — retry/backoff/timeout against the elevation API.
+- `study-database-systems` — `not yet exercised` here (graph is a static artifact,
+  no DB); see that guide for why.

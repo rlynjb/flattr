@@ -1,131 +1,120 @@
 # Interview Defense — flattr
 
-> A book for defending **flattr** as a whole project in a senior interview.
-> Eight chapters, read in order at least once. Coach voice throughout.
-> Every defense is grounded in real files in this repo — no fabricated claims.
+> A book for defending **flattr** in a senior-engineering interview.
+> Eight chapters, read in order at least once. The night before, read
+> only the one-page summary at the end of each chapter.
 
-flattr is a grade-aware pedestrian/scooter router. It optimizes for **flat,
-not fast**. The whole project is one hand-rolled parametric search engine —
-`search()` in `features/routing/astar.ts:22` — running over a build-time static
-graph (`mobile/assets/graph.json`, 1,621 nodes / 1,879 edges of Seattle).
-There's no backend, no database, no LLM. The interesting part isn't the
-search; it's the **cost function**: cost is directional, so A→B ≠ B→A, because
-uphill costs and downhill is free.
-
-This book teaches you to own that in a room, under pressure, without bluffing.
+flattr is a grade-aware pedestrian/scooter router — "optimized for flat,
+not fast." You hand-rolled a parametric A* search over a build-time static
+graph. No backend, no database, no LLM in the product. This book teaches
+you to walk an interviewer through that, hold ground under follow-ups, and
+own — out loud — the one place you're genuinely thin (distributed systems
+at horizontal scale).
 
 ---
 
 ## The system at a glance — the master diagram
 
-This is the diagram you return to whenever you lose the thread. Everything in
-the book hangs off this picture: a build-time half that bakes `graph.json`, and
-a runtime half that loads it and routes over it with zero server in between.
+This is the picture you re-anchor to all book long. Every chapter is a
+zoom into one band of it.
 
 ```
-  flattr — the whole system, build-time vs runtime
+  flattr — the whole system in one frame
 
-  ┌─ BUILD TIME (pipeline/, run once per area) ───────────────────────┐
-  │                                                                    │
-  │  Overpass API ──► parseOsm ──► splitWays ──► sampleElevations ──┐  │
-  │  (OSM streets)    osm.ts       split.ts      elevation.ts       │  │
-  │                                              (Open-Meteo, free) │  │
-  │                                                                 ▼  │
-  │                                          computeGrades ──► buildGraph
-  │                                          grade.ts          build-graph.ts
-  │                                                                 │  │
-  └─────────────────────────────────────────────────────────────────┼──┘
-                                                                      │
-                              graph.json  ◄────────────────────────────┘
-                              1,621 nodes / 1,879 edges  (static artifact)
-                                       │  bundled into the app
-                                       ▼
-  ┌─ RUNTIME (mobile/, Expo + RN + MapLibre) ─────────────────────────┐
-  │                                                                    │
-  │  loadGraph() ──► nearestNode(tap) ──► directedAstar() ──► route    │
-  │  loadGraph.ts    nearest.ts           astar.ts            line     │
-  │                       │                    │                       │
-  │                       │                    └─ one search() with    │
-  │                       │                       (costFn, heuristicFn)│
-  │                       └─ O(N) linear scan ◄── FIRST bottleneck     │
-  │                                                                    │
-  │  No backend. No DB. No network in the routing hot path.            │
-  └────────────────────────────────────────────────────────────────────┘
+  ┌─ BUILD TIME (pipeline/, runs on your machine, offline) ──────────────┐
+  │                                                                       │
+  │   OSM streets ──► split ──► Open-Meteo elevation ──► grade ──► graph  │
+  │   (overpass.ts)  (split.ts)  (elevation.ts, free)   (grade.ts)  .json │
+  │                                                                       │
+  │   output: ONE static artifact — mobile/assets/graph.json             │
+  │           seattle-mvp · 1621 nodes · 1879 edges                      │
+  └───────────────────────────────┬───────────────────────────────────────┘
+                                  │  bundled into the app, read-only
+  ┌─ RUNTIME (mobile/, Expo ~56 / RN 0.85 / React 19) ─────────▼──────────┐
+  │                                                                       │
+  │  ┌─ UI ──────────────┐   ┌─ ENGINE (features/, pure TS) ──────────┐  │
+  │  │ MapScreen.tsx     │   │ nearestNode()   snap tap → node id      │  │
+  │  │ GradeSlider userMax│──►│ directedAstar() ONE search() engine     │  │
+  │  │ MapLibre render   │◄──│   cost.ts  signed directed-grade penalty │  │
+  │  │ RouteSummaryCard  │   │   pqueue.ts hand-rolled binary heap      │  │
+  │  └───────────────────┘   └─────────────────────────────────────────┘  │
+  │                                                                       │
+  │  NO server · NO DB · NO network in the routing hot path               │
+  └───────────────────────────────────────────────────────────────────────┘
+
+  the one knob:  userMax  (max comfortable uphill grade %)
+  the one hook:  cost A→B  ≠  cost B→A   (uphill costs, downhill is free)
 ```
 
-The seam between the two halves is `graph.json`. Build-time spends an
-elevation API quota to bake grades in; runtime never touches that quota again.
-That split is the answer to half the questions in this book.
+The two-band split — build time vs runtime — is the spine of the whole
+defense. Almost every hard question resolves to "which band are we in?"
 
 ---
 
 ## The eight chapters
 
-| # | Chapter | The question it defends |
-|---|---------|--------------------------|
-| 01 | **The pitch** | "Tell me about a project you built." 10s / 30s / 90s. |
-| 02 | **The architecture** | "Walk me through the system." Trace one request. |
-| 03 | **The choices** | "Why this stack?" Hand-rolled vs OSRM, Expo vs Next.js, free vs paid elevation, static vs DB. |
-| 04 | **The scale story** | "What breaks first at 10x?" Graph size, elevation quota, per-query work — *not* users. |
-| 05 | **The failure story** | "What happens when things go wrong?" Elevation 429, steep-vs-disconnected, the unvalidated graph load. |
-| 06 | **The hard parts** | Hardest bug, proudest part, least-confident defense. |
-| 07 | **The counterfactuals** | "What would you do differently?" Validate on load, ElevationProvider seam, design the data seam up front. |
-| 08 | **The AI question** | "Did you use AI to build this?" Three modes of decision-making, never bluff code. |
+| # | Chapter | The question it answers | Covered |
+|---|---------|------------------------|---------|
+| 01 | The pitch | "Tell me about a project you built" | 10s / 30s / 90s pitch; the directional-cost hook |
+| 02 | The architecture | "Walk me through the system" | build/runtime split, one request traced end-to-end, why no backend |
+| 03 | The choices | "Why this stack?" | hand-rolled vs OSRM, Expo vs the spec's Next.js, Open-Meteo vs Google, static graph vs DB |
+| 04 | The scale story | "What breaks first at 10x?" | the three real axes (graph size, elevation quota, per-query work) — NOT users |
+| 05 | The failure story | "What happens when things go wrong?" | elevation 429, BLOCKED steep-vs-disconnected, the unvalidated graph load |
+| 06 | The hard parts | "Hardest bug? Proudest? Least confident?" | disconnected-components "no route", one search() / admissible A*, the bidirectional proof |
+| 07 | The counterfactuals | "What would you do differently?" | validate the graph load, an ElevationProvider seam, design the data seam up front |
+| 08 | The AI question | "Did you use AI to build this?" | the calibrated-honest answer; three modes of decision-making |
 
 ---
 
 ## How to use this book
 
 ```
-  FIRST READ          one chapter per sitting, in order, front to back.
-                      The chapters build: 02 sets the architecture that
-                      04 and 05 stress-test.
-
-  REVIEW              skim the chapter-opening diagrams and the pull
-                      quotes (┃-marked). ~70% of the book is in the
-                      visual treatments alone.
-
-  NIGHT BEFORE        read only the one-page summary at the end of each
-                      chapter. Eight pages total. That's your warm-up.
+  FIRST READ            REVIEW                 NIGHT BEFORE
+  ──────────            ──────                 ────────────
+  chapters in order     skim the chapter        read only the
+  one per sitting       diagrams + pull         one-page summary
+  front to back         quotes + boxes          at each chapter end
 ```
 
-The six recurring treatments, so your eye learns them:
+The six visual treatments recur in every chapter, so the eye finds them on
+re-read:
 
-- **Chapter-opening diagram** — the spine of the chapter, 15-30 lines.
-- **`THEY ASK` / `WHAT THEY'RE TESTING` callout** (single border) — before every question.
-- **Weak / strong side-by-side** — the contrast does the teaching.
-- **`WHEN YOU DON'T KNOW` box** (double border ╔╗) — at least one per chapter, leaning into the distributed-systems gap.
-- **Follow-up decision tree** — where the conversation goes next.
-- **Pull quotes** (┃ or ▸) — the lines you carry into the room.
+- **Chapter-opening diagram** — the chapter's visual spine
+- **"WHAT THEY'RE REALLY ASKING" callouts** (single-line box) — before every question
+- **Strong vs weak side-by-sides** — the contrast does the teaching
+- **"WHEN YOU DON'T KNOW" boxes** (double-line box) — at least one per chapter, leaning into the distributed-systems gap
+- **Follow-up decision trees** — where the conversation goes next
+- **Pull quotes** — the lines you carry into the room
 
 ---
 
-## Where this book sits in your study system
+## The honest spine of this defense
 
-This is the **project-level** defense — the wide opener, the "walk me through
-your app" moment. It pairs with the deep-dive concept files already generated
-under `.aipe/`:
+You did not build a distributed system. You built a graph algorithm and a
+mobile client around it. The strength of this project is *depth in a narrow
+place*: a hand-rolled, provably-admissible, directional-cost A* with real
+tests. The weakness is *breadth*: there is no server, no horizontal scale,
+no queue, no replication — and you have not shipped those anywhere yet.
 
-- **Drill into the algorithm** (admissibility, lazy deletion, bidirectional
-  consistency) → `.aipe/study-dsa-foundations/`
-- **Drill into the system shape** (build/runtime split, no-backend, failure
-  surfaces) → `.aipe/study-system-design/`
+Strong candidates own both. This book teaches you to lead with the depth,
+and to name the breadth gap before the interviewer corners you into it.
 
-When an interviewer drills past the project level into *one* decision, that's
-where the per-concept Interview-defense blocks live. This book gets you to the
-drill confidently; those files get you through it.
+```
+  ▸ Lead with the thing you built deeply.
+    Name the thing you haven't built before they make you.
+```
 
 ---
 
-## The one thing to remember walking in
+## Cross-links — where to go deeper
 
-Most candidates over-claim scale and under-own decisions. You do the reverse.
-You scoped this deliberately: no server, no DB, no LLM, hand-rolled engine.
-Every one of those is a *decision you can defend*, not a gap you have to hide.
+This book is the **project-level** opener — the wide walk-through. For the
+**concept-level** deep dives, when an interviewer drills into one mechanism:
 
-```
-        ▸ You didn't build a smaller Google Maps.
-          You built the one part of Google Maps that's
-          interesting — the cost function — and you
-          can reason about it from the invariant up.
-```
+- Algorithm internals (A* admissibility, heaps, bidirectional, graph
+  traversal): **`.aipe/study-dsa-foundations/`**
+- Architecture, boundaries, scale, failure handling at the system level:
+  **`.aipe/study-system-design/`**
+
+Use both. The concept files prepare the deep dive; this book prepares the
+wide opener.

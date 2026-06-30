@@ -1,112 +1,246 @@
-# Distributed-Systems Red-Flags Audit
+# 09 — Distributed Systems Red-Flags Audit
 
-Ranked coordination and partial-failure risks, grounded in real files. Ranked by consequence: what breaks, how likely, how bad. This is the audit file — it walks every lens, names the evidence, and emits `not yet exercised` honestly for the lenses that don't apply to a one-node app.
+**Industry names:** failure-mode audit / reliability review / production-readiness
+checklist. **Type:** Industry standard.
 
-## The ranking, at a glance
+> Ranked by consequence, grounded in real `file:line` evidence. flattr's distributed
+> surface is one seam (`01`) — client/build ⇄ three free APIs — so this audit is
+> deep on that seam and honest about everything beyond it being `not yet exercised`.
+> Strengths are ranked alongside risks, because "what's done right" is as much a part
+> of a review as "what's wrong."
 
-```
-  risk                                    │ severity │ likelihood │ status
-  ────────────────────────────────────────┼──────────┼────────────┼────────
-  1. no client request timeout            │  HIGH    │  MEDIUM    │ REAL gap
-  2. no jitter on retry backoff           │  LOW     │  LOW       │ fine (1 client)
-  3. unbounded retry loop header          │  LOW     │  LOW       │ guarded inside
-  4. build-time hard dependency on 3 APIs │  MEDIUM  │  MEDIUM    │ accepted
-  5. silent catch-all error swallowing    │  LOW     │  MEDIUM    │ intentional, untraced
-  ────────────────────────────────────────┴──────────┴────────────┴────────
-  everything else (replication, quorum, leadership, saga, outbox,
-  real queues, ordering, poison messages): NOT YET EXERCISED
-```
+## Zoom out, then zoom in
 
-## Risk 1 — No client-side request timeout (the real one)
-
-**Severity: HIGH. Evidence: `pipeline/overpass.ts:33`, `pipeline/elevation.ts:109`, `pipeline/geocode.ts:21`, `mobile/src/useTileGraph.ts:186`.**
-
-Every `fetch` in the codebase calls the provider with no `AbortController` and no deadline. `fetch` does not time out on its own. A connection that opens and then goes silent — server accepts the socket, sends nothing — hangs the `await` forever.
+You know how a code review sorts comments into "blocking," "should fix," and "nit"?
+A red-flags audit does that for failure modes — but ranked by *blast radius under
+partial failure*, not by code cleanliness. The question is never "is this pretty,"
+it's "when the third party is slow / down / throttling, what does this do to the
+user?"
 
 ```
-  The hang, and where it propagates
+  Zoom out — where each red flag lives on the one seam
 
-  await fetchOverpass(bbox)
-        └─► await fetchImpl(endpoint)  ── [silent connection] ──► ⌛ forever
-                                                                    │
-  consequence (run-time): busyRef stays true ──► pump WEDGED ──► no
-   further viewport/corridor builds EVER run. The map silently stops
-   loading new regions; the user just sees nothing happen.
+  ┌─ Client / Build (you own) ────────────────────────────────────┐
+  │  fetchOverpass ──┐  openMeteoProvider ──┐  geocode ──┐         │
+  │  retry, NO timeout│  backoff, NO timeout │  NO retry  │        │ ← findings
+  │       ▼           │       ▼              │  NO timeout│          live here
+  │  single-flight pump (one worker — hung call freezes all)       │
+  └───────────────────────┬───────────────────────────────────────┘
+                          │  HTTP
+                          ▼
+  ┌─ Third-party fleet (slow / 429 / down) ───────────────────────┐
+  └────────────────────────────────────────────────────────────────┘
 ```
 
-This is the one risk that bites *today*, with one client, no scale required. The retry loops in `02` don't help — they only run *after* a response arrives; a hang never arrives, so it escapes every guard. The fix is small and localized: wrap each `fetchImpl` in `AbortController` + `setTimeout(abort, DEADLINE)`, pass `signal`, and treat the abort as a retryable failure so the existing backoff/fallback machinery takes over. → full walk in `02-partial-failure-timeouts-and-retries.md` Part 4.
+Zoom in: the audit ranks six findings on this seam (three risks, three strengths)
+plus the `not yet exercised` frontier. Verdict-first per finding: the call, then the
+evidence, then the fix or the trigger.
 
-## Risk 2 — No jitter on retry backoff
+## The structure pass
 
-**Severity: LOW (today). Evidence: `overpass.ts:43` (`delayMs * (attempt + 1)`), `elevation.ts:117` (`delayMs * 2 ** (attempt + 1)`).**
-
-Both backoffs are deterministic — no randomization. With a fleet of clients, deterministic backoff means they retry in lockstep after a shared outage (thundering herd). flattr is **one client**, so there's no herd to synchronize; this is correctly a non-issue today. Flagged only so it's named: the trigger to add jitter is "flattr becomes multi-user." Don't add it before then.
-
-## Risk 3 — Unbounded `for` loop headers
-
-**Severity: LOW. Evidence: `overpass.ts:32` (`for (let attempt = 0; ; attempt++)`), `elevation.ts:108`.**
-
-Both retry loops have empty termination conditions in the `for` header. Read in isolation that looks like an infinite loop. It isn't — termination is enforced *inside* by `attempt < retries` plus the throw on non-retryable status. It's correct, but it's the kind of construct that invites a future edit to drop a guard and create a real infinite loop. Low risk, worth a comment; not worth a change.
-
-## Risk 4 — Build-time hard dependency on three external APIs
-
-**Severity: MEDIUM. Evidence: `pipeline/run-build.ts:43-46`, `pipeline/config.ts:10`.**
-
-`npm run build:graph` cannot produce `graph.json` without Overpass *and* an elevation source reachable. If Overpass is down, the build fails outright (no fallback — `run-build.ts:54-57` exits non-zero). The project context already documents the Open-Meteo 429 hazard as a known build-time footgun.
-
-This is **accepted, not a bug**: it's a developer-run build script, failures are loud and re-runnable, and there *is* a fallback path (`FLAT_ELEVATION=1`, `run-build.ts:28-31`) for the elevation leg. The blast radius is a developer re-running a command, not a user. The honest note: the elevation provider chain (Google > Open-Meteo > flat) has graceful degradation; the Overpass leg does not — a down Overpass just fails the build. Acceptable for now; the fix (cache last-good OSM) only earns its place if builds get frequent or automated.
-
-## Risk 5 — Silent catch-all error swallowing, untraced
-
-**Severity: LOW. Evidence: `useTileGraph.ts:219-220` (`catch {}` keeps last region), `useTileGraph.ts:21-30` (bestEffort swallows to flat), `elevCache.ts:26-28`, `elevCache.ts:54-56`.**
-
-Several `catch` blocks swallow errors silently and degrade — which is *correct behavior* for graceful degradation (a throttle shouldn't crash the map). The risk isn't the swallowing; it's that it's **invisible**. There's no log, metric, or counter when a region degrades or an Overpass fetch fails. In production you'd have no signal that the elevation API has been throttling all your users for an hour.
+**Axis — every finding is ranked on one axis: `blast radius under partial failure`.**
+Hold that question constant and the ranking falls out.
 
 ```
-  Degradation happens — but leaves no trace
+  One axis — "when a third party misbehaves, how far does the damage spread?" 
 
-  Open-Meteo 429 ─► bestEffortElevation catches ─► flat fallback
-                                                    │
-                                                    └─► (no log, no metric)
-                                                        you never know it happened
+  widest blast radius ◄──────────────────────────────────► narrowest
+  ① hung call freezes ALL loading   ④ self-heal cap   ⑥ cache poisoning (prevented)
+  ② retry has no time budget        (bounded outage)
+  ③ geocode has no retry at all
+  ───────────────────────────────────────────────────────────────────
+  strengths ride the SAME axis: ③graceful-degrade, ⑤single-flight,
+  ⑥cache-only-real keep the blast radius SMALL — that's why they're strengths.
 ```
 
-The degradation is the right call; the silence is the gap. The fix is observability, not behavior change: increment a counter / emit a log on each fallback and each swallowed Overpass failure. This is a debugging-observability finding as much as a distributed-systems one. → sibling `study-debugging-observability`.
+**Seam.** The load-bearing finding sits at the same seam every other file pointed
+to: the un-timed `await fetchImpl(...)`. Findings ①②③ are all facets of that one
+missing primitive; ④⑤⑥ are the defenses that already contain the seam well.
 
-## Lens audit — every concept, status named
+## How it works — the ranked findings
+
+### ① NO client-side timeout on any fetch — RISK, highest blast radius
+
+**Verdict:** the single highest-value distributed-systems fix in the repo. A remote
+node that accepts the socket then goes silent hangs the call indefinitely; the
+single-flight pump (`06`) means one hung call freezes *all* tile loading.
 
 ```
-  lens                              │ status            │ where
-  ───────────────────────────────────┼───────────────────┼──────────
-  partial failure / retries          │ EXERCISED         │ 02
-  timeouts                           │ GAP (Risk 1)      │ 02, 09
-  idempotency / delivery semantics   │ EXERCISED (by     │ 03
-                                     │  construction)    │
-  consistency / staleness            │ EXERCISED (rich)  │ 04
-  graceful degradation / CAP         │ EXERCISED         │ 04
-  backpressure                       │ EXERCISED (pump)  │ 06
-  replication                        │ not yet exercised │ 05
-  partitioning / sharding            │ not yet exercised │ 05 (key latent)
-  quorums                            │ not yet exercised │ 05
-  real queues / streams              │ not yet exercised │ 06
-  ordering / poison messages         │ not yet exercised │ 06
-  clocks / logical time              │ not yet exercised │ 07
-  leadership / leader election       │ not yet exercised │ 07
-  leases / split-brain               │ not yet exercised │ 07
-  consensus (Raft/Paxos)            │ not yet exercised │ 07
-  sagas / compensation               │ not yet exercised │ 08
-  transactional outbox               │ not yet exercised │ 08
-  reconciliation                     │ not yet exercised │ 08
+  evidence — every remote await is un-timed (verified by grep: no AbortController,
+  no signal, no Promise.race anywhere in pipeline/ mobile/ features/)
+
+  overpass.ts:33     await fetchImpl(endpoint, {…})   ← no signal
+  elevation.ts:109   await fetchImpl(url)             ← no signal
+  geocode.ts:21      await fetchImpl(`${ENDPOINT}…`)  ← no signal
+  ── note: overpass.ts:10 `[out:json][timeout:60]` is Overpass QL (server-side),
+     does NOT bound your socket.
 ```
 
-## The one thing to fix
+**Blast radius:** TCP's own timeout is minutes; a black-holed connection stalls a
+build for minutes, and the one-worker pump (`useTileGraph.ts:167`) holds `busyRef`
+true the whole time → *every* pan and route is blocked behind it.
+**Fix:** one wrapper — `AbortController` + `setTimeout(() => c.abort(), DEADLINE)`
+passed as `signal` to every `fetchImpl`. The hung call then *throws*, which the
+existing retry loops (`02`) already classify and retry. Small change, removes the
+worst failure mode. → full walk in `02`.
 
-If you do exactly one thing from this audit: **add request timeouts** (Risk 1). It's the only risk that's a real, present bug rather than a "not yet" — a single hung connection silently wedges the run-time pump, and it's a small, localized fix that plugs into machinery you already have. Everything below it is either correctly absent (the `not yet exercised` rows) or a deliberate, defensible tradeoff.
+### ② Retry budget bounds attempts, not wall-clock time — RISK
+
+**Verdict:** correct as far as it goes, incomplete without ①. The retry loops bound
+the *number* of attempts but not total time, so they can't rescue you from a hang
+(②'s symptom is ①'s cause).
+
+```
+  evidence
+  overpass.ts:42    attempt < retries        ← count bound (3), no deadline
+  elevation.ts:114  attempt < retries        ← count bound (3), no deadline
+  ── a count bound never fires if a single attempt never returns.
+```
+
+**Fix:** ① supplies the missing time bound; with per-attempt timeouts, the count
+bound becomes sufficient. Secondary: Overpass backoff is linear with **no jitter**
+(`overpass.ts:44`) — harmless at one client, a thundering-herd risk the day flattr
+is a multi-client server. → `02`.
+
+### ③ Geocode has no retry and no timeout — RISK, narrow
+
+**Verdict:** the geocode paths are the *least* defended of the three APIs — a single
+un-retried, un-timed call that throws on any non-200.
+
+```
+  evidence
+  geocode.ts:21-24   single fetch, `if (!res.ok) throw` — no retry loop at all
+  geocode.ts:47-50   geocodeSuggest — same, no retry
+  geocode.ts:65-67   reverseGeocode — same, no retry
+  ── contrast: overpass.ts + elevation.ts BOTH retry; geocode does not.
+```
+
+**Blast radius:** narrow — a failed geocode fails one address lookup (the user
+re-types), it doesn't freeze the app or corrupt data. **Fix:** wrap in the same
+retry+timeout pattern as Overpass; lower priority than ① because the blast radius is
+one user action, not the whole loader. Note Nominatim's "~1 req/sec" policy
+(`geocode.ts:2`) means any retry here *must* carry backoff.
+
+### ④ Self-heal retry is capped — STRENGTH
+
+**Verdict:** done right. Degraded regions self-heal toward real grades, but the
+retry is bounded so a sustained outage doesn't loop forever.
+
+```
+  evidence
+  useTileGraph.ts:209  if (degraded && retryCountRef.current < MAX_RETRIES)  ← cap 6
+  useTileGraph.ts:71   RETRY_MS = 12000   ← paced, not a tight loop
+  useTileGraph.ts:238  retryCountRef.current = 0  ← a fresh area resets the budget
+```
+
+This is eventual local consistency with a circuit-breaker-like cap. The one gap: it
+caps *count* (6 retries), not *time* — same shape as ②, but low-consequence here
+because each retry is silent and 12s apart. → `04`.
+
+### ⑤ Single-flight pump as backpressure — STRENGTH
+
+**Verdict:** the right primitive, hand-rolled. One build at a time, corridor
+prioritized, keeps flattr under the free-tier rate limits without a broker.
+
+```
+  evidence
+  useTileGraph.ts:167  if (busyRef.current) return       ← one-worker gate
+  useTileGraph.ts:170-180  corridor drains before view   ← priority
+  useTileGraph.ts:224  pump() in finally                 ← self-drain
+```
+
+The caveat is the flip side of ①: one worker means one hung call (no timeout)
+freezes everything — strength and blast-radius amplifier are the same mechanism. →
+`06`.
+
+### ⑥ Cache stores only real values; degradation is honest — STRENGTH
+
+**Verdict:** the subtle correctness win. Flat-fallback zeros never poison the cache,
+and the `degraded` flag keeps available-but-wrong data from masquerading as fresh.
+
+```
+  evidence
+  useTileGraph.ts:52-58  putElev only on successful fetch (throw skips the writes)
+  useTileGraph.ts:190-195 bestEffort wraps cache → 0s produced OUTSIDE, never cached
+  useTileGraph.ts:150-162 displayGraph EXCLUDES degraded → no fake-green over real
+  elevCache.ts:36        putElev: if has(key) return → idempotent write
+```
+
+This is dedup + consistency done correctly: only cache values you'd serve forever
+(`03`), mark stale data and hide it where it'd mislead (`04`).
+
+## Primary diagram — the audit at a glance
+
+```
+  flattr distributed red-flags, ranked by blast radius
+
+  RISKS (fix these)                          evidence            → file
+  ① no client timeout    freezes ALL loading  overpass/elev/geocode  02,06
+  ② retry: count not time  can't rescue hang   *.ts:42/114            02
+  ③ geocode: no retry      one lookup fails    geocode.ts:21          02
+
+  STRENGTHS (keep these)
+  ④ self-heal capped       bounded outage      useTileGraph:209       04
+  ⑤ single-flight pump     under rate limit    useTileGraph:167       06
+  ⑥ cache only real +      no poison, honest   useTileGraph:52,150    03,04
+    degraded flag          staleness
+
+  NOT YET EXERCISED (trigger named)
+  replication/quorum(05) · clocks/leases(07) · sagas/outbox(08)
+  → trigger: a shared server / multi-device sync / cross-service write
+```
+
+## Elaborate
+
+A production-readiness audit ranks by what hurts users under failure, not by code
+aesthetics — and the highest-value finding here (① no timeout) is invisible in local
+testing because the "silent server" case never happens on localhost. That's the
+recurring trap: the worst distributed-systems bugs live in the failure modes you
+can't reproduce on your machine. flattr's strengths (④⑤⑥) are notably *more* mature
+than its one real gap is severe — graceful degradation, honest staleness marking,
+and dedup-without-poisoning are things many production codebases get wrong. The
+single fix that closes the gap (an `AbortController` wrapper) is also the one that
+unlocks everything else: it turns hangs into the retryable failures the existing
+machinery already handles.
+
+## Interview defense
+
+**Q: "If you had one day to harden this app's reliability, what would you do?"**
+Verdict first: "Add a client-side timeout to every fetch — one `AbortController`
+plus an `abort()` on a `setTimeout`, passed as `signal`. Right now no remote call
+has a time bound, so a silent server hangs the call, and because there's a single
+build worker, that one hang freezes *all* tile loading. The fix is small and it
+converts hangs into the retryable failures the existing retry loops already handle.
+Second, give geocode the retry+timeout the other two APIs have." Naming the
+*interaction* (no timeout × single worker = total freeze) is the senior signal.
+
+```
+  the sketch you draw
+
+  one day → AbortController on every fetch
+            hung call ─► aborts ─► throws ─► existing retry catches it
+            (and the single-worker freeze goes away)
+```
+
+**Q: "What's already good here?"**
+"Three things most codebases miss: graceful degradation (elevation 429 → flat grades
+so the app stays up), honest staleness (the `degraded` flag hides wrong data from
+the heatmap while keeping it for routing connectivity), and a single-flight pump
+that gives free-tier-safe backpressure without a broker. The reliability *posture*
+is good; it's missing exactly one primitive — the timeout." Praising specifically,
+with evidence, shows you actually read it.
+
+**Anchor:** *One seam, one missing primitive — no client-side timeout — and because
+there's a single build worker, that one gap freezes everything; the strengths
+(degrade, mark, single-flight) are more mature than the gap is severe.*
 
 ## See also
 
-- `02-partial-failure-timeouts-and-retries.md` — Risks 1–3 in depth.
-- `04-consistency-models-and-staleness.md` — Risk 5's degradation is the CAP choice working as designed.
-- `06-queues-streams-ordering-and-backpressure.md` — the pump Risk 1 would wedge.
-- sibling `study-debugging-observability` — Risk 5's missing signal.
-- sibling `study-networking` — Risk 1 at the transport layer.
+- `02` — the timeout/retry walk behind findings ①②③.
+- `03` — the cache-only-real correctness behind ⑥.
+- `04` — the degraded-flag honesty behind ⑥.
+- `06` — the single-worker blast radius behind ① and ⑤.
+- `00` — the same ranked findings in the overview.
+- siblings **debugging-observability** (the `degraded`/`loadingStep` surface),
+  **networking** (where the timeout sits in transport), **performance-engineering**
+  (backoff/debounce as budgets).

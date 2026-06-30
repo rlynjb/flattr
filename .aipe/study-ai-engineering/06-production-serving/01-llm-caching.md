@@ -1,78 +1,203 @@
-# LLM Caching
+# LLM caching — exact, prompt, and semantic caches
 
-*Industry name: response / prompt caching — a production-serving optimization.*
+**Industry name(s):** response caching / prompt caching / semantic cache.
+**Type:** Industry standard (study material). **Not present for LLM in flattr** — but the caching *instinct* already ships in `elevCache.ts`.
 
-## Zoom out
+## Zoom out — flattr already caches a slow, repeated external call
+
+You've shipped a cache, just not for an LLM. `mobile/src/elevCache.ts`
+caches elevation samples keyed by a ~90 m DEM cell, in memory and on
+disk, so an already-fetched area *never re-hits the free elevation API*
+— the exact pattern an LLM exact-cache uses (key the input, store the
+output, skip the expensive call on a repeat). There's no LLM call to
+cache today. But a route-describe feature is the textbook exact-cache
+candidate: its input is `RouteSummary`'s three numbers, which repeat
+constantly, and its output is prose that's expensive to regenerate.
 
 ```
-  Serving stack (where caching lives)
-  ┌─────────────────────────────────────────────┐
-  │  client request                              │
-  │      │                                       │
-  │      ▼                                        │
-  │  ┌─────────┐  hit   ┌──────────────┐          │
-  │  │  CACHE  │───────►│ return saved │  cheap   │
-  │  └────┬────┘        └──────────────┘          │
-  │       │ miss                                   │
-  │       ▼                                        │
-  │  ┌──────────────┐  store  ┌─────────┐          │
-  │  │ EXPENSIVE OP │────────►│  CACHE  │  costly  │
-  │  └──────────────┘         └─────────┘          │
-  └─────────────────────────────────────────────┘
+  Zoom out — flattr's existing cache vs a future LLM cache
+
+  ┌─ External elevation API (slow, throttled) ──────────────┐
+  │  Open-Meteo — 429s on quota                             │
+  └────────────────────────────┬─────────────────────────────┘
+              cached by ▼  elevCache.ts (key = DEM cell)
+  ┌─ elevCache (TODAY) ─────────────────────────────────────┐
+  │  mem Map + AsyncStorage; "cached values valid forever"  │
+  └────────────────────────────┬─────────────────────────────┘
+              ★ same pattern, no LLM call exists to cache
+  ┌─ (future) describe call ───▼─────────────────────────────┐
+  │  key = RouteSummary; value = prose → EXACT cache         │
+  └──────────────────────────────────────────────────────────┘
 ```
 
-Caching is the oldest trick in serving: if the same expensive computation will be asked for again, do it once and keep the answer. For LLMs the "expensive op" is the model call (dollars + latency), and the key is usually the prompt (or a normalized hash of it). You ship a cache when the same inputs recur and the output is deterministic-enough to reuse.
+## Structure pass
+
+- **Layers:** external dependency → cache → consumer.
+- **Axis — key precision:** exact-cache keys on the literal input
+  (`elevCache` keys on a quantized cell; a describe cache keys on
+  `RouteSummary`). Semantic cache keys on *meaning* (embedding
+  similarity) — flattr has no embeddings, so semantic caching is the one
+  variant with no home here.
+- **Seam:** `elevCache.ts:31`/`:35` (`getElev`/`putElev`) is the
+  get-or-fetch boundary. A describe cache would sit at the same boundary
+  around the future LLM call: `getDescribe(key) ?? (await call, put)`.
 
 ## How it works
 
-### Move 1 — the pattern: key → stored value
+### Move 1 — the mental model
+
+Three cache types, by how the key is computed. **Exact cache**: hash the
+literal prompt; a byte-identical repeat hits. **Prompt cache** (provider
+feature): the model reuses computation over a shared *prefix* across
+calls. **Semantic cache**: embed the input and hit on *similar* (not
+identical) inputs — needs a vector store. flattr's `elevCache` is an
+exact cache (quantized key). A describe cache would also be exact,
+because `RouteSummary` is three discrete numbers — semantic similarity
+adds nothing.
 
 ```
-  prompt ──hash──► key ──lookup──► [value | MISS]
+  Pattern — cache types by key
+
+  exact      key = hash(input)        identical repeat → hit
+  prompt     key = shared prefix      provider reuses prefix compute
+  semantic   key = embedding ~近       similar input → hit (needs vectors)
+        │
+  flattr today: elevCache = EXACT (quantized DEM cell)
+  flattr future: describe = EXACT (RouteSummary as key)
 ```
 
-Mental model: a cache is a pure function memoizer wearing a TTL. The only hard parts are (1) choosing a key that means "same request" and (2) deciding when a stored value goes stale. LLM caching has two flavors:
+### Move 2 — the walkthrough
 
-- **Exact-prompt cache** — key = hash(full prompt). Trivial, brittle (one token differs → miss).
-- **Provider prompt caching** — the *provider* caches your long, stable prefix (system prompt, tools, big context) so repeated calls only pay for the changing tail. Different mechanism, same goal: don't recompute the stable part.
+**flattr's existing exact cache — `elevCache.ts`.** The header states the
+caching logic precisely:
 
-### Move 2 — step by step (exact-prompt cache)
-
-```
-  1. normalize prompt   "Route A→B, max 8%"  ─► canonical string
-  2. key = sha256(canonical)
-  3. GET key from store ──► hit?  ─► return cached sentence
-  4. miss ─► call model ─► get sentence
-  5. SET key = sentence  (with TTL / size cap)
-  6. return sentence
+```ts
+// elevCache.ts:1 — "Persists across app restarts so already-fetched
+// areas never re-hit the free elevation API ... DEM samples never
+// change, so cached values are valid forever."
 ```
 
-The store is anything with get/set: an in-memory `Map`, AsyncStorage on device, Redis server-side. The size cap + eviction policy (LRU, insert-order drop) is what keeps it from eating memory.
+Get-or-skip lives in two tiny functions:
+
+```ts
+// elevCache.ts:31 / :35 — the cache boundary
+export function getElev(key: string): number | undefined { return mem.get(key); }
+export function putElev(key: string, value: number): void {
+  if (mem.has(key)) return;           // ← idempotent insert
+  mem.set(key, value); dirty = true;  // ← debounced persist follows
+}
+```
+
+Two cache disciplines worth stealing for an LLM cache are already here:
+a **two-tier** store (memory + `AsyncStorage`) and a **bounded** one
+(`MAX_ENTRIES = 50000`, oldest drop first, `elevCache.ts:9`).
+
+**Why a describe cache is exact, and why it's a strong fit.** A future
+describe call's input is `RouteSummary`:
+
+```ts
+// summary.ts:5 — three numbers → a perfect exact-cache key
+export type RouteSummary = { distanceM: number; climbM: number; steepCount: number };
+```
+
+`JSON.stringify(summary)` (or a rounded form) is the key; the prose is
+the value. Identical routes recur constantly (re-render, re-open), so the
+hit rate is high — and the prose for a given summary *never changes*,
+exactly like the "valid forever" elevation samples.
+
+**Where semantic caching would and wouldn't help.** It wouldn't: two
+*similar* summaries (`climbM:39` vs `climbM:40`) should arguably produce
+slightly different prose, and embedding three numbers to find
+near-matches is overkill versus just rounding the key. Exact cache on a
+rounded `RouteSummary` is the right tool.
 
 ### Move 3 — the principle
 
-**Cache the expensive, stable, recurring computation — wherever it lives.** "LLM caching" is just this principle pointed at model calls. The same principle already shows up all over a routing engine; the model is incidental.
+Cache the expensive, repeated, deterministic-output call at its input
+boundary. flattr already does this for elevation in `elevCache.ts`; a
+route-describe cache is the same move with `RouteSummary` as the key. The
+cache type follows the key's nature — discrete inputs want an exact
+cache, and flattr's inputs are discrete, so the fancy semantic variant
+stays on the shelf.
 
-## In this codebase
-
-**NOT YET EXERCISED as LLM caching** — there is no model call to cache. But flattr is *built around* the exact same pattern, twice:
+## Primary diagram
 
 ```
-  EXPENSIVE OP                          CACHE (compute once, reuse)
-  ─────────────────────────────────────────────────────────────────
-  OSM fetch + elevation sampling   ──►  graph.json   (pipeline output)
-  Open-Meteo DEM lookup (per cell) ──►  mobile/src/elevCache.ts
-  [future] route → English sentence ──► (would cache on route key)
+  The caching instinct, transferred to a describe call
+
+  ┌─ elevCache.ts (SHIPPED) ────────────────────────────────┐
+  │  key = DEM cell → elev (mem + disk, bounded, forever)   │
+  │  getElev:31 / putElev:35  ← cache boundary              │
+  └──────────────────────────┬───────────────────────────────┘
+            same boundary, new key ▼ (future)
+  ┌─ describe cache ────────────────────────────────────────┐
+  │  key = RouteSummary {dist,climb,steep}  → prose         │
+  │  getDescribe(key) ?? (await LLM, putDescribe)           │
+  │  type: EXACT (semantic adds nothing for 3 numbers)      │
+  └──────────────────────────────────────────────────────────┘
 ```
 
-- **`graph.json` is a prebuilt cache.** The pipeline (`pipeline/elevation.ts`, `sampleElevations`) does the costly OSM + elevation work *once* at build time and freezes the result. Serving never recomputes it — it reads the cache. That is response caching with the cache key being "this map area."
-- **`mobile/src/elevCache.ts` is a textbook cache** — keyed by ~90m DEM cell (`getElev`/`putElev`), in-memory `Map` + on-disk AsyncStorage, debounced writes, `MAX_ENTRIES` cap with oldest-first eviction. The header comment says it outright: *"already-fetched areas never re-hit the free elevation API."* Swap "elevation API" for "model" and this file *is* an LLM cache.
-- **The LLM seam where caching would attach:** `features/routing/summary.ts:11` (`routeSummary`) returns the numbers a narration prompt would consume. If a future "describe this route in a sentence" call existed, identical routes (same edges, same `userMax`) would produce identical sentences — a perfect cache key. You'd hash the route + max, store the sentence next to the summary, and skip the model on repeat. **Not built. Design note only.**
+## Elaborate
 
-The muscle is already trained — you cache expensive external computation correctly today. Adding an LLM cache later is the same `elevCache.ts` shape with a prompt hash for a key.
+The non-obvious cost of an LLM exact-cache that `elevCache` sidesteps is
+**invalidation**. Elevation is "valid forever" — the DEM never changes —
+so `elevCache` never invalidates, which is why it's so simple. A describe
+cache inherits that *if* the prompt and model are pinned: change the
+prompt template or the model version and every cached prose answer is now
+stale. The practical move is to version the cache key (include a
+prompt/model version), so a template change rotates the whole cache —
+the one piece of complexity the elevation cache never had to handle.
+
+## Project exercises
+
+### B6-CACHE.1 — exact-cache a describe call, modeled on `elevCache`
+
+- **Exercise ID:** B6-CACHE.1
+- **What to build:** a `describeCache` keyed by a rounded `RouteSummary`,
+  with `getDescribe`/`putDescribe` mirroring `getElev`/`putElev`, two-tier
+  (mem + `AsyncStorage`) and bounded.
+- **Why it earns its place:** it reuses a proven flattr pattern for the
+  most cacheable LLM call the app could have.
+- **Files to touch:** new `mobile/src/describeCache.ts` (copy the shape
+  of `elevCache.ts`), reuse `RouteSummary` from `summary.ts:5`.
+- **Done when:** a repeated identical `RouteSummary` returns cached prose
+  without a second call, and survives an app restart.
+- **Estimated effort:** 2–3 hrs.
+
+### B6-CACHE.2 — version the cache key
+
+- **Exercise ID:** B6-CACHE.2
+- **What to build:** fold a `promptVersion`/`modelVersion` into the
+  describe-cache key so a template change invalidates stale prose.
+- **Why it earns its place:** it adds the one discipline `elevCache`
+  never needed (invalidation) — the real gotcha of LLM caching.
+- **Files to touch:** `mobile/src/describeCache.ts` (key builder).
+- **Done when:** bumping the version misses all prior cache entries.
+- **Estimated effort:** 1 hr.
+
+## Interview defense
+
+**Q: would you cache flattr's route descriptions, and how?** Answer:
+yes, with an exact cache keyed by `RouteSummary` (`summary.ts:5`) —
+three discrete numbers that repeat constantly and map to prose that's
+stable for a fixed prompt/model. I'd model it on the cache flattr already
+ships: `elevCache.ts`, which keys elevation by DEM cell, stores
+mem-plus-disk, bounds entries, and treats values as valid forever. The
+one thing I'd add that `elevCache` doesn't need is key versioning, so a
+prompt change invalidates stale prose. Semantic caching adds nothing for
+three numbers. Load-bearing point: cache the expensive repeated call at
+its input boundary — flattr already does exactly that for elevation.
+
+```
+  RouteSummary → [exact cache, versioned key] → prose (skip LLM on hit)
+```
+
+Anchor: *"flattr's `elevCache` is the caching instinct already in the
+repo; a describe cache is the same move with `RouteSummary` as the key."*
 
 ## See also
 
-- `02-llm-cost-optimization.md` — caching is one of the three cost levers
-- `04-rate-limiting-backpressure.md` — the other reason `elevCache` exists (avoid re-hitting a rate-limited API)
-- `features/routing/summary.ts:11` — the future narration seam a route cache would wrap
+- [02-llm-cost-optimization.md](02-llm-cost-optimization.md) — a cache hit is the cheapest cost lever.
+- [04-rate-limiting-backpressure.md](04-rate-limiting-backpressure.md) — caching reduces pressure on the throttled API.
+- [05-retry-circuit-breaker.md](05-retry-circuit-breaker.md) — serve stale cache when the call fails.
+- [../05-evals-and-observability/04-llm-observability.md](../05-evals-and-observability/04-llm-observability.md) — cache hit/miss as a span attribute.

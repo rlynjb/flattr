@@ -1,79 +1,45 @@
-# study-ai-engineering — flattr
+# Study: AI engineering — flattr
 
-AI engineering + ML study guide, generated against the **flattr** repo
-(grade-aware self-powered routing: hand-rolled A* over a grade-annotated
-street graph, plus an Expo/React Native map app).
+flattr has **no LLM, no embeddings, no RAG, no vector store, no trained
+model**. This guide teaches the AI/ML concepts as study material and
+anchors each to the real file:line **seam** in this repo where it would
+attach. Honest mode throughout — nothing is invented.
 
-## Read this first
+## Read these first
 
-**flattr has no AI and no ML.** No LLM, no embeddings, no vector store,
-no RAG, no trained model, no inference runtime. The dependency tree is
-`tsx` / `typescript` / `vitest` (engine) and `maplibre-react-native` /
-`expo` / `react-native` (mobile). Nothing else. The grep for
-`openai|anthropic|langchain|embedding|llm|gpt-|claude-|rag|mediapipe|onnx`
-returns zero real hits — the only `vector` in the tree is MapLibre's
-*vector tiles*, which is cartography, not ML.
+- [00-overview.md](00-overview.md) — the four seams, the framing.
+- [ai-features-in-this-codebase.md](ai-features-in-this-codebase.md) — what AI is NOT here + the 3 LLM seams.
+- [ml-features-in-this-codebase.md](ml-features-in-this-codebase.md) — what ML is NOT here + the 1 ML attach point (and why `classify.ts` is not a classifier).
 
-So this guide does two things, and only these two:
+## The four anchors
 
-1. **States honestly what AI/ML work the repo does NOT contain.** That's
-   the job of [`ai-features-in-this-codebase.md`](ai-features-in-this-codebase.md)
-   and [`ml-features-in-this-codebase.md`](ml-features-in-this-codebase.md).
-   Read those two first — they are the load-bearing files.
-
-2. **Maps the concrete seams where AI *would* attach**, anchored to real
-   flattr files with `file:line` grounding. There are exactly three worth
-   naming, and they're covered in the honesty files and revisited in the
-   concept sub-sections:
-   - **output→prompt seam** — `features/routing/summary.ts:11`
-     (`routeSummary` → a "describe my route" LLM call)
-   - **input→prompt seam** — `pipeline/geocode.ts:9` (`geocode` →
-     natural-language destination parsing)
-   - **injection vector** — OSM `display_name` flows untrusted into any
-     future prompt (`pipeline/geocode.ts:27`, `:52`, `:69`)
-
-The numbered sub-section directories below teach the AI/ML *concepts* as
-study material. Every concept's "in this codebase" block says
-**not yet exercised** and points at the attachment seam. The concepts are
-real; flattr's use of them is zero. Both halves are stated without flinching.
-
-## Reading order
-
-```
-1. ai-features-in-this-codebase.md   ← what AI flattr does NOT do + the 3 seams
-2. ml-features-in-this-codebase.md   ← what ML flattr does NOT do + where it'd attach
-3. 00-overview.md                    ← the whole map in one diagram
-4. 01-llm-foundations/ … 09-…/       ← concepts as study material (all "not yet exercised")
-```
+| Seam | File:line | Concept |
+|------|-----------|---------|
+| Output → prompt | `features/routing/summary.ts:5`, consumed `mobile/src/MapScreen.tsx:368` | route-describe LLM feature |
+| Input → prompt | `pipeline/geocode.ts:9`, called `mobile/src/MapScreen.tsx:82` | NL destination parsing |
+| Trust boundary | `pipeline/geocode.ts:27` (`display_name`) | prompt injection vector |
+| ML attach point | `features/routing/cost.ts:16` (`penalty()`) | learned edge cost (≥0, monotone, finite BLOCKED) |
 
 ## Sub-sections
 
-| dir | topic | flattr status |
-|-----|-------|---------------|
-| `01-llm-foundations/` | what an LLM is, tokens, sampling, structured output, streaming, cost, heuristic-before-LLM, provider abstraction, override locks | not exercised |
-| `02-context-and-prompts/` | context window, lost-in-the-middle, prompt chaining | not exercised |
-| `03-retrieval-and-rag/` | embeddings, chunking, vector DBs, hybrid, rerank, RAG, GraphRAG | not exercised |
-| `04-agents-and-tool-use/` | agents vs chains, tool calling, ReAct, routing, memory, recovery | not exercised |
-| `05-evals-and-observability/` | eval sets, eval methods, LLM-as-judge, observability | not exercised |
-| `06-production-serving/` | caching, cost optimization, prompt injection, rate limiting, retry | not exercised (injection seam is real) |
-| `07-system-design-templates/` | search/ranking, support chatbot — interview reframes | n/a |
-| `08-machine-learning/` | supervised pipeline, features, train/val/test, on-device inference, drift, retraining | not exercised |
-| `09-ml-system-design-templates/` | recommender, anomaly detection, object detection | n/a |
+- [01-llm-foundations/](01-llm-foundations/README.md) — LLM IO model, tokens, sampling, structured outputs, streaming, token cost, heuristic-before-LLM, provider abstraction, override locks.
+- [02-context-and-prompts/](02-context-and-prompts/README.md) — context window, lost-in-the-middle, prompt chaining.
+- [03-retrieval-and-rag/](03-retrieval-and-rag/README.md) — embeddings through RAG and GraphRAG.
+- [04-agents-and-tool-use/](04-agents-and-tool-use/README.md) — agents vs chains, tool calling, ReAct, routing, memory, recovery.
+- [05-evals-and-observability/](05-evals-and-observability/README.md) — eval sets, methods, LLM-as-judge, observability.
+- [06-production-serving/](06-production-serving/README.md) — caching, cost, **prompt injection (the live concern)**, rate limiting, retry/circuit-breaker.
+- [07-system-design-templates/](07-system-design-templates/README.md) — search ranking, tech-support chatbot (interview reframes).
+- [08-machine-learning/](08-machine-learning/README.md) — supervised ML through retraining, anchored to the `cost.ts` learned-cost attach point.
+- [09-ml-system-design-templates/](09-ml-system-design-templates/README.md) — recommender, anomaly detection, object detection / CV.
 
-## Cross-links to sibling guides
+## Cross-links (sibling guides)
 
-flattr's real engineering is graphs, routing, and a build pipeline — not AI.
-For the substance, read these siblings:
+runtime-systems · networking · database-systems · dsa-foundations ·
+system-design · software-design · frontend-engineering · data-modeling ·
+security · testing · distributed-systems · debugging-observability ·
+performance-engineering · prompt-engineering · agent-architecture
 
-- `study-dsa-foundations/` — the A*, binary heap, bidirectional search that
-  are the actual point of this repo
-- `study-system-design/` — build-time pipeline → static `graph.json` → mobile reader
-- `study-runtime-systems/`, `study-performance-engineering/` — the routing hot path
-- `study-networking/`, `study-security/` — the Nominatim/Overpass/Open-Meteo
-  HTTP boundaries (where the `display_name` injection vector also lives)
-- `study-prompt-engineering/`, `study-agent-architecture/` — the AI siblings;
-  same conclusion (no AI here), same seams referenced
-- `study-data-modeling/`, `study-database-systems/`, `study-software-design/`,
-  `study-frontend-engineering/`, `study-testing/`,
-  `study-debugging-observability/`, `study-distributed-systems/` — round out
-  the repo
+The graph/A\* substance lives in **dsa-foundations** and
+**system-design**; the `display_name` trust boundary is shared with
+**security**; the on-device serving story connects to
+**performance-engineering**.

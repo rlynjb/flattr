@@ -1,82 +1,185 @@
-# Domain Gap
+# Domain gap — graph built from one city, used elsewhere (faint but real)
 
-*Industry name: domain gap / distribution shift — train-vs-deploy mismatch.*
+**Industry name(s):** domain gap / distribution shift / train-serve skew
+(spatial flavor). **Type:** Industry standard concern.
 
-## Zoom out
+## Zoom out — flattr's graph is one Seattle slice; a cost fit there may not transfer
+
+Domain gap is when the data you trained on differs systematically from
+the data you serve on. flattr has no trained model, so no learned cost
+has a gap yet — but the *graph itself* is built from one small place
+(Capitol Hill, Seattle — config.ts:10), and that's a real, concrete
+domain-gap setup waiting to happen the moment a learned cost trained
+there gets pointed at another city.
 
 ```
-TRAIN DISTRIBUTION  ≠  DEPLOY DISTRIBUTION
-┌──────────────────┐     ┌──────────────────┐
-│ Seattle hills     │     │ Amsterdam (flat)  │
-│ grades 0..40%     │ ──► │ grades 0..3%      │
-│ DEM = 90m         │     │ DEM = 1m LIDAR    │
-└──────────────────┘     └──────────────────┘
-   model learned here       runs here → wrong
+  Zoom out — the gap lives between BUILD (one city) and a future
+  learned cost serving elsewhere
+
+  BUILD: pipeline reads OSM+elevation for BBOX (Capitol Hill, Seattle)
+         config.ts:10  → mobile/assets/graph.json
+        │
+        ▼  IF a cost were fit on THIS graph's grade distribution…
+  SERVE: …and shipped to flat Amsterdam or hilly San Francisco
+        │
+        ▼  ★ cost.ts penalty() now sees grades it never trained on
+           = domain gap
 ```
 
-A model only knows the distribution it was trained on. Deploy it where the inputs look
-different — different city, different sensor, different population — and accuracy quietly
-collapses *even though the model and code are unchanged*. The domain gap is the silent
-killer of "it worked in the notebook." New ground for you.
+The hand-tuned `penalty()` is gap-immune (it's a formula, not fit to a
+city). A *learned* cost would inherit Seattle's grade distribution and
+carry that bias to wherever it serves.
+
+## Structure pass
+
+- **Layers:** training domain (one bbox) → distribution shift → serving
+  domain (another city/user/season) → degraded predictions.
+- **Axis — same-distribution vs shifted.** The hand-tuned penalty assumes
+  nothing about the city, so it's robust. A fit model assumes the
+  training city's grade/surface mix.
+- **Seam:** the build-time bbox (`BBOX`, config.ts:10) defines the
+  training domain. The serve-time city defines the gap.
 
 ## How it works
 
-### Move 1 — the mental model: the model interpolates, it doesn't extrapolate
+### Move 1 — the mental model
+
+A model is a compression of the data it saw. Point it at data with a
+different shape and it extrapolates badly — confidently wrong on a
+distribution it never met. You've felt the analog in frontend: a layout
+tuned on your laptop that breaks on a small phone. Same idea, the
+"viewport" is the data distribution.
 
 ```
-trained on grades 0..40%        asked about grade 55% (steeper than any seen)
- cost                            ┌── model guesses wildly here ──┐
-  │   ___/  (learned shape)      │                                ▼
-  │__/                           └──── no data → no idea ─────────
-  └──────────────────────────────────────────────────── grade →
-        seen ◄────────►            unseen (extrapolation = garbage)
+  Pattern — domain gap
+
+  train domain          serve domain
+  ┌ Seattle grades ┐    ┌ Amsterdam grades ┐
+  │ flat..15%, hilly│   │ ~0-2%, very flat  │
+  └────────┬────────┘   └────────┬──────────┘
+           └──── model fit here ─┘ extrapolates wrong
 ```
 
-Inside the training range, a model interpolates well. Outside it, predictions are
-unfounded. A domain gap is just "deployment lives partly outside the training range."
+### Move 2 — the walkthrough
 
-### Move 2 — where flattr's gap would bite
+**Sub-step A — flattr's training domain is explicitly small.**
 
-A learned cost model trained on **Seattle** edges (`features/routing/cost.ts`):
+```
+  config.ts:10 — the training domain is a deliberate slice
 
-1. **Geographic shift.** Seattle's Capitol Hill hits ~30%; Amsterdam barely clears 3%. A
-   model that learned "penalty ramps hard above 8%" never sees that band in Amsterdam — it
-   over-penalizes nothing, useless. Train on the flats, deploy on the hills → the reverse,
-   dangerous.
-2. **Sensor shift.** `pipeline/elevation.ts` defaults to Open-Meteo's **90m DEM** —
-   coarse, it *smooths short steep pitches* (noted in the code's own comment). A model that
-   learned cost-vs-grade on 90m-smoothed grades, then deployed on **1m LIDAR** grades
-   (Google provider), sees sharper spikes it never trained on. Same city, different sensor,
-   real gap.
-3. **Population shift.** Labels from kick-scooter riders won't fit wheelchair users — the
-   `userMax` presets in `classify.ts` (5 / 8 / 15%) hint at how different the populations
-   are.
+  BBOX = [-122.3284, 47.6181, -122.3214, 47.6241]
+  // "a small Capitol Hill slice, Seattle … steep area"
+  // kept small to stay under free API rate limits
+```
 
-Defenses: detect the gap (file 15 drift), retrain on target-domain data (file 16), or
-**transfer-learn** (file 07) from the source model. The spatial split (file 03) is how you
-*measure* the gap before shipping.
+The comment is honest: small, steep, Seattle. A cost fit on these edges
+learns Seattle-Capitol-Hill grade statistics. The grade *penalty curve*
+might be city-agnostic in truth (an 8% grade is an 8% grade anywhere),
+but a fit model can pick up spurious correlations — e.g. Seattle's
+surface mix, block lengths, crossing density — that don't hold elsewhere.
+
+**Sub-step B — the kinds of shift to expect.**
+
+```
+  Three gaps a learned flattr cost could hit
+
+  geographic   another city: different grade/surface distribution
+  user         a wheelchair user vs a jogger: different effort curve
+  temporal     winter ice vs summer: same edge, different real cost
+```
+
+The user gap connects to the by-user split (`03-train-val-test.md`): test
+on a held-out *user* and you measure resistance to the user gap directly.
+
+**Sub-step C — why the hand-tuned penalty is the safe default.**
+
+```
+  Robustness — formula vs fit
+
+  penalty() = k1·g, k2·(g-half)²   ← no city baked in, transfers
+  learned f(x) fit on Seattle      ← carries Seattle's distribution
+  → keep the formula as a FALLBACK when serving a new domain
+```
 
 ### Move 3 — the principle
 
-**A model's competence is bounded by its training distribution. Ship outside that box and
-you're guessing.** flattr's hand-coded `penalty()` has no domain gap *because it encodes
-physics, not a distribution* — `k1*g` and `k2*(g-half)²` hold at any grade, any city. That
-robustness is exactly what you'd risk losing by learning the curve from one city's data.
+A learned model is only valid on the distribution it trained on. flattr's
+graph comes from one explicit bbox, so any cost fit on it owns that
+city's biases. The mitigation isn't clever — it's to measure the gap
+(compare grade distributions across cities) and keep the city-agnostic
+hand-tuned penalty as the fallback for domains you haven't trained on.
+That's the same instinct as cold-start: rules where there's no data.
 
-## In this codebase
+## Primary diagram
 
-**NOT YET EXERCISED — nothing is trained, so nothing can transfer poorly.** But the gap is
-concrete and waiting: `pipeline/config.ts` pins a single `BBOX` (Seattle MVP). Any learned
-`cost.ts` would be a Seattle model. The day flattr expands cities, the domain gap becomes
-the first thing that breaks — and the hand-coded penalty would *still* work, which is the
-honest argument for keeping it until you have multi-city labels.
+```
+  Domain gap for a future flattr learned cost
 
-`classify.ts` thresholds are city-agnostic constants (4/8%), not a fitted distribution —
-no domain gap applies.
+  ┌─ TRAIN domain (real today) ─────────────┐
+  │ Capitol Hill, Seattle  [config.ts:10]    │
+  │ steep, specific surface/block mix         │
+  └──────────────┬───────────────────────────┘
+                 │ ship the model elsewhere
+  ┌─ SERVE domain (the gap) ─▼──────────────┐
+  │ flat city / different user / winter       │
+  │ grades & surfaces the model never saw     │
+  └──────────────┬───────────────────────────┘
+  ┌─ mitigation ─▼──────────────────────────┐
+  │ measure distribution shift (PSI)          │
+  │ fall back to formula penalty() off-domain │
+  └───────────────────────────────────────────┘
+```
+
+## Elaborate
+
+The clean way to *detect* domain gap is the same statistic used for drift
+(`15-drift-detection.md`): compare the grade (or surface) distribution of
+the serving city against the training city with a population-stability
+index. A high PSI says "you're off-domain, don't trust the learned cost
+here." This is why drift and domain gap are siblings — drift is the gap
+appearing *over time* in the same place; domain gap is the same shift
+appearing *across place* at once. flattr's single-bbox build makes the
+cross-place version concrete and the temporal version hypothetical.
+
+## Project exercises
+
+### GAP.1 — grade-distribution profile per graph
+
+- **Exercise ID:** GAP.1
+- **What to build:** a script that, given a `graph.json`, prints the
+  histogram of `absGradePct` across edges — the "domain fingerprint" you'd
+  compare between two cities to quantify the gap.
+- **Why it earns its place:** it makes domain gap measurable instead of
+  hand-wavy, and reuses real `Edge.absGradePct` data.
+- **Files to touch:** new `pipeline/grade-profile.ts`,
+  `pipeline/grade-profile.test.ts` (assert the histogram sums to the edge
+  count; assert it runs on the bundled Capitol Hill graph).
+- **Done when:** the script outputs a grade histogram for
+  `mobile/assets/graph.json` and the test locks the bin counts.
+- **Estimated effort:** half a day.
+
+## Interview defense
+
+**Q: flattr's graph is one Seattle neighborhood. What happens when you
+expand?** Answer: the hand-tuned penalty is fine — it's a formula with no
+city baked in. The risk shows up only if I *learn* the cost: a model fit
+on Capitol Hill's steep, Seattle-specific grade and surface distribution
+carries that bias to a flatter city, that's domain gap. I'd detect it by
+comparing grade distributions (PSI) between cities and fall back to the
+formula penalty off-domain. It's the spatial twin of drift, and the
+by-user split already guards the per-user version of the gap.
+
+```
+  formula penalty → transfers (no city baked in)
+  learned cost on one city → owns its distribution → gap elsewhere
+```
+
+Anchor: *"`config.ts:10` defines the training domain as one small Seattle
+bbox — a learned cost inherits exactly that."*
 
 ## See also
 
-- `07-transfer-learning.md` — adapting a source-domain model to a new city cheaply
-- `15-drift-detection.md` — noticing the gap opened in production
-- `03-train-val-test.md` — the spatial split that exposes the gap pre-ship
-</content>
+- [15-drift-detection.md](15-drift-detection.md) — the temporal twin; same PSI statistic.
+- [03-train-val-test.md](03-train-val-test.md) — by-user split guards the user gap.
+- [07-transfer-learning.md](07-transfer-learning.md) — adapting a model across domains.
+- [11-cold-start.md](11-cold-start.md) — formula fallback when off-domain or data-poor.

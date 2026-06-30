@@ -1,50 +1,176 @@
-# Query Rewriting & HyDE
-*Query transformation / Hypothetical Document Embeddings — Industry standard*
+# Query rewriting and HyDE — N/A, but the closest seam is the NL-parse at geocode
 
-## Zoom out
+**Industry name(s):** query rewriting / HyDE (Hypothetical Document Embeddings).
+**Type:** Industry standard.
 
-User queries are short, vague, and underspecified; documents are verbose and declarative — so they embed *far apart* even when relevant. Query rewriting closes that gap: an LLM expands or restates the query, and **HyDE** goes further — it asks the LLM to *hallucinate a plausible answer*, then embeds that to retrieve real docs. flattr has a real input→prompt seam that *looks* adjacent, but it's geocoding, not document retrieval.
+## Zoom out — flattr rewrites no queries, but its input seam is where one would attach
+
+Query rewriting and HyDE both improve *retrieval* by reshaping the user's
+query before it hits an index — rewrite expands it into retrievable
+terms, HyDE generates a hypothetical answer and embeds that. flattr has
+no index to retrieve from, so neither applies. The nearest structural
+cousin is the input seam: the raw address string the user types, which
+goes straight to `geocode` (`MapScreen.tsx:82`). An LLM could *reshape*
+that string before geocoding — which is query rewriting's shape, pointed
+at a geocoder instead of a vector index.
 
 ```
-LAYERS — transform query before retrieval
-┌──────────────────────────────────────────────┐
-│ raw query "flat way home" (vague, sparse)     │
-│   ┌────────────────────────────────────────┐ │
-│   │ rewrite / HyDE → richer text to embed   │ │ ◄── better
-│   │   then kNN over the corpus              │ │     match
-│   └────────────────────────────────────────┘ │
-└──────────────────────────────────────────────┘
+  Zoom out — the closest "query reshape" seam is in front of geocode
+
+  ┌─ UI (mobile/) ──────────────────────────────────────────┐
+  │  AddressBar text ──► geocode(text) [MapScreen.tsx:82]    │
+  │  ★ an LLM rewrite would sit HERE, before geocode —       │
+  │     reshape "flat park near me" → "park near me"          │
+  └────────────────────────────┬─────────────────────────────┘
+  ┌─ engine (pipeline/) ───────▼─────────────────────────────┐
+  │  geocode() → Nominatim → { lat, lng, label }  geocode.ts:9│
+  └──────────────────────────────────────────────────────────┘
 ```
+
+## Structure pass
+
+- **Layers:** UI text → `geocode` → routing.
+- **Axis — is the user's input reshaped before lookup?** Today: no — the
+  raw string is a Nominatim query verbatim. With a rewrite step: an LLM
+  cleans/expands it first. The axis (raw vs reshaped input) would flip at
+  the `geocode` call site.
+- **Seam:** `MapScreen.tsx:82` (and `:182/:189`). This is the same input
+  seam the NL-parse chain uses — query rewriting and that parse step are
+  the *same insertion point*, differing only in what the LLM emits.
 
 ## How it works
 
-**Move 1 — the mental model.** A question and its answer don't look alike, but two *answers* do. HyDE exploits this: generate a fake answer to the query (it can be wrong on facts), embed *that*, and its vector lands near genuine answer-docs.
+### Move 1 — the mental model
+
+Query rewriting is "fix the user's question before you go looking" —
+short, vague queries get expanded into terms a corpus actually contains.
+HyDE goes further: generate a fake ideal answer, embed *that*, and
+retrieve docs near it, because answers look more like documents than
+questions do. Both reshape the query to close the gap between how users
+ask and how data is stored. flattr's gap isn't query↔corpus (there's no
+corpus) — it's *raw NL ↔ clean geocoder input*.
 
 ```
-PATTERN — HyDE
-  "what's a flat route?" ─►[LLM]─► "A flat route avoids grades
-                                     over 6%, favoring valleys…"
-                                          │ embed THIS
-                                          ▼
-                                   kNN ─► real docs near it
+  Pattern — reshape the query before lookup
+
+  rewrite: "fix auth thing" → "debug auth token verification errors" → retrieve
+  HyDE:    "fix auth thing" → fake answer → embed answer → retrieve near it
+  flattr's cousin: "flat park near me, skip hills" → "park near me" → geocode
+                    (reshape NL → clean place string, then geocode)
 ```
 
-**Move 2 — the mechanism.** Rewriting: LLM rephrases/expands/decomposes the query (maybe into several sub-queries) before retrieval. HyDE: LLM drafts a hypothetical passage → embed it → retrieve → discard the draft, keep the real hits. Both add one LLM call in front of retrieval.
+### Move 2 — the walkthrough
+
+**The raw query flattr passes today.** `MapScreen.tsx:182`:
+
+```ts
+const a = await geocode(from, { viewbox });   // raw user text, verbatim
+```
+
+`from` is whatever the user typed, handed straight to Nominatim. No
+reshaping. If the user writes "flattest park near me, skip the hill,"
+Nominatim gets the literal sentence — and a geocoder is poor at intent.
+
+**Where a rewrite step would attach.** The same place the NL-parse chain
+attaches: an LLM step before `geocode` that extracts a clean place string
+(and, in flattr's case, the grade constraint). The geocode call itself —
+`geocode.ts:9` — stays untouched; only its *input* is reshaped.
 
 ```
-MECHANISM — LLM in front of retrieval
-  query ─► [LLM rewrite/HyDE] ─► embed ─► retrieve ─► real docs ─► generate
+  Layers-and-hops — rewrite the NL query, then geocode (unchanged)
+
+  ┌─ UI ──────┐ hop1: raw NL text   ┌─ (NOT BUILT) rewrite ─┐
+  │AddressBar │ ───────────────────►│ LLM → clean place str │
+  └───────────┘                     └─────────┬─────────────┘
+                        hop2: "park near me"   │
+  ┌─ engine ──┐ ◄──────────────────────────────┘
+  │geocode.ts │  geocode(place) — UNCHANGED (geocode.ts:9)
+  └───────────┘
 ```
 
-**Move 3 — principle.** When query and corpus speak different dialects, translate the query into the corpus's dialect *before* you search — don't expect the index to bridge the gap.
+**The boundary condition.** Two. (1) HyDE specifically is the wrong tool
+even hypothetically — it generates a hypothetical *document* to embed, and
+flattr has nothing to embed; the only viable cousin is plain rewriting
+that emits a place string. (2) The rewrite output feeds a geocoder, so it
+must be a clean query, not free text — which makes it the same
+[structured-output](../01-llm-foundations/04-structured-outputs.md)
+discipline as the NL-parse chain. This is really *one* seam, described two
+ways.
 
-## In this codebase
+### Move 3 — the principle
 
-**Not yet exercised in flattr.** No LLM, no retrieval — so no query rewriting and no HyDE.
+Query rewriting and HyDE both exist to close the gap between how users
+express intent and how the lookup system expects it. flattr's lookup is a
+geocoder, not a vector index, so HyDE is structurally inapplicable and the
+only relevant move is reshaping NL into a clean place string — which is
+exactly the input-seam parse step. The principle: a "reshape the query"
+step belongs in front of *whatever* lookup you have; for flattr that
+lookup is `geocode`, and the reshape is a parse, not an embedding trick.
 
-There *is* a real input→prompt seam at `pipeline/geocode.ts:9` — `geocode(query)` takes a fuzzy human destination ("the bakery on Elm") and resolves it to a coordinate. Superficially that's "rewriting a vague query." But the distinction matters: geocoding resolves a *place name to a point* via Nominatim; query rewriting reshapes text to retrieve *documents*. flattr's query targets a map, not a corpus. If an LLM ever pre-normalized the user's destination phrasing before that call, *that* would be query rewriting — but it would still feed geocoding, not document retrieval. Note the seam; it is not RAG query rewriting. Not exercised.
+## Primary diagram
+
+```
+  flattr's closest cousin to query rewriting
+
+  ┌─ UI ────────────────────────────────────────────────────┐
+  │ AddressBar text (MapScreen.tsx:82/182/189)               │
+  └────────────────────────────┬─────────────────────────────┘
+  ┌─ (NOT BUILT) rewrite/parse ▼ ────────────────────────────┐
+  │ LLM → clean place string (+ grade)  ·  NOT HyDE          │
+  └────────────────────────────┬─────────────────────────────┘
+  ┌─ geocode (EXISTS) ─────────▼─────────────────────────────┐
+  │ geocode(place) → { lat, lng, label } [geocode.ts:9]      │
+  └──────────────────────────────────────────────────────────┘
+```
+
+## Elaborate
+
+Query rewriting and HyDE are retrieval-quality tools — they live or die by
+whether they improve measured recall over a corpus, the kind of tuning
+you'd do in **AdvntrCue**. flattr has no corpus, so HyDE is out entirely
+and "rewriting" collapses into the NL-parse step at the input seam. The
+transferable insight: a query-reshape step attaches in front of *any*
+lookup, but the technique has to match the lookup — embedding tricks for
+a vector index, plain parsing for a geocoder.
+
+## Project exercises
+
+### B-QR.1 — NL query rewrite in front of geocode
+
+- **Exercise ID:** B-QR.1
+- **What to build:** an LLM step that rewrites a messy NL destination
+  into a clean place string before `geocode`, with schema-validated
+  output. (This is the same insertion point as the NL-parse chain — build
+  one, get both.)
+- **Why it earns its place:** it makes the "reshape the query before
+  lookup" pattern concrete against flattr's real geocoder, and keeps
+  `geocode` untouched.
+- **Files to touch:** new `pipeline/rewrite-query.ts` (or reuse
+  `parse-destination.ts`); `mobile/src/MapScreen.tsx:182/189`.
+- **Done when:** "flattest park near me" geocodes "park near me" instead
+  of the literal sentence.
+- **Estimated effort:** half a day with a stub model.
+
+## Interview defense
+
+**Q: Would query rewriting or HyDE help flattr's retrieval?** Answer:
+HyDE no — it embeds a hypothetical document and flattr has nothing to
+embed. Plain query rewriting has a real home, but not over a corpus: it's
+the input seam in front of `geocode` (`MapScreen.tsx:182`), where an LLM
+reshapes messy NL into a clean place string. That's the same insertion
+point as the NL-parse chain, and `geocode.ts:9` stays unchanged.
+Load-bearing point: match the reshape technique to the lookup — parse for
+a geocoder, embedding tricks for a vector index.
+
+```
+  raw NL → [LLM rewrite] → clean place → geocode (unchanged). No HyDE.
+```
+
+Anchor: *"flattr's only query-reshape seam is in front of geocode — a
+parse, not HyDE, because there's no index to embed against."*
 
 ## See also
-- [11 — RAG](11-rag.md)
-- [05 — Dense vs sparse](05-dense-vs-sparse.md)
-- [01 — Embeddings](01-embeddings.md)
+
+- [../02-context-and-prompts/03-prompt-chaining.md](../02-context-and-prompts/03-prompt-chaining.md) — the same NL-parse input seam.
+- [../01-llm-foundations/04-structured-outputs.md](../01-llm-foundations/04-structured-outputs.md) — the rewrite output must be schema'd.
+- [01-embeddings.md](01-embeddings.md) — why HyDE is structurally inapplicable.

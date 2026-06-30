@@ -1,206 +1,187 @@
-# 10 — Self-critique and self-consistency
+# 10 · Self-critique and self-consistency
 
-*Industry name(s): "self-critique," "self-refine," "self-consistency,"
-"reflexion," "sampling + vote." Type label: Industry standard.*
+> Industry name: self-critique / self-refine / self-consistency (majority vote) · Type label: Industry standard
 
-> **Seam, not present.** flattr generates nothing to critique. But it has a
-> genuinely high-stakes output that would justify the extra cost: a route
-> description that claims "Flat all the way" when there's a steep block
-> (`mobile/src/RouteSummaryCard.tsx:31` already branches on `clean =
-> steepCount === 0`). Getting that honesty wrong is flattr's worst failure.
-> This file teaches self-critique against exactly that output.
+> **Status: seam, not feature.** flattr runs no model output through a review step — but Seam 1's route description is exactly the kind of output where a wrong word ("flat" when `steepCount` was 3) misleads a user on a hill. This file maps self-critique and self-consistency onto that seam, with `penalty()`/`routeSummary` as the ground truth to check against.
 
-## Zoom out — where the extra reliability step sits
+## Zoom out — where this concept lives
 
-Self-critique and self-consistency are reliability multipliers: spend 2–5x the
-token budget to make one output more trustworthy. They sit *after* the first
-generation, as an extra pass. flattr has exactly one output where that cost is
-justified.
+Self-critique and self-consistency are reliability layers you add *after* a chain produces output, before you trust it. Here's where they'd wrap Seam 1:
 
 ```
-  Zoom out — the extra pass on flattr's highest-stakes output
+  Zoom out — reliability layers wrapping Seam 1's description
 
-  ┌─ generation (future Seam 1) ────────────────────────────────────┐
-  │ RouteSummary → "Flat all the way" / "⚠ Flattest available"      │
-  │   ★ getting steep-honesty wrong = flattr's worst bug ★          │
-  └───────────────────────────┬──────────────────────────────────────┘
-                              ▼ JUSTIFIES the 2-5x cost
-  ┌─ reliability pass (future) ─────────────────────────────────────┐
-  │ self-critique: "does this mention steepness iff steepCount>0?"  │
-  │ self-consistency: run N times, vote on honesty                  │
-  └──────────────────────────────────────────────────────────────────┘
+  ┌─ Chain: describe ────────────────────────────────────────────┐
+  │ routeSummary → LLM → "Mostly flat, 2.1km" (draft)            │
+  └─────────────────────────┬────────────────────────────────────┘
+                            │ before trusting it
+  ┌─ Reliability layer (SEAM) ▼──────────────────────────────────┐
+  │ ★ THIS FILE ★                                               │ ← we are here
+  │ self-critique: "does this match steepCount=1?" → revise      │
+  │ self-consistency: run N times, vote on the answer            │
+  │ cost: 2-5x tokens for one step of reliability                │
+  └─────────────────────────┬────────────────────────────────────┘
+                            │ trusted output
+  ┌─ UI ────────────────────▼────────────────────────────────────┐
+  │ RouteSummaryCard shows the description                        │
+  └──────────────────────────────────────────────────────────────┘
 ```
 
-## Zoom in
+Now zoom in. Two related patterns: **self-critique** — ask the model to evaluate its own output against criteria and revise — and **self-consistency** — run the same prompt N times and vote on the answer. Both buy reliability for 2-5x the token budget, both have a sharp limit: a model critiquing itself shares the blind spots that produced the error. Let me build them.
 
-The pattern, two flavors: **self-critique** — ask the model to evaluate and
-revise its own output. **self-consistency** — run the same prompt N times and
-vote. Both buy reliability with tokens (2–5x). Worth it for high-stakes,
-hard-to-review outputs. The catch: a model critiquing itself shares the blind
-spots that produced the output — diminishing returns, and a hard ceiling.
+## Structure pass
 
-## The structure pass
+**Layers.** Two: the *generation* (the draft) and the *verification* (critique or vote). The key question is whether the verification has *independent ground truth* or just re-asks the same model. flattr supplies real ground truth — `routeSummary` and `penalty` are deterministic facts the critique can check against.
 
-**Layers:** first output → critique/votes → final output.
-**Axis:** *reliability per token* — how much trust does the extra pass buy?
-**Seam:** the first-output→reliability-pass boundary, where you decide the
-stakes justify the multiplier.
+**Axis — trust (can the verifier catch what the generator missed?).**
 
 ```
-  axis = "is the extra reliability worth the token multiplier?"
+  One axis — "does the check have independent signal?" — across the layers
 
-  ┌─ low stakes ──┐ worth it: NO — 1x, ship the first output
-  │  ── seam ──      ◄── decided by the cost of being wrong
-  └─ high stakes ─┘ worth it: YES — 2-5x for steep-honesty
+  self-critique vs ITSELF:   same model, same blind spots
+    → catches surface errors, misses its own systematic ones
+
+  self-critique vs GROUND TRUTH (routeSummary facts):
+    → "you said 'flat' but steepCount=1" → catches the real error
+
+  the seam: trust flips when the verifier has signal the generator lacked
 ```
+
+**Seam.** The load-bearing boundary is *between self-reference and external reference*. A model checking its own work against itself has diminishing returns (its blind spots produced the error and persist into the critique). A model checking its output against *deterministic facts it didn't generate* — flattr's `steepCount`, `climbM` — has real signal. That flip is the whole design decision.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You know two ways to make code more reliable: a code review (someone reads it
-and flags problems — that's self-critique) and running a flaky test N times to
-see if it's really green (that's self-consistency). Self-critique adds a
-reviewer; self-consistency adds repetition and a vote. Both cost more; you
-reserve them for the code that matters. flattr's honesty claim is the code that
-matters.
+You know code review catches more when the reviewer wasn't the author — a second set of eyes sees what the first missed. Self-critique is the model reviewing its own PR: better than nothing, but it shares the author's blind spots. Self-consistency is running the flaky test five times and trusting the majority result. Both are familiar reliability moves; the LLM versions cost tokens instead of CI minutes.
 
 ```
-  Pattern — two reliability shapes
+  The two kernels — critique loop and consistency vote
 
-  SELF-CRITIQUE:  draft ─► "critique your draft" ─► revise ─► final
-                          (one extra pass)
-
-  SELF-CONSISTENCY: prompt ─► run 1 ─┐
-                    prompt ─► run 2 ─┼─► vote ─► final
-                    prompt ─► run 3 ─┘
+  self-critique:                 self-consistency:
+  ┌─ generate draft ─┐           ┌─ run N times ────────────┐
+  │                  │           │ out1 out2 out3 out4 out5 │
+  ┌─ critique it ────┐           └──────────┬───────────────┘
+  │ vs criteria/facts│                      │ majority vote
+  ┌─ revise ─────────┐           ┌─ pick the modal answer ──┐
+  │                  │           │                          │
+  └──────────────────┘           └──────────────────────────┘
+   1 gen + 1-2 critique          N gens (N=3..5 typical)
 ```
 
-### Move 2 — both flavors on flattr's honesty claim
+### Move 2 — the step-by-step walkthrough
 
-**Step 1 — the high-stakes output that justifies the cost.** flattr's UI
-already encodes the stakes:
+**Self-critique — ask the model to evaluate, then revise.** Step one: generate the draft description. Step two: a second call asks "does this description accurately reflect the route? Check it against these facts." Step three: revise based on the critique. For Seam 1, the *facts* are the gift flattr provides — `routeSummary` already computed the ground truth:
 
-```tsx
-// mobile/src/RouteSummaryCard.tsx:28,31 — EXISTS
-const clean = summary.steepCount === 0;
-... <Text>{clean ? "Flat all the way" : "⚠ Flattest available"}</Text>
+```ts
+// features/routing/summary.ts:5 — the ground truth the critique checks against
+export type RouteSummary = {
+  distanceM: number;    // critique: does the prose's distance match?
+  climbM: number;       // critique: if climbM>10, did it mention the climb?
+  steepCount: number;   // critique: did it say "flat" while steepCount>0?  ← the catch
+};
 ```
 
-A future LLM description that says "Flat all the way" when `steepCount > 0` is
-the worst possible flattr bug — it breaks the product's core honesty promise
-and could send someone up a hill they can't manage. *That* output justifies a
-reliability pass. The Seam 1 description for a clean route does not.
-
-**Step 2 — self-critique against the honesty invariant.** The critique prompt
-has a concrete, checkable target:
+The critique isn't the model second-guessing its vibes — it's the model checking its prose against *deterministic numbers it didn't make up*. "You wrote 'flat' but `steepCount` is 1" is a real, grounded correction. That's self-critique with external signal, which is the version that works.
 
 ```
-  // FUTURE — self-critique pass
-  draft = describe(summary)
-  critique = ask("Does this description mention steep blocks if and only if
-                  steepCount > 0? steepCount=" + summary.steepCount + ". Draft: " + draft)
-  if (critique says inconsistent) draft = revise(draft, critique)
+  Hop — self-critique against routeSummary ground truth
+
+  ┌─ draft ──────────┐  "Flat, 2.1km"  ┌─ critique call ────────┐
+  │ describe (LLM)   │ ──────────────► │ check vs {steepCount:1}│
+  └──────────────────┘                 │ → "MISMATCH: said flat,│
+                                       │    steepCount=1"       │
+                                       └──────────┬─────────────┘
+                                                  │ revise
+                                       ┌─ corrected ────────────┐
+                                       │ "Mostly flat, 2.1km,   │
+                                       │  one short climb"      │
+                                       └────────────────────────┘
 ```
 
-**Step 3 — but prefer a mechanical check (the honest answer).** Here flattr
-exposes the limit of self-critique beautifully: the honesty invariant is
-*mechanically checkable* — `description.mentionsSteep === (steepCount > 0)`.
-When you can verify with code, you don't pay 2-5x for the model to verify
-itself. Self-critique is for outputs you *can't* mechanically check (is this
-sentence natural? is this tone right?). flattr's steep-honesty is checkable —
-so the right move is a code assertion, and self-critique is reserved for the
-subjective polish.
+**Self-consistency — run N times, vote.** For a *decision* (not prose) — say Seam 2's parse of an ambiguous query, or the climb-warning decision from `09` — run the same prompt 3-5 times at nonzero temperature and take the majority answer. The intuition: a correct answer is a stable attractor; errors scatter. If 4 of 5 runs say `preferFlat: true`, that's your answer. This works for discrete answers (the votes have to be comparable) and not for prose (no two descriptions are identical to vote on).
 
-**Step 4 — self-consistency for the genuinely subjective.** If you wanted the
-*most natural* description, run the prompt 3 times at temperature, and pick the
-one that passes the mechanical honesty check AND reads best. The vote here is
-"honest AND natural," with honesty checked by code, naturalness by you or a
-judge (concept 05).
+**Cost — 2-5x token budget.** Self-critique is roughly 2-3x (generate + critique + revise). Self-consistency is Nx (N full generations). You're buying one step of reliability with a multiple of your token spend, so you apply it *selectively*.
+
+**When the extra cost is worth it.** High-stakes outputs (the description that sends someone up a hill they wanted to avoid — flattr's whole point is grade safety), low-trust classifiers (an ambiguous parse where a wrong `preferFlat` ruins the route), and content hard to manually review at volume. flattr's spec even has the analog: `BLOCKED` is large-finite specifically so "no flat route" stays *honest and distinct* — the system already cares about not lying about grade. A description that says "flat" about a steep route violates that same value, which is exactly where the critique-against-`steepCount` step earns its tokens.
+
+**The diminishing-returns limit — shared blind spots.** A model critiquing its own output has the same blind spots that produced it. If the model systematically under-weights short steep stretches, it'll under-weight them in the critique too. This is why the *external ground truth* matters so much here: self-critique against `routeSummary`'s deterministic numbers escapes the shared-blind-spot trap, because the numbers came from `penalty()` and the graph, not from the model. Pure self-critique (model vs its own judgment, no external facts) catches sloppy surface errors and misses systematic ones — useful, but bounded.
 
 ```
-  Layers-and-hops — reliability pass on the honesty claim
+  The diminishing-returns boundary
 
-  ┌─ generate ───┐ draft   ┌─ mechanical check (PREFERRED) ─┐ pass/fail
-  │ describe()   │ ──────► │ mentionsSteep == (steep>0)?    │ ──► ship/regen
-  └──────────────┘         └────────────────────────────────┘
-        │ (only for subjective axes)
-        ▼
-  ┌─ self-critique ──┐ "is the tone right?" ─► revise ─► final
-  └──────────────────┘  (2x cost, reserved for unverifiable axes)
+  model critiques itself, no facts:   catches typos, misses its biases
+  model critiques vs routeSummary:    catches "flat" when steepCount>0
+                                      (external signal breaks the loop)
+  → always give the critique ground truth it didn't generate
 ```
-
-### Move 2 variant — load-bearing skeleton
-
-Kernel: **an extra pass gated by stakes, preferring mechanical checks**. What
-breaks:
-
-- **No reliability pass on the honesty claim** → "Flat all the way" ships on a
-  steep route. *Load-bearing for high-stakes output.*
-- **Self-critique where a mechanical check exists** → you pay 2-5x for what a
-  one-line assertion does, and the model misses what it missed the first time.
-  *Waste + the blind-spot ceiling.*
-- **Self-consistency on low-stakes output** → 3-5x cost for no product gain.
-  *Anti-pattern.*
 
 ### Move 3 — the principle
 
-Reliability passes buy trust with tokens — reserve them for high-stakes,
-*unverifiable* outputs. When the invariant is mechanically checkable (flattr's
-steep-honesty is), a code assertion beats self-critique every time, because the
-model shares the blind spots that produced the error.
+Self-critique and self-consistency buy reliability for a multiple of token spend, and you spend it only where the output is high-stakes or hard to review. The decisive design choice is whether the verifier has *independent signal*: a model checking itself shares its blind spots, but a model checking its prose against deterministic facts it didn't generate (flattr's `routeSummary`, `penalty`) escapes that trap. The lesson generalizes: self-critique is only as good as the ground truth you hand the critic. When you have real facts, ground the critique in them; when you don't, expect diminishing returns and prove the gain with evals (`05`).
 
 ## Primary diagram
 
-```
-  Self-critique / self-consistency on flattr's honesty claim (FUTURE)
+The full reliability layer at Seam 1, both patterns, with the ground-truth grounding marked.
 
-  RouteSummary{steepCount} ─► describe() ─► draft
-                                              │
-              ┌───────────────────────────────┤
-              ▼ checkable (PREFER)             ▼ unverifiable
-  ┌─ mechanical ──────────────┐   ┌─ self-critique / N-vote ──────────┐
-  │ mentionsSteep==(steep>0)? │   │ "tone natural?" → revise / vote   │
-  │ 1x cost, no blind spot ✓  │   │ 2-5x cost, blind-spot ceiling     │
-  └───────────────────────────┘   └────────────────────────────────────┘
+```
+  Self-critique + self-consistency at Seam 1
+
+  ┌─ Generate ───────────────────────────────────────────────────┐
+  │ describe(routeSummary) → draft prose                         │
+  └─────────────────────────┬────────────────────────────────────┘
+            ┌───────────────┴───────────────┐
+  ┌─ Self-critique ─────────┐     ┌─ Self-consistency ───────────┐
+  │ check draft vs          │     │ (for DECISIONS, not prose)   │
+  │ routeSummary facts:     │     │ run N times → vote           │
+  │  steepCount, climbM     │     │  e.g. preferFlat: 4/5 → true │
+  │ ★ external ground truth │     │  cost: N×                    │
+  │   → escapes blind spots │     └──────────────────────────────┘
+  │ → revise                │
+  │ cost: 2-3×              │
+  └─────────────────────────┘
+            │ trusted output
+  ┌─ UI ────▼────────────────────────────────────────────────────┐
+  │ RouteSummaryCard — now safe to claim "flat"                  │
+  └──────────────────────────────────────────────────────────────┘
+   apply selectively: high-stakes (grade safety) only
 ```
 
 ## Elaborate
 
-Self-consistency is from Wang et al. ("Self-Consistency Improves Chain of
-Thought"); self-refine / Reflexion are the self-critique lineage. The crucial
-production caveat — a model can't reliably catch errors it's prone to making —
-is why eugeneyan.com and Hamel both push *external* verification (mechanical
-checks, a different model as judge) over pure self-critique. flattr is a clean
-illustration: its highest-stakes invariant happens to be mechanically
-checkable, which is the best possible case. Read `05-eval-driven-iteration.md`
-for external verification done right and `09-chain-of-thought.md` for the
-reasoning step self-critique builds on.
+Self-consistency comes from Wang et al.'s "Self-Consistency" paper (sample diverse reasoning paths, marginalize over the answer); self-critique/self-refine from Madaan et al.'s "Self-Refine." The production nuance the papers underplay is the shared-blind-spot ceiling — which is why the strongest version in practice grounds the critique in external signal (a validator, a retrieval check, or here, deterministic domain facts). flattr is an unusually clean teacher because the ground truth is *already computed and sitting right next to the seam*: `routeSummary` and `penalty` are facts the model didn't generate, so a critique against them has real teeth. This connects forward to agentic patterns (`study-agent-architecture`) where the "critic" becomes a tool that checks output against the world.
+
+## Project exercises
+
+### EX-CRITIQUE-1 — Ground-truth self-critique for descriptions
+
+- **Exercise ID:** EX-CRITIQUE-1
+- **What to build:** A `describeWithCheck(summary)` that generates a description, runs a critique call comparing it against `summary.steepCount`/`climbM`, and revises on mismatch — logging how often the critique caught a "flat"-but-steep error.
+- **Why it earns its place:** Demonstrates self-critique *with external ground truth*, the version that escapes shared blind spots, using facts flattr already computes.
+- **Files to touch:** new `features/routing/describe-checked.ts`; uses `RouteSummary` from `summary.ts`.
+- **Done when:** an injected wrong description ("flat" for a steepCount=2 route) is caught and corrected by the critique step.
+- **Estimated effort:** 3-4 hours.
 
 ## Interview defense
 
-**Q: "When is self-critique not worth it?"** When the invariant is mechanically
-checkable, or the output is low-stakes. flattr's steep-honesty is checkable in
-one line — paying 2-5x for the model to re-check itself is waste, and worse, it
-shares the blind spot that caused the error. Reserve self-critique for
-high-stakes outputs you genuinely can't verify with code.
+**Q: What's the limit of self-critique?**
+
+Shared blind spots — a model critiquing its own output has the same biases that produced it, so it catches surface errors and misses systematic ones. The fix is to ground the critique in external signal: deterministic facts the model didn't generate.
 
 ```
-  checkable invariant → code assertion (1x, no blind spot)
-  unverifiable + high-stakes → self-critique / vote (2-5x)
+  critique vs self          → bounded (shared blind spots)
+  critique vs routeSummary  → real signal ("flat" but steepCount=1)
 ```
 
-Anchor: *"flattr's worst bug is 'Flat all the way' on a steep route —
-`RouteSummaryCard.tsx` already branches on `steepCount===0`. That's high-stakes,
-which argues for a reliability pass; but it's mechanically checkable, which
-means a code assertion beats self-critique."*
+Anchor: flattr's `routeSummary` gives the critique ground truth (`steepCount`, `climbM`) the model didn't make up — that's what makes the check work.
+
+**Q: When is 2-5x the token cost worth it?**
+
+High-stakes outputs, low-trust classifiers, content hard to review at volume. flattr's grade-safety mission is the case: a description that says "flat" about a steep route is the exact failure the whole product exists to prevent, so the critique-against-`steepCount` step earns its tokens.
 
 ## See also
 
-- [05-eval-driven-iteration.md](05-eval-driven-iteration.md) — external
-  verification > self-critique
-- [09-chain-of-thought.md](09-chain-of-thought.md) — the reasoning step under it
-- [02-structured-outputs.md](02-structured-outputs.md) — schema makes honesty
-  checkable
-- `.aipe/study-security/` — never let unverified LLM output trigger side effects
-</content>
+- `05-eval-driven-iteration.md` — proving the reliability gain is real
+- `09-chain-of-thought.md` — the cheaper reliability step below this one
+- `02-structured-outputs.md` — the critique's verdict as a structured field
+- `13-forbidden-patterns.md` — the other selective-cost generation concern

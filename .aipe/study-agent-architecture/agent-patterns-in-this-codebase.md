@@ -1,188 +1,106 @@
-# Agent patterns in this codebase — the router-as-tool seam
+# Agent patterns in flattr
 
-## The plain statement
+> The honest per-repo audit. Read `00-overview.md` first for the framing.
 
-**This codebase does not currently use any autonomous agent loop.** There is
-no LLM, no tool-calling, no model-decided control flow, and no multi-agent
-topology. Every step in flattr is decided by engineer-written code: the build
-pipeline is a fixed chain of pure transforms, and the router is a control
-loop where the A* cost rule decides each step.
+## The headline
 
-The patterns below are covered as *study material* and as a *future seam*.
-The one genuinely interesting thing flattr has, from an agent-architecture
-view, is that its router is already shaped like an agent's tool layer. This
-file maps that seam concretely — the exact function signatures an LLM agent
-would call, and the one feature that would justify wrapping them.
+**flattr does not currently use any autonomous agent loop.** There is no
+LLM in the codebase, no tool-calling, no ReAct, no multi-agent topology. The
+patterns in this guide are covered as study material; the system-design
+templates in `06-orchestration-system-design-templates/` identify the
+topologies flattr *could* adopt and the refactor each would require.
 
-## Agent patterns table
+What flattr *does* have is the deterministic skeleton an agent loop is built
+on, plus four functions already shaped like agent tools. That's the value of
+this guide: contrast and seam, not a description of agents flattr runs.
 
-```
-  ┌──────────────────────┬──────────────────┬──────────────────────────┐
-  │ Feature              │ Pattern / shape  │ Why this pattern          │
-  ├──────────────────────┼──────────────────┼──────────────────────────┤
-  │ build pipeline       │ chain (no model) │ steps known in advance;   │
-  │ (pipeline/run-build) │                  │ pure transforms           │
-  ├──────────────────────┼──────────────────┼──────────────────────────┤
-  │ routing (search)     │ control loop     │ a loop, but CODE decides  │
-  │ (features/routing/   │ (NOT an agent)   │ each step via A* cost     │
-  │  astar.ts)           │                  │ rule — deterministic      │
-  ├──────────────────────┼──────────────────┼──────────────────────────┤
-  │ (none)               │ single-agent     │ NOT YET EXERCISED         │
-  │                      │ ReAct            │                          │
-  ├──────────────────────┼──────────────────┼──────────────────────────┤
-  │ (none)               │ multi-agent      │ NOT YET EXERCISED         │
-  └──────────────────────┴──────────────────┴──────────────────────────┘
-```
+## The agent patterns table
 
-Neither feature names a model in any decision. The control envelope on the
-router is the A* admissibility invariant and the `BLOCKED` large-finite
-sentinel (steep-but-reachable stays distinct from disconnected) — both
-deterministic guards, not agent guardrails.
-
----
-
-## The seam: flattr's router is already a tool layer
-
-Here's the part worth studying. An LLM agent needs tools, and a *good* tool
-is a well-typed, side-effect-free, single-purpose function with typed inputs
-and typed outputs. flattr's router functions are *exactly that already.* Look
-at the signatures — these are agent tools that happen not to have an agent
-calling them yet.
-
-### The four tool-shaped functions (real signatures)
+flattr's features mapped to the *nearest* pattern — with the honest caveat
+that none use a model:
 
 ```
-  flattr's router functions — already tool-shaped
-
-  ┌─ search() ─ features/routing/astar.ts:22 ─────────────────┐
-  │  search(graph, startId, goalId, userMax, costFn, heur)    │
-  │    → SearchResult { path: Path|null, nodesExpanded, ... } │
-  │  pure, deterministic, no I/O, fully tested                │
-  └───────────────────────────────────────────────────────────┘
-  ┌─ routeSummary() ─ features/routing/summary.ts:11 ─────────┐
-  │  routeSummary(graph, path, userMax)                       │
-  │    → { distanceM, climbM, steepCount }                    │
-  │  human-facing totals; pure                                │
-  └───────────────────────────────────────────────────────────┘
-  ┌─ geocode() ─ pipeline/geocode.ts:9 ──────────────────────┐
-  │  geocode(query, opts?) → Promise<GeocodeResult | null>   │
-  │    GeocodeResult = { lat, lng, label }                    │
-  │  the ONE function with a network hop (Nominatim)          │
-  └───────────────────────────────────────────────────────────┘
-  ┌─ nearestNode() ─ features/routing/nearest.ts:5 ──────────┐
-  │  nearestNode(graph, point) → string (nodeId)             │
-  │  snaps a coordinate to the graph; pure                    │
-  └───────────────────────────────────────────────────────────┘
+  ┌────────────────────┬──────────────────────┬───────────────────────────┐
+  │ Feature            │ Nearest pattern      │ Why / the honest caveat   │
+  ├────────────────────┼──────────────────────┼───────────────────────────┤
+  │ features/routing/  │ agent-loop SKELETON  │ same kernel (state·step·  │
+  │ astar.ts search()  │ (deterministic)      │ execute·terminate) — but  │
+  │                    │                      │ CODE fills step (g+h),    │
+  │                    │                      │ not a model. astar.ts:48  │
+  ├────────────────────┼──────────────────────┼───────────────────────────┤
+  │ pipeline/          │ sequential PIPELINE  │ fixed chain of pure stages│
+  │ run-build.ts       │ (no LLM)             │ osm→elev→split→grade→graph│
+  ├────────────────────┼──────────────────────┼───────────────────────────┤
+  │ summarizePath /    │ verifier / CRITIC    │ grades route vs userMax   │
+  │ steepEdges         │ (deterministic rule) │ (steepCount) — reports,   │
+  │                    │                      │ doesn't loop. astar.ts:126│
+  ├────────────────────┼──────────────────────┼───────────────────────────┤
+  │ MapScreen.tsx flow │ ROUTING (hand-coded) │ geocode→nearestNode→search│
+  │                    │                      │ — fixed order, no model   │
+  ├────────────────────┼──────────────────────┼───────────────────────────┤
+  │ bench/run.ts       │ trajectory EVAL      │ stage comparison on       │
+  │                    │ (deterministic)      │ pushes/pops/nodesExpanded │
+  └────────────────────┴──────────────────────┴───────────────────────────┘
 ```
 
-Each one passes the "is this a good tool?" test:
+None of these is an agent. Each is the deterministic cousin of an agent
+pattern — which is exactly why flattr teaches the contrast so cleanly.
 
-- **Typed input, typed output.** `geocode(query) → {lat, lng, label} | null`
-  is already the JSON-shaped contract a tool schema describes. No parsing of
-  free-form strings, no ambiguous returns.
-- **Single responsibility.** `search` finds a path. `routeSummary` totals it.
-  `geocode` resolves an address. `nearestNode` snaps a coordinate. Each does
-  one thing — exactly what you want when a model has to decide *which* tool.
-- **Side-effect discipline.** Three of the four are pure (no I/O, no
-  mutation). Only `geocode` touches the network, and it's the one that would
-  need a circuit breaker if an agent called it in a loop. That clean split
-  (pure tools vs the one network tool) is the side-effect boundary an agent's
-  guardrails would key on.
+## The one control loop, with its envelope
 
-### What the agent would add — and what it would NOT touch
+flattr's `search()` (`astar.ts:22`) is a real control loop. Its structure:
 
 ```
-  Phase A (now)                  Phase B (a planner agent)
-  ─────────────                  ──────────────────────────
-  someone calls these            a MODEL decides which to call,
-  functions directly             in what order, when to stop
-  (mobile UI, tests)
+  ┌─ control loop: features/routing/astar.ts ──────────────────┐
+  │  STATE      open · g · came · closed         (:30-33)       │
+  │  STEP       g + costFn + heuristicFn          (:68-72)       │
+  │             ↑ CODE decides — a model would fill this slot   │
+  │  EXECUTE    expand adjacency                  (:64-67)       │
+  │  TERMINATE  success: current === goal         (:52)         │
+  │             budget:  open.isEmpty()           (:48,:77)      │
+  └─────────────────────────────────────────────────────────────┘
 
-  ┌─ the four functions ─┐       ┌─ the four functions ─┐
-  │ search / summary /   │  ═══► │ search / summary /   │  ◄── UNCHANGED
-  │ geocode / nearest    │       │ geocode / nearest    │      (now "tools")
-  └──────────────────────┘       └──────────┬───────────┘
-                                            │ called as tools
-                                 ┌──────────▼───────────┐
-                                 │ a ReAct loop (NEW)   │
-                                 │ step = model.decide  │
-                                 │ budget = iter cap     │
-                                 └──────────────────────┘
+  control envelope (all FREE — structural, not engineered):
+    • iteration bound — finite graph + closed set → guaranteed halt
+    • no cost ceiling needed — deterministic, µs per step, no tokens
+    • no guardrails needed — no model, no untrusted output in the loop
 ```
 
-The takeaway is *what doesn't change*: the router. You'd add a loop (the
-skeleton from `01-reasoning-patterns/02-agent-loop-skeleton.md`) and a thin
-tool-schema wrapper around each function, and the existing, tested router
-code stays byte-for-byte the same. That's the payoff of having tool-shaped
-functions before you have an agent — the seam is pre-cut.
+The lesson the envelope teaches: every control an *agent* loop must add by
+hand (iteration cap, cost ceiling, output guardrail) flattr gets for free
+because there's no model — the loop is finite, deterministic, and trusted.
 
----
-
-## The one feature that would cross into agent territory
-
-**"Plan me a flat afternoon route with three coffee stops."** This is the
-single flattr feature that genuinely needs a model-decided loop, because the
-stops, their order, and the routing between them aren't known until the model
-reasons about the request.
+## The shape verdict
 
 ```
-  Layers-and-hops — the hypothetical planner agent
+  Workflow / chain ── flattr is closest to this, but WITHOUT an LLM.
+                      pipeline/ is a pure chain; the router is a
+                      code-decides loop. Not the workflow-with-LLM shape
+                      the spec names — there's no LLM.
 
-  ┌─ UI ──────────┐  "flat afternoon, 3 coffee stops"
-  │ MapScreen     │ ─────────────────────────────────┐
-  └───────────────┘                                  │
-  ┌─ Agent loop (NEW — Service layer) ───────────────▼──────┐
-  │  step: model decides next tool call                     │
-  │   turn 1 → geocode("coffee near X")  → candidate stops  │
-  │   turn 2 → nearestNode(stop) ×3      → graph node ids    │
-  │   turn 3 → search(graph, a, b, userMax, gradeCost, h)   │
-  │            ×N legs                    → flat paths       │
-  │   turn 4 → routeSummary(...)         → totals per leg    │
-  │   terminate: model emits final plan OR iteration cap    │
-  └────────────────────────────┬────────────────────────────┘
-                              │ tool calls (no model touches graph directly)
-  ┌─ Tools (UNCHANGED router) ─▼───────────────────────────┐
-  │  geocode · nearestNode · search · routeSummary         │
-  └─────────────────────────────────────────────────────────┘
+  Single-agent ────── NOT present. (Would arrive via the "plan an
+                      afternoon" feature — 07-routing.md + template 01.)
+
+  Multi-agent ─────── NOT present, and not justified.
+                      (Two steps away — see 03/01-when-not-to-go-multi-agent.)
 ```
 
-Even this stays **single-agent** — one ReAct loop, not a multi-agent
-topology (see `03-multi-agent-orchestration/01-when-not-to-go-multi-agent.md`
-for why the sub-tasks are sequential tool calls, not independent
-specialties). The control envelope it would need: an iteration cap (the
-budget exit flattr's `search()` gets for free but an agent must engineer), a
-circuit breaker on `geocode` (the one network tool), and output validation
-before trusting the model's final plan.
+## If flattr grew an agent — the one seam
 
-## Where each not-yet-exercised pattern would attach
+The single concrete path to a real agent (detailed in
+`01-reasoning-patterns/07-routing.md` and template 01): a new
+`features/plan/` module with one ReAct loop, registering the four existing
+functions as tools, for a "plan a flat afternoon with 3 coffee stops"
+feature. Crucially, **`features/routing/` doesn't change** — the router
+becomes a tool the agent calls. `geocode` is the one tool needing a circuit
+breaker and rate-limit (`05-production-serving/03`); trajectory evals attach
+at `bench/` (`04-agent-infrastructure/04`).
 
-```
-  ┌──────────────────────────┬────────────────────────────────────┐
-  │ Pattern (not yet present) │ Attachment point in flattr         │
-  ├──────────────────────────┼────────────────────────────────────┤
-  │ single-agent ReAct loop   │ wrap router fns as tools; new loop  │
-  │                          │  in features/ (planner feature)     │
-  ├──────────────────────────┼────────────────────────────────────┤
-  │ agentic retrieval / RAG   │ no knowledge corpus exists; would   │
-  │                          │  need a doc store + embeddings first │
-  ├──────────────────────────┼────────────────────────────────────┤
-  │ agent memory tiers        │ no persistence layer (graph.json is │
-  │                          │  read-only); would need a store      │
-  ├──────────────────────────┼────────────────────────────────────┤
-  │ multi-agent topology      │ no decomposable model problem exists │
-  ├──────────────────────────┼────────────────────────────────────┤
-  │ trajectory / tool evals   │ bench/ measures search perf today;  │
-  │                          │  agent evals would attach there      │
-  ├──────────────────────────┼────────────────────────────────────┤
-  │ guardrails / control env  │ iteration cap + circuit breaker on  │
-  │                          │  geocode + output schema validation  │
-  └──────────────────────────┴────────────────────────────────────┘
-```
+## Where to read the grounded contrasts
 
-## See also
-
-- `01-reasoning-patterns/02-agent-loop-skeleton.md` — the loop you'd wrap the tools in
-- `01-reasoning-patterns/01-chains-vs-agents.md` — why the current router isn't an agent
-- `06-orchestration-system-design-templates/02-agentic-support-system.md` — the planner as a template
-- `study-system-design` — the router functions as service boundaries
-- `study-ai-engineering` — tool-calling mechanics (the model side of this seam)
+- The loop contrast: `01-reasoning-patterns/02-agent-loop-skeleton.md`
+- The chain vs loop: `01-reasoning-patterns/01-chains-vs-agents.md`
+- The tool seam: `01-reasoning-patterns/07-routing.md` +
+  `04-agent-infrastructure/03-tool-calling-and-mcp.md`
+- The breaker boundary: `05-production-serving/03-per-tool-circuit-breaking.md`
+- The eval attachment: `04-agent-infrastructure/04-agent-evaluation.md`

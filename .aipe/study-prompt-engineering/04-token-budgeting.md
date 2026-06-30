@@ -1,217 +1,197 @@
-# 04 — Token budgeting and context window management
+# 04 · Token budgeting and context window management
 
-*Industry name(s): "token budgeting," "context window management,"
-"lost-in-the-middle," "prefix caching." Type label: Industry standard.*
+> Industry name: token budgeting / context window management / prefix caching · Type label: Industry standard
 
-> **Seam, not present.** flattr counts no tokens because it makes no LLM
-> calls. But its payloads are unusually instructive: the Seam 1 context is
-> *three numbers* (`RouteSummary`), and the lurking danger is `Edge.geometry`
-> (`features/routing/types.ts:14`) — a polyline that, if naively stuffed into
-> a prompt, blows the budget. This file teaches budgeting against both.
+> **Status: seam, not feature.** flattr counts no tokens because it sends no prompts. But it has a textbook token-budget trap sitting in plain sight: `Edge.geometry` is a polyline of `[lat, lng]` pairs, and a route's path can carry hundreds of them. This file maps token discipline onto Seam 1, where that geometry would tempt you into the prompt.
 
-## Zoom out — where the token budget gets spent
+## Zoom out — where this concept lives
 
-Every prompt fits inside a context window, and every section of it costs
-tokens. Budgeting is allocating that fixed window across the four sections
-before you hit the wall. Here's flattr's payload, sized.
+Token budgeting is the most operational concept in this folder — it's hygiene, not a trick. Here's where it bites flattr's Seam 1:
 
 ```
-  Zoom out — token cost by section at Seam 1
+  Zoom out — the token budget at Seam 1 (describe my route)
 
-  ┌─ CONTEXT WINDOW (e.g. 200k tokens) ─────────────────────────────┐
-  │ ┌─ system (constant) ──┐  ~150 tok   cached prefix              │
-  │ ┌─ few-shot (constant) ┐  ~120 tok   cached prefix              │
-  │ ┌─ context (per-call) ─┐  ★ TINY: 3 numbers ≈ 20 tok ★          │
-  │ ┌─ DANGER ─────────────┐  Edge.geometry polyline = HUNDREDS     │
-  │ │ if you stuff geometry │  of [lat,lng] pairs if added naively  │
-  │ └───────────────────────┘                                       │
-  │ ┌─ response budget ────┐  reserve ~100 tok for the one sentence │
-  │ └───────────────────────────────────────────────────────────────┘
-  └──────────────────────────────────────────────────────────────────┘
+  ┌─ Runtime (routing) ──────────────────────────────────────────┐
+  │  Path { nodes[], edges[], cost, lengthM, steepEdges[] }      │
+  │  each Edge has geometry: [lat,lng][]  ← THE TRAP             │
+  └─────────────────────────┬────────────────────────────────────┘
+                            │  what do you put in the prompt?
+  ┌─ Prompt assembly (SEAM 1) ▼──────────────────────────────────┐
+  │  ★ THIS FILE: budget the context section ★                  │ ← we are here
+  │  RIGHT: {distanceM, climbM, steepCount}  ≈ 30 tokens         │
+  │  WRONG: full Edge[].geometry polylines    ≈ thousands        │
+  └─────────────────────────┬────────────────────────────────────┘
+                            │  HTTP
+  ┌─ Provider ──────────────▼────────────────────────────────────┐
+  │  context window: fixed budget — system+context+history+reply │
+  └──────────────────────────────────────────────────────────────┘
 ```
 
-flattr's honest situation: the *intended* payload is microscopic, but the
-graph data sitting one field away is enormous. Budgeting is knowing which is
-which.
+Now zoom in. The pattern is: **the context window is a fixed budget you allocate across system prompt, retrieved context, history, and the response — and you count tokens, because the thing that fits a 10-node test route blows the window on a 400-node real one.** Let me build the budget.
 
-## Zoom in
+## Structure pass
 
-The pattern: **count tokens for every section, allocate the window
-deliberately (system + retrieved + history + response), keep the stable parts
-at the front for prefix caching, and never cross 80% utilization.** The 80%
-rule is the load-bearing one: above it, you're one model change or one verbose
-input away from truncation.
+**Layers.** Three: the *window* (the fixed total), the *allocation* (how you split it across sections), and the *position* (where in the window content sits — because attention isn't uniform). flattr's analog is its own fixed budget — the A\* search has a node-expansion cost, and `bench/` measures it. Same instinct: a fixed resource you must measure and allocate.
 
-## The structure pass
-
-**Layers:** stable prefix → per-call payload → reserved response.
-**Axis:** *cost* — tokens (= latency = dollars) per unit of work.
-**Seam:** the stable/variable boundary, which is *also* the prefix-cache
-boundary. Put it in the wrong place and you pay full price every call.
+**Axis — cost (per unit of work).**
 
 ```
-  axis = "what does this section cost, and is it cached?"
+  One axis — "what does this cost per call?" — down the layers
 
-  ┌─ system + few-shot ┐ cost: paid ONCE if at front (cached)
-  │  ── seam ──          ◄── cache boundary == stable/variable line
-  ├─ context (per-call)┤ cost: paid every call (small for flattr)
-  └─ response ─────────┘ cost: paid every call, you reserve for it
+  ┌─ window (total) ─────────────┐  → FIXED ceiling (e.g. 200k tok)
+  └──────────────────────────────┘
+      ┌─ allocation ─────────────┐  → YOUR CHOICE (sum must fit)
+      └──────────────────────────┘
+          ┌─ position ───────────┐  → ATTENTION COST (middle is cheap-attention)
+          └──────────────────────┘
+
+  the seam: scaling input flips "fits" to "truncates" — silently
 ```
+
+**Seam.** The load-bearing boundary is *between the test input and the production input*. A chain that fits comfortably on `gradeGraph` (4 nodes, `fixtures.ts:70`) can truncate or time out on a real city route with hundreds of edges — *if nobody counted tokens*. The flip is silent: no error, just a truncated prompt and a worse answer.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You already budget bytes. You know not to ship a 3MB hero image, you know a
-`SELECT *` that drags 200 columns over the wire is a mistake, you size your
-API responses. Tokens are the same resource discipline, just on the prompt.
-The context window is the payload size limit; token budgeting is `Content-
-Length` planning for a prompt. flattr's `RouteSummary` is the lean
-`SELECT distanceM, climbM, steepCount`; dumping `Edge.geometry` is the
-`SELECT *`.
+You know how a `fetch()` response can be 200 bytes or 2MB depending on the query, and a UI that renders fine on the small one janks on the large one? Token budgeting is that, for prompts. The same prompt template costs 30 tokens on a 4-node route and thousands on a 400-node route — and the window is a hard wall, not a slow degradation.
 
 ```
-  Pattern — the budget as a fixed jar you fill in priority order
+  The token-budget kernel — allocate the fixed window
 
-  WINDOW = [████████████████████████████████████████] 200k
-            │system│few-shot│ context │   (free)    │response│
-            └ cached prefix ┘└ per-call┘             └reserved┘
-                                  ▲
-                        flattr's context = 3 numbers ≈ 20 tok
-                        DON'T let Edge.geometry leak in here
+  ┌─────────── context window (fixed total) ───────────┐
+  │ system │ few-shot │ retrieved context │  response   │
+  │  ~5%   │   ~10%   │      ~60%         │   ~25%      │
+  └────────┴──────────┴───────────────────┴─────────────┘
+            ▲ constant (front)            ▲ per-call (back)
+            └── cacheable prefix ─────────┘
+   rule: if context > 80% of window, you're one model-change
+         away from breaking. Compress before you hit it.
 ```
 
-### Move 2 — budgeting the two seams
+### Move 2 — the step-by-step walkthrough
 
-**Step 1 — count the tokens you actually send.** Seam 1's context is
-literally:
+**Count tokens — know your tokenizer.** A token is roughly 4 characters of English; code and coordinates tokenize *worse* (more tokens per character). flattr's `Edge.geometry` is the worst case — strings of `[47.6062, -122.3321]` are dense in digits and punctuation, each of which costs tokens. You count *before* you build the prompt, not after it fails. This is basic hygiene, the line between amateur and professional prompt work: the amateur ships and discovers the limit in production; the professional counted first.
+
+**Allocate the budget — sections get shares.** For Seam 1: system prompt (small, constant), few-shot examples (small, constant), the route context (this is the variable), response (reserve room — the model can't write a description if you left it 5 tokens). The sum must fit with margin.
+
+**The trap — `Edge.geometry` should never enter the prompt.** Look at the actual type:
 
 ```ts
-// the real fields — features/routing/summary.ts:5
-{ distanceM: 3200, climbM: 45, steepCount: 0 }
+// features/routing/types.ts:10 — the Edge
+export type Edge = {
+  id: string;
+  geometry: [number, number][];  // ← polyline: can be MANY [lat,lng] pairs
+  lengthM: number;
+  riseM: number;
+  gradePct: number;
+  absGradePct: number;
+};
 ```
 
-Serialized as `distance_m=3200 climb_m=45 steep_count=0`, that's ~15–20
-tokens. You can hold the entire per-call payload in your head. This is the
-*best* place to learn budgeting precisely because it's so small that any bloat
-is obvious.
-
-**Step 2 — find the thing that would blow the budget.** It's one field away:
+A `Path` (`types.ts:31`) carries an array of edge IDs; resolve each to its `Edge` and you've got every polyline point of the whole route. Templating *that* into "describe my route" is the rookie move — it's thousands of tokens of coordinates the model doesn't need to say "mostly flat, 2.1km." The compression is already computed for you: `routeSummary()` (`summary.ts:11`) reduces the entire path to three numbers.
 
 ```ts
-// features/routing/types.ts:14 — the danger field
-geometry: [number, number][]; // [lat, lng] polyline
+// features/routing/summary.ts:5 — the compression, already done
+export type RouteSummary = {
+  distanceM: number;   // the whole path → 1 number
+  climbM: number;      // every rise → 1 number
+  steepCount: number;  // every steep edge → 1 number
+};
+// thousands of geometry tokens  →  ~30 tokens. This IS context compression.
 ```
 
-A route crosses dozens of edges; each `geometry` is a list of coordinate
-pairs. Serialize the full path geometry into a prompt "so the model has
-context" and you've turned a 20-token payload into thousands. The route that
-works on a 3-block walk truncates or times out on a cross-town route — the
-classic "worked on small inputs, broke at scale because nobody counted." The
-fix: send the *summary*, not the geometry. Retrieval-as-compression — you
-already derived the three numbers; send those.
+`routeSummary` is, in token terms, a *compressor*: it takes the unbounded geometry and returns a bounded summary. That's the entire lesson of "retrieve what's relevant, don't stuff everything" — except flattr already wrote the retriever.
 
-**Step 3 — keep the stable parts at the front (prefix caching).** System +
-few-shot are constant (concept 01). Put them first and providers cache that
-prefix across calls — you pay to process it once, not every request. The
-ordering from concept 01 (constant sections first) is *also* the
-cost-optimal ordering. Two reasons, one layout.
+**Lost-in-the-middle — position matters even when it fits.** Suppose the route summary *does* fit but you also stuffed in 50 nearby POIs. Content in the *middle* of a long prompt is attended worse than content at the start or end. So the `RouteSummary` — the thing the model must actually use — goes at the *end* of the context (near the user instruction), not buried in the middle of a POI dump. Even within budget, position is a lever.
 
 ```
-  Layers-and-hops — prefix caching across two calls
+  Position within the window — attention is U-shaped
 
-  call 1: [system+fewshot CACHED][ctx A] ──► provider processes all
-  call 2: [system+fewshot HIT  ][ctx B] ──► provider skips prefix
-          └── same bytes, processed once ──┘  cheaper + faster
+  ┌── start ──┬──────── middle ────────┬── end ──┐
+  │ attended  │  poorly attended       │ attended│
+  │ well      │  (lost in the middle)  │ well    │
+  └───────────┴────────────────────────┴─────────┘
+       ▲                                    ▲
+   system/rules                      the RouteSummary
+   (constant)                        (the thing to USE → put it here)
 ```
 
-**Step 4 — respect lost-in-the-middle.** Even when everything fits, content
-in the *middle* of a long prompt is attended worst. flattr's payload is too
-small for this to bite today — but the moment Seam 2 grows retrieval ("here
-are 8 candidate destinations"), the relevant one must not be buried in the
-middle. Put the most important context at the start or end.
+**Prefix caching — keep the stable stuff at the front.** Providers cache the static *prefix* of a prompt across calls — the longest run of identical leading tokens. So the system prompt + few-shot examples (constant, from `01-anatomy.md`) go first and get cached; the per-call `RouteSummary` goes last and breaks the cache only from that point on. This is the operational reason the anatomy's constant-before-per-call ordering isn't aesthetic — it's billing. Put one per-call token in front of the constants and you've invalidated the entire cached prefix every call.
 
-**Step 5 — the 80% rule.** If a prompt uses >80% of the window, it's fragile:
-a model swap with a different tokenizer, or one verbose user input, tips it
-over. flattr at 20 tokens is at ~0.01% — nowhere near. But the *discipline* is
-to compute the ratio and refuse to design at 95%.
+```
+  Hop — prefix caching across two calls
 
-### Move 2 variant — load-bearing skeleton
+  call 1: [system|few-shot|]  [route A]   → cache the prefix ──┐
+  call 2: [system|few-shot|]  [route B]   → prefix HIT ────────┘
+          └─ identical prefix ─┘└ varies ┘
+   if any per-call token sneaks before the │, both calls miss
+```
 
-Kernel: **count + reserve response budget**. What breaks:
-
-- **Don't count** → you discover the limit by truncation in production.
-  *Load-bearing.*
-- **Don't reserve response budget** → the prompt fills the whole window and
-  the model has no room to answer; output gets cut mid-sentence. *Load-
-  bearing — people forget the response needs room too.*
-- **Ignore prefix caching** → still correct, just costs more. *Hardening.*
-- **Ignore lost-in-the-middle** → fine until you add retrieval. *Hardening
-  for flattr today.*
+**The specific failure.** A chain that worked fine on small inputs starts truncating or timing out at scale because nobody counted tokens. The classic shape: works on the demo (4-node fixture), breaks in production (real city route). The fix is upstream — count, then compress with `routeSummary` *before* assembly, never stuff raw geometry.
 
 ### Move 3 — the principle
 
-Token counting is hygiene, not optimization. The professional computes the
-budget before designing the prompt; the amateur learns it from a truncation
-incident. flattr's tiny payload makes it easy — which is exactly why it's the
-right place to build the habit.
+The context window is a fixed budget; the input size is variable; therefore you count tokens and compress before you assemble. flattr hands you the compressor for free — `routeSummary` turns an unbounded path into three numbers. The discipline is to *use the summary, not the geometry*, keep constants at the front for caching, and put the must-use content at the end to dodge lost-in-the-middle. The amateur ships and finds the wall; the professional measured the budget first.
 
 ## Primary diagram
 
-```
-  flattr's token budget — the lean payload and the trap (FUTURE)
+The full token budget at Seam 1 — the trap, the compressor, the positions, the cache seam.
 
-  ┌─ WINDOW ────────────────────────────────────────────────────────┐
-  │ [system ~150][few-shot ~120]  ← cached prefix, front, stable     │
-  │ [context: distance/climb/steep ≈ 20 tok]  ← per-call, TINY       │
-  │ [reserve ~100 for the one-sentence answer]                       │
-  │                                                                   │
-  │ ✗ NEVER: [Edge.geometry polyline ×N edges = thousands of tok]    │
-  │   → send the RouteSummary, not the path coordinates              │
-  └──────────────────────────────────────────────────────────────────┘
-   utilization ≈ 0.2%  → miles below the 80% line. Stay there.
+```
+  Token budget at Seam 1 — compress, allocate, position
+
+  ┌─ Runtime ────────────────────────────────────────────────────┐
+  │ Path → edges[] → Edge.geometry [lat,lng][]  ✗ DON'T send this │
+  │ routeSummary(path) → {distanceM,climbM,steepCount} ✓ send this│
+  └─────────────────────────┬────────────────────────────────────┘
+                            │ ~30 tokens, not thousands
+  ┌─ Prompt (Seam 1) ───────▼────────────────────────────────────┐
+  │ ┌──────── context window (fixed) ────────────────────┐       │
+  │ │ system │ few-shot ║ <route>{summary}</route> │ reply│       │
+  │ │  front (cached prefix)  ║  per-call (cache seam) │    │      │
+  │ │                         ║  ↑ summary at END       │    │      │
+  │ │                         ║    (dodge lost-in-middle)│   │      │
+  │ └─────────────────────────╨──────────────────────────┘       │
+  └──────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-Lost-in-the-middle comes from the Liu et al. "Lost in the Middle" paper and is
-replicated across providers; prefix caching is an Anthropic/OpenAI feature
-with the same shape (cache the stable front). The deeper move — retrieval as
-context compression — is the same instinct as flattr's pipeline already
-precomputing `RouteSummary` instead of recomputing over the graph at request
-time: derive the small thing once, pass the small thing. The reader has
-shipped this exact compression in AdvntrCue's RAG (retrieve relevant chunks,
-don't stuff the corpus). Read `05-eval-driven-iteration.md` next — token cost
-per call is a metric the eval set should track alongside quality.
+Lost-in-the-middle is a real, measured effect (the "Lost in the Middle" paper, Liu et al.) — relevant content placed mid-prompt is recalled worse than the same content at the head or tail. Prefix caching is provider-specific in pricing but universal in shape: Anthropic's prompt caching and OpenAI's automatic prefix caching both reward a stable leading prefix. The deeper connection is to RAG (from `me.md`, you shipped AdvntrCue): retrieval *is* context compression — you fetch the relevant chunks instead of stuffing the whole corpus, the same way `routeSummary` fetches the three relevant numbers instead of stuffing the whole polyline. flattr's `Edge.geometry` is the cleanest token trap I've seen in a non-LLM repo precisely because the compressor already exists next to it.
+
+## Project exercises
+
+### EX-TOKEN-1 — Token-count the route description prompt
+
+- **Exercise ID:** EX-TOKEN-1
+- **What to build:** A `budgetRouteDescription(path)` that counts tokens for two variants — full `Edge.geometry` vs `routeSummary` — and asserts the summary stays under a fixed budget while geometry blows it on a large grid graph.
+- **Why it earns its place:** Makes the trap visceral — you watch the geometry variant cross the window on `makeGridGraph(40)` while the summary stays flat.
+- **Files to touch:** new `features/routing/token-budget.ts`; uses `makeGridGraph` from `fixtures.ts:108`, `routeSummary` from `summary.ts`.
+- **Done when:** the test shows geometry tokens scale with route length and summary tokens stay constant.
+- **Estimated effort:** 2-3 hours.
 
 ## Interview defense
 
-**Q: "Your chain worked in dev and timed out in prod. First thing you check?"**
-Token count. Something in the per-call payload scales with input size and
-nobody counted it. In a flattr-shaped system it'd be `Edge.geometry` — a
-polyline that's tiny for a 3-block route and thousands of tokens for a
-cross-town one. Fix: send the derived `RouteSummary` (3 numbers), never the
-raw geometry.
+**Q: A chain works in the demo and times out in production. Token-budget diagnosis?**
+
+The demo input was small; production input is large; nobody counted tokens, so the variable section (here, route geometry) blew the window silently. Fix is upstream: count tokens, then compress — send the summary, not the raw data.
 
 ```
-  3-block route:  geometry ≈ 40 pairs   → fits
-  cross-town:     geometry ≈ 900 pairs  → truncates ✗
-  fix: send RouteSummary{3 nums} either way ✓
+  4-node fixture:  fits   ✓
+  400-node route:  truncates  ✗  ← same template, scaled input
+  fix: routeSummary compresses path → 3 numbers before assembly
 ```
 
-**Q: "What's the 80% rule?"** Above 80% window utilization you're one model
-change or one verbose input from breaking. Design with headroom; compute the
-ratio before you ship.
+Anchor: flattr's `routeSummary` (`summary.ts:11`) already compresses an unbounded `Path` to three numbers — use it, never the `Edge.geometry` polylines.
 
-Anchor: *"flattr's intended payload is 20 tokens — but the danger field is one
-hop away in `types.ts:14`. Budgeting is knowing the difference."*
+**Q: What's the 80% rule?**
+
+If a prompt uses more than 80% of the context window in steady state, you're one model change or one larger-than-expected input away from breaking. Leave headroom; compress before you hit the ceiling.
 
 ## See also
 
-- [01-anatomy.md](01-anatomy.md) — section order is also cache order
-- [02-structured-outputs.md](02-structured-outputs.md) — schemas keep output
-  bounded
-- [05-eval-driven-iteration.md](05-eval-driven-iteration.md) — track cost
-  per call
-- `.aipe/study-performance-engineering/` — tokens as latency + dollar budget
-</content>
+- `01-anatomy.md` — constant-before-per-call ordering that caching depends on
+- `02-structured-outputs.md` — `routeSummary` as the structured, compact context
+- `07-output-mode-mismatch.md` — geometry as the wrong thing to put in either direction
+- `08-few-shot.md` — examples cost tokens too; 3 good beats 20 mediocre

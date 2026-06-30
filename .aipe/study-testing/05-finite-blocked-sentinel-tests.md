@@ -1,74 +1,70 @@
 # 05 — Finite-BLOCKED Sentinel Tests
 
-**Industry names:** sentinel value testing · semantic-distinction testing ·
-guarding a domain invariant in tests. **Type:** Project-specific (the
-`BLOCKED = 1e9 ≠ Infinity` decision is flattr's own, from `docs/flattr-spec.md`
-§14.4).
+**Industry names:** *sentinel value testing* / *testing a saturating cost* / *distinguishing
+"degraded" from "impossible"*. **Type:** Project-specific (the testing technique is general;
+this exact distinction is flattr's).
 
 ---
 
-## Zoom out — where this lives
+## Zoom out, then zoom in
 
-flattr has two failure modes that *look* identical to a naive router but mean
-opposite things to a user: "there's a route, but it's too steep for you" vs
-"there's no route at all." The whole design hinges on keeping them distinct, and
-a cluster of tests exists to pin that distinction.
+flattr's whole product promise is "we'll find you a flat route — and if we can't, we'll be
+honest about it." That honesty has two failure shapes that must never be confused: *"the
+only route is too steep"* (return it, flag it) versus *"there is no route at all"* (return
+null). The design choice that keeps them distinct is `BLOCKED = 1e9` — a large *finite*
+number, not `Infinity`. And a whole class of tests exists only to defend that choice.
 
 ```
-  Zoom out — the sentinel keeps two failures distinct
+  Zoom out — where the sentinel lives and what it protects
 
-  ┌─ cost layer ────────────────────────────────────────────────┐
-  │  penalty(g > max) → ★ BLOCKED = 1e9 (large FINITE) ★         │ ← we are here
-  │                     NOT Infinity                            │
-  └───────────────────────────┬─────────────────────────────────┘
-                              │ router still relaxes BLOCKED edges
-  ┌─ router layer ────────────▼─────────────────────────────────┐
-  │  too steep → RETURNS the path + flags steepEdges            │
-  │  disconnected → returns null                                │
-  └───────────────────────────┬─────────────────────────────────┘
-                              │
-  ┌─ user ────────────────────▼─────────────────────────────────┐
-  │  "steep but possible" ≠ "nowhere to go" — different UX       │
-  └─────────────────────────────────────────────────────────────┘
+  ┌─ features/routing/cost.ts:5 ── BLOCKED = 1e9 (finite!) ────┐
+  │   penalty(g > max) → BLOCKED   (not Infinity)              │
+  └────────────────────────────┬───────────────────────────────┘
+                               │ flows into every cost function
+  ┌─ the two outcomes it keeps distinct ──▼────────────────────┐
+  │  steep-but-only path  → returned, steepEdges flagged       │
+  │  genuinely disconnected → path is null                     │
+  │                                                            │
+  │  ★ tests pin BOTH (astar.test.ts:82 / :91) ★ ← THIS CONCEPT│
+  └────────────────────────────────────────────────────────────┘
 ```
 
-Zoom in: if "too steep" cost were `Infinity`, the router's `cost < best`
-comparison would treat a steep edge as *unusable* and return `null` — collapsing
-"steep route exists" into "no route." Making BLOCKED a large *finite* number
-means the router still traverses it (reluctantly), returns the path, and flags
-the steep edges. The tests are the guardrail that keeps anyone from "tidying"
-`1e9` into `Infinity`.
+Here's the trap: if `BLOCKED` were `Infinity`, a too-steep edge would have infinite cost,
+the search would treat it as impassable, and an only-steep route would come back as `null` —
+indistinguishable from a disconnected graph. The user would see "no route" when the truth is
+"a steep route exists." The finite sentinel keeps the steep path *in the running* (just
+expensive), so it's returned and flagged. The tests are what stop someone from "simplifying"
+`1e9` to `Infinity` and silently breaking the product.
 
 ---
 
-## Structure pass
+## The structure pass
 
-**Layers:** the sentinel constant (`cost.ts`) → the router that honors it
-(`astar.ts`) → the user-visible outcome. One value, traced up three layers.
-
-**Axis — "what does this failure mean to the user?"** Held constant down the
-stack:
+Layer it, pick the axis — **"can this path still be returned?"** — and watch it flip at the
+sentinel boundary.
 
 ```
-  axis = "is there a usable answer here?"  — traced downward
+  axis traced: "is this path still returnable?"
 
-  ┌─ cost.ts ───────────────┐
-  │ steep edge → 1e9 finite  │  → "expensive, but a number"
-  └────────────┬─────────────┘
-  ┌────────────▼─────────────┐
-  │ router relaxes it anyway  │  → "path found, edges flagged"
-  └────────────┬─────────────┘
-  ┌────────────▼─────────────┐
-  │ user sees a steep route   │  → "possible, here's the warning"
-  └───────────────────────────┘
-
-  vs. disconnected → no edge at all → router returns null → "no route"
+  ┌─ flat / moderate edge ──────────────────────────┐
+  │  cost = length × small penalty → YES, cheap      │
+  └───────────────────────┬──────────────────────────┘
+                          │  seam: grade crosses userMax
+  ┌─ too-steep edge (BLOCKED finite) ─▼─────────────┐
+  │  cost = length × HUGE but finite → YES, but only │  ← still returnable!
+  │  if it's the ONLY option; flagged as steep       │
+  └───────────────────────┬──────────────────────────┘
+                          │  seam: no edge at all
+  ┌─ disconnected ────────▼──────────────────────────┐
+  │  no path exists → null                           │  ← genuinely impossible
+  └──────────────────────────────────────────────────┘
 ```
 
-The axis-answer is "yes, but costly" for steep and "no" for disconnected. The
-sentinel is what keeps those two answers from collapsing into one.
-
-**Seam:** `penalty(g > max) === BLOCKED` *and* `Number.isFinite(cost) === true`.
+The load-bearing seam is the middle one: a too-steep edge is *expensive*, not *impossible*.
+That's the finite sentinel's entire job — keep "degraded" on the returnable side of the line
+and reserve `null` for "impossible." If `BLOCKED` were `Infinity`, that middle band would
+collapse into the bottom one, and "steep" would masquerade as "no route." The tests pin all
+three bands so the collapse can't happen unnoticed.
 
 ---
 
@@ -76,200 +72,241 @@ sentinel is what keeps those two answers from collapsing into one.
 
 ### Move 1 — the mental model
 
-You've used a sentinel before — `-1` from `indexOf` to mean "not found,"
-`null` vs `undefined` to mean different absences. The trap is overloading *one*
-sentinel for *two* meanings. flattr deliberately uses two distinct signals:
-a large finite number for "too steep" and genuine absence (`null`) for "no
-route." The tests exist to prove they never merge.
+You've used a sentinel before — `-1` for "not found" in an index search, or `NaN` to mean
+"no value." The trick is picking a sentinel that's *in the same number space* as real values
+so arithmetic still works on it. `BLOCKED = 1e9` is that: it's enormous (any real route cost
+is in the thousands of meters, so `1e9` always loses to a real alternative) but it's a normal
+float — you can add to it, compare it, sum a path through it. `Infinity` can't do that
+cleanly: `Infinity` makes a path uncomparable, so the search discards it entirely.
 
 ```
-  one value, two failure semantics — kept distinct
+  the sentinel band — finite keeps "steep" returnable
 
-   penalty result        router output       meaning
-   ─────────────────     ──────────────      ──────────────────
-   1e9 (BLOCKED)    ──►  path + steepEdges ──► "steep, possible"
-   no edge exists   ──►  null              ──► "no route at all"
+  cost scale (meters-ish):
 
-   (if BLOCKED were Infinity, the top row collapses into the bottom)
+   0 ────── real routes ────── ~thousands ┄┄┄ 1e9 (BLOCKED) ┄┄┄ ∞
+                                                  ▲
+                       a steep edge lands HERE: astronomically
+                       expensive, but FINITE → still summable,
+                       still comparable, still returnable if it's
+                       the only path. Infinity would fall off the
+                       right edge → discarded → looks like "no route"
 ```
+
+Strategy in one sentence: **pick a sentinel big enough to always lose but finite enough to
+still be returned, then test both "it loses" and "it's still there."**
 
 ### Move 2 — the walkthrough
 
-**The constant declares the intent.** `cost.ts:5` makes the choice explicit and
-the threshold test pins it:
+**Part 1 — the sentinel is finite by deliberate design, and the comment says why.** This is
+the one line the whole pattern protects:
 
 ```ts
-// cost.ts:5
-export const BLOCKED = 1e9;   // large FINITE, deliberately not Infinity
-
-// cost.test.ts:55-58 — over-max returns the sentinel
-it("returns BLOCKED above max", () => {
-  expect(penalty(5.01, max)).toBe(BLOCKED);
-  expect(penalty(20, max)).toBe(BLOCKED);
-});
+// features/routing/cost.ts:4-5  (annotated)
+/** Large but FINITE, so an only-steep path is still returned and flagged. */
+export const BLOCKED = 1e9;
 ```
 
-**The finiteness itself is asserted — this is the load-bearing test.** A steep
-climb costs *more than* BLOCKED (length added on top) but must stay finite, or
-the router's arithmetic breaks:
+The doc comment is a warning to the next engineer: *don't make this Infinity.* The cost
+functions multiply by it but never produce `Infinity`, so a path summing several blocked
+edges is still a finite, comparable number.
+
+**Part 2 — the cost test pins that BLOCKED stays finite even when stacked.** The subtle bug
+is a path through *multiple* steep edges — does the cost still stay finite and comparable?
 
 ```ts
-// cost.test.ts:81-86 — the distinction, pinned
+// features/routing/cost.test.ts:81-86  (annotated)
 it("gradeCostDirected blocks a too-steep climb but stays finite", () => {
-  const e = edgeAt(9);
+  const e = edgeAt(9);                          // 9% grade, over userMax of 5
   const c = gradeCostDirected(e, "A", max);
-  expect(c).toBeGreaterThan(BLOCKED);     // it IS blocked-tier
-  expect(Number.isFinite(c)).toBe(true);  // ← but FINITE — the whole point
+  expect(c).toBeGreaterThan(BLOCKED);           // it IS the blocked-tier cost
+  expect(Number.isFinite(c)).toBe(true);        // ← but FINITE. the load-bearing assert
 });
 ```
 
-`Number.isFinite(c)` is the assertion that would fail the instant someone
-changed `1e9` to `Infinity`. It's small, but it's guarding the project's most
-subtle correctness rule.
+`Number.isFinite(c)` is the assertion that fails the instant someone swaps `1e9` for
+`Infinity`. It's a direct guard on the design invariant. (`penalty` over max returns
+`BLOCKED` exactly — `cost.test.ts:55` — and the cost function multiplies length in, so the
+edge cost is `> BLOCKED` but still finite.)
 
-**The router honors the distinction — three tests, three outcomes.** The payoff
-is at the routing layer (`astar.test.ts:73-97`), where the same fixture produces
-all three behaviors:
-
-```ts
-// astar.test.ts:82-89 — steep-only path is RETURNED and FLAGGED, not dropped
-g.edges = g.edges.filter((e) => e.id === "xy");   // leave only the steep edge
-const r = directedAstar(g, "X", "Y", 5);
-expect(r.path).not.toBeNull();             // ← NOT null: the route exists
-expect(r.path!.steepEdges).toEqual(["xy"]); // ← flagged as steep
-
-// astar.test.ts:91-96 — genuinely disconnected → null
-g.nodes["ISO"] = ...; g.adjacency["ISO"] = [];
-expect(directedAstar(g, "X", "ISO", 5).path).toBeNull();   // ← null: no route
-```
-
-```
-  the three-way truth table the tests pin
-
-  scenario                router result        assertion
-  ──────────────────────  ──────────────────   ────────────────────
-  flat route available    direct path          nodes == [...]
-  only-steep route        path + steepEdges     not null, steepEdges
-  disconnected            null                  toBeNull()
-```
-
-**The heap also respects it.** Because BLOCKED is finite, it sorts correctly in
-the priority queue — a steep edge goes to the *back*, not into undefined-ordering
-territory:
+**Part 3 — the routing test proves a steep-only path is RETURNED and FLAGGED.** Now the
+behavior the sentinel buys, end to end:
 
 ```ts
-// pqueue.test.ts:101-106 — BLOCKED-priority item orders to the back
-pq.push("blocked", 1e9);
-pq.push("ok", 10);
-expect(pq.peek()).toBe("ok");   // finite BLOCKED still compares cleanly
+// features/routing/astar.test.ts:82-89  (annotated)
+it("still returns an only-steep path and flags the steep edge", () => {
+  const g = directionalGraph();
+  g.edges = g.edges.filter((e) => e.id === "xy");   // delete the flat detour — leave only steep
+  g.adjacency = { X: ["xy"], Y: ["xy"], F: [] };
+  const r = directedAstar(g, "X", "Y", 5);
+  expect(r.path).not.toBeNull();                    // ← NOT null: the steep path is returned
+  expect(r.path!.steepEdges).toEqual(["xy"]);       // ← and HONESTLY flagged as steep
+});
 ```
 
-That's the cross-cutting consequence: a finite sentinel participates in normal
-comparisons (sorting, `<`, arithmetic), where `Infinity` would poison
-`Infinity - Infinity = NaN` and break the relaxation step.
+Walk it: remove every flat option so `xy` (8% > userMax 5) is the only way from X to Y. A
+naive `Infinity` design would return `null` here ("no route"). flattr returns the path —
+because `BLOCKED` is finite, the search still ranks and reconstructs it — *and* tags `xy` in
+`steepEdges` so the UI can warn the user. This is the product promise, tested.
+
+**Part 4 — the contrast test proves null is reserved for genuinely disconnected.** The other
+half of the distinction — null must still mean *impossible*, not *steep*:
+
+```ts
+// features/routing/astar.test.ts:91-96  (annotated)
+it("returns null only when genuinely disconnected, not when merely steep", () => {
+  const g = directionalGraph();
+  g.nodes["ISO"] = { id: "ISO", lat: 9, lng: 9, elevationM: 0 };  // an island node
+  g.adjacency["ISO"] = [];                                         // no edges at all
+  expect(directedAstar(g, "X", "ISO", 5).path).toBeNull();        // ← null = truly no route
+});
+```
+
+The two tests together draw the line: `:82` says *steep ≠ null*, `:91` says *disconnected =
+null*. Read them as a pair — that pairing IS the pattern:
+
+```
+  the two-test pair that defends the distinction
+
+  test               input                        asserts
+  ────               ─────                         ───────
+  astar.test.ts:82   only-steep edge remains       path NOT null + steepEdges flagged
+  astar.test.ts:91   isolated node, no edges       path IS null
+
+  together: "steep" and "impossible" can never collapse into each other
+```
+
+**Part 5 — the sentinel even shows up in the priority-queue test.** The finiteness has to
+survive the heap ordering too — a `1e9` priority must sort to the back, not get special-cased:
+
+```ts
+// features/routing/pqueue.test.ts:101-106  (annotated)
+it("orders a large-finite BLOCKED priority to the back", () => {
+  const pq = new PQueue<string>();
+  pq.push("blocked", 1e9);                  // the BLOCKED-tier priority
+  pq.push("ok", 10);
+  expect(pq.peek()).toBe("ok");             // ← "ok" comes first; blocked sits at the back
+});
+```
+
+The heap treats `1e9` as just a large number (because it is one), so a blocked path naturally
+sorts last and gets expanded only if nothing better exists. With `Infinity` you'd risk
+comparison oddities. The sentinel's finiteness is load-bearing at *every* layer it touches —
+cost, search, and queue — and there's a test at each.
 
 ### Move 2 variant — the load-bearing skeleton
 
-```
-  a sentinel that is a NORMAL value (finite, comparable)
-  +  a test that the sentinel is returned at the threshold
-  +  a test that the result stays finite (the anti-Infinity guard)
-  +  router tests proving steep≠disconnected (path+flag vs null)
-```
+Strip finite-sentinel testing to its kernel:
 
-What breaks without each:
+1. **A sentinel in the real value space** — `1e9`, a normal float. *Make it `Infinity`* and
+   it falls out of the comparable range; the steep path becomes unreturnable and masquerades
+   as null.
+2. **A "stays finite" assertion** — `Number.isFinite(c)` (`cost.test.ts:84`). *Remove it* and
+   nothing stops a future refactor from swapping in `Infinity`; the guard is gone.
+3. **The two-outcome contrast pair** — steep-returned (`:82`) AND disconnected-null (`:91`).
+   *Drop either one* and the distinction is half-tested: you'd catch a regression on one
+   outcome but silently allow the two to collapse.
 
-- **Sentinel as Infinity** → `cost < best` treats steep as unusable; "steep
-  route" returns `null`; the product's core feature (show the flat-ish way *and*
-  fall back to flagged-steep) silently dies.
-- **No finiteness assertion** → nothing stops a refactor from "simplifying"
-  `1e9` to `Infinity`; the test is the only documentation of *why* it's finite.
-- **No three-way router test** → you can't tell whether `null` means "steep" or
-  "disconnected" — the two failures are indistinguishable in the test suite, so
-  a regression that collapses them passes.
+The part people forget is **#3 — testing the contrast, not just one branch**. It's easy to
+test "steep path is returned" and feel done. But the *value* of the finite sentinel is the
+*distinction*, and a distinction needs both sides asserted. One test without the other proves
+the wrong thing.
+
+**Skeleton vs hardening:** the kernel is finite-sentinel + isFinite-guard + the contrast
+pair. The pqueue ordering test (`:101`) is hardening — it confirms the sentinel behaves at a
+third layer — but the cost+routing pair is the load-bearing defense.
 
 ### Move 3 — the principle
 
-**When two failures mean different things to the user, they must be two distinct
-signals in the code — and a test must pin the distinction so a refactor can't
-merge them.** The general lesson: a sentinel that participates in normal
-operations (finite, comparable) is safer than one that doesn't (`Infinity`,
-`NaN`, `null` overloaded for two meanings), and the *test that asserts the
-sentinel's type* (`Number.isFinite`) is what protects a non-obvious design choice
-from a well-meaning cleanup. This is testing as executable documentation of
-intent.
+**When your code has two failure modes that look alike but mean different things to the user,
+encode the difference in a value the type system and arithmetic preserve — then test both
+sides of the line.** "Degraded but possible" and "genuinely impossible" are different
+promises; collapsing them is a product bug, not just a code bug. flattr's `1e9` is the
+encoding and the `isFinite` + steep-returned + disconnected-null trio is the defense. The
+generalization: any saturating quantity (a maxed-out retry budget, a clamped score, a
+rate-limit ceiling) wants a finite sentinel and a test that proves it saturates *without*
+becoming "impossible."
 
 ---
 
 ## Primary diagram
 
 ```
-  BLOCKED traced from constant to UX, with its tests
+  FINITE-BLOCKED SENTINEL TESTS — full recap
 
-  cost.ts:5  BLOCKED = 1e9 (finite)
-      │  cost.test.ts:55  → returned at threshold
-      │  cost.test.ts:81  → result stays FINITE (anti-Infinity guard)
-      ▼
-  astar.ts  router relaxes BLOCKED edges (finite → still comparable)
-      │  astar.test.ts:82  → steep-only path RETURNED + steepEdges flagged
-      │  astar.test.ts:91  → disconnected → null
-      ▼
-  pqueue.ts  BLOCKED sorts to the back (finite → clean comparison)
-      │  pqueue.test.ts:101  → "ok" peeked before "blocked"
-      ▼
-  user:  "steep but possible" (warned)  ≠  "no route" (null)
+  ┌─ cost.ts:5 ── BLOCKED = 1e9 (finite, NOT Infinity) ────────┐
+  │  penalty(g > userMax) → BLOCKED                            │
+  └────────────────────────────┬───────────────────────────────┘
+                               │ multiplied into cost; never → Infinity
+        ┌──────────────────────┼──────────────────────────┐
+        ▼                      ▼                          ▼
+  ┌─ cost test ───┐   ┌─ routing tests (the pair) ──┐  ┌─ pqueue test ─┐
+  │ isFinite(c)   │   │ :82 steep-only → returned   │  │ :101 1e9 sorts│
+  │ == true       │   │     + steepEdges flagged    │  │  to the back  │
+  │ (test:84)     │   │ :91 disconnected → null     │  │               │
+  └───────────────┘   └─────────────────────────────┘  └───────────────┘
+       guards the         defends the DISTINCTION:        confirms finite
+       finiteness         steep ≠ impossible              at the queue layer
+
+   if 1e9 → Infinity: steep collapses into null → "no route" lie → tests go RED
 ```
 
 ---
 
 ## Elaborate
 
-The finite-sentinel choice is a known numerical-computing pattern: avoid
-`Infinity`/`NaN` in arithmetic that feeds comparisons, because they propagate
-(`Inf - Inf = NaN`, and any comparison with `NaN` is false, which silently breaks
-the `cost < best` relaxation that Dijkstra/A* depend on). flattr's spec calls
-this out explicitly (§14.4), and the test suite enforces it at three layers. The
-honest limit: `1e9` is a *magic threshold* — if a legitimate route ever
-accumulated cost near `1e9` (a path with thousands of steep edges), a real route
-could be mistaken for blocked-tier. The current fixtures don't probe that
-boundary; a worthwhile addition is a test that a long flat route never crosses
-`BLOCKED` by accumulation alone. That's the one untested corner of an otherwise
-well-guarded invariant.
+This is **sentinel value testing** with a domain twist: the sentinel isn't just "absent/
+error," it's a *saturating cost* that has to keep participating in arithmetic. The choice of
+`1e9` over `Infinity` is the kind of subtle design decision that's invisible until it breaks
+in production as a confusing "no route found" — which is precisely why the spec
+(`docs/flattr-spec.md` §14.4, per project context) and the project's must-not-change
+constraints call it out, and why the tests pin it at three layers.
+
+It's downstream of `04-fixture-driven-graph-tests.md` (the steep `directionalGraph` and the
+isolated-`ISO`-node setups are fixtures shaped for exactly this) and it's why the optimality
+oracle (`01`) still returns a path on steep graphs rather than null. The three patterns
+interlock: shaped fixtures provide the steep/disconnected inputs, the finite sentinel keeps
+the steep one returnable, and the oracle confirms the returned path is still optimal among
+the steep options.
+
+Where to read next: `04-fixture-driven-graph-tests.md` (the inputs), `01-optimality-oracle.md`
+(why steep paths stay optimal), and `audit.md` lens 5 (error/boundary paths).
 
 ---
 
 ## Interview defense
 
-**Q: Why is "too steep" a large finite number instead of Infinity?**
+**Q: "Your router has two 'failure' cases — too steep and no route. How do you keep them
+distinct, and how do you test it?"**
 
-> Because "too steep" and "no route" are different answers to the user, and
-> Infinity collapses them. With Infinity, the router's `cost < best` check treats
-> a steep edge as unusable and returns null — so a steep-but-walkable route
-> disappears. A large *finite* BLOCKED keeps the edge comparable: the router
-> still traverses it, returns the path, and flags the steep edges.
-> `cost.test.ts:81` asserts `Number.isFinite` precisely to stop a refactor from
-> "tidying" it to Infinity.
+> "I encode the difference in the cost: `BLOCKED` is `1e9`, a large *finite* number, not
+> `Infinity`. Finite means a too-steep edge is astronomically expensive but still comparable
+> and summable — so if it's the only path, the search still returns it, flagged as steep.
+> `Infinity` would make it uncomparable and the path would come back null, indistinguishable
+> from a disconnected graph — the user sees 'no route' when a steep route exists. I test it as
+> a pair: one test deletes every flat option and asserts the steep path is returned *and* its
+> edge is in `steepEdges`; the other isolates a node and asserts null. Plus an
+> `expect(Number.isFinite(c)).toBe(true)` that fails the moment someone swaps in Infinity.
+> `astar.test.ts:82` and `:91`, `cost.test.ts:84`."
 
 ```
-  steep edge → 1e9 finite → router returns path + steepEdges flag
-  (Infinity → router returns null → feature dies)
+  sketch while you talk:
+
+  BLOCKED = 1e9 (finite) ──► steep path still RETURNABLE + flagged
+       │                                  vs
+  reserve null for ──────► genuinely disconnected
+       │
+  test the CONTRAST (both sides) — not just one branch
 ```
 
-**Q: How do you test that two different failures stay distinct?**
-
-> Drive the same fixture to both outcomes and assert they differ. flattr's
-> `astar.test.ts` filters to a steep-only graph and asserts `path` is *not* null
-> with `steepEdges` populated; then adds a disconnected node and asserts `null`.
-> Two failures, two distinct assertions. Anchor: "if two failures mean different
-> things to the user, the test suite has to be able to tell them apart — or a
-> regression that merges them passes silently."
+**Anchor:** *"The value of the finite sentinel is the distinction, so I test the contrast —
+steep-returned AND disconnected-null — not just one side."*
 
 ---
 
 ## See also
 
-- `01-optimality-oracle.md` — the cost guard the oracle's blind spot relies on.
-- `02-property-invariant-tests.md` — the heap's BLOCKED-orders-to-back case.
-- `04-fixture-driven-graph-tests.md` — `directionalGraph()` drives these tests.
-- `audit.md` lens 5 (edge/error paths), lens 7 (red-flag checklist).
-- sibling `study-software-design` — sentinel-vs-overload as a design decision.
+- `04-fixture-driven-graph-tests.md` — the steep/disconnected fixtures these tests use
+- `01-optimality-oracle.md` — why a returned steep path is still the optimal steep path
+- `02-property-invariant-tests.md` — `pqueue.test.ts:101` (the sentinel at the queue layer)
+- `audit.md` lens 5 (boundary/error paths), and the project's must-not-change constraints

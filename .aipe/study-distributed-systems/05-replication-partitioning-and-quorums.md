@@ -1,172 +1,239 @@
-# Replication, Partitioning & Quorums
+# 05 — Replication, Partitioning, and Quorums
 
-**Status: `not yet exercised`.** flattr has no second copy of any data, no shards, no quorum. There's one process and one bundled `graph.json`. This file teaches the concepts and names the exact trigger that would force each into flattr's design — because *that* is the honest, useful thing to study here.
+**Industry names:** replication (leader/follower, multi-leader) / sharding
+(partitioning) / quorum reads & writes / failover. **Type:** Industry standard.
 
-> Per `me.md`: horizontal-scale distributed systems (multi-region replication, sharding under load) is the named gap in Rein's portfolio. This file teaches it; it does not pretend the repo evidences it.
+> **Status in flattr: NOT YET EXERCISED.** flattr has exactly one copy of one
+> read-only graph file and one client. There is no second replica to keep in
+> sync, no shard to route a key to, no quorum to assemble. This file teaches the
+> concepts so they're not a black box, and names the precise change that pulls
+> each into scope. Per the anchoring rules, nothing below claims repo evidence —
+> where flattr touches the *edge* of a concept, it's labelled as an analogy, not
+> an implementation.
 
 ## Zoom out, then zoom in
 
-```
-  Zoom out — where replication/partitioning WOULD live (all empty today)
-
-  ┌─ Local state layer ─────────────────────────────────────────┐
-  │  graph.json — ONE copy, ONE file, no replicas, no shards     │ ← we are here
-  │              (replication slot: EMPTY)                        │
-  │              (partitioning slot: EMPTY — though bbox tiling   │
-  │               is a *spatial* partition seed, see below)       │
-  └────────────────────────┬─────────────────────────────────────┘
-                           │
-  ┌─ would-be storage tier ▼ (does not exist) ───────────────────┐
-  │  [ no database, no primary/replica, no quorum reads/writes ]  │
-  └───────────────────────────────────────────────────────────────┘
-```
-
-**Zoom in.** Replication = keeping more than one copy of the same data so a copy can fail without losing the data (or so reads can spread across copies). Partitioning (sharding) = splitting *different* data across nodes so no single node holds it all. Quorums = the rule for how many copies must agree before a read/write counts, so you can tolerate some copies being down. flattr needs none of these yet because it has one copy of one dataset on one node. But it has *one* latent seed of partitioning worth naming.
-
-## Structure pass
-
-**Layers.** Today: just the bundled artifact. Future: a storage tier with primary/replicas/shards.
-
-**The axis: `state` — how many copies exist, and who owns each?**
+You know how flattr keeps one `graph.json` and reads it? Replication and
+partitioning are the two answers to "what happens when one copy on one machine
+isn't enough" — and they answer *different* not-enough problems. Replication is
+for **too risky** (one copy, one disk, one outage = total loss / total
+downtime): keep N copies so losing one doesn't lose the data. Partitioning is for
+**too big** (one copy won't fit on one machine, or one machine can't serve the
+load): split the data across machines so each holds a slice.
 
 ```
-  The state axis — copy count, today vs the trigger
+  Zoom out — where these would sit IF flattr had a backend
 
-                   │ today (flattr)       │ when it changes
-  ─────────────────┼──────────────────────┼─────────────────────────
-  copies of data   │ 1 (graph.json)       │ N replicas for HA / read scale
-  ownership        │ the bundle           │ a primary, M followers
-  split across     │ none (one dataset)   │ shards by region / bbox
-  agreement rule   │ n/a (one copy)       │ quorum (W + R > N)
+  ┌─ Client (you own) ────────────────────────────────────────────┐
+  │  app reads graph data                                         │
+  └───────────────────────┬───────────────────────────────────────┘
+                          │  HTTP (today: straight to third parties)
+                          ▼
+  ┌─ ★ A SERVER flattr DOES NOT HAVE ★ ───────────────────────────┐
+  │  replication: N copies of the graph, survive a node loss      │ ← not yet
+  │  partitioning: graph split by region, route bbox → shard      │   exercised
+  │  quorum: agree across copies on what's current               │
+  └───────────────────────┬───────────────────────────────────────┘
+                          ▼
+  ┌─ datastore replicas / shards ─────────────────────────────────┐
+  └────────────────────────────────────────────────────────────────┘
 ```
 
-**The seam that doesn't exist yet — but almost does.** flattr already partitions *space* into bbox tiles (`features/map/tiles.ts`, the corridor/viewport split in `useTileGraph.ts`). That's a partition *key* (geography) sitting right there. It's used today only to decide *what to fetch*, not *where data lives* — but it's the natural shard key the day flattr needs one. Naming that latent seam is the real finding: the partitioning scheme is already implied by the data model.
+Zoom in: the concepts are **replication** (copies for durability + availability),
+**partitioning** (slices for scale), and **quorums** (the voting rule that lets a
+replicated system stay correct when some replicas are down). flattr exercises none
+because it never grew the server band where they live.
+
+## The structure pass
+
+**Layers (hypothetical, the day flattr grows a backend).** Three: the routing
+layer (which node owns this bbox?), the replication layer (how many copies, who's
+authoritative?), the quorum layer (how many must agree before a read/write
+counts?).
+
+**Axis — trace `where does the single point of failure move?` as you add each
+mechanism.**
+
+```
+  One axis — "what's the single point of failure?" — as you layer mechanisms on
+
+  ┌─ today: one graph.json, one client ─┐
+  │ SPOF = that one file / that device  │  → lose it, lose everything
+  └──────────────────┬───────────────────┘
+                     │  add replication ↓
+  ┌─ N replicas of the graph ───────────┐
+  │ SPOF moves to: the failover logic    │  → data survives a node loss; now
+  │ (who promotes a new leader?)         │     "who's in charge?" is the risk → 07
+  └──────────────────┬───────────────────┘
+                     │  add partitioning ↓
+  ┌─ graph split by region ─────────────┐
+  │ SPOF moves to: the partition map     │  → one shard down ≠ whole system down,
+  │ (which node owns Seattle?)           │     but a bad routing key is now the risk
+  └───────────────────────────────────────┘
+```
+
+The lesson the axis exposes: these mechanisms don't *remove* the single point of
+failure — they **move it** to a smaller, more recoverable place. That's the whole
+game, and it's exactly the trade flattr hasn't had to make yet.
+
+**Seam.** The seam that *would* matter is the partition key — the function
+`bbox → which node owns it`. flattr already has the *shape* of a partition key
+(everything is keyed by bbox — `01`, `03`) but no partition *map* (every bbox goes
+to the same place: the bundled file). The bbox is a partition key waiting for a
+second partition.
 
 ## How it works
 
-### Move 1 — the mental model
+### Move 1 — the mental model: copies vs slices
 
-You've shipped these shapes already, per `me.md`: buffr is SQLite-primary + Supabase-secondary (a primary/replica split), and dryrun uses GitHub-as-backend. So you know the *what*. The piece flattr would add is the *coordination*: keeping copies in sync and deciding what counts as "enough copies agreed."
-
-```
-  Replication vs partitioning — orthogonal axes
-
-  REPLICATION (same data, many copies)    PARTITIONING (different data, split)
-  ┌─────┐  ┌─────┐  ┌─────┐               ┌──────────┐ ┌──────────┐
-  │ A   │= │ A'  │= │ A'' │               │ Seattle  │ │ Portland │
-  └─────┘  └─────┘  └─────┘               │ graph    │ │ graph    │
-   primary  follower follower             └──────────┘ └──────────┘
-   survives a node loss                    no node holds the whole world
-
-  QUORUM ties replication together:
-   N copies, write needs W acks, read needs R copies; W + R > N → reads see latest
-```
-
-### Move 2 — the walkthrough (concept + the trigger in flattr)
-
-**Part 1 — replication, and its trigger.** Replication buys two things: durability (lose a node, keep the data) and read throughput (spread reads across copies). flattr's `graph.json` is bundled into every app install — so in a loose sense it's "replicated" to every phone, but read-only and never coordinated, which is distribution, not replication. Real replication needs a *write* that must propagate to copies.
+Two orthogonal ideas people constantly conflate:
 
 ```
-  Trigger for replication in flattr
+  The pattern — replication and partitioning are perpendicular
 
-  TODAY                        TRIGGER                    THEN YOU NEED
-  ─────                        ───────                    ─────────────
-  read-only bundled graph  →   user accounts that store → primary DB + replicas
-  (no writes to replicate)     saved routes / prefs       sync + failover
+         partitioning (slices) ──────────────►
+        ┌─────────┬─────────┬─────────┐
+   r    │ shard A │ shard B │ shard C │   each shard = a DIFFERENT slice
+   e ▲  │ (full   │ (full   │ (full   │   of the data
+   p │  │  copy)  │  copy)  │  copy)  │
+   l │  ├─────────┼─────────┼─────────┤   each row = a COPY of the same slice
+   i │  │ replica │ replica │ replica │
+   c │  │   A'    │   B'    │   C'    │   partitioning → scale
+   a    └─────────┴─────────┴─────────┘   replication  → durability + availability
+   tion (copies)
 ```
 
-Until there's writable, server-owned state, there's nothing to replicate. The trigger is "flattr grows a backend with user data."
+Partitioning answers "too big for one node" (split it). Replication answers "one
+node can die" (copy it). Real systems do both: shard for scale, replicate each
+shard for safety. flattr does neither — one slice, one copy.
 
-**Part 2 — partitioning, and the shard key that's already chosen.** Sharding splits data so one node never holds it all. flattr's data is naturally spatial, and it *already tiles by bbox*:
+### Move 2 — the kernel of each, and what breaks without it
+
+**Replication — the kernel.** Keep N copies; one is the **leader** (takes
+writes), the rest are **followers** (copy the leader, serve reads). What breaks
+when a part is missing:
+
+- **drop the leader concept** → two copies both take writes, diverge, and you have
+  a conflict you can't auto-resolve (multi-leader's hard problem).
+- **drop failover** → leader dies, no follower gets promoted, writes stop — you
+  bought durability but not availability.
+- **drop replication lag awareness** → a read hits a follower that's behind the
+  leader, returns stale data, and breaks read-your-writes (`04`).
+
+**Partitioning — the kernel.** A **partition key** + a **routing function** that
+maps key → node. What breaks:
+
+- **drop a good key choice** → hot partition (one shard gets all the traffic, e.g.
+  partitioning by `country` when 90% of users are in one country).
+- **drop rebalancing** → add a node and either everything reshuffles (downtime) or
+  nothing moves to it (wasted capacity). Consistent hashing exists to make adding
+  a node move only `1/N` of keys.
+
+**Quorums — the kernel.** With N replicas, require W replicas to ack a write and R
+to serve a read. The rule that makes it correct:
 
 ```
-  flattr's latent shard key — geography
+  The pattern — the quorum overlap rule
 
-  the world graph (too big for one node / one bundle)
-        │  partition by bbox (the SAME key tiles.ts already uses)
-        ▼
-  ┌──────────┐ ┌──────────┐ ┌──────────┐
-  │ shard:   │ │ shard:   │ │ shard:   │  ← each node owns a geographic region
-  │ Seattle  │ │ Portland │ │ SF       │
-  └──────────┘ └──────────┘ └──────────┘
+  N = 3 replicas,  W = 2 (write must reach 2),  R = 2 (read must hear from 2)
 
-  a cross-region route (rare) = the cross-shard query problem
-  (today handled in-process by mergeGraphs/stitchGraph — same idea, one node)
+  if  W + R > N   then every read set OVERLAPS every write set
+      2 + 2 > 3   → any 2 readers include ≥1 replica that saw the latest write
+                  → you read the latest value even with 1 replica down
+
+  drop the W+R>N rule → a read can miss every replica that has the new write
+                      → you serve stale data and call it consistent (the bug)
 ```
 
-The interesting honest observation: `mergeGraphs` + `stitchGraph` in `tiles.ts` already solve the *cross-partition stitching* problem in-process — joining two bbox tiles at their shared boundary nodes. If flattr ever sharded by region, that exact stitching logic is what a cross-shard route query would need, just promoted across a network boundary. The algorithm exists; only the boundary would change.
+The `W + R > N` overlap is the load-bearing insight people forget — it's *why*
+quorums give strong consistency without contacting every replica. flattr has N=1,
+so W+R>N is trivially satisfied and there's nothing to tune.
 
-**Part 3 — quorums, and why they're far off.** A quorum is the agreement rule for replicated writes: with N copies, require W acknowledge a write and R respond to a read, set W + R > N, and any read is guaranteed to overlap at least one copy that has the latest write. It's how you stay correct while tolerating down nodes. flattr is *two* triggers away from needing this — it needs replication first (a backend with writes), then enough replicas that you'd tolerate some being down. Don't reach for quorums before you have replicas to count.
-
-### Move 2.5 — current vs future
+### Move 2.5 — current vs future: the trigger
 
 ```
-  Phase A (now)                  Phase B (backend + user data)        Phase C (scale)
-  ─────────────                  ─────────────────────────────        ───────────────
-  1 copy, read-only              primary DB + read replicas           shard by bbox
-  bbox tiling = fetch hint       replication for saved routes         quorum reads/writes
-  mergeGraphs in-process         failover on primary loss             cross-shard stitch
-                                                                       (mergeGraphs, networked)
+  Phase A (now)                vs   Phase B (the trigger that flips it)
+  ─────────────────                ────────────────────────────────────
+  one graph.json, one client        a SHARED server hosts the graph for many users
+  no replica, no shard              ↓
+  bbox is a key with one target     replication: ≥2 copies so a node loss isn't an
+  W+R>N trivial (N=1)               outage  → failover logic, lag awareness (→ 07)
+                                    partitioning: graph too big for one node OR
+                                    multi-region → bbox becomes a real partition key
+                                    quorum: tune W/R so reads see latest writes
+
+  the bbox key already exists (01,03) — only the second partition is missing.
 ```
 
-The migration cost is real and sequential: you can't skip to Phase C. Each phase introduces exactly one new coordination problem, which is why naming the trigger per concept matters more than teaching all three at once.
+The concrete trigger from `00`: **a multi-user service** (the graph stops being a
+bundled asset and becomes a hosted, possibly per-region dataset). Multi-region is
+the partitioning trigger; "can't afford an outage" is the replication trigger.
 
 ### Move 3 — the principle
 
-Replication and partitioning are answers to two different questions — "how do I survive losing a node?" (replicate) and "how do I hold more than one node's worth of data?" (partition) — and quorums are the rule that lets replication tolerate failure without lying about freshness. The discipline flattr models *by absence* is not adding any of them until a write or a too-big dataset forces the question. The shard key, though, is worth knowing in advance: it's already geography.
+Replication and partitioning don't eliminate the single point of failure — they
+relocate it somewhere smaller and more recoverable (failover logic, the partition
+map) and then *that* becomes the thing you engineer. flattr hasn't paid this cost
+because it has one read-only copy and one reader; the absence is correct, not a
+gap. **Reach for replication when an outage is unacceptable, for partitioning when
+one node can't hold the data or the load — and never confuse the two, because they
+solve perpendicular problems.**
 
 ## Primary diagram
 
+What flattr would grow, and the SPOF relocation at each step.
+
 ```
-  Replication / partitioning / quorums — flattr's status
+  the path flattr WOULD take (not yet taken)
 
-  ┌─ TODAY ──────────────────────────────────────────────────────┐
-  │  graph.json: 1 copy · read-only · bbox-tiled (fetch hint only)│
-  │  replication: ✗   partitioning: ✗ (key latent)   quorum: ✗    │
-  └──────────────────────────────────────────────────────────────┘
-        │ trigger 1: backend + user writes
+  one file, one client          SPOF = the file
+        │ multi-user service
         ▼
-  ┌─ replication appears ─────────────────────────────────────────┐
-  │  primary + replicas for saved routes; failover                │
-  └──────────────────────────────────────────────────────────────┘
-        │ trigger 2: dataset outgrows one node
+  hosted graph + N replicas     SPOF → failover logic (07)
+        │ too big / multi-region
         ▼
-  ┌─ partitioning + quorums appear ───────────────────────────────┐
-  │  shard by bbox (key already chosen) · W+R>N reads/writes       │
-  │  cross-shard route = mergeGraphs/stitchGraph over the network  │
-  └──────────────────────────────────────────────────────────────┘
+  partition graph by bbox       SPOF → partition map; bbox = the key (already exists)
+        │ need fresh reads under replica lag
+        ▼
+  tune quorum W+R > N           reads overlap writes → strong consistency
 ```
-
-## Elaborate
-
-The canonical references are the Dynamo paper (quorums + consistent hashing for partitioning) and any primary/replica RDBMS setup (Postgres streaming replication). Consistent hashing is the standard way to assign partitions to nodes so adding a node only moves a fraction of the data — flattr's spatial key is simpler (a 2D grid), which is actually a nicer fit for geographic data than a hash ring. The reason this whole file is `not yet exercised` is structural, not a deficiency: a single-client app with a read-only dataset has no node to replicate to and no data too big to hold. Sibling `study-database-systems` owns datastore-local replication mechanics; `study-system-design` owns the scale-tradeoff decision of when to shard.
 
 ## Interview defense
 
-**Q: "How would you scale flattr's graph beyond one city?"**
-Lead with the shard key, because it's already there.
+**Q: "How would you scale flattr's graph to many users and regions?"**
+Verdict first: "Today it's a single bundled read-only file, so there's no
+replication or sharding — and that's correct at one client. To scale, I'd host the
+graph and add two perpendicular things: replication (≥2 copies + failover) so a
+node loss isn't an outage, and partitioning by bbox (the key already exists —
+everything's keyed by bbox) once it won't fit one node or goes multi-region. If I
+add replicas and need fresh reads, I tune quorum so W+R>N and reads overlap
+writes." Naming that the bbox is *already* a partition key, and that the two
+mechanisms solve different problems, is the signal.
 
 ```
-  shard by bbox (the key tiles.ts already uses)
+  the sketch you draw
 
-  [Seattle node] [Portland node] [SF node]
-        cross-region route → stitch at shared boundary nodes
-        (mergeGraphs/stitchGraph, promoted across the network)
+  too risky  → replication (copies)   → SPOF moves to failover
+  too big    → partitioning (slices)  → SPOF moves to partition map
+  stale reads→ quorum  W + R > N      → read set overlaps write set
 ```
 
-"The data is spatial and I already tile by bbox for fetching, so the shard key is geography — each node owns a region. A cross-region route is a cross-shard query, and I already have the in-process version of the fix: `mergeGraphs` + `stitchGraph` join two tiles at their shared boundary nodes. Sharding would promote that stitch across a network boundary. I'd add replication *before* sharding though — only once there's writable user data worth not losing. Quorums come last, when there are enough replicas that I'd tolerate some being down."
+**Q: "Why does W + R > N matter?"**
+"It guarantees the read set and write set overlap by at least one replica, so any
+read hears from at least one replica that has the latest write — that's how you
+get strong consistency without contacting all N. Violate it and a read can miss
+every replica that has the new value and serve stale data." That overlap is the
+one quorum fact interviewers check for.
 
-**Anchor:** *The shard key is already geography; the cross-shard stitch already exists in-process.*
-
-**Q: "Why no replication today?"**
-"Nothing to replicate — the graph is read-only and bundled, so it's distributed-to-every-client but never coordinated. Replication needs a write that must propagate. The trigger is a backend with user data."
-
-**Anchor:** *Replication needs a write to propagate; flattr has none yet.*
+**Anchor:** *Replication is copies for durability; partitioning is slices for
+scale; they're perpendicular. flattr has neither — one read-only copy, one reader
+— and the bbox is a partition key waiting for a second partition.*
 
 ## See also
 
-- `01-distributed-system-map.md` — the single node this would multiply.
-- `04-consistency-models-and-staleness.md` — quorums are how replicated reads stay fresh.
-- `07-clocks-coordination-and-leadership.md` — replicas need a way to order writes (clocks/leadership).
-- sibling `study-database-systems` — datastore replication mechanics.
-- sibling `study-system-design` — when-to-shard as a scale decision.
+- `01` — why flattr has one node (the system map).
+- `03` — the bbox as a natural key (here it'd become the partition key).
+- `04` — replication lag is a read-your-writes / staleness problem.
+- `07` — failover needs leader election, which flattr also doesn't have yet.
+- sibling **system-design** — the scale tradeoffs; sibling **database-systems** —
+  replication as a storage-engine feature.

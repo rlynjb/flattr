@@ -1,263 +1,261 @@
-# BLOCKED as large-finite
+# 05 — BLOCKED as a large finite number
 
-> **Sentinel-as-large-finite / defining the special case out of existence**
-> — Project-specific application of an APOSD move.
+**Industry names:** sentinel-as-large-finite / soft constraint / define-the-error-away.
+**Type label:** Project-specific (the technique is general; the choice is flattr's).
+
+An over-grade edge costs a billion, not infinity. That one decision keeps
+"no *flat* route" distinct from "no route at all" — and erases a whole
+branch of special-case code.
+
+---
 
 ## Zoom out, then zoom in
 
-When an edge is too steep for the rider, what cost do you give it? The
-obvious answer — `Infinity` — is wrong, and the reason it's wrong is the
-whole insight of this file. flattr uses `BLOCKED = 1e9`: large enough that
-the router avoids steep edges whenever any alternative exists, but *finite*
-so that when a steep edge is the **only** way through, the route still comes
-back — flagged as steep, not silently dropped.
+This is a single constant (`cost.ts:5`) with outsized leverage. It sits
+inside the penalty kernel (`02`) but it deserves its own file because the
+*finiteness* is a deliberate, load-bearing, easy-to-get-wrong choice.
 
 ```
-  Zoom out — where BLOCKED lives and what it preserves
+  Zoom out — where BLOCKED lives and what it protects
 
-  ┌─ cost.ts ──────────────────────────────────────────┐
-  │  penalty(g, max): if (g > max) return BLOCKED;      │ ← we are here (=1e9)
-  └──────────────────────┬──────────────────────────────┘
-                         │ a finite, huge number (not Infinity)
-  ┌─ search() ───────────▼──────────────────────────────┐
-  │  steep edge = very expensive edge, not a dead end    │
-  │  still relaxable → still part of a returnable path   │
-  └──────────────────────┬──────────────────────────────┘
-                         │ Path { steepEdges: [...] }
-  ┌─ UI ─────────────────▼──────────────────────────────┐
-  │  "steep but it's your only option" (honest)          │
-  │  vs  "no route" (genuinely disconnected)             │
-  └─────────────────────────────────────────────────────┘
+  ┌─ ROUTING CORE ───────────────────────────────────────────────┐
+  │  penalty()  cost.ts:16  →  returns ★ BLOCKED = 1e9 ★ when g>max│
+  │                              cost.ts:5  ← we are here          │
+  │     ▼                                                          │
+  │  search()  → still returns a PATH (expensive) for steep-only   │
+  │  search()  → returns NULL only when truly disconnected         │
+  └───────────────────────────────────────────────────────────────┘
+  ┌─ UI consequence ─────────────────────────────────────────────┐
+  │  "steep route, flagged"  ≠  "no route exists"                 │
+  └───────────────────────────────────────────────────────────────┘
 ```
 
-Zoom in: this is APOSD's **"define the special case out of existence."** A
-naive design needs a branch: "if all edges are too steep, do X." flattr has
-no such branch. A too-steep edge is just an expensive edge; the search loop
-treats it identically to any other. One constant erases an entire class of
-special-case handling — and keeps two genuinely different failures distinct.
+Zoom in: the pattern is **a soft constraint encoded as a large finite
+cost** — the opposite of a hard `Infinity` or a thrown exception. You've
+done this whenever you ranked a bad-but-allowed option as "very expensive"
+instead of filtering it out, so it still appears when it's the *only*
+option. Here the bad option is "a hill steeper than you wanted," and
+flattr keeps it on the table, just last.
+
+---
 
 ## Structure pass
 
-**Layers.** The constant, the loop, the honesty flag:
-- *The constant*: `BLOCKED = 1e9` (`cost.ts:5`).
-- *The loop*: `search()` relaxes it like any cost.
-- *The honesty layer*: `steepEdges` in the returned `Path` (`astar.ts:126`).
+**Layers.** The constant (`BLOCKED`) → the penalty that returns it → the
+search that sums it → the two distinguishable outcomes (steep path vs no
+path). One number, propagating up to a user-visible distinction.
 
-**Axis — "what does 'unroutable' mean?"** Two distinct failures that a
-careless design collapses into one:
+**Axis held constant — "can this route still be returned?"**
 
 ```
-  axis = "why is there no good route?"
+  "is a steep-only path returnable?" — Infinity vs large-finite
 
-  ┌─ disconnected graph ──────┐   genuinely no path → search returns null
-  │  start/goal not connected │   (open empties, path: null — astar.ts:77)
-  └────────────────────────────┘
-                  ║  these MUST stay distinct
-  ┌─ only-steep path ─────────┐   a path exists, all steep → returns the path
-  │  connected but all > max  │   with steepEdges flagged (honest)
-  └────────────────────────────┘
-
-  Infinity collapses these into one; 1e9 keeps them apart
+  ┌─ Infinity design ────┐          ┌─ large-finite design ────────┐
+  │ steep edge = ∞        │          │ steep edge = 1e9             │
+  │ ∞ + anything = ∞      │          │ 1e9 + length = still finite  │
+  │ → path cost = ∞       │          │ → path has a real total cost │
+  │ → indistinguishable   │  flips   │ → comparable, RANKED last    │
+  │   from "no route"     │ ═══════► │ → returned + flagged steep   │
+  └──────────────────────┘          └──────────────────────────────┘
 ```
 
-**Seam.** The boundary is the choice of sentinel value. With `Infinity`, a
-too-steep edge can never be relaxed (`tentative < g` is always false against a
-finite incumbent, and any path through it has infinite cost), so an
-all-steep-but-connected graph returns `null` — *identical* to a disconnected
-graph. With `1e9`, the steep path has a huge but finite cost, gets relaxed,
-and returns. The two failure modes flip apart exactly at this constant.
+**Seam.** `BLOCKED (finite) │ Infinity (the path not taken)`. The axis
+"can a steep-only route still come back" flips between the two designs.
+Finite is what lets the search *rank and return* a steep route instead of
+treating it as nonexistent.
+
+---
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You know the difference between `null` (no value) and `NaN` or a sentinel like
-`-1` (a value that means "special") — and you know that `array.indexOf`
-returning `-1` is more useful than throwing, because `-1` is still a number
-you can compare and branch on later. `BLOCKED` is that move for cost: instead
-of "this edge has no usable cost" (Infinity → unrelaxable), it's "this edge
-has an enormous but real cost" — still a number the search can work with.
+The shape: a wall you can climb if you absolutely must, priced so high
+you only take it when there's no alternative — versus a wall you can't
+climb at all. Infinity is the impassable wall (it collapses into "no
+route"); a billion is the climbable-but-awful wall (it stays a route).
 
 ```
-  the pattern — sentinel that stays in the number line
+  Pattern — finite wall vs infinite wall
 
-  cost spectrum:
-    0 ──── flat ──── moderate ──── steep ──── BLOCKED(1e9) ┊ Infinity
-                                              └─ still routable ─┘ └ unrelaxable
-    "avoid if you can"  ◄──────────────────────┘
-    "but take if you must" ─────────────────────┘
+  cost
+   │   1e9 ┤■■■■■  ← finite wall: steep-only path totals ~1e9·n,
+   │       │        a real number → search returns + flags it
+   │       │
+   │   ∞   ┤▓▓▓▓▓  ← infinite wall: path totals ∞ → equals
+   │       │        "no path" → search returns NULL, user can't tell
+   └───────┴─────── grade
+              g > max
 ```
 
-In one sentence: **make the forbidden case prohibitively expensive but still
-representable, so the system degrades to honesty instead of a dead end.**
+### Move 2 — the walkthrough
 
-### Move 2 — the step-by-step walkthrough
-
-#### One constant, with the rationale in the comment
+**The constant, and the comment that is the whole rationale.**
+`cost.ts:4-5`:
 
 ```ts
-// cost.ts:4-5 — the whole pattern in two lines
+// features/routing/cost.ts:4-5
 /** Large but FINITE, so an only-steep path is still returned and flagged. */
 export const BLOCKED = 1e9;
 ```
 
-The comment is doing real work — it carries the *why* that the value `1e9`
-can't (pattern: comments explain what code can't, `audit.md` Lens 7). A reader
-who "cleans up" `BLOCKED` to `Infinity` would break the only-steep case
-silently; the comment is the guard rail. **What breaks if it's `Infinity`?**
-`penalty` returns `Infinity`, so `gradeCostDirected` returns `Infinity`, so in
-the relaxation `tentative = g.get(current) + Infinity` is `Infinity`, which is
-never `< (g.get(next) ?? Infinity)` in a useful way — the steep neighbor never
-gets a usable cost, and a connected-but-all-steep graph returns `null`,
-indistinguishable from disconnected.
+The doc-comment carries what the value can't: *finite is the point.* This
+is the kind of comment audit lens 7 praises — it explains the decision,
+not the syntax.
 
-#### The search loop has no special case for steepness
+**Where it's returned.** `cost.ts:18`, inside `penalty`: `if (g > max)
+return BLOCKED`. So an over-grade edge contributes `length * (1 + 1e9)`
+to the path cost — huge, but a number.
 
-```ts
-// astar.ts:68-72 — relaxation, no steepness branch anywhere
-const tentative = g.get(current)! + costFn(edge, current, userMax);
-if (tentative < (g.get(next) ?? Infinity)) {   // 1e9 is finite → comparable
-  g.set(next, tentative);
-  open.push(next, tentative + heuristicFn(...));
-}
-```
-
-There is no `if (edge too steep) skip`. The steep edge flows through the exact
-same relaxation as a flat one — its cost is just ~1e9 larger, so the router
-picks it *only* when every alternative is even more expensive (i.e., there is
-no alternative). **What breaks if you added a "skip steep edges" branch
-instead?** You'd reintroduce the special case the sentinel eliminated — and
-you'd lose the only-steep route entirely, because skipping all its edges
-disconnects the graph in the search's eyes.
-
-#### The honesty layer flags what BLOCKED let through
-
-```ts
-// astar.ts:124-129 — summarizePath flags steep edges it routed over
-cost += costFn(edge, from, userMax);          // includes the ~1e9 if steep
-lengthM += edge.lengthM;
-if (Number.isFinite(userMax) && directedGrade(edge, from) > userMax) {
-  steepEdges.push(edge.id);                   // ← tell the user the truth
-}
-```
-
-This is the other half of the contract. Because BLOCKED let the steep route
-*through*, the system owes the user honesty about it. `steepEdges` collects
-every edge that exceeded `userMax`, and the UI shows "this route includes
-steep sections" rather than pretending the route is flat. **What breaks
-without this flag?** The router would return a steep route as if it were
-fine — worse than returning nothing, because it's misleading.
+**Why finite changes the search outcome.** Trace two scenarios through
+`search` (`astar.ts:22`):
 
 ```
-  execution trace — connected, all edges steep, userMax=8
+  Execution trace — steep-only path, two designs
 
-  edges: A→B (grade 12%), B→goal (grade 10%)   both > 8 → BLOCKED applies
-  ─────────────────────────────────────────────────────────────
-  relax A→B:  tentative = 0 + len·(1+1e9) ≈ 1e9·len   FINITE → accepted
-  relax B→goal: tentative ≈ 2e9·len                    FINITE → accepted
-  pop goal:   reconstruct → Path{ cost≈huge,
-                                  steepEdges:[A→B, B→goal] }  ← returned, flagged
+  graph: start ─steep(g>max)─ goal     (the ONLY connection)
 
-  with Infinity: tentative = Infinity → path: null  (looks disconnected ✗)
+  design = BLOCKED (1e9):
+    relax edge: tentative = 0 + length·(1+1e9)  = ~1e9·length  (finite)
+    push goal at ~1e9
+    pop goal → reconstruct → return PATH (cost ~1e9, steepEdges=[that edge])
+    ► user sees: "here's a route, but it's steeper than you wanted"
+
+  design = Infinity:
+    relax edge: tentative = 0 + length·(1+∞)  = ∞
+    push goal at ∞  (or never improve over Infinity sentinel)
+    ► path cost ∞ — indistinguishable from a disconnected graph
+    ► user sees: "no route" — WRONG, a route exists
 ```
+
+**The honesty flag rides alongside.** `summarizePath` (`astar.ts:126`)
+records *which* edges exceeded `userMax` into `steepEdges` — separately
+from the cost. So the returned `Path` carries both "here's the route" and
+"these segments are over your limit." The finite cost gets the route
+returned; the `steepEdges` list makes it honest. **Boundary condition:**
+`null` is reserved for genuine disconnection — `search` returns `null`
+only when the frontier empties without reaching the goal (`astar.ts:77`).
+The two failure modes stay distinct *because* steep edges never make the
+cost non-finite.
+
+**Why not `Infinity` — and the one risk of `1e9`.** `Infinity` would
+fold "steep" into "disconnected," losing the distinction the product
+needs (spec §14.4). The cost of the finite choice: if a path stacked
+enough blocked edges that the total approached `Number.MAX_SAFE_INTEGER`
+(~9e15), precision could erode. At `1e9` per blocked edge you'd need
+millions of blocked edges in one path to get there — impossible for a
+real route — so `1e9` has comfortable headroom. That's why the *magnitude*
+is chosen, not arbitrary: big enough to dominate any real distance,
+small enough to never overflow.
 
 ### Move 3 — the principle
 
-The right sentinel keeps the special case inside the normal machinery. By
-making "forbidden" a large finite cost rather than infinity, flattr deletes
-the branch that would handle "all routes are steep" *and* preserves the
-distinction between "steep" and "impossible." The general lesson: **when you
-reach for a sentinel, ask whether it should stay inside the value's domain.**
-`Infinity` leaves the number line; `1e9` stays on it, and staying on it is
-what lets the system degrade gracefully instead of failing.
+When a constraint is "strongly discouraged" rather than "physically
+impossible," encode it as a large finite cost, not infinity and not a
+filter. The optimizer then treats it as the last resort it is — avoided
+when alternatives exist, surfaced (and flagged) when it's all there is.
+Reserve infinity / exceptions / null for the genuinely impossible, so
+"bad option" and "no option" stay distinguishable to the user. The whole
+move is *defining the error away*: there's no "no flat route" special
+case in the search because a steep route is just an expensive route.
+
+---
 
 ## Primary diagram
 
-The full move: one finite constant, no special-case branch, an honesty flag,
-two failure modes kept distinct.
-
 ```
-  BLOCKED as large-finite — complete
+  BLOCKED as large-finite — full recap
 
-  ┌─ cost.ts ──────────────────────────────────────────────────┐
-  │  penalty: g > max → BLOCKED (1e9, FINITE)                   │
-  └───────────────────────────┬─────────────────────────────────┘
-                              │ huge but comparable cost
-  ┌─ search() — NO steepness branch ───────────────────────────┐
-  │  relax steep edge exactly like any edge                    │
-  │     connected + all steep → finite path FOUND              │
-  │     truly disconnected    → open empties → path: null      │
-  └───────────────────────────┬─────────────────────────────────┘
-              ┌───────────────┴────────────────┐
-   ┌─ Path (only-steep) ─────┐       ┌─ null (disconnected) ──┐
-   │ cost huge,              │       │ no path at all         │
-   │ steepEdges: [...] ◄──── │       └────────────────────────┘
-   │ "steep but your only    │
-   │  option" (honest)       │
-   └─────────────────────────┘
+  cost.ts:5   BLOCKED = 1e9  (finite, /** still returned and flagged */)
+        │
+  cost.ts:18  penalty: g > max → return BLOCKED
+        │
+  astar.ts:68 tentative = g + length·(1 + BLOCKED)   ← stays FINITE
+        │
+        ├──► steep-only path:  cost ~1e9·n  → RETURNED, steepEdges flagged
+        └──► disconnected:     frontier empties → return NULL (astar.ts:77)
+
+  outcome:  "steep route (honest)"  ≠  "no route"   ← the distinction 1e9 buys
 ```
+
+---
 
 ## Elaborate
 
-This is APOSD's "define errors / special cases out of existence" plus a
-deliberate sentinel choice. The `project context` lists it as a must-not-
-change constraint precisely because it's subtle and easy to "simplify"
-wrong. It's the cleanest error-handling move in the repo — instead of
-try/catch or a skip-branch, a single constant makes the hard case fall
-through the normal path.
+"Large finite instead of infinite" is a staple of optimization and
+constraint solving — soft constraints in CP/SAT solvers, penalty methods
+in numerical optimization, "lexicographic" objectives where you scale one
+term to dominate another. The shared idea: keep the math finite so the
+solution stays *comparable and returnable*, and let magnitude express
+priority. flattr's twist is pairing the finite cost with an explicit
+`steepEdges` list so the route can be both returned and honestly labeled.
+The failure to avoid is the classic one: using `Infinity` or `null` for a
+merely-bad option and thereby collapsing it into "impossible." Read `02`
+for the penalty curve this caps, `04` for why the cost must also stay
+non-negative.
 
-It depends on pattern `02` (the penalty function that returns it) and is
-consumed by pattern `01` (the search loop that relaxes it). It also interacts
-with admissibility: because `BLOCKED` is finite and positive, the penalty
-stays `≥ 0` and A\*'s heuristic stays a valid lower bound — `Infinity` would
-technically also stay `≥ 0`, but it would break relaxation, which is the
-practical failure. For the error-handling philosophy, read the matching
-`read-aposd` chapter.
+---
+
+## Project exercises
+
+### EX-05-A — Make the distinction a test
+
+- **What to build:** two tests on a tiny fixture — one where the only
+  path is steep (assert a path *is* returned with non-empty `steepEdges`),
+  one where start/goal are disconnected (assert `path === null`).
+- **Why it earns its place:** locks in the exact behavior `1e9` buys; a
+  future refactor to `Infinity` would fail these.
+- **Files to touch:** `features/routing/astar.test.ts`,
+  `features/routing/fixtures.ts`.
+- **Done when:** both tests pass and a comment names the distinction.
+- **Estimated effort:** 40 min.
+
+### EX-05-B — Find the overflow ceiling
+
+- **What to build:** a note (or test) computing how many stacked `BLOCKED`
+  edges it takes to approach `Number.MAX_SAFE_INTEGER`, documenting the
+  headroom that justifies `1e9`.
+- **Why it earns its place:** turns "1e9 feels big enough" into a number,
+  the kind of justification an interviewer probes for.
+- **Files to touch:** a comment in `cost.ts` or a test.
+- **Done when:** the headroom is stated explicitly.
+- **Estimated effort:** 20 min.
+
+---
 
 ## Interview defense
 
-**Q: "Why `1e9` instead of `Infinity`? `Infinity` is the honest 'don't go
-here' value, and `1e9` looks like a magic number that could be exceeded by a
-long enough route."**
+**Q: Why is `BLOCKED` a billion and not `Infinity`?**
 
-`Infinity` collapses two failures I need to keep apart. If a steep edge costs
-`Infinity`, then a graph that's connected but entirely too-steep returns the
-same `null` as a graph that's genuinely disconnected — and the product's whole
-point is to say "this is steep, but it's your only way" instead of silently
-"no route." `1e9` makes steep edges prohibitively expensive (the router takes
-them only when there's no alternative) while keeping the cost finite and
-comparable, so the path still reconstructs and I flag it via `steepEdges`. On
-the magic-number worry: real pedestrian routes are well under a million
-meters, and even at extreme lengths the penalty multiplier would have to stack
-absurdly to approach 1e9 per edge — the headroom is enormous, and the comment
-at `cost.ts:4` documents the intent.
+Because `Infinity` would make "the only route is steeper than you wanted"
+indistinguishable from "there's no route at all" — both come back as an
+infinite-cost / null result. With a large *finite* cost, a steep-only
+path still has a real total cost, so the search returns it (ranked last)
+and flags the steep segments in `steepEdges`. `null` stays reserved for
+genuine disconnection. One constant keeps two very different user
+messages distinct.
 
 ```
-  Infinity                       1e9 (BLOCKED)
-  ┌────────────────────┐         ┌────────────────────────┐
-  │ all-steep → null   │ same    │ all-steep → path+flag   │ distinct
-  │ disconnected→ null │ as ✗    │ disconnected → null     │ from each other ✓
-  └────────────────────┘         └────────────────────────┘
+  Infinity:  steep-only path = ∞ = "no route"   ✗ (user misled)
+  1e9:       steep-only path = ~1e9·n (finite)  ✓ returned + flagged
+             disconnected = null                ✓ still distinct
 ```
 
-*Anchor: large-finite keeps "steep but routable" distinct from "no route";
-Infinity collapses them.*
+**Q: Why `1e9` specifically — isn't that arbitrary?** It needs to
+dominate any real distance (so a single blocked edge outweighs detouring
+miles) while leaving headroom under `Number.MAX_SAFE_INTEGER` (~9e15) so
+summed path costs never lose precision. At `1e9` per blocked edge you'd
+need millions in one path to risk overflow — impossible for a real route.
+Big enough to win, small enough to stay exact.
 
-**Q: "What does this buy you in the search loop's complexity?"**
+**Anchor:** "`BLOCKED = 1e9`, finite on purpose — so 'steep route,
+flagged' stays distinct from 'no route' (`null`). It defines the
+no-flat-route special case out of the search."
 
-It deletes the special case. There's no "if every edge is too steep" branch
-anywhere — a steep edge is just an expensive edge, relaxed by the same line
-as a flat one (`astar.ts:68`). That's the APOSD move: instead of *handling*
-the special case, choose a representation where it isn't special. The honesty
-flag (`steepEdges`, `astar.ts:126`) is the small price — having let the steep
-route through, I owe the user the truth about it.
-
-*Anchor: the sentinel choice removes a special-case branch from the search
-loop entirely; steepness becomes "expensive," not "forbidden."*
+---
 
 ## See also
 
-- `02-penalty-as-the-domain-seam.md` — where BLOCKED is returned.
-- `01-parametric-search-over-cost-fns.md` — the loop that relaxes it.
-- `audit.md` Lens 6 (errors/special cases defined out of existence).
-- `read-aposd` — "define errors out of existence" chapter.
+- `02-penalty-as-the-domain-seam.md` — the penalty curve `BLOCKED` caps.
+- `04-lazy-deletion-priority-queue.md` — why costs also stay non-negative.
+- `audit.md` lens 6 (define-the-error-away), lens 7 (the rationale comment).

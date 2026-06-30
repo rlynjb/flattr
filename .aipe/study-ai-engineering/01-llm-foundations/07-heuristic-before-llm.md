@@ -1,56 +1,206 @@
-# Heuristic Before LLM
-*Deterministic-first / cascade routing — Language-agnostic*
+# Heuristic before LLM
 
-## Zoom out
+**Industry name(s):** heuristic-before-LLM / deterministic-first routing /
+the cheap-path-first pattern. **Type:** Industry standard architecture
+discipline.
 
-The cheapest, fastest, most testable inference is the one you don't send to a model. The mature pattern is a cascade: a deterministic rule handles the common, unambiguous case in microseconds, and the LLM is the *fallback* for genuine ambiguity only. flattr is a striking example — it's all heuristic and *no* LLM, deterministic by design. So this concept lets you see the "fast path" half fully built, with the LLM half simply absent.
+## Zoom out — where this would sit in flattr
+
+The pattern: don't call a model for work a deterministic rule already
+nails. Keep the cheap, exact, testable path as the default; reserve the
+LLM for the genuinely ambiguous cases (parse fuzzy NL, write prose). flattr
+is the *poster child for the heuristic side* — its router is exact A*, its
+grade classification is a threshold table, its cost function is a
+hand-tuned formula. There is **zero LLM**, and that's correct: none of
+flattr's current work is ambiguous enough to need one. This file teaches
+the pattern flattr already embodies and names the two seams where an LLM
+would earn its slot.
 
 ```
-LAYERS — the cascade, fast path first
-┌──────────────────────────────────────────────┐
-│ input ─► [ deterministic rule ] ─► answer ✓     │ ◄── 99% exits here
-│                  │ ambiguous?                    │
-│                  ▼                               │
-│            [ LLM fallback ] ─► answer            │ ◄── flattr: absent
-└──────────────────────────────────────────────┘
+  Zoom out — flattr is already the deterministic-first default
+
+  ┌─ HEURISTIC core (flattr TODAY — keep it) ───────────────┐
+  │ directedAstar  ─► exact path        (cost.ts CostFn)     │
+  │ classifyAbs    ─► color band        (if/else, classify.ts)│
+  │ penalty()      ─► grade cost        (formula, cost.ts:16)│
+  └────────────────────────────┬─────────────────────────────┘
+              only fall to a model for AMBIGUOUS cases ▼
+  ┌─ LLM lane (NOT BUILT — narrow) ─────────────────────────┐
+  │ • parse "avoid hills near park" → filter (INPUT seam)    │
+  │ • describe RouteSummary as prose (OUTPUT seam)           │
+  └──────────────────────────────────────────────────────────┘
 ```
+
+flattr has **no LLM and needs none today**. The lesson: flattr already
+lives on the right side of this pattern — the skill is knowing the two
+spots where crossing to the LLM lane is justified.
+
+## Structure pass
+
+- **Layers:** deterministic core (router, classify, cost) → optional LLM
+  lane (parse, describe) → UI.
+- **Axis — determinism vs ambiguity:** the core handles inputs with a
+  *right answer* (shortest grade-aware path, which color a grade is). An
+  LLM handles inputs with *no closed-form rule* (free-text intent, natural
+  phrasing). The axis is "is there an exact rule?" — if yes, never call a
+  model.
+- **Seam:** the flip is at the *edges* of the deterministic core. Input
+  edge: where fuzzy NL would enter (near `geocode.ts:9` /
+  `MapScreen.tsx:182`). Output edge: where numbers become prose
+  (`summary.ts:5`). Everything between stays heuristic.
 
 ## How it works
 
-**Move 1 — the mental model.** Don't reach for the model first; reach for it *last*. A threshold table, a formula, a lookup — if it answers correctly and cheaply, ship that and never pay the latency, cost, and nondeterminism tax. The LLM earns its place only where rules genuinely can't decide: fuzzy natural language, open-ended judgment. The art is drawing the line so the fast path takes the overwhelming majority of traffic.
+### Move 1 — the mental model
+
+You know "don't reach for a regex when `String.includes` works, and don't
+reach for a parser when a regex works." Heuristic-before-LLM is the next
+rung: don't reach for a model when a rule, table, or formula works. The
+model is the *most* expensive, least testable, least deterministic tool —
+last resort, not first.
 
 ```
-PATTERN — flattr's grade classifier IS the fast path
-  absGradePct ─► classifyAbs()
-       ≤ 4  ─► green
-       ≤ 8  ─► yellow
-       else ─► red
-  pure threshold table. no model. fully testable. (classify.ts:11)
+  Pattern — escalate only when the cheaper tool can't decide
+
+  exact rule? ──yes──► use it (A*, threshold, formula)   ← flattr lives here
+       │ no
+       ▼
+  small heuristic? ──yes──► use it
+       │ no
+       ▼
+  genuinely ambiguous? ──► LLM   (parse NL / write prose)
 ```
 
-**Move 2 — the mechanism, in flattr's own code.** flattr's spec §14 mandates "hand-rolled only," and the codebase honors it with two deterministic engines:
+### Move 2 — the walkthrough
 
-- `features/grade/classify.ts:11` — `classifyAbs` maps a grade percent to a color band via fixed thresholds (4%, 8%). A `directedGradePct` variant (`:33`) bands against the user's max. No model, no ambiguity, no variance.
-- `features/routing/cost.ts:16` — `penalty(g, max)` is a closed-form piecewise function: free downhill, linear moderate, quadratic steep, `BLOCKED` over max. The A* cost is a formula, not a prediction.
+**flattr's core is all heuristic — and that's right.** Three examples:
+
+```ts
+// cost.ts:16 — a FORMULA, not a model
+export function penalty(g, max, k1 = 0.4, k2 = 1.0) {
+  if (g <= 0) return 0;            // downhill/flat: free
+  if (g > max) return BLOCKED;     // over max: blocked (finite, cost.ts:5)
+  const half = 0.5 * max;
+  if (g <= half) return k1 * g;    // moderate: linear
+  return k2 * (g - half) ** 2 + k1 * half;  // steep: quadratic
+}
+```
+
+```ts
+// classify.ts:11 — a THRESHOLD TABLE, not an ML classifier
+export function classifyAbs(absGradePct, bands = DEFAULT_BANDS): Band {
+  const g = Math.abs(absGradePct);
+  if (g <= bands.greenMax) return "green";   // if/else over {greenMax:4, yellowMax:8}
+  if (g <= bands.yellowMax) return "yellow";
+  return "red";
+}
+```
+
+Each has an exact right answer. An LLM here would be slower, costlier,
+non-deterministic, and *worse* — it would approximate a formula you can
+just write. **Never call `classify.ts` ML.** It is `if/else`.
 
 ```
-MECHANISM — deterministic by construction
-  edge grade ─► penalty(g,max)   [cost.ts:16]
-     g≤0      ─► 0
-     g≤½max   ─► k1·g            (linear)
-     g≤max    ─► k2·(g-½max)²+…  (quadratic, continuous at boundary)
-     g>max    ─► BLOCKED
-  same input → same cost, every run. no LLM in the loop.
+  Layers-and-hops — heuristic core, LLM only at the fuzzy edges
+
+  INPUT edge          ┌─ DETERMINISTIC CORE ─┐         OUTPUT edge
+  (fuzzy NL?)         │ penalty()  classifyAbs│         (prose?)
+  ┌─────────┐ filter  │ directedAstar         │ summary ┌─────────┐
+  │ LLM parse│ ──────► │ (exact, tested)       │ ──────► │LLM describe│
+  └─────────┘         └───────────────────────┘         └─────────┘
+   geocode.ts:9 region                                  summary.ts:5
 ```
 
-The "LLM fallback" arm of the cascade doesn't exist here — and that's the point. flattr proves the fast path can carry 100% of the load when the problem is well-specified. The lesson for AI work: only the *residual* ambiguity after your rules should ever reach a model.
+**Where an LLM would actually earn its slot.** Two spots, both ambiguous:
+parsing free-text intent ("flatter route, avoid the bridge") into a filter
+at the input edge, and turning `RouteSummary` into a sentence at the output
+edge. Both have no closed-form rule. Everything else stays heuristic.
 
-**Move 3 — principle.** Spend a model only on the cases your rules can't decide; everything a formula can answer, let the formula answer.
+### Move 3 — the principle
 
-## In this codebase
+The deterministic path is the default; the LLM is an escalation for inputs
+with no exact rule. flattr already gets this right — its core is exact and
+its would-be model lives only at the fuzzy edges. The engineering skill is
+resisting the urge to model-ify work a formula already solves.
 
-**Fully exercised — as the heuristic half only.** flattr is deterministic by design (spec §14); `features/grade/classify.ts` (threshold table) and `features/routing/cost.ts` (penalty formula) are the fast path, and there is intentionally no LLM fallback. If one were ever added, the natural-language input at `pipeline/geocode.ts:9` is the place an *ambiguous* query ("somewhere flat-ish nearby") would fall through to a model after the plain-address path failed — a textbook cascade, with flattr's existing engine as the deterministic first stage.
+## Primary diagram
+
+```
+  Heuristic-before-LLM — flattr already lives on the right side
+
+  ┌─ KEEP DETERMINISTIC (today) ────────────────────────────┐
+  │ penalty (cost.ts:16) · classifyAbs (classify.ts:11)      │
+  │ directedAstar — exact, testable, $0, deterministic       │
+  └────────────────────────────┬─────────────────────────────┘
+            escalate ONLY for ambiguous edges ▼
+  ┌─ LLM LANE (NOT BUILT — narrow, justified) ──────────────┐
+  │ in:  fuzzy NL → filter   (near geocode.ts:9)             │
+  │ out: RouteSummary → prose (summary.ts:5)                 │
+  └──────────────────────────────────────────────────────────┘
+```
+
+## Elaborate
+
+This is the single most under-applied discipline in AI engineering: teams
+LLM-ify deterministic work and inherit latency, cost, and flakiness for no
+gain. The strong version is a *router*: a cheap rule decides whether the
+request even needs the model. flattr's whole core is that cheap rule
+already; the work is keeping it that way and only adding the model at the
+two fuzzy seams. dryrun applies the same escalation (on-device heuristic /
+model, cloud only when needed).
+
+## Project exercises
+
+### B-HB.1 — document the escalation boundary
+
+- **Exercise ID:** B-HB.1
+- **What to build:** a short `ROUTING.md`-style note (or code comment
+  block) at the cost/classify modules stating "deterministic by rule; LLM
+  only at the parse and describe edges," with the two seam file:line refs.
+- **Why it earns its place:** it codifies the pattern flattr embodies so a
+  future contributor doesn't model-ify the formula.
+- **Files to touch:** `features/routing/cost.ts:16`;
+  `features/grade/classify.ts:11`.
+- **Done when:** the note names both seams and forbids LLM-ifying the core.
+- **Estimated effort:** 30 min.
+
+### B-HB.2 — guard before escalating
+
+- **Exercise ID:** B-HB.2
+- **What to build:** a `needsLLM(text): boolean` heuristic at the input
+  edge that returns false for inputs the existing geocode path already
+  handles (plain addresses), so the model is only called for genuinely
+  fuzzy intent.
+- **Why it earns its place:** it builds the cheap-path-first router
+  explicitly at the real input seam.
+- **Files to touch:** `pipeline/geocode.ts:9`;
+  `mobile/src/MapScreen.tsx:182` (resolve site).
+- **Done when:** plain addresses skip the model; only fuzzy intent
+  escalates; a test covers both.
+- **Estimated effort:** 1–2 hrs.
+
+## Interview defense
+
+**Q: Where does flattr use a model, and why so little?** Answer: It uses
+none, correctly. The router is exact A*, grade classification is a
+threshold table (`classify.ts` — `if/else`, not ML), and the cost
+function is a tuned formula (`cost.ts:16`). None of that is ambiguous, so a
+model would only add latency, cost, and flakiness. The two spots a model
+*would* earn its slot are fuzzy NL parsing and prose description — the
+edges of the deterministic core. Keep the cheap path default; escalate
+only for ambiguity.
+
+```
+  exact rule (router/classify/cost) → no model
+  ambiguous edge (parse/describe)   → escalate to LLM
+```
+
+Anchor: *"flattr is deterministic-first by construction; the LLM lane is
+only the two fuzzy edges — parse near geocode.ts:9, describe at
+summary.ts:5."*
 
 ## See also
-- [04 — Structured outputs](04-structured-outputs.md)
-- [03 — Sampling parameters](03-sampling-parameters.md)
+
+- [01-what-an-llm-is.md](01-what-an-llm-is.md) — why classify.ts isn't ML.
+- [08-provider-abstraction.md](08-provider-abstraction.md) — the lane the escalation picks.
+- [04-structured-outputs.md](04-structured-outputs.md) — typing the escalated output.

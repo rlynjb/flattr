@@ -1,245 +1,209 @@
-# 02 — Structured outputs via tool calling and schemas
+# 02 · Structured outputs via tool calling and schemas
 
-*Industry name(s): "structured outputs," "tool calling," "function calling,"
-"JSON mode," "constrained decoding." Type label: Industry standard.*
+> Industry name: structured outputs / tool calling / response schema · Type label: Industry standard
 
-> **Seam, not present.** flattr never asks a model for JSON. But it already
-> has the thing structured outputs produce: typed structs validated at a
-> boundary. `RouteSummary` (`features/routing/summary.ts:5`) and the geocode
-> result (`pipeline/geocode.ts:3`) are exactly the shapes a structured-output
-> prompt would target. This file teaches the pattern against them.
+> **Status: seam, not feature.** flattr enforces structured shapes *in TypeScript* (`RouteSummary`, `GeocodeResult`), never at an LLM boundary. This file maps schema-first prompting onto Seam 2 (`pipeline/geocode.ts`), where free text would become a typed struct.
 
-## Zoom out — where the schema sits at both seams
+## Zoom out — where this concept lives
 
-Structured output is the discipline of making the model emit data your code
-can parse, every time, instead of prose you regex. It sits at the boundary
-between the model and your typed code. flattr has two such boundaries.
+flattr already lives and dies by typed contracts — it's strict-mode TypeScript with no `any`. The thing it doesn't have is a typed contract *across a model boundary*, where the producer is a model that might hand you anything. That's the seam:
 
 ```
-  Zoom out — the schema boundary at flattr's two seams
+  Zoom out — structured output at Seam 2 (NL-destination parse)
 
-  ┌─ Engine (typed TS, exists) ─────────────────────────────────────┐
-  │  type RouteSummary = {distanceM; climbM; steepCount}  (out)      │
-  │  type GeocodeResult = {lat; lng; label}              (in target) │
-  └───────────────────────────────┬──────────────────────────────────┘
-                                  │ the schema IS this type
-  ┌─ Model boundary (future) ─────▼──────────────────────────────────┐
-  │   ┌──────────────────────────────────────────────────────────┐  │
-  │   │ ★ STRUCTURED OUTPUT ★  declare schema → provider enforces  │  │
-  │   │   → validate parse → retry on schema-fail                  │  │
-  │   └──────────────────────────────────────────────────────────┘  │
-  └──────────────────────────────────────────────────────────────────┘
+  ┌─ UI (mobile) ────────────────────────────────────────────────┐
+  │  AddressBar.tsx  →  "somewhere flat near the water"          │
+  └─────────────────────────┬────────────────────────────────────┘
+                            │  free text
+  ┌─ Parse (SEAM 2) ────────▼────────────────────────────────────┐
+  │  LLM call with a SCHEMA  ★ THIS FILE ★                       │ ← we are here
+  │  declare GeocodeQuery {placeText, near?, preferFlat?}        │
+  │  provider enforces → validate at boundary → retry on fail    │
+  └─────────────────────────┬────────────────────────────────────┘
+                            │  typed struct
+  ┌─ Existing code ─────────▼────────────────────────────────────┐
+  │  pipeline/geocode.ts  geocode(query) → GeocodeResult         │
+  └──────────────────────────────────────────────────────────────┘
 ```
 
-The schema isn't a new thing to invent — flattr's TypeScript types already
-*are* the schema. You'd express them as Zod or JSON Schema and hand them to
-the provider.
+Now zoom in. The pattern is: **you don't ask the model to "respond in JSON" in prose — you declare a schema, make the provider enforce it, validate the parse at your boundary, and retry on failure.** The prose-instruction version is how it was done in 2022. The schema-enforced version is how it's done now. Let me build the difference.
 
-## Zoom in
+## Structure pass
 
-The pattern: **declare the output shape as a schema, let the provider enforce
-it during decoding, validate the parse at your boundary anyway, and retry with
-a stricter system prompt when validation fails.** All four steps. The blog-post
-version is step one — "use JSON mode." The production version is all four,
-plus logging the schema-fail rate to a dashboard.
+**Layers.** Three: the *schema declaration* (what shape you want), the *provider enforcement* (the model is constrained to emit that shape), and the *boundary validation* (you re-check the shape on receipt because enforcement is not a guarantee). flattr's existing `geocode` has only the third layer — it casts `await res.json()` to `NominatimRow[]` and trusts it.
 
-## The structure pass
-
-**Layers:** prompt asks → provider decodes → your code validates.
-**Axis:** *guarantee* — how sure am I the output is the right shape?
-**Seam:** the provider→your-code boundary, where best-effort meets must-be-true.
+**Axis — guarantees (promised vs best-effort).** Trace it down the layers:
 
 ```
-  axis = "is the output guaranteed to be the right shape?"
+  One axis — "is the output shape guaranteed?" — down the layers
 
-  ┌─ prompt text ────┐  guarantee = NONE ("please return JSON" ≠ promise)
-  ├─ provider schema ┤  guarantee = STRONG (constrained decoding)
-  │  ── seam ──        ◄── still validate! provider bugs + fences exist
-  └─ your validator ──┘  guarantee = ABSOLUTE (you throw if wrong)
+  ┌─ schema declaration ─────────┐  → INTENT only (you asked)
+  └──────────────────────────────┘
+      ┌─ provider enforcement ───┐  → BEST-EFFORT (model usually obeys)
+      └──────────────────────────┘
+          ┌─ boundary validation ┐  → GUARANTEED (you enforce or reject)
+          └──────────────────────┘
+
+  the guarantee only becomes real at the bottom layer — that's the seam
 ```
 
-The lesson hides in that seam: even with provider-enforced schema mode, you
-validate again on your side. I've been burned by courteous models wrapping
-schema-valid JSON inside a markdown fence "to be helpful." The provider
-thought it returned JSON; my parser saw ` ```json `.
+**Seam.** The load-bearing boundary is *between provider enforcement and your validation*. People assume "JSON mode" means guaranteed JSON. It means *very-likely* JSON. The guarantee only exists where you parse-and-validate. Skip that layer and you've built on best-effort while believing it's guaranteed — which is the bug that takes two weeks to find.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You know `JSON.parse(await res.json())` and you know the sinking feeling when
-the server returns HTML instead and it throws. Structured output is moving
-that contract *upstream*: instead of hoping the model returns parseable text
-and catching the throw, you tell the provider the exact shape and it
-constrains its own token sampling to produce only that shape. It's the
-difference between `response.json()` praying, and a typed RPC where the wire
-format can't be wrong.
+You know `await res.json()` followed by a type cast `as NominatimRow[]` — that cast is a lie the compiler believes. The network could return anything; TypeScript just *asserts* the shape. Structured output is the same situation at the LLM boundary, except the producer is even less reliable than an HTTP API. So the pattern adds the step the cast skips: actually validate.
 
 ```
-  Pattern — structured output as a constrained funnel
+  The structured-output kernel — declare, enforce, validate, retry
 
-   free-token space  ────────────►  all possible strings
-        │
-        │  schema constrains decoding
-        ▼
-   ┌──────────────────────┐
-   │ only strings that     │  ◄── provider rejects tokens that
-   │ match the schema      │      would break the shape
-   └──────────┬───────────┘
-              │ validate again on your side
-              ▼
-   typed value your code trusts (RouteSummary)
+  declare schema  ─────►  call with schema  ─────►  parse + validate
+        ▲                                                  │
+        │                                          ┌───────┴───────┐
+        │                                       valid?           invalid?
+        │                                          │                │
+        │                                       return         retry (stricter)
+        └──────────────────────────────────────────────────────────┘
+                          bounded: max N retries, then fail loudly
 ```
 
-### Move 2 — the four steps against flattr's types
+### Move 2 — the step-by-step walkthrough
 
-**Step 1 — declare the schema (your existing type, as Zod).** flattr's type
-is already the contract:
+**Declare the schema — not in prose, in a schema language.** For Seam 2 you want the model to turn "somewhere flat near the water" into a struct. In flattr's stack that's a Zod schema (TS-native), the shape that feeds `geocode`:
 
 ```ts
-// EXISTS — features/routing/summary.ts:5
-export type RouteSummary = { distanceM: number; climbM: number; steepCount: number };
-
-// FUTURE — the same shape, expressed for the provider
-const RouteSummarySchema = z.object({
-  distanceM:  z.number(),
-  climbM:     z.number(),
-  steepCount: z.number().int().nonnegative(),
+// future: pipeline/parse-destination.ts
+const GeocodeQuery = z.object({
+  placeText: z.string(),              // → goes to geocode(query)
+  near: z.string().optional(),        // "the water" → a landmark hint
+  preferFlat: z.boolean(),            // "flat" → routing knob
 });
+// existing target, pipeline/geocode.ts:9
+//   geocode(query: string) → GeocodeResult { lat, lng, label }
 ```
 
-The Zod object is mechanically the TS type with runtime teeth. That `int()`
-and `nonnegative()` are guarantees the bare TS type can't enforce — and a
-model *will* hand you `steepCount: 2.0000001` or `-1` if you let it.
+The schema *is* the prompt's output contract. You don't write "return JSON with placeText, near, and preferFlat" in the system prompt — you hand the provider the schema and let it constrain generation. This is the line internet advice gets wrong: "respond only in JSON" as a sentence in the prompt is strictly worse than schema-enforced generation, because the sentence is a suggestion and the schema is a constraint.
 
-**Step 2 — let the provider enforce.** You pass the schema to the call (as a
-tool definition or `response_format`). The provider constrains decoding so the
-returned tokens match. This is the part the blog posts stop at.
+**Let the provider enforce.** Tool calling / response-schema mode constrains the model's token sampling to only produce schema-conformant output. Three flavors you'll meet: tool calling (the model "calls a function" whose parameters are your schema — most portable), JSON mode (model promises valid JSON but not *your* JSON), and `response_format`/structured-output mode (provider validates against your schema server-side). For Seam 2, tool calling is the right default — `parse_destination(placeText, near, preferFlat)` reads as a function the model fills in.
 
-**Step 3 — validate at the boundary anyway.** Here's the production code that
-the blog posts skip:
+**Validate at the boundary — this is the layer flattr's `geocode` skips.** Look at the existing cast:
 
-```
-  // FUTURE — never trust the parse, even in schema mode
-  raw = await callModel(prompt, RouteSummarySchema)
-  stripped = stripMarkdownFences(raw)        // the courtesy-fence defense
-  result = RouteSummarySchema.safeParse(stripped)
-  if (!result.success) {
-     metrics.increment("route_summary.schema_fail")   // ← log the rate
-     return retryWithStricterPrompt(prompt)           // step 4
-  }
-  return result.data                          // now it's a real RouteSummary
+```ts
+// pipeline/geocode.ts:25-27 — the existing pattern, trust-by-cast
+const rows = (await res.json()) as NominatimRow[];   // ← cast, not validated
+if (!rows.length) return null;
+return { lat: parseFloat(rows[0].lat), ... };
 ```
 
-**Step 4 — retry with a stricter system prompt on fail.** On a schema fail,
-re-call with an appended line: "Return ONLY the JSON object. No prose, no code
-fences." One retry catches the vast majority. Two retries then hard-fail and
-alert.
+That `as NominatimRow[]` is fine against Nominatim (a stable API). Against a model it's the bug. The structured-output version replaces the cast with a parse:
 
-```
-  Layers-and-hops — the validate-and-retry loop at the model seam
-
-  ┌─ your code ──┐ hop1: prompt+schema  ┌─ provider ──┐
-  │ caller       │ ───────────────────► │ decode      │
-  │              │ hop2: JSON (maybe     │ (enforced)  │
-  │              │   fenced) ◄────────── └─────────────┘
-  │ validate ────┤
-  │   ok? ──────────► return RouteSummary
-  │   fail? ─────hop3: retry w/ stricter system ──► (back to provider)
-  └──────────────┘
+```ts
+// future: the boundary check the cast skips
+const parsed = GeocodeQuery.safeParse(modelOutput);  // ← actual validation
+if (!parsed.success) { /* retry path */ }
 ```
 
-### Move 2 variant — load-bearing skeleton
+**Retry on schema fail — bounded.** When validation fails, re-call with a stricter system prompt ("your last output failed validation: <error>; return ONLY the schema"). Bounded: max 2-3 retries, then fail loudly and log. The thing nobody mentions in blog posts: **log the schema-fail rate to your metrics dashboard.** A schema-fail rate that climbs from 0.5% to 8% overnight is your early warning that the model got upgraded under you (see `03-prompts-as-code.md`).
 
-Kernel: **schema + boundary validation**. What breaks if you drop each:
+```
+  Hops — the retry loop, bounded
 
-- **Drop the schema** → you're back to "respond only in JSON" in prose, which
-  is *not how this is done in 2026*; the model freelances and your parse
-  throws intermittently. *Load-bearing.*
-- **Drop boundary validation** → the fence bug ships to prod; works in the
-  demo, breaks the day a model upgrade makes the model chattier. *Load-bearing
-  — this is the one people skip.*
-- **Drop the retry** → still correct, just less resilient; a transient
-  schema-fail becomes a user-visible error. *Hardening.*
-- **Drop the metric** → you lose your early-warning signal for model drift.
-  *Hardening, but the cheapest insurance you'll ever buy.*
+  ┌─ Parse ──────┐  call+schema  ┌─ Provider ─┐
+  │ attempt n    │ ────────────► │ LLM        │
+  │              │ ◄──────────── │ output     │
+  └──────┬───────┘   output      └────────────┘
+         │ validate
+    ┌────┴────┐
+    │ valid?  │── yes ──► return GeocodeQuery → geocode()
+    └────┬────┘
+         │ no, n < 3
+         ▼ re-call with stricter prompt + the validation error
+    (n ≥ 3 → throw + log schema_fail_rate metric)
+```
 
-### When to NOT use structured output
+**The specific bug — courteous models and markdown fences.** I have shipped six features on structured output and every one broke at least once because a model, trying to be helpful, wrapped schema-conformant JSON inside a ```` ```json ```` fence. The JSON was *correct*; the fence broke the parser. Two defenses: use real schema-enforced mode (which doesn't fence) rather than "respond in JSON" prose, and make your boundary parser strip fences before validating. Both. Defense in depth at the parser is cheap.
 
-For Seam 1's *prose* description ("A flat 3.2 km route…"), the output is
-open-ended generation — you do NOT force a schema on it; that's concept 09's
-"reasoning in a thinking field" trap inverted. Structured output is for the
-*classifier-shaped* seams: parsing the NL destination at Seam 2 into
-`{lat, lng}` args, or extracting a route's facts. Open-ended creative text:
-no schema. Anything your code branches on: schema.
+### Move 2.5 — current state vs future state
+
+```
+  Phase A (today)              Phase B (Seam 2 built)
+  ───────────────              ──────────────────────
+  geocode(query: string)      parseDestination(text) → GeocodeQuery
+    query must be a literal      free text → schema-enforced struct
+    address                      validated, retried, logged
+  res.json() as NominatimRow[]  GeocodeQuery.safeParse(output)
+    cast, trusted (fine —        validated (required — producer is
+    Nominatim is stable)         a model, not stable)
+```
+
+What *doesn't* have to change: `geocode()` itself. Seam 2 sits *in front* of it. The model parses free text into a `query` string and the existing `geocode(query)` runs unchanged. That's the payoff of single-purpose chains (`06`) — you bolt the LLM step on without rewriting the deterministic step.
 
 ### Move 3 — the principle
 
-A schema turns a best-effort text generator into a typed function at the call
-boundary — but only if you validate on your side too. The provider's
-guarantee is strong, not absolute, and the gap is where the fence bug lives.
+Structured output is not "ask nicely for JSON." It's a four-step contract: declare schema → provider enforces → you validate → you retry-and-log. The guarantee lives only at *your* validation step; everything above it is best-effort. Build on best-effort while believing it's guaranteed and you've shipped the bug that fails 5% of the time. **When to NOT use it:** open-ended generation. Seam 1's *route description* is prose — you don't want a schema strangling "mostly flat, one short climb" into fields. Structured output is for input parsing (Seam 2) and classification, not for the creative output.
 
 ## Primary diagram
 
-```
-  Structured output at flattr's Seam 2 (NL → geocode args)
+The full Seam 2 structured-output flow, every layer and the validation seam labeled.
 
-  ┌─ UI ───────┐ "somewhere flat near the water"
-  │ AddressBar │ ──────────────┐
-  └────────────┘               ▼
-  ┌─ model seam (future) ───────────────────────────────────────┐
-  │ schema = z.object({lat, lng, queryHint})                     │
-  │  declare → provider enforces → strip fences → safeParse      │
-  │     fail ──► retry stricter ──► fail ──► hard error + alert   │
-  └───────────────────────────┬──────────────────────────────────┘
-                              ▼ validated {lat,lng}
-  ┌─ engine (exists) ──────────────────────────────────────────┐
-  │ geocode.ts / nearest.ts consume typed coords                │
-  └─────────────────────────────────────────────────────────────┘
+```
+  Seam 2 — NL destination → typed struct → existing geocode
+
+  ┌─ UI (mobile) ────────────────────────────────────────────────┐
+  │ AddressBar.tsx → "somewhere flat near the water"             │
+  └─────────────────────────┬────────────────────────────────────┘
+                            │ free text + GeocodeQuery schema
+  ┌─ Parse (Seam 2) ────────▼────────────────────────────────────┐
+  │ ┌── declare ──┐   ┌── enforce ──┐   ┌── validate ──┐ ★seam★   │
+  │ │ Zod schema  │ ► │ tool call   │ ► │ safeParse    │          │
+  │ │ {placeText, │   │ (provider   │   │ valid? retry │          │
+  │ │  near,flat} │   │  constrains)│   │ if not (≤3)  │          │
+  │ └─────────────┘   └─────────────┘   └──────┬───────┘          │
+  └─────────────────────────────────────────── │ ─────────────────┘
+                                               │ GeocodeQuery {placeText}
+  ┌─ Existing (unchanged) ──────────────────────▼─────────────────┐
+  │ pipeline/geocode.ts:9  geocode(placeText) → GeocodeResult     │
+  └──────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-Tool calling, JSON mode, and `response_format` are three provider takes on
-the same idea; they differ in syntax and in how strictly they constrain
-(constrained decoding vs. a post-hoc check). Anthropic, OpenAI, and Google all
-support it with slightly different shapes — that vendor detail belongs here in
-Elaborate, not in the concept, because the *pattern* (declare → enforce →
-validate → retry) survives the swap, which is exactly how flattr's own
-`CostFn`/`HeuristicFn` types (`features/routing/types.ts:40,43`) abstract over
-strategy. Hamel Husain and the OpenAI cookbook both hammer the same point:
-the parse-and-validate step is non-optional. Read `07-output-mode-mismatch.md`
-next — the failure mode when one stage's schema doesn't match the next's
-expectation.
+Provider variance is real and lives here, not in its own concept (per the spec's scope). OpenAI's `response_format: { type: "json_schema", strict: true }` validates server-side; Anthropic enforces via tool-use `input_schema`; Google's Gemini has `responseSchema`. The portable pattern that survives all three is tool calling — a named function with typed parameters — which is why I anchored Seam 2 to it. The canonical reference is the OpenAI cookbook's structured-output recipes and Anthropic's tool-use docs. The thing that survives provider upgrades is your *boundary validation*: it doesn't care which provider produced the output.
+
+## Project exercises
+
+### EX-STRUCT-1 — Schema-first destination parser
+
+- **Exercise ID:** EX-STRUCT-1
+- **What to build:** `parseDestination(text): Promise<GeocodeQuery>` with a Zod schema, tool-calling enforcement, `safeParse` validation, bounded retry, and a logged `schema_fail` counter.
+- **Why it earns its place:** Builds all four layers, including the two flattr's `geocode` skips (enforcement + validation). The fence-stripping defense is a real production reflex you only learn by hitting it.
+- **Files to touch:** new `pipeline/parse-destination.ts`; consumes `GeocodeResult` from `pipeline/geocode.ts`.
+- **Done when:** a malformed model output (fenced JSON, extra field) is caught by `safeParse` and triggers exactly one retry; the fail counter increments.
+- **Estimated effort:** 3-4 hours.
 
 ## Interview defense
 
-**Q: "You're using JSON mode and it still broke. Why?"** The model wrapped
-schema-valid JSON in a markdown code fence as a courtesy, so `JSON.parse`
-choked on the backticks. JSON mode guarantees the *content* is valid JSON, not
-that there's nothing around it. Fix: strip fences, then `safeParse`, then
-retry with a stricter system line. And log the fail rate so a model upgrade
-that increases fencing shows up as a metric, not a 3am page.
+**Q: "Respond only in JSON" in the prompt — what's wrong with it?**
+
+It's a suggestion, not a constraint. The model usually obeys and occasionally wraps the JSON in a markdown fence to be helpful, breaking your parser. Use schema-enforced mode (tool calling / response_format) which constrains sampling, and validate at the boundary regardless.
 
 ```
-  provider: ```json\n{...valid...}\n```   ◄── valid JSON, unparseable wrapper
-  fix:  strip fence → parse → validate → retry
+  prose "respond in JSON"  →  best-effort, fence risk
+  schema-enforced mode     →  constrained sampling
+  + boundary safeParse     →  the actual guarantee
 ```
 
-Anchor: *"flattr's `RouteSummary` is already the schema — three numbers,
-`steepCount` non-negative int. The provider enforces it; I `safeParse` it
-again because I've shipped the fence bug before."*
+Anchor: flattr's `geocode` does `res.json() as NominatimRow[]` — a cast, fine for a stable API, fatal at a model boundary where you must `safeParse`.
 
-**Q: "When would you NOT force a schema?"** The prose route description at
-Seam 1 — open-ended generation. Forcing a schema on creative text either
-fights the model or makes the output worse.
+**Q: Where does the "guarantee" of structured output actually live?**
+
+At your validation step, not the provider's. Provider enforcement is best-effort; the guarantee is the `safeParse` + retry you own. Skip it and you've built on best-effort believing it's guaranteed — the 5%-failure bug.
 
 ## See also
 
-- [01-anatomy.md](01-anatomy.md) — the output contract lives in section 1
-- [07-output-mode-mismatch.md](07-output-mode-mismatch.md) — schema mismatch
-  across stages
-- [05-eval-driven-iteration.md](05-eval-driven-iteration.md) — schema-fail
-  rate as an eval metric
-- `.aipe/study-security/` — output validation as a trust boundary
-</content>
+- `01-anatomy.md` — the context section the schema constrains
+- `03-prompts-as-code.md` — logging schema-fail rate to catch model upgrades
+- `06-single-purpose-chains.md` — why Seam 2 bolts onto `geocode` without rewriting it
+- `07-output-mode-mismatch.md` — the parser-breaks-on-mode-mismatch failure
+- `12-prompt-injection-defense.md` — output schema as an injection defense

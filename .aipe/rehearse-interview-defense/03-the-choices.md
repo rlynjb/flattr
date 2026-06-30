@@ -1,337 +1,336 @@
-# Chapter 3 — The choices
+# Chapter 3 — The Choices
 
-This is the chapter that separates engineers from tutorial-followers. An
-interviewer doesn't actually care that you chose A* — they care *whether you
-chose it* or just used the first thing you found. Every load-bearing decision in
-flattr has an alternative you rejected, a real criterion you decided on, and a
-cost you're paying right now. This chapter arms you with all three for each one.
+Now the interviewer probes the *why*. Why did you hand-roll a router when
+OSRM exists? Why Expo and not the Next.js the spec called for? Why a free
+elevation API? Why a static file and not a database? These questions test
+one thing: do you make decisions, or do you default to whatever you'd heard
+of?
 
-There are four choices that matter in flattr, and a bunch that don't. We'll
-defend the four — hand-rolled engine vs OSRM, Expo vs the spec's Next.js, free
-Open-Meteo vs paid Google elevation, static graph vs a database — and we'll
-explicitly *not* spend time on the trivial ones (which test runner, which map
-style). Naming which choices are load-bearing is itself a senior signal.
+The senior move on every one of these is the same shape: name the
+alternative, name the actual decision criterion (not a vibe), and name the
+cost you're paying. A choice with no named cost reads as a choice you didn't
+really make. This chapter gives you that shape four times.
 
 ---
 
-## The chapter-opening diagram — the decision tree
+## The decision tree — the major choices at a glance
 
-Here's every major choice as a fork, with the path you took highlighted. The
-ones marked `◄── PICKED` are the four you defend; the criterion is on each
-branch.
+This is the chapter's spine: four load-bearing choices, the alternative you
+rejected, and the one criterion that decided each.
 
 ```
-  flattr — the load-bearing choices
+  flattr's load-bearing choices — picked path highlighted [★]
 
   ROUTING ENGINE
-  ├── use OSRM / Valhalla / GraphHopper
-  │     → project becomes "tune someone's cost weights"
-  └── hand-roll graph + A*                      ◄── PICKED
-        criterion: the graph work IS the project (spec §14)
+    OSRM / Valhalla / GraphHopper ──── can't express my custom cost
+    ★ hand-rolled A* ─────────────────► the directional grade cost IS
+                                         the project; off-the-shelf
+                                         engines route on distance/time
 
-  COST MODEL
-  ├── undirected (absGradePct, A→B == B→A)
-  │     → kept as gradeCostAbs for the heatmap
-  └── directional (signed grade, A→B ≠ B→A)     ◄── PICKED
-        criterion: uphill effort ≠ downhill effort (cost.ts:32)
+  FRONTEND
+    Next.js web (what the spec said) ── wrong target for a walking app
+    ★ Expo / React Native ────────────► routing happens on the sidewalk,
+                                         on a phone, with GPS
 
-  FRONTEND SHELL
-  ├── Next.js web (what the spec proposed, §8)
-  └── Expo / React Native mobile               ◄── PICKED
-        criterion: a router is used outdoors, on a phone,
-                   with GPS — native fits the actual use
+  ELEVATION DATA
+    Google Elevation (paid, reliable) ─ costs money + API key per build
+    ★ Open-Meteo (free) ──────────────► build-time only, retries absorb
+                                         429s, $0 — cost is throttling
 
-  ELEVATION SOURCE
-  ├── Google Elevation API (paid, sharp)
-  │     → kept as googleProvider, gated on a key
-  └── Open-Meteo free DEM (no key, 90m coarse)  ◄── PICKED
-        criterion: free + good-enough to ship; behind an
-                   interface so the upgrade is one swap
-
-  DATA STORE
-  ├── Postgres / SQLite (queryable, mutable)
-  └── static graph.json baked at build time     ◄── PICKED
-        criterion: data is read-only at runtime; no writes,
-                   no queries beyond the search → no DB needed
-
-  BLOCKED VALUE
-  ├── Infinity (steep edge = impassable)
-  └── 1e9 large-but-finite                       ◄── PICKED
-        criterion: keep "no flat route" distinct from
-                   "no route" (cost.ts:5, spec §14.4)
+  GRAPH STORAGE
+    Postgres / PostGIS / SQLite ─────── server or migration for static data
+    ★ static graph.json (bundled) ────► graph never changes at runtime;
+                                         a DB buys nothing, costs a hop
 ```
 
-Every fork has a real reason on the picked branch. That's what you're rehearsing
-to say out loud.
+Every picked path has a one-line criterion attached. That's the discipline:
+the choice is the criterion, not the technology.
 
 ---
 
-## Choice 1 — hand-rolled engine vs OSRM
+## Choice 1 — Hand-rolled router vs OSRM
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│ THEY ASK                                                          │
-│   "Why did you write your own router instead of using OSRM        │
-│    or Valhalla?"                                                  │
-│                                                                   │
-│ WHAT THEY'RE TESTING                                              │
-│   Reinventing the wheel, or a deliberate scope choice? Do you     │
-│   know what those engines actually do — and what writing it       │
-│   yourself bought you? Or did you avoid them because you didn't   │
-│   know how to integrate them?                                     │
-└─────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────┐
+│ THEY ASK                                                 │
+│   "Why did you build your own router instead of using    │
+│    OSRM or Valhalla?"                                    │
+│                                                          │
+│ WHAT THEY'RE REALLY ASKING                               │
+│   Did you reinvent a wheel out of ignorance? Or did you  │
+│   understand the existing tools well enough to know they │
+│   couldn't do the thing you needed? "Not invented here"  │
+│   is a red flag; "they structurally can't express my     │
+│   cost" is a green one.                                  │
+└─────────────────────────────────────────────────────────┘
 ```
 
-> "Deliberately. If I'd used OSRM or Valhalla, flattr would be a config file —
-> I'd be tuning someone else's cost weights, and the graph would be hidden
-> behind their API. The entire point of the project is the graph work: I wrote
-> the binary-heap priority queue (`pqueue.ts`), the graph and directed traversal
-> (`graph.ts`), and the A* (`astar.ts`) myself. And I built it as a measurable
-> progression — Dijkstra, then A*, then grade cost, then directional cost — so I
-> can show *why each refinement exists*, not just that one algorithm runs.
+The strong answer, in your voice:
+
+> "The whole project is the cost function. flattr's cost is a *directional*
+> grade penalty — uphill is penalized quadratically once it gets steep,
+> downhill is free, and over your `userMax` it's effectively blocked. That's
+> not a weight you can hand to OSRM. OSRM and Valhalla route on distance or
+> travel time with a fixed cost model; you can't pass them 'penalize the
+> signed grade in the direction of travel against this user's max.' So
+> hand-rolling wasn't reinventing the wheel — the wheel doesn't turn the way
+> I needed.
 >
-> The cost I'm paying: those engines are far faster and battle-tested at scale,
-> with contraction hierarchies and all the production speedups. At my graph size
-> (1,621 nodes) that doesn't matter. At a metro-scale graph it would, and that's
-> where I'd reach for one — but then I'd have lost the thing I was building this
-> to learn."
+> Concretely, the cost lives in `cost.ts`. `gradeCostDirected` takes the
+> edge, the node you're entering from, and `userMax`, and returns
+> `length * (1 + penalty(directedGrade, userMax))`. The `directedGrade`
+> flips the sign based on travel direction — that's the directional part,
+> in graph.ts:17 — and `penalty` returns 0 for any grade at or below zero,
+> which is why downhill is literally free (cost.ts:16).
+>
+> The cost I'm paying for hand-rolling: I own the correctness. OSRM is
+> battle-tested over millions of routes; my A* is tested over 22 test files,
+> not millions of users. So I traded a proven engine for an expressive one,
+> and I covered the gap with tests rather than scale."
+
+That last paragraph is the whole answer. You named the cost (you own
+correctness) and you named the mitigation (tests). That's a complete
+decision.
 
 ```
-┃ "If I'd used OSRM, this would be config, not graph
-┃  work. The graph IS the project."
+┌─────────────────────────┬─────────────────────────┐
+│ WEAK ANSWER             │ STRONG ANSWER           │
+├─────────────────────────┼─────────────────────────┤
+│ "I wanted to learn how   │ "OSRM routes on a fixed │
+│ routing works, so I       │ cost model. My cost is  │
+│ built it from scratch     │ a directional grade     │
+│ instead of using a        │ penalty — uphill costs, │
+│ library."                 │ downhill is free — and  │
+│                          │ that's not a weight you │
+│                          │ can pass to OSRM. The   │
+│                          │ custom cost IS the       │
+│                          │ project. The cost I pay: │
+│                          │ I own correctness, so I  │
+│                          │ tested it hard."         │
+├─────────────────────────┼─────────────────────────┤
+│ Why it's weak:          │ Why it works:           │
+│ "To learn" is a fine     │ Names the structural    │
+│ personal reason but a    │ reason OSRM can't do it,│
+│ weak engineering one.    │ anchors to the actual   │
+│ It tells the interviewer │ cost function, and owns │
+│ you'd have used the       │ the tradeoff (correctness│
+│ library if you'd known    │ ownership) with the     │
+│ about it.                 │ mitigation (tests).     │
+└─────────────────────────┴─────────────────────────┘
 ```
 
-The "cost I'm paying" sentence is what makes this answer senior. You're not
-claiming hand-rolling was free — you named the speed and battle-testing you gave
-up.
+```
+┃ "The custom cost function isn't a feature of the router.
+┃  It IS the router. That's why it's hand-rolled."
+```
 
 ---
 
 ## Choice 2 — Expo / React Native vs the spec's Next.js
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│ THEY ASK                                                          │
-│   "Your spec says Next.js on the web. You built an Expo mobile    │
-│    app. Why the divergence?"                                      │
-│                                                                   │
-│ WHAT THEY'RE TESTING                                              │
-│   Do you follow a plan blindly, or revise it for good reasons?    │
-│   Can you justify a deviation from your own written design        │
-│   without sounding like you just changed your mind?               │
-└─────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────┐
+│ THEY ASK                                                 │
+│   "Your spec says Next.js on Netlify, but you built it   │
+│    in React Native. Why did you diverge from your own    │
+│    plan?"                                                │
+│                                                          │
+│ WHAT THEY'RE REALLY ASKING                               │
+│   Can you change your mind for a real reason and own it? │
+│   Diverging from a written spec is fine — pretending you │
+│   never wrote it, or having no reason, is not. They want │
+│   to see judgment, not loyalty to a doc.                 │
+└─────────────────────────────────────────────────────────┘
 ```
 
-This one is interesting *because* it contradicts the written spec
-(`docs/flattr-spec.md §8` proposes Next.js + MapLibre on Netlify). Own the
-revision.
+The strong answer, in your voice:
 
-> "The spec proposed Next.js on the web. I changed it to Expo / React Native —
-> currently Expo ~56, RN 0.85, React 19, with MapLibre via
-> `@maplibre/maplibre-react-native`. The reason is the use case: a flat-route
-> router is something you use *outdoors, on a phone, with live GPS*. The web
-> version would be a demo; the mobile version is the actual product. I get
-> location, tap-to-route, and a real on-device map.
+> "The spec proposed Next.js on Netlify — that was the early plan. When I
+> got into it, the use case argued against it. flattr is a *walking and
+> scooter* router. You use it on the sidewalk, on a phone, while you're
+> deciding which way to go up a hill. That's a native mobile context with
+> GPS, not a desktop browser tab. So I moved the client to Expo / React
+> Native — Expo ~56, RN 0.85, React 19 — rendering with MapLibre's React
+> Native bindings. The engine didn't care: it's pure TypeScript under
+> `features/`, framework-agnostic, so the same `directedAstar` runs
+> unchanged. Only the shell changed.
 >
-> The core engine didn't care either way — it's pure TypeScript under
-> `features/routing/`, no framework. There's a sync script
-> (`mobile/scripts/sync-engine.mjs`) that copies it into the mobile app. So the
-> divergence was only in the shell, not the graph work. The cost: a mobile
-> toolchain is heavier than `next dev`, and I'm pinned to Expo 56's exact
-> versioned APIs."
+> The cost: React Native is a heavier toolchain than a web app, and Expo
+> pins you to versioned native modules — I keep a note in `mobile/AGENTS.md`
+> to read the exact Expo v56 docs before touching native code, because the
+> APIs shift between versions. That's real friction I accepted to get the
+> right form factor."
 
-The move here: you revised your own plan and can say *why* without
-defensiveness. Interviewers love a justified deviation — it shows the plan
-served you, not the reverse.
+The move here: you diverged from your *own* spec and you frame it as the
+spec being wrong, caught early. That's a strength. The engine being
+framework-agnostic is the detail that makes it credible — you didn't rewrite
+anything, you swapped the shell.
 
 ---
 
-## Choice 3 — free Open-Meteo vs paid Google elevation
+## Choice 3 — Open-Meteo (free) vs Google Elevation (paid)
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│ THEY ASK                                                          │
-│   "Why Open-Meteo for elevation and not Google's API?"           │
-│                                                                   │
-│ WHAT THEY'RE TESTING                                              │
-│   Did you think about cost and fidelity as a tradeoff, or just    │
-│   grab the free one? Did you design for the upgrade, or hard-     │
-│   wire the cheap choice in?                                       │
-└─────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────┐
+│ THEY ASK                                                 │
+│   "Why a free elevation API? Doesn't that hurt           │
+│    reliability?"                                         │
+│                                                          │
+│ WHAT THEY'RE REALLY ASKING                               │
+│   Did you think about WHERE the dependency sits? A flaky │
+│   free API in a user's hot path is a problem. A flaky    │
+│   free API at build time is an inconvenience. Do you see │
+│   the difference?                                        │
+└─────────────────────────────────────────────────────────┘
 ```
 
-> "Open-Meteo is free, needs no API key, and serves the Copernicus 90-meter DEM.
-> That's good enough to ship and learn with. The cost I'm paying is fidelity —
-> 90 meters is coarse, so it smooths out short steep pitches, which for a
-> *grade* router is exactly the data I care most about.
+The strong answer, in your voice:
+
+> "The key thing is *where* that dependency sits. Open-Meteo is only used at
+> build time, in `pipeline/elevation.ts`, when I generate `graph.json`. It is
+> never in a user's path. So 'reliability' means 'does my offline build
+> occasionally have to retry,' not 'does a user's route fail.'
 >
-> The important part is I designed for the upgrade. Elevation is behind an
-> interface — `ElevationProvider` in `elevation.ts:7`, one method, `sample()`.
-> There's already a `googleProvider` and an `openMeteoProvider` implementing it.
-> Swapping to Google's paid, sharper data, or to LIDAR, is one line at the call
-> site. So I took the free option knowing the seam to upgrade it is already
-> there."
+> And it does throttle — under heavy testing it returns 429s, which is
+> exactly why `elevation.ts` retries with exponential backoff, up to three
+> attempts (elevation.ts:97, :114). When the quota's genuinely exhausted, the
+> build degrades to flat-fallback elevation and marks that region degraded
+> rather than stalling. So I get free elevation data, and the cost — request
+> throttling — lands at build time where I can absorb it with retries, not on
+> a user mid-route. If this were a paid product I'd put Google behind the
+> same interface; the point is the seam, not the vendor."
+
+That answer reframes the whole question. The interviewer is implying "free =
+unreliable = bad," and you correct the frame: reliability only matters in the
+hot path, and this dependency isn't in the hot path. That reframe is the
+senior move.
 
 ```
-        ▸ "I took the free option, but the seam to
-          upgrade it is already in the code." — naming
-          the seam turns a cheap choice into a designed one.
+┃ "A flaky dependency at build time is an inconvenience.
+┃  A flaky dependency in the user's path is an outage.
+┃  Open-Meteo is the first kind."
 ```
-
-This is the cleanest "evaluated-and-accepted" decision in the project — and a
-preview of Chapter 8's three modes. You didn't default to free; you chose free
-*and* built the off-ramp.
 
 ---
 
-## Choice 4 — static graph.json vs a database
+## Choice 4 — Static graph.json vs a database
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│ THEY ASK                                                          │
-│   "Why a static JSON file instead of a database?"                │
-│                                                                   │
-│ WHAT THEY'RE TESTING                                              │
-│   Do you reach for a DB by reflex, or do you actually look at     │
-│   the access pattern? Can you name what a DB would buy you here   │
-│   — and correctly conclude it buys nothing?                       │
-└─────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────┐
+│ THEY ASK                                                 │
+│   "Why a static JSON file and not a database?"           │
+│                                                          │
+│ WHAT THEY'RE REALLY ASKING                               │
+│   Do you reach for a database reflexively? Or do you ask │
+│   what a database would actually buy you here? The right │
+│   answer to "do I need a DB" is sometimes no, and the    │
+│   engineers who know that are the ones who've felt the   │
+│   cost of a DB they didn't need.                         │
+└─────────────────────────────────────────────────────────┘
 ```
 
-> "Because the access pattern doesn't need one. At runtime the graph is
-> read-only — there are no writes, no per-user data, no queries beyond the graph
-> search itself, which walks an in-memory adjacency map, not a table. A database
-> buys you mutability, concurrent writes, and rich queries. flattr needs none of
-> those at runtime. The graph is computed once at build time and frozen into
-> `graph.json` (1,621 nodes, 1,879 edges), which the app bundles and
-> `loadGraph()` imports directly.
+The strong answer, in your voice:
+
+> "A database earns its place when data changes at runtime, needs querying
+> you can't precompute, or has to be shared across clients. None of those is
+> true here. The graph is static — it's computed once, offline, and it never
+> changes while the app runs. The only query against it is 'find me the
+> nearest node' and 'route between two nodes,' and both are graph traversals
+> over an in-memory structure, not SQL. And it's not shared — each app has
+> its own copy bundled in.
 >
-> The cost: the data is immutable until I re-run the build, and the whole graph
-> loads into memory at once. At 1,621 nodes that's trivial. The point where I'd
-> add a real store is when I need live updates — a street closes, construction —
-> or when the graph is too big to hold in memory. Neither is true at this
-> scope."
+> So a database would add a server, a network hop on every route, an
+> availability dependency, and an operational surface, in exchange for
+> nothing. I bundle `graph.json` — 1600-odd nodes — and load it into memory
+> once with `loadGraph` (loadGraph.ts:9). The cost I'm paying: the graph
+> ships with the app, so updating coverage means shipping a new build, not
+> running a migration. At this scope, that's the right trade. The moment I
+> add user accounts or saved routes — mutable, per-user, shared state — a DB
+> becomes the right call, and that's the boundary where my answer flips."
 
-```
-┌──────────────────────────────┬──────────────────────────────┐
-│ WEAK ANSWER                   │ STRONG ANSWER                 │
-├──────────────────────────────┼──────────────────────────────┤
-│ "A database felt like         │ "The runtime access pattern   │
-│ overkill for a small project, │ is read-only with no queries  │
-│ so I just used a JSON file."  │ beyond the in-memory graph    │
-│                               │ search. A DB buys mutability  │
-│                               │ and querying — I need neither │
-│                               │ at runtime. I'd add one when  │
-│                               │ I need live updates or the    │
-│                               │ graph outgrows memory."       │
-├──────────────────────────────┼──────────────────────────────┤
-│ Why it's weak:                │ Why it works:                  │
-│ "Overkill" and "small         │ Reasons from the access        │
-│ project" are vibes, not       │ pattern, names what a DB would │
-│ reasons. It signals you avoid │ actually provide, concludes it │
-│ databases out of discomfort,  │ provides nothing here, and     │
-│ not analysis.                 │ names the exact trigger to add │
-│                               │ one. That's the analysis.      │
-└──────────────────────────────┴──────────────────────────────┘
-```
-
-Data-modeling depth (why no schema, no indexes, no migrations) →
-`.aipe/study-data-modeling/` and `.aipe/study-database-systems/`.
+The phrase "that's the boundary where my answer flips" is gold. It tells the
+interviewer you didn't choose "no DB" as a permanent religion — you chose it
+for *this* shape of data and you know exactly what would change your mind.
 
 ---
 
-## Where the choices conversation goes next
+## When the choices question goes past your depth
 
-```
-  You've defended hand-rolling the engine.
-        │
-        ├─► IF THEY ASK "is your A* actually optimal?"
-        │     "Yes — the heuristic is admissible. Cost is
-        │      length*(1+penalty), penalty ≥ 0, so cost ≥
-        │      length; haversine straight-line ≤ true path
-        │      length, so it never overestimates. A* returns
-        │      the same path as Dijkstra. Chapter 6 proves it."
-        │
-        ├─► IF THEY ASK "why directional cost specifically?"
-        │     "Uphill effort and downhill effort aren't
-        │      symmetric. directedGrade flips sign by travel
-        │      direction (graph.ts:17); penalty only hits
-        │      positive grade (cost.ts:16). Downhill is free."
-        │
-        └─► IF THEY ASK "what about the BLOCKED value?"
-              "1e9, large-but-finite, not Infinity (cost.ts:5).
-               That keeps 'a path exists but it's steep' (A*
-               returns it, flags the steep edges) distinct from
-               'no path at all' (null, disconnected). Two real
-               graph states. Chapter 5."
-```
-
----
-
-## The "I don't know" box — when they push on the engine internals
+The trap on choices is the comparative-internals follow-up: "how does OSRM's
+contraction hierarchy actually work?" You picked *not* to use OSRM — you
+don't owe its internals.
 
 ```
 ╔═══════════════════════════════════════════════════════════════╗
 ║ WHEN YOU DON'T KNOW                                            ║
 ║                                                               ║
-║   They ask: "How would OSRM's contraction hierarchies         ║
-║   actually speed this up? Walk me through the preprocessing."  ║
+║   They ask: "OSRM uses contraction hierarchies to get         ║
+║   sub-millisecond routes on a continent-scale graph. How      ║
+║   does that work, and could you have used it here?"           ║
 ║                                                               ║
-║   You chose NOT to use these and you haven't implemented      ║
-║   them. Don't fake the internals of a technique you skipped.  ║
+║   You know CHs exist and roughly why (precomputed shortcuts    ║
+║   that let you skip most of the graph), but you haven't        ║
+║   implemented one, and the details — the contraction order,    ║
+║   the witness search — are genuinely outside what you've       ║
+║   built.                                                       ║
 ║                                                               ║
-║   Say:                                                         ║
-║   "I know contraction hierarchies are a preprocessing         ║
-║    speedup — you precompute shortcut edges so queries skip    ║
-║    through dense regions — and that's the class of technique   ║
-║    production routers use at metro scale. I deliberately       ║
-║    didn't implement it; at 1,621 nodes my A* query is         ║
-║    sub-millisecond, so the preprocessing cost wouldn't pay     ║
-║    back. I haven't built one, so I can't walk you through      ║
-║    the contraction ordering in detail. If you want, I can      ║
-║    reason about where it'd fit in my pipeline."               ║
+║   Say:                                                        ║
+║   "At a high level I know contraction hierarchies precompute   ║
+║    shortcut edges so a query can skip most of the graph,       ║
+║    which is how OSRM gets continental routes fast. I haven't   ║
+║    implemented one — the contraction ordering and the witness  ║
+║    search are details I'd have to study before I claimed I     ║
+║    understood them. The reason it didn't come up for me is     ║
+║    scale: at 1600 nodes a plain A* is already sub-millisecond, ║
+║    so the precompute would be solving a problem I don't have   ║
+║    yet. At a million nodes it'd be exactly where I'd look."    ║
 ║                                                               ║
-║   What this signals: you know what the technique IS and WHY   ║
-║   you skipped it (the scale math), and you stop cleanly at    ║
-║   the boundary of what you've built. That's the senior        ║
-║   pattern — knowing the shape without faking the depth.       ║
-║                                                               ║
-║   Do NOT say:                                                  ║
-║   "Yeah, it like... contracts the nodes into a hierarchy      ║
-║    and then it's faster" — vague restatement of the name is   ║
-║    worse than admitting you skipped it.                       ║
+║   What this signals: you know the concept, you're honest       ║
+║   about the depth limit, AND you tie it back to YOUR scale —   ║
+║   you didn't need it, so not having implemented it is a        ║
+║   reasonable gap, not a hole. That last move turns "I don't    ║
+║   know" into "I didn't need to."                               ║
 ╚═══════════════════════════════════════════════════════════════╝
 ```
 
----
-
-## What you'd change about the choices
-
-The one I'd revisit is elevation. Open-Meteo's 90m DEM was the right call to
-*ship*, but for a grade router, coarse elevation undermines the core value — it
-literally smooths away the steep pitches I exist to route around. Since the
-`ElevationProvider` seam is already there (Chapter 7 covers this), the change is
-cheap: wire `googleProvider` behind a config flag, accept the cost and the API
-key, and get sharp grades. Everything else I'd keep — hand-rolled engine, no DB,
-directional cost, finite BLOCKED. Those were right and I'd make them again.
+For the algorithm-internals deep dive (A* admissibility, why the heuristic
+must be a lower bound, heap mechanics), point yourself at
+**`.aipe/study-dsa-foundations/`**.
 
 ---
 
-## One-page summary — Chapter 3
+## What you'd change
 
-**Core claim:** Every load-bearing choice has an alternative, a criterion, and a
-cost. Naming all three — especially the cost — is what reads as senior.
+The choice I'd most reconsider is the elevation provider being hardwired into
+the pipeline. Open-Meteo was right for a free build, but the call to it isn't
+behind a clean interface — if I wanted to drop in Google's paid API for
+reliability, I'd be editing `elevation.ts` rather than swapping a provider
+behind a seam. The *decision* (free elevation, build-time only) was right;
+the *structure* (no provider abstraction) is what I'd fix. Chapter 7 makes
+the `ElevationProvider` seam a full counterfactual.
 
-**The four choices:**
-- **Hand-rolled vs OSRM** → the graph work is the project; cost = speed/battle-testing at scale.
-- **Expo vs Next.js (spec divergence)** → a router is used outdoors on a phone; engine is framework-agnostic so only the shell changed.
-- **Open-Meteo vs Google elevation** → free + good-enough; upgrade seam (`ElevationProvider`, elevation.ts:7) already built; cost = 90m coarseness.
-- **Static graph.json vs DB** → runtime is read-only, no queries beyond the in-memory search; cost = immutable until rebuild.
+---
 
-**Plus:** finite `BLOCKED` (1e9) keeps "steep" distinct from "disconnected"; directional cost from signed grade.
+## One-page summary — read this the night before
+
+**Core claim:** Every load-bearing choice gets the same defense: name the
+alternative, name the real criterion, name the cost. A choice with no named
+cost reads as a choice you didn't make.
+
+**Questions covered:**
+- *Hand-rolled vs OSRM* → OSRM can't express a directional grade cost; the
+  custom cost IS the project. Cost: I own correctness, covered by tests.
+- *Expo vs the spec's Next.js* → walking app = phone + GPS, not browser. The
+  pure-TS engine moved unchanged; only the shell swapped.
+- *Open-Meteo vs Google* → build-time only, never the hot path; 429s absorbed
+  by retries (elevation.ts:97). Reliability only matters in the user path.
+- *Static graph vs DB* → data is static, unqueried beyond traversal,
+  unshared. A DB buys nothing, costs a hop. Answer flips at user accounts.
 
 **Pull quotes:**
-- ┃ "If I'd used OSRM, this would be config, not graph work."
-- ▸ "I took the free option, but the seam to upgrade it is already in the code."
+- "The custom cost function IS the router. That's why it's hand-rolled."
+- "A flaky dependency at build time is an inconvenience; in the user's path
+  it's an outage."
 
-**What you'd change:** Swap to the (already-implemented) paid `googleProvider` for sharp elevation — coarse 90m data undercuts the whole point of a grade router. Keep everything else.
+**What you'd change:** Put elevation behind an `ElevationProvider` seam so a
+paid API is a swap, not an edit. The decision was right; the structure isn't.

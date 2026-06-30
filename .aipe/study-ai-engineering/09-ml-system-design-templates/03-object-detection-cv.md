@@ -1,94 +1,43 @@
-# Object Detection / Computer Vision
+# 03 — Object Detection (On-Device CV)
 
-*Image -> bounding boxes / landmarks, with an on-device inference runtime.*
+A reusable interview template, reframed against flattr. This is the cleanest "no"
+in the set: flattr has no camera, no video, no pixels. The useful move in an
+interview is to say so immediately and pivot to the portfolio project that *does*
+do on-device CV (contrl), rather than torturing flattr into a fit.
 
-The CV interview prompt. "Detect objects / faces / poses in an image or video
-stream." Two halves to get right: the *model* (a detector that maps pixels to
-boxes or keypoints) and the *runtime* (where it runs, and the latency/memory
-budget — especially on-device, where you can't lean on a GPU cluster).
+- **The prompt:** "Design a computer-vision system that detects objects in real-time video, running on-device."
 
-You have shipped exactly this shape. **contrl** is an on-device MediaPipe
-pose-landmark pipeline that maps camera frames -> body keypoints -> a rep
-counter. That's the reference to reason from here; it's the real on-device CV
-system you can speak to.
+- **Standard architecture:** On-device object detection is a per-frame inference loop — capture, preprocess to the model's input tensor, run a quantized detector, post-process boxes, and overlay, all without leaving the device. The diagram below shows the frame path with the model loaded once at startup.
 
-## Standard architecture (anchored on contrl)
-
-```text
-              ON-DEVICE CV PIPELINE (contrl's shape, generic)
-  ┌─────────┐   ┌──────────────┐   ┌──────────────┐   ┌────────────────┐
-  │ camera  │──▶│ PREPROCESS   │──▶│ MODEL        │──▶│ POSTPROCESS    │
-  │ frame   │   │ resize/norm  │   │ (MediaPipe   │   │ keypoints ->   │
-  └─────────┘   │ on device    │   │  pose, TFLite│   │ rep count /    │
-                └──────────────┘   │  on device)  │   │ boxes / logic  │
-                                   └──────┬───────┘   └────────────────┘
-                                          │
-                              on-device BUDGET discipline:
-                              frame rate, model size, thermal,
-                              battery, dropped-frame backpressure
+```
+              On-device object detection — per-frame inference loop
+  ┌──────────┐ frame ┌──────────────┐ tensor ┌──────────────────┐ raw out ┌──────────────┐
+  │  Camera  │──────►│ Preprocess   │───────►│ Detector model   │────────►│ Post-process │
+  │ (stream) │       │ resize/norm  │        │ (quantized, GPU/ │         │ NMS + decode │
+  └──────────┘       └──────────────┘        │  NPU delegate)   │         └──────┬───────┘
+       ▲                                      └──────────────────┘                │ boxes
+       │                                              ▲                           ▼
+       │                                              │ weights            ┌──────────────┐
+       │                                      ┌───────┴────────┐           │  Overlay UI  │
+       └──────────────────────────────────────│ Model loaded   │           │ draw on frame│
+                next frame (no round-trip)     │ once at start  │           └──────────────┘
+                                               └────────────────┘
 ```
 
-The hard part is rarely the model — it's the budget. On-device means a fixed
-compute envelope, no network round-trip, and a thermal/battery ceiling. contrl's
-real engineering is the postprocess + budget loop (keypoints -> reps without
-jitter, at frame rate, on a phone), not training a detector.
+  The whole point of on-device is that no box in this diagram touches the network per frame. flattr has none of these boxes because it has no frames.
 
-## Data and features (generic)
+- **Data model:** Model weights bundled in the app, a label map (class id → name), and per-frame the input tensor plus output detections (boxes, class, score) — all transient, nothing persisted by default. flattr's persisted data model is entirely non-visual: `Node {lat, lng, elevationM}` and `Edge {gradePct, absGradePct, lengthM, riseM, kind?}` in `mobile/assets/graph.json`. There is no image, frame buffer, tensor, or label map anywhere in the codebase.
 
-- **Input** — pixels. Frames or stills. Labels are boxes/masks/keypoints.
-- **Features** — the model learns them; your job is preprocessing (resize,
-  normalize, color space) and postprocessing (NMS, smoothing, tracking).
-- **Scale concerns** — on-device: model quantization (TFLite/INT8), frame
-  decimation, warm-up cost, and dropping frames under load rather than queuing.
+- **Key components:** Capture/preprocess — pulls frames and resizes/normalizes to the model's fixed input; the technical choice is doing the resize on GPU to avoid CPU-bound frame drops. Detector — a compact architecture (SSD-MobileNet / YOLO-nano class) behind a hardware delegate; the choice is a quantized model on the NPU/GPU delegate over a float CPU model because the per-frame latency budget (~33ms at 30fps) is unforgiving. Post-process — non-max suppression and box decode; the choice is to cap detections and tune the NMS IoU so overlay stays stable frame-to-frame.
 
-## Applies to this codebase
+- **Scale concerns (ordered by what hits first):** (1) Per-frame latency — the 30fps budget breaks first; a model that's 50ms/frame drops to ~20fps and feels broken. (2) Thermal/battery — sustained NPU use throttles within minutes on phones, degrading throughput; needs frame-skipping or a duty cycle. (3) Model size in the bundle — large weights bloat install size and cold-start load; quantization addresses both. (4) Device fragmentation — delegate availability varies across Android/iOS hardware, forcing a CPU fallback path.
 
-**None. Be blunt: flattr has no CV surface at all.** flattr processes a geometry
-graph — nodes, edges, lat/lng, elevation, grade. There is no camera, no image,
-no pixel, no frame anywhere in the repo. Searching `features/`, `pipeline/`, and
-`mobile/` turns up map rendering and route geometry, never image input. Object
-detection, landmarks, bounding boxes — zero applicability.
+- **Eval framing:** Offline — mAP at IoU thresholds on a held-out image set, plus on-device latency and the accuracy lost to quantization. Online — real-world detection precision/recall under the conditions that matter (lighting, motion blur), frame rate sustained on target devices, and battery drain per session. Offline mAP on clean images routinely overstates real performance.
 
-The single legitimate point of contact is *on-device inference shape*, and even
-that is an analogy, not a match:
+- **Common failure modes:** Quantization accuracy cliff — int8 conversion tanks small-object recall; mitigate with quantization-aware training or per-channel quantization. Thermal throttling — fps collapses after minutes; mitigate with adaptive frame-skip. Domain shift — model trained on clean data fails on the user's actual camera; mitigate with in-domain fine-tuning. Jittery boxes — detections flicker frame-to-frame; mitigate with temporal smoothing/tracking.
 
-```text
-  the ONLY on-device-inference shape flattr has
-  ┌──────────────────────────────────────────────────────────┐
-  │  features/routing/astar.ts   — A* over the street graph   │
-  │  runs ON DEVICE, under a budget, no server round-trip      │
-  │  ...but it's an ALGORITHM, not a model. No pixels, no       │
-  │  weights, no inference. Determinism, not detection.         │
-  └──────────────────────────────────────────────────────────┘
-```
+- **Applies to this codebase: NO.** This template does not fit flattr at all, and it's worth stating plainly why rather than reaching. flattr has no camera input, no video stream, no images, and no CV model — its entire input is a precomputed street graph and a user-set max grade. There is nothing to detect because there are no pixels. The only on-device-*model* parallel anyone could draw is the learned edge cost in `features/routing/cost.ts` — `penalty()` (cost.ts:16) is a small parameterized function that runs locally inside A* — but that is a scalar cost over graph edges, not detection over a visual signal. It shares the word "on-device" with this template and nothing else: no perception, no frames, no inference loop. Forcing flattr into an object-detection answer would be dishonest. The right interview move is to name the mismatch and redirect.
 
-So the honest statement is: flattr does on-device *computation* (A* routing),
-not on-device *inference*. The thing CV and flattr share is the *constraint* —
-"it has to run on the phone, within a budget" — not the *technique*.
+  For genuine contrast, **contrl** is the portfolio project that actually does this: it runs MediaPipe on-device to detect pose landmarks from the camera and turns the landmark stream into a rep counter — a real end-to-end, on-device CV pipeline with exactly the capture → model → post-process → overlay loop in the diagram above. That is where the on-device-detection story lives. flattr is the wrong artifact for this prompt; contrl is the right one.
 
-## How to make it apply
-
-**Out of scope.** There is no path to bolt object detection onto a routing
-engine without inventing a new product. Don't force it.
-
-The transferable lesson is the part worth carrying into an interview: the
-**on-device-budget discipline** you built for contrl is the same discipline
-flattr would need *if* it ever moved elevation work onto the device. Today
-elevation is a build-time network call (`pipeline/elevation.ts` —
-`openMeteoProvider` / `googleProvider`, both `fetch`-based, run in the build, not
-on the phone). If flattr ever did on-device elevation infill (e.g., refining
-coarse 90m DEM grades locally), the engineering problem would rhyme exactly with
-contrl: a fixed compute envelope on the phone, no round-trip, drop-work-under-
-load. The `ElevationProvider` interface (`pipeline/elevation.ts:7`) is even the
-seam where an on-device provider would plug in — same pattern as swapping a
-`CostFn`. That's a runtime-budget story, not a vision story, and it's the only
-honest bridge from contrl's CV work to flattr.
-
-## See also
-
-- `pipeline/elevation.ts:7` — `ElevationProvider` seam (where on-device infill
-  would attach, hypothetically)
-- `features/routing/astar.ts` — flattr's only on-device-compute (algorithm, not
-  inference)
-- `01-recommender-system.md` — the one reframe with a *real* model attach point
-- contrl (reader's project) — the actual on-device CV pipeline this anchors to
+- **How to make it apply (honest: it doesn't, and shouldn't):** There is no honest refactor of flattr that produces object detection, because flattr has no visual input to detect over — adding a camera would be building a different app, not refactoring this one. The only on-device-model surface that exists is the learned cost in `cost.ts`, and that is optimization inside graph search, not detection; bolting a CV model onto a routing app would be invention, which this study set forbids. The correct answer to "make it apply" is to refuse the premise: in an interview, say "flattr has no camera, so this template doesn't apply — but I've shipped exactly this in contrl, where MediaPipe pose-landmark detection feeds a rep counter on-device," and walk the contrl pipeline instead. That keeps flattr honest and still answers the question with a real on-device CV system you've built.

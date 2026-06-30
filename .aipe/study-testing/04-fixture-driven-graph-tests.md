@@ -1,59 +1,64 @@
 # 04 — Fixture-Driven Graph Tests
 
-**Industry names:** test fixtures · golden inputs · the Object Mother / factory
-pattern · "known-answer tests." **Type:** Industry standard (the
-named-topology factory set is project-shaped).
+**Industry names:** *test fixtures* / *known-answer tests (KAT)* / *golden inputs*.
+**Type:** Industry standard (the graph-specific shaping is project-specific).
 
 ---
 
-## Zoom out — where this lives
+## Zoom out, then zoom in
 
-The routing tests don't run on the real `graph.json` (144k+ edges, no known
-optimum). They run on hand-built micro-graphs whose answers are computable by
-hand — and those fixtures are a shared, named module, not inline literals.
+To test a router you need graphs. Real OSM graphs have thousands of nodes and no known
+"correct" answer you can type into an assertion. So flattr builds tiny graphs *by hand*,
+each shaped to make one routing property obvious and each with a closed-form answer you can
+verify with a pencil.
 
 ```
   Zoom out — fixtures feed every routing test
 
-  ┌─ features/routing/fixtures.ts ──────────────────────────────┐
-  │  diamondGraph()  gradeGraph()  directionalGraph()           │
-  │  makeGridGraph(n)            ← named topologies, known answers│ ← we are here
-  └───────────────────────────────┬─────────────────────────────┘
-            consumed by            │
-  ┌───────────────────────────────▼─────────────────────────────┐
-  │ astar.test  bidirectional.test  cost (via edge helper)       │
-  │ + bench/run.ts (same fixtures power the benchmark)           │
-  └─────────────────────────────────────────────────────────────┘
+  ┌─ features/routing/fixtures.ts ─── ★ THIS CONCEPT ★ ────────┐
+  │  diamondGraph()      6 nodes, known shortest = S,A,G = 200  │
+  │  gradeGraph()        flat-vs-steep choice, known winner     │
+  │  directionalGraph()  uphill detour, downhill direct         │
+  │  makeGridGraph(n)    n×n lattice, parametric                │
+  └────────────────────────────┬───────────────────────────────┘
+                               │ imported by EVERY routing test
+        ┌──────────────────────┼──────────────────────┐
+        ▼                      ▼                      ▼
+   astar.test.ts        bidirectional.test.ts   cost / nearest tests
+   (oracle, stages)     (meet-in-the-middle)    (penalty, snapping)
 ```
 
-Zoom in: each fixture is a *named topology built to exercise one behavior*. The
-diamond has a known shortest path. The grade graph has a flat-vs-steep choice.
-The directional graph has uphill/downhill asymmetry. The name tells you what the
-graph is *for* — so a test reading `gradeGraph()` already announces its intent.
+The point isn't "we have test data." It's that **each fixture is designed so the right
+answer is known by construction.** The diamond's shortest path is `S,A,G` because the
+builder set the lengths that way — so `expect(path.nodes).toEqual(["S","A","G"])` isn't a
+guess, it's arithmetic. Known-answer fixtures are what let every other routing pattern
+(the oracle, the finite-BLOCKED tests) assert against a real expected value.
 
 ---
 
-## Structure pass
+## The structure pass
 
-**Layers:** the fixture factory (data construction) under the tests (assertions).
-The seam is the factory boundary — what each `*Graph()` promises its callers.
-
-**Axis — "what behavior does this fixture isolate?"** Each topology answers it
-differently, and that's why there are several rather than one:
+Layer it, pick the axis — **"is the expected answer known, or discovered?"** — and watch it
+flip across the fixture seam.
 
 ```
-  axis = "which routing behavior does this graph make checkable?"
+  axis traced: "where does the expected answer come from?"
 
-  diamondGraph()     → shortest-path-by-distance (S→A→G = 200)
-  gradeGraph()       → flat-vs-steep PREFERENCE (long flat beats short steep)
-  directionalGraph() → uphill/downhill ASYMMETRY (A→B ≠ B→A)
-  makeGridGraph(n)   → SCALE (too big to eyeball → forces the oracle)
+  ┌─ real OSM graph (mobile/assets/graph.json) ─────┐
+  │  expected answer UNKNOWN — too big to verify     │  ← can't assert against
+  └───────────────────────┬──────────────────────────┘
+                          │  seam: fixtures.ts hand-builds a tiny graph
+  ┌─ hand-built fixture ──▼──────────────────────────┐
+  │  expected answer KNOWN BY CONSTRUCTION           │  ← assert exact values
+  │  (the builder chose the lengths/elevations)      │
+  └──────────────────────────────────────────────────┘
 ```
 
-Each fixture is the minimal graph that makes one property visible. Adding nodes
-would muddy the signal; removing any would collapse the behavior.
-
-**Seam:** the factory return — a fresh `Graph` object every call.
+The seam is `fixtures.ts` itself. On one side, the real graph: routable but unverifiable —
+you don't know the true shortest path through 10,000 nodes. On the other, the fixture:
+small enough that *you set* the answer when you built it. Every routing assertion in the
+repo stands on the known-answer side of this seam — which is also exactly the gap
+`audit.md` lens 1 flags: nothing tests the *unknown* side (the real shipped `graph.json`).
 
 ---
 
@@ -61,196 +66,224 @@ would muddy the signal; removing any would collapse the behavior.
 
 ### Move 1 — the mental model
 
-You've set up a small known data structure at the top of a test so the assertion
-has something concrete to check — a 3-row array, a sample user object. A fixture
-factory is that, promoted to a named, reusable function with the *answer designed
-in*. `diamondGraph()` isn't a random graph; it's built so S→A→G = 200 by
-construction, and the test's job is just to confirm the router finds it.
+You've written a test with a setup block that creates a couple of rows in a DB before the
+assertion. A fixture is that, but *designed* — not just "some data" but data shaped so the
+answer is forced. The diamond graph isn't random; it has a fast route and a slow route with
+lengths chosen so `S,A,G` (200) beats every alternative.
 
 ```
-  fixture = topology + KNOWN answer, designed together
+  the diamond fixture — shaped so the answer is forced
 
-   diamondGraph()
-        S
-       ╱ ╲
-   100╱   ╲100        known: shortest S→G = S,A,G = 200
-     A     B          (the S,B,G path is 100+150 = 250)
-   100╲   ╱150
-       ╲ ╱
-        G
+            A ──100── G          S→A→G = 100+100 = 200  ← the known shortest
+          ╱100        ╱150
+        S ──100── B ─╯           S→B→G = 100+150 = 250  (slower)
+          ╲300              ╲
+            D ──────300────── G  S→D→G = 600            (decoy, far)
+
+        expected: dijkstra(S,G).path.nodes == ["S","A","G"], cost 200
 ```
+
+Strategy in one sentence: **build the smallest graph that makes one property unmistakable,
+and set its numbers so the answer is closed-form.**
 
 ### Move 2 — the walkthrough
 
-**The builder derives physics from geometry, so fixtures stay honest.** The
-`edge()` helper computes length/rise/grade from the nodes rather than letting the
-author type arbitrary numbers — so a fixture can't accidentally claim a
-physically impossible edge:
+**Part 1 — the builder derives grade from geometry, so fixtures stay consistent.** You
+don't hand-type `gradePct` and risk it disagreeing with the elevations — the `edge()` helper
+computes it:
 
 ```ts
-// fixtures.ts:10-26 — grade is DERIVED, not hand-typed
+// features/routing/fixtures.ts:10-26  (annotated)
 function edge(id, from, to, lengthM): Edge {
-  const riseM = to.elevationM - from.elevationM;     // from the nodes
-  const gradePct = (riseM / lengthM) * 100;          // real grade
-  return { id, fromNode: from.id, toNode: to.id,
-           geometry: [[from.lat, from.lng], [to.lat, to.lng]],
+  const riseM = to.elevationM - from.elevationM;   // rise comes from the NODES
+  const gradePct = (riseM / lengthM) * 100;        // grade derived, never hand-typed
+  return { id, fromNode: from.id, toNode: to.id, /* ... */
            lengthM, riseM, gradePct, absGradePct: Math.abs(gradePct) };
 }
 ```
 
-This is the load-bearing design choice: the *only* free parameter is `lengthM`;
-everything else is computed. A fixture's grade is always consistent with its
-elevations, so a test can trust it. When a fixture *needs* an inconsistency (force
-a detour flat regardless of elevation), it overrides explicitly and says why:
+So when a test sets node `H` to elevation 9 and connects it with a 100m edge, the 9% grade
+*follows automatically*. The fixture can't have an inconsistent grade — the data model is
+enforced by the builder. That's why the fixtures are trustworthy enough to assert against.
+
+**Part 2 — each fixture isolates exactly one property.** This is the design discipline.
+Three fixtures, three jobs:
+
+```
+  one fixture, one property under test
+
+  fixture            shape                         the property it makes obvious
+  ───────            ─────                         ─────────────────────────────
+  diamondGraph    flat, fast vs slow route      shortest-path correctness (oracle)
+  gradeGraph      short+steep vs long+flat       grade cost prefers flat (the product!)
+  directionalGraph uphill X→Y vs flat detour      direction matters (X→Y != Y→X)
+  makeGridGraph(n) parametric n×n lattice         scale + heuristic pruning
+```
+
+`gradeGraph()` (`fixtures.ts:70`) is the product thesis in miniature: a short steep path via
+`H` (elevation 9) and a long flat path via `L` (elevation 0). The test asserts plain A*
+takes the short steep route but `gradeAstar` takes the long flat one:
 
 ```ts
-// fixtures.ts:98-100 — explicit override, commented
-// Force the detour edges flat regardless of Y's elevation, so only "xy" is steep.
-edges[1] = { ...edges[1], riseM: 0, gradePct: 0, absGradePct: 0 };
+// features/routing/astar.test.ts:56-63  (annotated)
+const plain = astar(g, "S", "G");
+expect(plain.path!.nodes).toEqual(["S", "H", "G"]);   // distance-only → steep shortcut
+const flat = gradeAstar(g, "S", "G", 5);
+expect(flat.path!.nodes).toEqual(["S", "L", "G"]);    // grade-aware → the flat detour
+expect(flat.path!.lengthM).toBeGreaterThan(plain.path!.lengthM);  // longer, on purpose
 ```
 
-**The known answer is baked in and asserted directly.** The diamond's optimum is
-hand-computed, so its test is a *known-answer test* — no oracle needed for the
-base case:
+The fixture is *built* so these two answers differ — that's the whole point of choosing
+elevation 9 for `H`. A random graph wouldn't reliably produce this contrast.
+
+**Part 3 — the directional fixture forces an asymmetry by overriding derived grade.**
+Sometimes the property you want needs data the natural derivation won't give. The builder
+handles it explicitly:
 
 ```ts
-// astar.test.ts:7-12 — the hand-computed anchor of the whole oracle chain
-const r = dijkstra(diamondGraph(), "S", "G");
-expect(r.path!.nodes).toEqual(["S", "A", "G"]);   // known by construction
-expect(r.path!.lengthM).toBe(200);
-expect(r.path!.cost).toBe(200);
+// features/routing/fixtures.ts:88-101  (annotated)
+const Y = node("Y", 0, 0.001, 8);            // Y is 8m up → edge X→Y climbs 8%
+// ...
+// Force the detour edges flat regardless of Y's elevation, so ONLY "xy" is steep.
+edges[1] = { ...edges[1], riseM: 0, gradePct: 0, absGradePct: 0 };   // xf forced flat
+edges[2] = { ...edges[2], riseM: 0, gradePct: 0, absGradePct: 0 };   // fy forced flat
 ```
 
-This is the root of the oracle chain in `01`: the diamond's known answer
-validates Dijkstra, then Dijkstra validates everything else. The fixture is
-where "trusted reference" gets its trust.
+The comment names the intent: the detour `X→F→Y` must read as flat so the *only* steep edge
+is the direct `xy`. Now `directedAstar(X,Y)` detours but `directedAstar(Y,X)` (downhill,
+free) takes the direct edge — `astar.test.ts:74` asserts exactly that asymmetry. The
+override is deliberate fixture-shaping, called out so a future reader doesn't "fix" it.
 
-**Fresh instance per call — no shared mutable state.** Every fixture is a
-function returning a *new* object, so tests that mutate (add an isolated node to
-test disconnection) don't leak into other tests:
+**Part 4 — `makeGridGraph(n)` is the one parametric fixture, for scale and pruning.** The
+hand-built graphs prove *correctness* on tiny cases; the grid proves the engine *scales* and
+the heuristic *prunes*:
 
 ```ts
-// astar.test.ts:91-96 — mutates a LOCAL copy, safe because fixture is fresh
-const g = directionalGraph();            // fresh graph, this test owns it
-g.nodes["ISO"] = { id: "ISO", ... };     // mutate freely
-g.adjacency["ISO"] = [];
-expect(directedAstar(g, "X", "ISO", 5).path).toBeNull();
+// features/routing/fixtures.ts:108-128  (annotated, condensed)
+export function makeGridGraph(n: number): Graph {
+  // n×n lattice, node ids "row,col", ~80m edges,
+  // elevation = c*3 + a ridge term  → grades vary smoothly across the grid
+  // edges: each node connects right (c+1) and down (r+1)
+}
 ```
 
-That's why `audit.md` lens 4 marks "order/shared-state dependence" CLEAR — the
-factory pattern makes cross-test contamination structurally impossible.
-
-```
-  why a factory, not a shared const
-
-  shared const G          factory diamondGraph()
-  ──────────────          ──────────────────────
-  test A mutates G   →    test A gets its own G
-  test B sees the    ✗    test B gets a fresh G  ✓
-  mutation (flake)        (isolated by construction)
-```
-
-**The grid fixture exists specifically to defeat hand-verification.**
-`makeGridGraph(12)` builds 144 nodes with a smooth elevation ramp — deliberately
-too large to eyeball, which is *why* the oracle (`01`) is needed for it. The
-fixture set is designed as a pair with the verification strategy: small graphs
-→ known-answer tests; large graphs → oracle tests.
+It takes `n`, so the same fixture serves the 12×12 oracle test (`astar.test.ts:42`) and the
+30×30 bidirectional pruning test (`bidirectional.test.ts:35`, which needs an *interior* pair
+so Dijkstra has room to flood and bidirectional can demonstrably expand fewer nodes). One
+parametric builder, many scales.
 
 ### Move 2 variant — the load-bearing skeleton
 
-```
-  a named factory per behavior
-  +  physics DERIVED from geometry (consistent by construction)
-  +  a fresh instance per call (isolation)
-  +  the answer designed in (known) OR designed too-big (oracle)
-```
+Strip a known-answer fixture to its kernel:
 
-What breaks without each:
+1. **Small enough to verify by hand** — 3 to 6 nodes. *Make it big* and you lose the known
+   answer; you're back to "looks reasonable," which asserts nothing.
+2. **Shaped to force one property** — the diamond forces a unique shortest path; gradeGraph
+   forces a flat-vs-steep split. *Make it generic* and the property you're testing might not
+   even be exercised by the data.
+3. **A derived, consistent data model** — grade computed from geometry, not hand-typed.
+   *Hand-type the derived fields* and they drift out of sync with the nodes, so the fixture
+   lies and the test passes for the wrong reason.
 
-- **Inline literals instead of named factories** → every test rebuilds the graph,
-  duplication everywhere, and the intent ("this is the grade-choice graph")
-  disappears into a wall of coordinates.
-- **Hand-typed grades instead of derived** → a fixture can claim a physically
-  impossible edge, and a test passing on a lie is worse than no test.
-- **Shared const instead of factory** → one mutating test poisons the rest.
-- **Only small fixtures** → you never stress the heuristic; the oracle has
-  nothing big to run on.
+The part people forget is **#2 — shaping for the property**. A common failure is reusing one
+generic fixture for everything; then a test "passes" without the fixture ever exercising the
+branch under test. flattr's discipline is one fixture per property, each named for what it
+proves (`diamondGraph`, `gradeGraph`, `directionalGraph`).
+
+**Skeleton vs hardening:** the kernel is small + shaped + derived-consistent. The parametric
+`makeGridGraph(n)` is hardening for scale tests; the hand-built trio is the load-bearing
+correctness layer.
 
 ### Move 3 — the principle
 
-**A good fixture is the smallest input that makes one behavior checkable, with
-its answer designed in.** Name it for the behavior, derive its internals so it
-can't lie, and return a fresh copy so tests stay isolated. The deeper pairing:
-fixtures and verification strategy are co-designed — small known-answer fixtures
-seed the trust that large oracle-tested fixtures then propagate. You can't have
-the oracle chain in `01` without the diamond's hand-computed root here.
+**A good fixture is a theorem you can run: you set the inputs so the output is known, then
+assert the code reproduces it.** The skill isn't generating data — it's *designing* data so
+the answer is closed-form and one property is unmistakable. This is why fixture-driven
+testing pairs so naturally with the optimality oracle (`01`): the fixture gives the known
+*input*, the oracle gives the known *relation*, and together every routing assertion stands
+on solid ground. The honest limit (`audit.md` lens 1): fixtures verify the *engine*, not the
+*shipped graph* — nothing here asserts the real `graph.json` is routable.
 
 ---
 
 ## Primary diagram
 
 ```
-  fixtures.ts — topologies co-designed with verification
+  FIXTURE-DRIVEN GRAPH TESTS — full recap
 
-  ┌─ small, KNOWN-ANSWER (seed the trust) ──────────────────────┐
-  │  diamondGraph()      S→A→G = 200   (hand-computed)          │
-  │  gradeGraph()        flat beats steep (known node lists)    │
-  │  directionalGraph()  A→B ≠ B→A     (known asymmetry)        │
-  └───────────────────────────┬─────────────────────────────────┘
-                              │ trust flows up via the oracle (01)
-  ┌─ large, ORACLE-TESTED (propagate the trust) ──▼─────────────┐
-  │  makeGridGraph(12/30)   144–900 nodes, no human knows the   │
-  │  optimum → A* must EQUAL Dijkstra cost                       │
+  ┌─ fixtures.ts ── the builders ──────────────────────────────┐
+  │  edge() derives grade from node elevations (consistent)    │
+  │     │                                                      │
+  │     ├─ diamondGraph()   → known shortest S,A,G = 200       │
+  │     ├─ gradeGraph()     → flat L beats steep H (the thesis)│
+  │     ├─ directionalGraph→ X→Y detours, Y→X direct (override)│
+  │     └─ makeGridGraph(n) → parametric lattice, scale+prune  │
+  └────────────────────────────┬───────────────────────────────┘
+                               │ imported fresh per test (no shared state)
+                               ▼
+  ┌─ assertions stand on KNOWN answers ────────────────────────┐
+  │  toEqual(["S","A","G"])  ← arithmetic, not a guess         │
+  │  feeds → 01 optimality oracle · 05 finite-BLOCKED tests    │
+  │  gap → real graph.json (unknown answer) untested (lens 1)  │
   └─────────────────────────────────────────────────────────────┘
-
-  every edge: grade DERIVED from geometry · fresh instance per call
 ```
 
 ---
 
 ## Elaborate
 
-This is the Object Mother / test-data-builder pattern (Fowler), specialized to
-graph topologies. The "derive physics from geometry" rule is what keeps these
-fixtures from rotting into lies — a common failure mode where hand-maintained
-test data drifts out of sync with what the system considers valid. The same
-factories power `bench/run.ts`, so the benchmark and the correctness tests share
-inputs — a nice property: the thing you measure is the thing you verified. The
-one extension worth noting: there's no fixture for the *real* `graph.json` shape
-at scale, so build-pipeline behavior on production-sized data is only covered by
-the small `sampleOverpass()` fixture in `build-graph.test.ts`. Fine for now;
-worth a golden-file test if graph-building logic grows.
+These are **known-answer tests** (the term cryptographers use for "fixed input → fixed
+expected output, verified by construction") plus a small **object-mother** pattern (named
+builder functions that produce ready-to-use domain objects). The design discipline — one
+fixture shaped per property — is what separates this from the common anti-pattern of a
+single bloated shared fixture every test borrows from, where tests accidentally couple and
+nobody can tell which data a given assertion actually depends on.
+
+It's the no-mock counterpart to `03-injected-fetch-isolation.md`: the network tests fake the
+*boundary*, the routing tests use *real* (if tiny) data and run the real algorithm
+end-to-end. That's why the routing suite has such high signal — there's almost nothing
+faked, so a green test means the real code produced the right answer on real data.
+
+Where to read next: `01-optimality-oracle.md` (the relation that runs on these fixtures),
+`05-finite-blocked-sentinel-tests.md` (the steep-graph fixtures), and `study-dsa-foundations`
+for the graph representations.
 
 ---
 
 ## Interview defense
 
-**Q: Why not test the router on the real graph?**
+**Q: "How do you get test data for a graph router when real graphs are huge and have no
+known answer?"**
 
-> Because the real graph has no known optimum — you can't assert a path is
-> *correct* against it. So I use named micro-fixtures with the answer designed
-> in: `diamondGraph()` is built so S→A→G = 200, and the test confirms the router
-> finds it. The grades are derived from node geometry, so the fixture can't claim
-> a physically impossible edge.
+> "I hand-build tiny fixtures shaped so the answer is closed-form. A 6-node diamond where I
+> set the edge lengths so the shortest path is provably `S,A,G` at 200 — the assertion is
+> arithmetic, not a guess. Then one fixture per property: a flat-vs-steep graph to prove the
+> grade cost prefers flat, a directional graph to prove `X→Y != Y→X`. Grade is *derived* from
+> node elevations in the builder, so the fixtures can't be internally inconsistent. The real
+> `graph.json` is the gap — it's too big to assert against, so nothing tests routing through
+> the shipped artifact end-to-end. That's `fixtures.ts` and `astar.test.ts`."
 
 ```
-  diamondGraph()  →  known: S,A,G = 200  →  test confirms router finds it
+  sketch while you talk:
+
+  hand-build small ─► set numbers so answer is KNOWN ─► assert exact
+       │
+   one fixture / property:  diamond(shortest) · grade(flat-wins) · directional(asymmetry)
 ```
 
-**Q: How do you keep fixtures from causing test-order flake?**
+**Anchor:** *"A good fixture is a theorem you can run — I shaped the inputs so the output is
+known, one property per graph."*
 
-> Make each fixture a factory that returns a fresh instance, not a shared const.
-> A test that needs to mutate the graph (add a disconnected node to test the null
-> path, `astar.test.ts:91`) mutates its own copy — nothing leaks. Anchor: "a
-> fixture is the smallest input that makes one behavior checkable, and a fresh
-> copy every call."
+**Q: "What's the weakness?"** Fixtures verify the engine, not the shipped graph. I'd add one
+integration test that loads the real `graph.json`, routes between two known nodes, and
+asserts a non-null path — closing the unknown-answer side of the seam.
 
 ---
 
 ## See also
 
-- `01-optimality-oracle.md` — the diamond's known answer roots the oracle chain.
-- `03-injected-fetch-isolation.md` — `sampleOverpass()` is the pipeline-side fixture.
-- `05-finite-blocked-sentinel-tests.md` — `directionalGraph` powers the BLOCKED tests.
-- `audit.md` lens 2, lens 4.
-- sibling `study-dsa-foundations` — the graph representation under test.
+- `01-optimality-oracle.md` — the relation asserted on these fixtures
+- `05-finite-blocked-sentinel-tests.md` — the steep/disconnected fixtures
+- `03-injected-fetch-isolation.md` — the faked-boundary counterpart (this is the no-mock half)
+- `audit.md` lens 1 (the real-graph gap), lens 4 (fresh fixtures = no shared state)
+- sibling guide **`study-dsa-foundations`** — graph representation theory

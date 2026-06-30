@@ -1,199 +1,175 @@
-# 11 — Meta-prompting
+# 11 · Meta-prompting
 
-*Industry name(s): "meta-prompting," "prompt generation," "prompt
-optimization," "LLM-writes-prompts." Type label: Industry standard.*
+> Industry name: meta-prompting / prompt generation / LLM-authored prompts · Type label: Industry standard
 
-> **Seam, not present.** flattr has no prompts, so nothing generates prompts.
-> But the workflow has a perfect anchor: `pipeline/config.ts` is flattr's
-> "knobs a human tunes" file, and the meta-prompting workflow is exactly
-> "human writes the goal → LLM drafts → human reviews → it enters the repo
-> as a reviewed file." This file teaches that workflow against flattr's two
-> seams.
+> **Status: seam, not feature.** flattr has no prompts, so nothing generates prompts. This file maps meta-prompting onto the authoring workflow you'd use *to write* Seam 1 and Seam 2's prompts — using a model to draft them, with `fixtures.ts` as the grounding the draft must satisfy.
 
-## Zoom out — where meta-prompting sits (authoring time, not runtime)
+## Zoom out — where this concept lives
 
-Meta-prompting is using an LLM to *write or improve* the prompts for your other
-LLM calls. Crucially it's an *authoring-time* activity — the generated prompt
-enters the repo as a reviewed file (concept 03), it doesn't run live and
-unreviewed.
+Meta-prompting sits *upstream* of the codebase — it's a workflow for producing the prompt files that then get versioned (`03-prompts-as-code.md`). Here's where it fits:
 
 ```
-  Zoom out — meta-prompting lives at authoring time
+  Zoom out — meta-prompting in the authoring workflow
 
-  ┌─ authoring time (human + LLM) ──────────────────────────────────┐
-  │ human writes goal ─► LLM drafts prompt ─► human edits ─►         │
-  │   commits to prompts/describe-route.md (concept 03)             │
-  └───────────────────────────┬──────────────────────────────────────┘
-                              ▼ ONLY THEN does it run
-  ┌─ runtime (Seam 1 / Seam 2) ─────────────────────────────────────┐
-  │ the reviewed prompt drives the actual LLM call                  │
-  └──────────────────────────────────────────────────────────────────┘
+  ┌─ Authoring (offline, human-driven) ──────────────────────────┐
+  │ human writes GOAL → ★ LLM drafts the prompt ★ → human edits  │ ← we are here
+  │   "describe a route from a RouteSummary, ≤2 sentences..."    │
+  └─────────────────────────┬────────────────────────────────────┘
+                            │ reviewed, edited
+  ┌─ Source (git) ──────────▼────────────────────────────────────┐
+  │ describe-prompt.ts  (now a version-controlled file, 03)      │
+  └─────────────────────────┬────────────────────────────────────┘
+                            │ tested against
+  ┌─ Evals (fixtures.ts) ───▼────────────────────────────────────┐
+  │ the drafted prompt must pass the golden set (05)             │
+  └──────────────────────────────────────────────────────────────┘
 ```
 
-## Zoom in
+Now zoom in. The pattern is: **use an LLM to draft or improve a prompt for another LLM call — human writes the goal, model drafts, human reviews and edits, and the edited prompt enters the codebase as source.** It saves time on initial drafting of complex prompts and wastes time on small tweaks. The risk: prompts that read like LLM output instead of engineering specs. Let me build it.
 
-The pattern: **human writes the goal, an LLM drafts the prompt, the human
-reviews and edits, the prompt enters the codebase as a reviewed file.** It
-saves time on *initial drafting* of complex prompts. It does NOT help with
-small tweaks or prompts under heavy iteration pressure — there, the round-trip
-is slower than just editing. The risk: prompts that read like LLM output
-(vague, padded) instead of like engineering specs (tight, testable).
+## Structure pass
 
-## The structure pass
+**Layers.** Two: the *meta-prompt* (the goal you give the drafting model) and the *target prompt* (what it produces, which then runs in production). The human sits at the boundary as the editor — meta-prompting is human-in-the-loop by design.
 
-**Layers:** goal → draft → reviewed prompt.
-**Axis:** *authorship* — who is responsible for what ships?
-**Seam:** the draft→review boundary. The LLM authors the draft; the human
-authors what *ships*. The boundary must not collapse.
+**Axis — control (who authors the final prompt?).**
 
 ```
-  axis = "who is accountable for the prompt that ships?"
+  One axis — "who controls the final prompt text?" — through the workflow
 
-  ┌─ LLM draft ───┐ accountable: NO ONE — it's a suggestion
-  │  ── seam ──      ◄── accountability lands ENTIRELY on review
-  └─ reviewed file┘ accountable: the human who committed it
+  ┌─ goal ──────────────┐  → HUMAN (you set the intent)
+  └─────────────────────┘
+      ┌─ draft ─────────┐  → LLM (proposes the text)
+      └─────────────────┘
+          ┌─ edit ──────┐  → HUMAN (you own what ships)  ← the seam
+          └─────────────┘
+
+  the seam: authorship flips back to the human at the edit step
+  — skip it and you've shipped LLM output as your spec
 ```
+
+**Seam.** The load-bearing boundary is *the human edit step*. Meta-prompting without the human edit is just letting a model write your production prompt unreviewed — and the failure mode is prompts that read like LLM filler ("It is important to carefully consider...") instead of tight engineering specs. The edit is where authorship returns to you.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You already use code generation and accept the contract: a generator (or
-Copilot) drafts, *you* review and own what merges. You'd never ship generated
-code unread. Meta-prompting is that contract for prompts. The LLM is a faster
-first draft, not an author of record. flattr's `pipeline/config.ts` is the
-human-owned knobs file — meta-prompting produces a *draft* of such a file that
-a human then owns.
+You already use a model to draft code you then review and edit — autocomplete proposes, you accept-and-fix. Meta-prompting is that for prompts: the model drafts the prompt, you review and tighten it, the result is yours. It's a *drafting accelerator*, not an authorship replacement — exactly like the difference between AI-assisted code and AI-authored-unreviewed code.
 
 ```
-  Pattern — meta-prompting as draft-then-own
+  The meta-prompting kernel — draft, edit, commit
 
-  human: "goal: describe a route in one honest sentence"
-            │
-            ▼
-  LLM:  drafts a full system prompt + few-shot scaffold
-            │
-            ▼
-  human: edits to a tight spec ─► commits as prompts/describe-route.md
-            │
-            ▼
-  runtime: the REVIEWED file runs (never the raw draft)
+  ┌─ human: GOAL ────────────────────────────────────┐
+  │ "describe a route from {distanceM,climbM,         │
+  │  steepCount}, ≤2 sentences, mention climb iff>10" │
+  └────────────────────┬─────────────────────────────┘
+                       │ meta-prompt
+  ┌─ LLM: DRAFT ───────▼─────────────────────────────┐
+  │ proposes a full system prompt + few-shot examples │
+  └────────────────────┬─────────────────────────────┘
+                       │ ★ human EDIT (authorship returns) ★
+  ┌─ git: COMMIT ──────▼─────────────────────────────┐
+  │ describe-prompt.ts — now reviewed source          │
+  └──────────────────────────────────────────────────┘
 ```
 
-### Move 2 — the workflow against flattr's seams
+### Move 2 — the step-by-step walkthrough
 
-**Step 1 — human writes the goal, not the prompt.** For Seam 1: "I need a
-prompt that turns `{distanceM, climbM, steepCount}` into one honest sentence
-that always flags steep blocks." That's a spec, the human's job.
+**The workflow — human goal, model draft, human edit.** You write the *goal* precisely: for Seam 1, "produce a system prompt that turns a `RouteSummary {distanceM, climbM, steepCount}` into a ≤2-sentence route description, mentions the climb only if `climbM > 10`, never says 'flat' if `steepCount > 0`, no markdown." The model drafts a full prompt — system text plus candidate few-shot examples. Then you edit: cut the filler, tighten the contract, fix anything that misread the goal.
 
-**Step 2 — LLM drafts the full prompt.** It produces the system prompt, the
-few-shot scaffold (concept 08), the output contract (concept 02). For a complex
-prompt this saves real time — you're editing a draft instead of staring at a
-blank file.
+**Where it saves time — initial drafting of complex prompts.** A prompt with several rules, a few-shot section, and an output contract is tedious to write from a blank page. The model gets you 70% of the way — a structured first draft with the sections in place — and you spend your time on the 30% that's actually hard: the edge-case rules and the example selection. This is the genuine win, and it's real.
 
-**Step 3 — human reviews and edits (where accountability lives).** The draft
-*will* be padded ("You are a helpful and knowledgeable routing assistant..."
-— LLM-output smell). The human cuts it to an engineering spec. This is the
-load-bearing step: the same review discipline flattr applies to every `.ts`
-file applies here.
-
-**Step 4 — it enters the repo as a reviewed file (concept 03).** The output of
-meta-prompting is a committed, version-controlled, model-paired prompt file —
-identical to any other source artifact. There is no "the LLM's prompt runs
-unreviewed" path.
+**Where it wastes time — small tweaks and high-iteration prompts.** If you're changing one word ("concise" → "brief") or you're mid-eval-loop iterating a prompt against `fixtures.ts` ten times a day, round-tripping through a drafting model is *slower* than just editing the text. Meta-prompting is for the cold start, not the hot loop. I've watched people meta-prompt a one-line change and it's pure ceremony.
 
 ```
-  Layers-and-hops — meta-prompting feeding the prompts-as-code pipeline
+  Hop — when meta-prompting pays vs when it doesn't
 
-  ┌─ human ──────┐ goal     ┌─ drafting LLM ─┐ draft prompt
-  │ writes spec  │ ───────► │ generates      │ ──────────────┐
-  └──────────────┘          └────────────────┘                ▼
-                                            ┌─ human review ─────────┐
-                                            │ cut padding → tight    │
-                                            └───────────┬────────────┘
-                                                        ▼ commit
-                                            ┌─ prompts/*.md (concept 03) ─┐
-                                            │ reviewed, model-paired       │
-                                            └──────────────────────────────┘
+  cold start (new complex prompt):
+    blank page ──meta-prompt──► 70% draft ──edit──► done   ✓ faster
+
+  hot loop (eval iteration, tweaks):
+    prompt ──edit one rule──► run evals ──repeat          ✓ faster
+    prompt ──meta-prompt──► draft ──re-edit──► run evals  ✗ ceremony
 ```
 
-**Step 5 — when it does NOT help.** A one-word tweak to an existing prompt, or
-a prompt you're iterating ten times an hour against an eval set (concept 05) —
-the meta-prompt round-trip is pure overhead there. Draft new complex prompts
-with it; hand-tune everything else.
+**Grounding the draft in `fixtures.ts`.** The strongest version of the Seam 1 meta-prompt *hands the drafting model the golden cases*: "here are three real `RouteSummary` objects from our test graphs and the ideal sentence for each (`diamondGraph`→flat, `gradeGraph`→flat-over-steep, `directionalGraph`→directional); write a system prompt that produces outputs like these." Now the draft is grounded in real, verified examples instead of the model's guess at what a route description should sound like. The fixtures (`fixtures.ts:46`) double as the meta-prompt's grounding *and* the eval set (`05`) the result must pass — same golden set, third use.
 
-### Move 2 variant — load-bearing skeleton
+**The risk — prompts that read like LLM output.** A model drafting a prompt produces LLM-flavored prose: hedgy, over-explained, "It is crucial to ensure that you carefully...". That's the opposite of a good production prompt, which is terse and specific. The edit step exists to strip this. A prompt that still reads like a model wrote it is a prompt nobody owned — and unowned prompts drift fastest, because no human has a mental model of why each line is there. The tell: if you can't explain why a sentence is in the prompt, the model put it there and you didn't edit hard enough.
 
-Kernel: **human owns the goal and the review; LLM owns only the draft**. What
-breaks:
+### Move 2.5 — current state vs future state
 
-- **Skip the human review** → padded, untested prompts ship; you've outsourced
-  accountability to a model. *Load-bearing — this is the whole risk.*
-- **Meta-prompt a tiny tweak** → round-trip slower than editing. *Anti-pattern.*
-- **Generated prompt bypasses the prompts/ pipeline** → loses versioning, model
-  pairing, evals. *Load-bearing — it must enter as a reviewed file.*
+```
+  Phase A (today)            Phase B (meta-prompting in use)
+  ───────────────            ───────────────────────────────
+  no prompts to author       human writes goal → LLM drafts →
+                             human edits → commits to git
+  fixtures.ts: test data     fixtures.ts: ALSO grounds the draft
+                             AND evals the result (same set, 3 uses)
+```
+
+What doesn't change: the prompt still enters the codebase as reviewed source (`03`) and still passes the eval set (`05`). Meta-prompting changes *how the first draft is produced*, not the discipline around it. The model writing a draft doesn't excuse it from review, versioning, or evals.
 
 ### Move 3 — the principle
 
-Meta-prompting is code generation for prompts: it accelerates the first draft
-and changes nothing about ownership. The human writes the goal and owns the
-review; the generated artifact enters the repo through the same gate as any
-other source. The risk is forgetting that a fluent draft is still a draft.
+Meta-prompting is a drafting accelerator with a mandatory human edit step. It pays for the cold start of a complex prompt and costs ceremony on small tweaks and hot iteration loops. The decisive move is grounding the draft in real examples (flattr's `fixtures.ts`) and editing until the prompt reads like an engineering spec, not LLM filler — because authorship has to return to the human or you've shipped an unowned prompt that nobody can reason about when it drifts.
 
 ## Primary diagram
 
-```
-  Meta-prompting workflow into flattr's prompts/ (FUTURE)
+The full meta-prompting workflow, grounded in fixtures, feeding the versioned source.
 
-  ┌─ human: goal spec ──────────────────────────────────────────────┐
-  │ "summary → one honest sentence, always flag steepCount>0"       │
-  └───────────────────────────┬─────────────────────────────────────┘
-                              ▼ LLM drafts
-  ┌─ draft (NOT shippable) ──────────────────────────────────────────┐
-  │ "You are a helpful routing assistant..." ← padding to cut        │
-  └───────────────────────────┬─────────────────────────────────────┘
-                              ▼ human review (accountability)
-  ┌─ prompts/describe-route.md (concept 03) ─────────────────────────┐
-  │ tight spec · model-paired · co-located eval · version-controlled │
-  └─────────────────────────────────────────────────────────────────┘
+```
+  Meta-prompting — draft grounded in fixtures, owned by the human
+
+  ┌─ Human: goal ────────────────────────────────────────────────┐
+  │ "RouteSummary → ≤2 sentences, climb iff>10, never 'flat'     │
+  │  if steepCount>0" + 3 grounding examples from fixtures.ts    │
+  └─────────────────────────┬────────────────────────────────────┘
+                            │ meta-prompt (grounded)
+  ┌─ LLM: draft ────────────▼────────────────────────────────────┐
+  │ proposes system prompt + few-shot section (70% there)        │
+  └─────────────────────────┬────────────────────────────────────┘
+                            │ ★ HUMAN EDIT — strip filler, tighten ★
+  ┌─ git: describe-prompt.ts ▼───────────────────────────────────┐
+  │ reviewed source (03) → must pass fixtures.ts evals (05)      │
+  └──────────────────────────────────────────────────────────────┘
+   use for: cold start of complex prompts
+   skip for: one-word tweaks, hot eval loops
 ```
 
 ## Elaborate
 
-aipe (in the reader's portfolio) is the lived example: its slash commands lean
-on meta-prompting under the hood — a human describes intent, the system
-composes the actual prompt, and the result is a committed, reviewable artifact.
-That's the workflow above, shipped. Anthropic and OpenAI both ship
-prompt-generator tools that follow the same draft-then-review contract; the
-discipline (human owns the review, output enters version control) is what
-separates it from "let the AI write the AI." Read `03-prompts-as-code.md` for
-the pipeline the generated prompt enters and `08-few-shot.md` for the scaffold
-the draft produces.
+Meta-prompting is what aipe (from `me.md`'s portfolio) does under the hood — its slash commands lean on meta-prompting to compose templates, and it's the mature, productized form of this workflow: a tool that turns a human goal into a structured prompt artifact. The canonical references are Anthropic's prompt generator and OpenAI's "generate a prompt" tooling, both of which are meta-prompting with guardrails. The risk it surfaces — prompts reading like LLM output — is the same risk as AI-authored code that nobody reviewed: it works until it needs to be reasoned about, and then no human has the model of it. flattr makes the grounding move clean, because `fixtures.ts` is exactly the verified-example set a good meta-prompt should be anchored to.
+
+## Project exercises
+
+### EX-META-1 — Draft the Seam 1 prompt, grounded in fixtures
+
+- **Exercise ID:** EX-META-1
+- **What to build:** A meta-prompt that hands a model three `(RouteSummary → sentence)` pairs from `fixtures.ts` and asks it to draft the Seam 1 system prompt; then edit the draft to a terse spec and run it against the `05` eval set.
+- **Why it earns its place:** Exercises the grounded-draft + human-edit workflow and proves the edited prompt (not the raw draft) is what passes evals.
+- **Files to touch:** new `features/routing/meta/draft-describe.md` (the meta-prompt), output to `describe-prompt.ts`.
+- **Done when:** the raw draft and the edited draft are both kept, and the edited one scores higher on `fixtures.ts` evals.
+- **Estimated effort:** 2-3 hours.
 
 ## Interview defense
 
-**Q: "Can't you just have an LLM write your prompts?"** For the first draft of
-a complex prompt, yes — it's code generation for prompts and it saves real
-time. But the human owns the goal and the review, and the output enters the
-repo as a reviewed, version-controlled, model-paired file. The risk is shipping
-a fluent draft that reads like LLM output instead of a tight engineering spec.
-Small tweaks and heavily-iterated prompts: hand-tune, the round-trip is slower.
+**Q: When does meta-prompting help and when is it ceremony?**
+
+Helps on the cold start of a complex prompt — a model gets you a structured 70% draft. Ceremony on one-word tweaks and hot eval-iteration loops, where round-tripping through a drafting model is slower than just editing the text.
 
 ```
-  complex new prompt → meta-prompt the draft, then OWN the review
-  one-word tweak     → just edit it (round-trip is overhead)
+  cold start (complex) → meta-prompt → edit   ✓
+  tweak / hot loop     → just edit          ✓ (meta-prompt = ceremony)
 ```
 
-Anchor: *"aipe already ships this — slash commands meta-prompt under the hood,
-but every result lands as a committed file. flattr's `pipeline/config.ts` is
-the same 'human-owned knobs' shape a generated prompt file would join."*
+Anchor: ground the draft in flattr's `fixtures.ts` examples so the model isn't guessing what a route description should sound like.
+
+**Q: What's the risk, and what controls it?**
+
+Prompts that read like LLM output — hedgy, over-explained — instead of terse engineering specs. The control is the mandatory human edit step where authorship returns to you. The tell that you didn't edit hard enough: you can't explain why a given sentence is in the prompt.
 
 ## See also
 
-- [03-prompts-as-code.md](03-prompts-as-code.md) — the pipeline generated
-  prompts enter
-- [08-few-shot.md](08-few-shot.md) — the few-shot scaffold a draft produces
-- [05-eval-driven-iteration.md](05-eval-driven-iteration.md) — the generated
-  prompt still faces the eval gate
-- [01-anatomy.md](01-anatomy.md) — the structure a draft must fill
-</content>
+- `03-prompts-as-code.md` — where the edited prompt lands as source
+- `05-eval-driven-iteration.md` — the evals the draft must pass
+- `08-few-shot.md` — the examples the meta-prompt is grounded in
+- `01-anatomy.md` — the four sections the draft should produce

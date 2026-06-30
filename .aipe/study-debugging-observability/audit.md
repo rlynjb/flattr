@@ -1,232 +1,203 @@
-# Debugging & Observability — the 8-lens audit (flattr)
+# Audit — Debugging & Observability lenses · flattr
 
-> Pass 1. One section per lens. Each names what the repo actually does, grounded
-> in `file:line`, or says `not yet exercised` with the trigger that flips it on.
-> Where a finding earns a deep walk, it cross-links to a Pass 2 pattern file.
+Pass 1. Eight lenses, walked in order against the actual repo. Each names what
+flattr does with `file:line` grounding, or says `not yet exercised` and names
+the trigger. Significant findings cross-link to their Pass 2 pattern file rather
+than restating the mechanism.
 
-The headline: flattr's observability is **in-band** — it travels as return-value
-data, not as a logging/metrics/tracing side channel. That makes the
-"data-shaped" lenses (1, 2, 6) rich and the "infrastructure-shaped" lenses
-(3, 4, 5, 7) mostly `not yet exercised`. Both are honest signals about a
-pure-engine + on-device app with no server.
-
----
-
-## 1. observability-map — what can be observed at each boundary
-
-The strongest lens in the repo. Walk the boundaries and ask "what evidence
-crosses here?"
-
-```
-  flattr's evidence map — what's observable at each seam
-
-  ┌─ BUILD-TIME (pipeline/) ────────────────────────────────────┐
-  │  Open-Meteo HTTP boundary → res.status (429 visible)         │ elevation.ts:114
-  │  console.log progress at each phase                          │ run-build.ts:43-49
-  │  console.error on build failure                              │ run-build.ts:55
-  └─────────────────────────────────────────────────────────────┘
-  ┌─ ENGINE (features/routing/) ────────────────────────────────┐
-  │  every search returns nodesExpanded / pushes / pops          │ types.ts:45-51
-  │  every path returns steepEdges (compromise list)             │ types.ts:36
-  │  path === null  ⇔  genuinely disconnected (not just steep)   │ astar.ts:77
-  └─────────────────────────────────────────────────────────────┘
-  ┌─ BENCH (bench/) ────────────────────────────────────────────┐
-  │  counters tabulated across 5 stages, side by side            │ run.ts:44-56
-  └─────────────────────────────────────────────────────────────┘
-  ┌─ MOBILE (mobile/src/) ──────────────────────────────────────┐
-  │  degraded flag per region (grades are fake)                  │ useTileGraph.ts:75
-  │  routed.found flag (route exists / doesn't)                  │ MapScreen.tsx:156-160
-  │  user-visible note: "Grades approximate…"                    │ MapScreen.tsx:376
-  └─────────────────────────────────────────────────────────────┘
-```
-
-Every important boundary emits *something the caller can inspect*. The gap: none
-of it is persisted or aggregated over time — it's observable in the moment, not
-after the fact. → deep walk in `01-in-band-search-instrumentation.md`.
+Verdict up front: flattr's observability is **in-band and ephemeral**. Behavior
+is richly visible *while it runs* — the search counts its own work, the tests
+assert an optimality oracle, the UI paints route honesty — but nothing is
+*persisted*. There is no structured log, no metric store, no trace, no error
+tracker. For a pre-backend single-artifact app that's a defensible shape; the
+moment it ships to a real device, the persistence gap is the whole risk.
 
 ---
 
-## 2. reproduction-and-evidence — minimal repro, hypotheses, controlled experiments
+## 1. observability-map
 
-Exercised, and well. The repo's whole testing posture is "reproduce on a tiny
-deterministic graph, then assert."
+**What can be observed at each boundary.** Three runtimes, three regimes.
 
-- **Minimal repros as fixtures.** `makeGridGraph(12)` and hand-built graphs
-  (`diamondGraph`, `directionalGraph`) in the routing tests are the minimal
-  reproductions — a 12×12 grid is small enough to reason about by hand, big
-  enough to expose a wrong heuristic (`features/routing/astar.test.ts:38-52`).
-- **Controlled experiment = the second computation.** The optimality probe runs
-  the *same input* through two algorithms and compares
-  (`astar.test.ts:38-46`) — a controlled experiment where the control is
-  Dijkstra. → `02-optimality-oracle-probe.md`.
-- **Injectable dependencies for hypothesis isolation.** `openMeteoProvider`
-  takes a `fetchImpl` parameter (`pipeline/elevation.ts:90`), so a test can feed
-  a fake 429 response and reproduce the rate-limit path deterministically
-  (`pipeline/elevation.test.ts:66-70`). This is the seam that lets you reproduce
-  a network failure without the network.
-- **The documented repro habit.** Project memory + `context.md:78-80`:
-  `curl` Open-Meteo before debugging the pipeline, because a 429 produces
-  all-flat grades that mimic a grade-bug. Instrument the upstream before
-  suspecting your code. → the "all grades green" incident in
-  `04-degrade-and-surface-seam.md`.
+- **Build-time** (`pipeline/run-build.ts`): stdout narration only —
+  `console.log("Fetching OSM…")` (`run-build.ts:43`), `console.log("Wrote
+  data/graph.json: N nodes, M edges")` (`run-build.ts:49-51`), `console.warn`
+  on the FLAT-elevation path (`run-build.ts:29`), `console.error(err)` at the
+  top-level catch (`run-build.ts:54-56`). Human-readable, not machine-parseable,
+  not persisted.
+- **Test/bench** (`bench/run.ts`, `*.test.ts`): the richest evidence surface.
+  The search engine counts `nodesExpanded / pushes / pops` as it runs
+  (`astar.ts:35-37, 46-77`) and the bench prints them in a comparison table
+  (`bench/run.ts:46-56`, `bench/report.ts:19-37`). The tests assert behavioral
+  invariants (optimality, symmetry, fallback). → see `01-` and `02-`.
+- **Runtime** (`mobile/src/`): in-band UI signals only. `degraded` flags on
+  flat-fallback regions (`useTileGraph.ts:75`), three route states in
+  `RouteSummaryCard.tsx` (`:21, :32`), the "Grades approximate" note
+  (`MapScreen.tsx:375`). No console output, no telemetry. → see `03-`.
 
----
+The map's defining feature: **the boundary between "instrumented" and "blind" is
+the boundary between dev-time and runtime.** Everything before the app is well-
+observed; the app itself observes only through pixels.
 
-## 3. structured-logs-and-correlation — events, levels, context, correlation IDs, redaction
+## 2. reproduction-and-evidence
 
-**not yet exercised.** There is no structured logging. The entire logging
-surface is **8 `console.*` calls**, all build-time or bench:
+**Minimal repro, hypotheses, controlled experiments.** This is flattr's
+strongest lens, because the core is pure and deterministic.
 
-- `pipeline/run-build.ts:25,32,43,45,49` — phase progress (`console.log`)
-- `pipeline/run-build.ts:55` — build failure (`console.error`)
-- `bench/run.ts:56,58` — table output (`console.log`)
+- **Deterministic fixtures.** `features/routing/fixtures.ts` builds grid graphs
+  with a pure elevation function; `fixtureProvider` (`elevation.ts:13-19`) makes
+  elevation `a pure function of lat/lng`. A wrong route is reproducible from a
+  graph + start + goal + `userMax`, with no network, no clock, no randomness.
+- **Controlled experiments via the bench.** `bench/run.ts:36-42` runs five
+  algorithm variants over the *same* fixed interior pairs — a controlled
+  comparison where only the (costFn, heuristicFn) changes. That's a designed
+  experiment: hold the input constant, vary one factor, read the counters.
+- **The two documented debugging stories** are both repro-first:
+  - *"no route between those points"* — disconnected graph components from
+    viewport-only tiling. Diagnosed with a reachability/BFS probe
+    (instrument-before-fix), fixed by corridor loading (`MapScreen.tsx:136-148`,
+    `useTileGraph.ts:269-280`). → `04-`.
+  - *"all grades green"* — Open-Meteo throttled → flat fallback masked real
+    grades. Diagnosed by curling the API and excluding degraded regions from
+    display (`useTileGraph.ts:150-162`). → `03-`, `05-`.
 
-No levels, no JSON fields, no correlation IDs, no redaction. No logging library
-in either `package.json` (root has only `tsx`, `typescript`, `vitest`, `@types/node`).
+## 3. structured-logs-and-correlation
 
-**Trigger:** the first time a `build:graph` run fails in CI and the plain
-`console.error(err)` (`run-build.ts:55`) doesn't carry enough context to
-reproduce — which bbox, which phase, which provider. At that point a leveled
-logger with the bbox + phase as structured fields earns its place. No correlation
-IDs are needed until there's more than one in-flight request to correlate, which
-requires a server (lens 5).
+**Events, levels, context, correlation IDs, redaction, searchable fields.**
 
----
+`not yet exercised.` There is no structured logging anywhere. The only logging
+is raw `console.*` in two build-time scripts (`run-build.ts`, `bench/run.ts`) —
+unleveled (`.log`/`.warn`/`.error` used as plain output, not a level system),
+unstructured (interpolated strings, not JSON fields), uncorrelated (no request
+or build ID), and not persisted. The runtime app logs *nothing* —
+errors are swallowed by bare `catch {}` (`useTileGraph.ts:219`,
+`MapScreen.tsx:86`).
 
-## 4. metrics-slis-slos-and-alerts — signals, indicators, objectives, thresholds
+**Becomes relevant when:** the app ships to real devices. The first time a user
+reports "it routed me up a hill," there is currently zero evidence trail —
+no log of the graph state, the `userMax`, or whether elevation was degraded.
+Minimum viable: a structured log line at the route call carrying
+`{startId, endId, userMax, found, steepCount, corridorDegraded}`.
 
-**Partially exercised — as ad-hoc measurement, not as monitored metrics.**
+## 4. metrics-slis-slos-and-alerts
 
-The bench harness *computes* exactly the signals you'd turn into SLIs: per-stage
-`nodesExpanded`, `pushes`, `pops`, and wall-clock `ms`
-(`bench/report.ts:2-9`, `bench/run.ts:44-52`). But they're printed to a console
-table once per manual `npm run bench` run — there is no time series, no
-objective, no alert threshold, nothing that pages.
+**Signals, SLIs, SLOs, alerts, actionable thresholds.**
 
-The closest thing to an SLI *defined* anywhere is implicit in the assertions:
-"A* expands no more nodes than Dijkstra" (`astar.test.ts:48-52`) is a
-correctness objective enforced at test time, and the bench narrative documents
-the expected shape — A* prunes the flood to a cone, bidirectional meets in the
-middle (`bench/report.ts:59-63`). That's a documented baseline, not a live SLO.
+`not yet exercised` as production telemetry — but the *raw material* exists. The
+search already computes the exact counters a metric system would want:
+`nodesExpanded`, `pushes`, `pops` (`types.ts:46-51`), plus per-run `ms` and
+`cost` in the bench (`bench/run.ts:46-54`). These are printed to a table, never
+aggregated, never thresholded, never alerted on. → see `01-` for the mechanism.
 
-**Trigger:** first real deploy. The two SLIs that matter — p95 route-compute
-latency and **degraded-region rate** (how often elevation falls back to flat) —
-both have their raw signal already (`ms` in the bench; the `degraded` flag in
-`useTileGraph.ts:75`). What's missing is collection over time and a threshold
-that alerts. → the counters are deep-walked in
-`01-in-band-search-instrumentation.md`.
+There is one *implicit* objective enforced in code, worth naming: the optimality
+oracle (`astar.test.ts:38`) is effectively an SLO on correctness — "A* cost must
+equal Dijkstra cost" — checked in CI rather than monitored in prod. → `02-`.
 
----
+**Becomes relevant when:** fallback rate or route latency needs a threshold.
+E.g. "if >5% of corridor builds degrade to flat over 5 min, the elevation quota
+is exhausted — page." Today `corridorDegraded` is a per-render boolean
+(`useTileGraph.ts:285`); it would need to be counted and windowed to alert.
 
-## 5. traces-and-request-lifecycles — spans, causal chains, latency attribution
+## 5. traces-and-request-lifecycles
 
-**not yet exercised** as distributed tracing; the *causal chains exist* but are
-all in-process and observable by reading the code.
+**Request lifecycles, spans, causal chains, latency attribution.**
 
-The longest lifecycle is the build pipeline: `osm → split → elevation → grade →
-build-graph` (`pipeline/run-build.ts`). It's a fixed, single-process sequence
-with no spans and no IDs — you attribute latency by reading the `console.log`
-phase markers, not a trace. The on-device tile lifecycle
-(`useTileGraph.ts` viewport-change → fetch OSM → elevation → build → merge →
-render) is similarly single-process.
+`not yet exercised` in the distributed sense — no service boundary, no
+multi-hop request, nothing to trace across processes. The closest thing is the
+build pipeline's phase narration: `buildGraph` accepts an `onPhase` callback
+(`useTileGraph.ts:196-197`, `build-graph.ts`) that drives `setLoadingStep`
+("Fetching streets" → later phases) so the UI shows which stage a build is in.
+That's a single-process progress trace, surfaced to the user, not a span tree.
 
-**Trigger:** the moment any of these phases moves behind a network hop to a
-separate service. The instant elevation is a remote service you call per request
-(rather than a build-time batch), you'd want a span around it with a correlation
-ID so a slow build can be attributed to the elevation hop vs the graph build.
-Today there's nothing to correlate across — one process, one timeline.
+Latency *is* attributed, but only in the bench: `time()` wraps each algorithm
+(`bench/run.ts:23-27`) and reports `ms` per stage. Single-process, dev-time.
 
----
+**Becomes relevant when:** a backend is introduced and one route request fans
+out (geocode → Overpass → elevation → build → search) across services. Today
+that chain runs in-process in `handleRoute` (`MapScreen.tsx:174-199`) and
+`useTileGraph`'s `pump`; a span per hop would attribute where a slow route went.
 
-## 6. state-snapshots-and-debugging-boundaries — state inspection, network traces, before/after
+## 6. state-snapshots-and-debugging-boundaries
 
-Exercised through three mechanisms:
+**State inspection, network traces, error output, before/after snapshots.**
 
-- **The search result is a state snapshot.** `SearchResult`
-  (`types.ts:45-51`) is a frozen snapshot of the search's work: how many nodes
-  it finalized, how many pushes/pops it took. Two snapshots side by side (A* vs
-  Dijkstra) *are* a before/after comparison of search efficiency
-  (`bench/run.ts:44-56`).
-- **The network boundary is inspectable by injection.** `fetchImpl` injection
-  (`elevation.ts:90`) lets a test substitute a recorded `Response` — a network
-  trace you control. `pipeline/elevation.test.ts:66-70` snapshots the 429 path.
-- **The `degraded` flag is a region-level state snapshot.** Each `Region`
-  carries `{ bbox, graph, degraded }` (`useTileGraph.ts:75`); the display graph
-  *excludes* degraded regions while the routing graph *includes* them
-  (`useTileGraph.ts:139-162`) — the flag is the state that drives two different
-  downstream views. → `04-degrade-and-surface-seam.md`.
+Partially exercised, and well-suited to it because the engine is functional.
 
----
+- **State is snapshottable by construction.** A `Graph` is a plain serializable
+  object (`types.ts:22-28`); `graph.json` *is* a state snapshot — the exact
+  artifact the app reads. You can diff two builds, or feed a captured graph back
+  into `search()` to reproduce a route offline.
+- **The merged-graph seam is the key debugging boundary.** `useTileGraph` keeps
+  two derived graphs side by side: `graph` (routing — includes degraded
+  regions, `:132-145`) and `displayGraph` (heatmap — *excludes* degraded
+  regions, `:150-162`). That split is itself a debugging insight made
+  structural: the "all green" bug was the display graph painting bogus flat
+  grades, so the fix was to snapshot routing-state and display-state separately.
+- **Network errors are observable at the seam but then dropped.**
+  `bestEffortElevation` (`useTileGraph.ts:20-31`) catches the throttle, flips
+  `degraded`, returns flat — the *fact* of failure is captured as a boolean, but
+  the error object (status, body) is discarded by the bare `catch`.
 
-## 7. incident-analysis-and-prevention — root cause, remediation, regression guards, runbooks
+**Gap:** no network trace is retained. When Open-Meteo 429s, the code knows
+*that* it failed (sets `degraded`) but keeps no record of the response — which
+is exactly why the human discipline is "curl it yourself" (`05-`).
 
-Exercised informally, through project history — two real incidents, each
-diagnosed and guarded.
+## 7. incident-analysis-and-prevention
 
-- **Incident A — "no route between those points."** Root cause: viewport-only
-  tiling produced disconnected graph components, so two real points had no path
-  between them. Found by a reachability probe (instrument-before-fix:
-  confirm the graph is disconnected before touching the router). The prevention
-  is structural and now load-bearing: `BLOCKED = 1e9` is **finite, not
-  Infinity** (`cost.ts:4-5`) so "only-steep path" stays distinct from
-  "disconnected → null", and the routing graph deliberately includes degraded
-  regions so excluding them can't reintroduce disconnection
-  (`useTileGraph.ts:135-145`). Regression guard:
-  `astar.test.ts:91-96` ("returns null only when genuinely disconnected, not
-  when merely steep"). → `03-route-honesty-signals.md`.
-- **Incident B — "all grades green."** Root cause: Open-Meteo throttled (429),
-  the flat fallback returned 0 m elevation everywhere, and the all-flat grades
-  painted the whole map green — masking the real grades. Diagnosed by
-  `curl`-ing the API (confirming the 429 was upstream, not a grade-compute bug).
-  Remediation: tag the region `degraded` and *exclude degraded regions from the
-  display graph* so fake grades don't paint over real ones
-  (`useTileGraph.ts:147-162`), plus a self-heal retry
-  (`useTileGraph.ts:209-218`). Runbook-as-memory:
-  "curl before debugging" (`context.md:78-80`). → `04-degrade-and-surface-seam.md`.
+**Root cause, contributing conditions, remediation, regression guards.**
 
-What's missing: these runbooks live in commit history and project memory, not a
-written incident doc or `RUNBOOK.md`. **Trigger:** a third person joining the
-project, at which point the curl-first habit needs to be written down where they
-can find it, not learned by hitting the 429.
+Two real incidents are documented and both were closed with a structural
+prevention, not just a patch — the strongest signal in this lens.
 
----
+- **"No route between those points."** *Root cause:* viewport-only tiling
+  produced disconnected graph components — a distant start and goal landed in
+  separate components (spec §14.2, `MapScreen.tsx:136-138` comment). *Diagnosis:*
+  a reachability/BFS probe (instrument-before-fix) confirmed the goal was
+  unreachable, not merely steep. *Remediation:* bulk-load the corridor spanning
+  both endpoints + a tile of margin so they share one component
+  (`MapScreen.tsx:139-148`, `useTileGraph.ts:269-280`). *Regression guard:*
+  `astar.test.ts:91` — "returns null only when genuinely disconnected, not when
+  merely steep." → `04-`.
+- **"All grades green."** *Root cause:* Open-Meteo throttled → flat (0 m)
+  fallback → every grade computed as 0 → all-green heatmap masking real grades.
+  *Contributing condition:* the fallback was silent. *Diagnosis:* curl the API
+  (got the 429), then realize the display graph was including degraded regions.
+  *Remediation:* exclude degraded regions from `displayGraph`
+  (`useTileGraph.ts:150-162`) and self-heal via capped retries
+  (`:209-218`). *Surfaced:* "Grades approximate" note (`MapScreen.tsx:375`). →
+  `03-`, `05-`.
 
-## 8. debugging-observability-red-flags-audit — ranked blind spots
+**Runbook:** the curl-first discipline (`05-`) is the closest thing to a runbook
+— a documented "before you debug the pipeline, probe the external API" step
+captured in `.aipe/project/context.md` and user memory.
 
-Ranked by what behavior the repo would currently fail to explain.
+## 8. debugging-observability-red-flags-audit
 
-```
-  blind spot                       consequence                    severity
-  ───────────────────────────────  ─────────────────────────────  ────────
-  1. no error tracking / crash     a user-side crash is invisible  HIGH once
-     reporting (no Sentry/dep)      — you learn from store reviews  shipped
-                                    or nothing. MapScreen.tsx has
-                                    no error boundary surfacing
-                                    crashes to any backend.
+**Ranked blind spots, by consequence.**
 
-  2. degraded-rate is computed      you can't tell whether grades   HIGH once
-     but never collected            are routinely fake in prod —    shipped
-     (useTileGraph.ts:75)           the signal exists per-region,
-                                    nothing aggregates it.
+1. **Runtime errors are swallowed silently.** `catch {}` at
+   `useTileGraph.ts:219` (Overpass build failure) and `MapScreen.tsx:86`
+   (transient/rate-limit) discard the error entirely. *Consequence:* on a real
+   device, a persistent Overpass outage looks identical to "nothing loaded" —
+   no signal reaches anyone. This is the highest-consequence gap because it's an
+   *active* silencing, not just a missing feature. Mitigated only by the
+   `degraded` flag covering the *elevation* path; the *streets* path has no
+   equivalent surfaced signal beyond the stale-region keepalive.
+2. **No persisted evidence at runtime.** Every diagnostic signal the app
+   produces is a transient React render (`degraded`, the route states). Close
+   the app, lose the evidence. *Consequence:* no post-hoc debugging of a user
+   report is possible.
+3. **Degraded state is per-region boolean, not counted.** `corridorDegraded`
+   (`useTileGraph.ts:285`) tells you *this* corridor is flat, but there's no
+   running count of how often the quota is being hit — so quota exhaustion has
+   no trend signal until everything is green. → relates to lens 4.
+4. **The "all green" failure is only caught by display exclusion, not asserted.**
+   The `displayGraph`/`graph` split (`:132-162`) prevents the bug structurally,
+   but there's no test asserting degraded regions stay out of the display graph
+   — the regression guard is architectural, not verified. (Verification is
+   `study-testing`'s lens; flagged here as a diagnostic risk.)
+5. **Build-time logs are unleveled and unstructured.** `console.log`/`.warn`/
+   `.error` in `run-build.ts` aren't a level system you can filter — fine for a
+   hand-run CLI, a problem the moment builds run unattended (CI/cron).
 
-  3. console.error(err) loses       a CI build failure may be       MEDIUM
-     context (run-build.ts:55)      unreproducible — no bbox/phase
-                                    captured with the error.
-
-  4. nearestNode is O(n) and        a tap that snaps to a far/wrong MEDIUM
-     silent (nearest.ts:5-18)       node gives a baffling route
-                                    with no log of WHICH node it
-                                    snapped to — hard to diagnose
-                                    "why did it route from there?"
-
-  5. no latency signal in prod      bench measures ms offline;      LOW until
-     (bench-only)                   on-device route-compute time    deployed
-                                    is unmeasured on real hardware.
-```
-
-The top two are the same root issue: **flattr observes itself beautifully
-in-band but persists nothing.** Every signal needed to debug production already
-exists as a return value — `degraded`, `found`, `steepEdges`, the counters. The
-missing layer is collection, not instrumentation. That's the cheapest possible
-production-observability story to bootstrap, because the hard part (deciding what
-to measure) is already done.
+None of these are wrong *for the current scope*. They are the precise list of
+what to instrument first when flattr grows a backend or ships to real users.

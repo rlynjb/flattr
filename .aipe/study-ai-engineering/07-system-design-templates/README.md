@@ -1,26 +1,39 @@
-# 07 — System-Design Templates
+# 07 — System Design Templates
 
-**Generic AI-system-design interview reframes — with honest, flattr-grounded applicability bullets.**
+Interview-reframe templates. Each takes a canonical ML/AI system-design prompt and
+answers it about flattr — the same hand-rolled A* router over a grade-annotated street
+graph, viewed through a different framing each time. **The code does not change between
+templates; the lens does.**
 
-These are the canonical "design an X" whiteboard questions, written as reusable templates: the standard architecture, the data model, the scale concerns. flattr has **no LLM and no model**, so the architecture/data/scale sections are generic study material. What's *not* generic is the **"Applies to this codebase"** section in each file — those bullets are answered about flattr's real files only, and the answer is mostly *"it doesn't apply; here's the nearest real seam."*
+The point is rehearsal: in a system-design loop you get a generic prompt ("design a
+ranking system", "design a support bot") and have to map it onto whatever you actually
+built. These files practice that mapping honestly. flattr has no LLM, no RAG, no
+embeddings, no ML — it is a deterministic shortest-path solver in TypeScript on
+Expo/React Native — so most of these templates land at *partially* or *no*, and the
+value is in saying *why* precisely, not in pretending otherwise.
 
-Read these to rehearse the templates, and to practice the harder skill: saying precisely *why* a famous architecture has no home in a given codebase, and where the one honest analog (if any) lives.
+Every template follows the same nine-bullet shape: the prompt, standard architecture
+(box diagram), data model, key components, scale concerns, eval framing, common failure
+modes, an honest **Applies to this codebase** verdict, and a concrete **How to make it
+apply** refactor that names flattr's real files.
 
-## Files
+## Templates
 
-| # | Template | flattr verdict |
-|---|----------|----------------|
-| [01](01-search-ranking.md) | Search + ranking | Partial — `AddressBar.tsx` + `geocode.ts geocodeSuggest` is a real search UI, but it's a pass-through to Nominatim with no flattr-side ranker. A* "ranks" routes by explicit cost (`cost.ts`), not learning. |
-| [02](02-tech-support-chatbot.md) | LLM support chatbot | Not at all — no chat, no support corpus, no model. Only thread: a route-explanation assistant over `summary.ts:11` would be a *different product*. Out of scope. |
+- **[01 — Search & Ranking](01-search-ranking.md)** — *Applies: partially.* flattr's
+  geocode autocomplete (`geocodeSuggest`, `MapScreen.tsx:82`) and `nearest.ts` spatial
+  nearest-neighbor are genuine retrieval surfaces, but there's no learned ranker, no
+  embeddings, and no click logs. flattr does stage-one retrieval and stops; its
+  "ranking" is geographic distance, not relevance learning.
 
-## Real seams (verified)
+- **[02 — Tech Support Chatbot](02-tech-support-chatbot.md)** — *Applies: no.* flattr is
+  a routing tool, not a Q&A/support system. The only generative-adjacent surface is the
+  route-describe OUTPUT seam (`summary.ts` → `RouteSummaryCard`), and even fully built
+  it's a captioner, not a chatbot. Included to practice declining a template cleanly.
 
-The only points where flattr touches anything an LLM pipeline would care about:
+## How to read these
 
-- **output→prompt:** `features/routing/summary.ts:11` — route totals (distance/climb/steep), the natural thing a model would describe.
-- **input→prompt:** `pipeline/geocode.ts:9` — address query resolution; the entry point for user-typed text.
-- **injection vector:** `pipeline/geocode.ts:27,52,69` — OSM `display_name` is untrusted and would need escaping before ever entering a prompt.
-
-## Bottom line
-
-flattr is a grade-aware routing engine: a hand-rolled A* over a grade-annotated street graph, plus an Expo/RN map app. It has no learned ranker and no chatbot. These templates are worth knowing cold for interviews — the value here is the disciplined *no*, anchored to the three real seams above.
+Read the **Applies to this codebase** bullet first. It is the honest verdict — what
+flattr actually exercises versus what the template assumes. The architecture and scale
+sections are the generic textbook answer, kept so the template is reusable; the flattr-
+specific truth lives in the last two bullets. Nothing here claims flattr does AI it
+doesn't do.

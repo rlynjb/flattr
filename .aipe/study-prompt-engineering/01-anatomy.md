@@ -1,254 +1,192 @@
-# 01 — Anatomy of a production prompt
+# 01 · Anatomy of a production prompt
 
-*Industry name(s): "prompt structure," "the four-part prompt." Type label:
-Industry standard.*
+> Industry name: prompt structure / message-role composition · Type label: Industry standard
 
-> **Seam, not present.** flattr sends nothing to a model. This file teaches
-> the four sections of a prompt by building the *one prompt flattr would
-> have first*: the "describe my route" prompt at Seam 1, fed by the real
-> `RouteSummary` struct from `features/routing/summary.ts:11`.
+> **Status: seam, not feature.** flattr sends no prompts. This file maps the four sections onto the prompt flattr *would* assemble at Seam 1 (`features/routing/summary.ts`), anchored to real types.
 
-## Zoom out — where a prompt's anatomy sits
+## Zoom out — where this concept lives
 
-A prompt is not one blob of text. It's four sections with four different
-lifetimes, and the whole skill is keeping them from bleeding into each other.
-Here's where they'd live relative to flattr's existing code.
+A prompt isn't one string. It's four sections with different lifetimes, and the whole discipline starts with not mixing them up. Here's where the prompt would sit in flattr if Seam 1 existed:
 
 ```
-  Zoom out — the four sections, mapped to flattr's Seam 1
+  Zoom out — the "describe my route" prompt, in context
 
-  ┌─ Engine layer (exists: features/routing/) ──────────────────────┐
-  │  routeSummary() ──► RouteSummary{distanceM, climbM, steepCount}  │
-  └───────────────────────────────┬──────────────────────────────────┘
-                                  │ this struct feeds section 2
-  ┌─ Prompt assembly (future) ────▼──────────────────────────────────┐
-  │  ┌──────────────┐ constant  ← shipped with the build             │
-  │  │ 1 SYSTEM     │           "You describe walking routes..."     │
-  │  ├──────────────┤ per-call  ← ★ RouteSummary goes HERE ★         │
-  │  │ 2 CONTEXT    │           "distance=3200m climb=45m steep=0"   │
-  │  ├──────────────┤ constant  ← 2-3 frozen examples                │
-  │  │ 3 FEW-SHOT   │           input→ideal output pairs             │
-  │  ├──────────────┤ per-call  ← the actual ask                     │
-  │  │ 4 USER MSG   │           "Describe this route."               │
-  │  └──────────────┘                                                │
-  └──────────────────────────────────────────────────────────────────┘
+  ┌─ Runtime (routing) ──────────────────────────────────────────┐
+  │  astar.ts  →  routeSummary(graph, path, userMax)             │
+  │                         │  RouteSummary {distanceM,climbM,    │
+  │                         │    steepCount} + Path.steepEdges    │
+  └─────────────────────────┼────────────────────────────────────┘
+                            │  structured object
+  ┌─ Prompt assembly (SEAM 1) ▼──────────────────────────────────┐
+  │  ┌──────────────┐  ★ THIS FILE: the four sections ★          │ ← we are here
+  │  │ system       │  who the model is, output contract         │
+  │  │ context      │  ← the RouteSummary goes HERE              │
+  │  │ few-shot     │  2-3 example route descriptions           │
+  │  │ user message │  "describe this route"                    │
+  │  └──────────────┘                                            │
+  └─────────────────────────┬────────────────────────────────────┘
+                            │  HTTP
+  ┌─ Provider ──────────────▼────────────────────────────────────┐
+  │  LLM → "Mostly flat, 2.1km, one short climb near the bridge" │
+  └──────────────────────────────────────────────────────────────┘
 ```
 
-The box we care about is section 2 — it's the only one wired to flattr's
-real data. The other three are constant text you'd write once.
+Now zoom in. The pattern is: **a prompt is a struct with four named fields, and each field has a different rate of change.** Get the fields confused and your prompt drifts — which is the single most common way prompt-dependent features rot. Let me build the struct.
 
-## Zoom in
+## Structure pass
 
-The pattern: **a prompt is four sections, each doing exactly one job, split
-by what changes per call.** System and few-shot are constant (they ship with
-the build). Context and user-message are per-call (they change every request).
-Mix those lifetimes — drop a per-call detail into the system prompt — and you
-get drift, the slow rot where a prompt that worked in March behaves
-differently in June and nobody can point at the line that did it.
+**Layers.** Three nested levels in the assembled prompt: the *envelope* (which message role each chunk goes in — system vs user), the *sections* (the four logical blocks), and the *tokens* (the actual text). Confusion happens when people edit at the token level without respecting the section they're editing.
 
-## The structure pass
-
-**Layers:** four sections, top (most constant) to bottom (most variable).
-**Axis:** *lifetime* — when is this text decided?
-**Seam:** the line between constant and per-call. That's where drift leaks.
+**Axis — lifecycle (rate of change).** Hold one question across the sections: *how often does this text change?*
 
 ```
-  axis = "when is this text decided?"  — traced down the sections
+  One axis — "how often does this section change?" — across the four sections
 
-  ┌─ system ───────┐   decided: BUILD TIME (frozen, version-controlled)
-  ├─ few-shot ─────┤   decided: BUILD TIME (frozen examples)
-  │   ─── seam: constant | per-call ───  ◄── lifetime FLIPS here
-  ├─ context ──────┤   decided: REQUEST TIME (this route's numbers)
-  └─ user message ─┘   decided: REQUEST TIME (this user's ask)
+  ┌─ system prompt ──────────────┐   → changes per DEPLOY    (constant)
+  └──────────────────────────────┘
+      ┌─ few-shot examples ──────┐   → changes per DEPLOY    (constant)
+      └──────────────────────────┘
+          ┌─ context injection ──┐   → changes per CALL      (the RouteSummary)
+          └──────────────────────┘
+              ┌─ user message ───┐   → changes per CALL      (the request)
+              └──────────────────┘
+
+  the answer flips between example #2 and #3 — that's the seam
 ```
 
-If you can't say whether a sentence is build-time or request-time, it's in the
-wrong section. That single question prevents most prompt rot.
+**Seam.** The load-bearing boundary is *between constant and per-call*. System prompt + few-shot examples are baked at deploy time; context + user message are filled at request time. This boundary is exactly the one prefix caching exploits (see `04-token-budgeting.md`) and exactly the one that injection attacks try to blur (see `12-prompt-injection-defense.md`). Everything constant goes first; everything per-call goes last.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You already know this shape from React, you just call the parts something
-else. A component has **props that never change for a given mount** (config
-passed once) and **props that change every render** (state-derived values).
-A prompt is the same split: system + few-shot are the config you pass once;
-context + user message are the per-render values. Mixing them is like
-hardcoding today's date into a component's default props — it works until the
-day it doesn't, and the bug is invisible because the code "looks fine."
+You already know this shape. A React component has props that are constant for the component's definition and props that change per render. A prompt is the same: the system prompt and examples are the *definition*, the context and user message are the *per-render props*. Same split, different surface.
 
 ```
-  Pattern — the four-part prompt as one assembled string
+  The four-section prompt — the kernel shape
 
-         ┌─────────────── ASSEMBLED PROMPT ───────────────┐
-  build  │ [SYSTEM]   role + rules + output contract       │
-  time   │ [FEW-SHOT] example_in → example_out  (×2–3)     │
-         ├────────────────────────────────────────────────┤
-  req    │ [CONTEXT]  ◄── RouteSummary serialized here     │
-  time   │ [USER]     "Describe this route in one line."   │
-         └────────────────────────────────────────────────┘
-                              │
-                              ▼  one call
-                         LLM → prose
+  ┌─────────────────────────────────────────────────┐
+  │ 1. SYSTEM    role + output contract              │ constant
+  │    "You describe walking routes for a            │ (deploy-time)
+  │     grade-aware router. Be concrete. ≤2 sentences"│
+  ├─────────────────────────────────────────────────┤
+  │ 2. FEW-SHOT  2-3 example (input,output) pairs    │ constant
+  │    {distanceM:1200,climbM:8,...} → "Flat, 1.2km" │ (deploy-time)
+  ├─────────────────────────────────────────────────┤
+  │ 3. CONTEXT   the data for THIS call              │ per-call
+  │    <route>{distanceM:2100,climbM:14,steepCount:1}│ (request-time)
+  │            steepEdges:["e44"]</route>            │
+  ├─────────────────────────────────────────────────┤
+  │ 4. USER      the instruction for THIS call       │ per-call
+  │    "Describe this route in one sentence."        │ (request-time)
+  └─────────────────────────────────────────────────┘
 ```
 
-### Move 2 — walk each section against flattr's real struct
+### Move 2 — the step-by-step walkthrough
 
-**Section 1 — the system prompt (constant; sets role + the output contract).**
-This is where you state the job once and freeze it. For Seam 1 it would say:
-"You describe self-powered travel routes. One sentence. Mention flatness
-honestly — if there are steep blocks, say so." The thing juniors get wrong:
-they put the route's numbers here. They don't go here. Numbers are per-call.
+**System prompt — who the model is and what it must emit.** This is the constant frame. In a React component, this is the part of the JSX that never depends on props. For flattr's Seam 1, the system prompt names the role ("you describe walking routes for a grade-aware router") and the output contract ("one sentence, no markdown, mention the climb only if `climbM > 10`"). It changes when you *deploy a new version of the feature*, never per request.
 
-**Section 2 — context injection (per-call; this is the ONLY section wired to
-flattr).** Here's the real struct that feeds it, today, in the repo:
+```
+  Hop: structured object → system-prompt frame
+
+  ┌─ Runtime ────────┐  RouteSummary    ┌─ Prompt assembly ──────┐
+  │ routeSummary()   │ ───────────────► │ system: role + contract│
+  │ returns struct   │   (per call)     │ (constant — not the    │
+  └──────────────────┘                  │  struct, the FRAME)    │
+                                        └────────────────────────┘
+```
+
+The thing to anchor: the system prompt does NOT contain the route. It contains the *rules for describing any route*. The route arrives in section 3.
+
+**Context injection — the per-call data.** This is where flattr's real structured output goes. Here's the actual type that would be templated in:
 
 ```ts
-// features/routing/summary.ts:5,11-20  — EXISTS today
-export type RouteSummary = { distanceM: number; climbM: number; steepCount: number };
-
-export function routeSummary(graph: Graph, path: Path, _userMax: number): RouteSummary {
-  let climbM = 0;
-  for (let i = 0; i < path.edges.length; i++) {
-    const edge = edgeById(graph, path.edges[i]);
-    const fromNode = path.nodes[i];
-    const directedRise = fromNode === edge.fromNode ? edge.riseM : -edge.riseM;
-    if (directedRise > 0) climbM += directedRise;     // uphill-only sum
-  }
-  return { distanceM: path.lengthM, climbM, steepCount: path.steepEdges.length };
-}
+// features/routing/summary.ts:5
+export type RouteSummary = {
+  distanceM: number;      // → "2.1km"
+  climbM: number;         // → "one climb" (only if > threshold)
+  steepCount: number;     // → "one short steep stretch you flagged"
+};
+// plus, from features/routing/types.ts:36
+// Path.steepEdges: string[]   ← the edge IDs that exceeded userMax
 ```
 
-Line-by-line for the prompt's sake: `distanceM` is total length, `climbM` is
-*directed* uphill rise only (downhill doesn't subtract — that's a product
-decision flattr already made), `steepCount` is how many blocks exceed the
-user's max grade. Those three numbers are the entire context payload. The
-serialization step — the future code — would be one line:
+`distanceM`, `climbM`, and `steepCount` are three numbers and one array. You template them into the context section wrapped in a delimiter (`<route>...</route>`) — the delimiter matters for injection defense, covered in `12`. The key discipline: **the context section is data, not instructions.** The system prompt says "describe the route below"; the context section *is* the route. Mixing a stray instruction into the context section ("...and make it sound exciting") is exactly how prompts drift.
 
-```
-  // FUTURE — the context section, built from the real struct
-  context = `distance_m=${s.distanceM} climb_m=${s.climbM} steep_count=${s.steepCount} user_max_pct=${userMax}`
-```
+**Few-shot examples — constant, between system and context.** Two or three `(RouteSummary → sentence)` pairs that pin the output format. flattr already has the perfect source for these: the golden graphs in `features/routing/fixtures.ts:46` (`diamondGraph`, `gradeGraph`, `directionalGraph`) produce known routes, so you can compute real `RouteSummary` objects and hand-write the ideal sentence for each. Full treatment in `08-few-shot.md`. They live *with* the system prompt (constant) — not with the context (per-call). Putting an example in the per-call slot means it gets re-sent and re-billed every request and breaks prefix caching.
 
-That's it. Three numbers and the knob. Notice what's *not* here: no graph, no
-node list, no geometry. flattr's context payload is tiny by construction,
-which is a gift — see `04-token-budgeting.md`.
-
-```
-  Layers-and-hops — RouteSummary crossing into the context section
-
-  ┌─ engine ─────┐ hop 1: routeSummary()   ┌─ assembler ──┐
-  │ summary.ts   │ ──────────────────────► │ serialize    │
-  └──────────────┘   RouteSummary{3 nums}  └──────┬───────┘
-                                          hop 2:  │ inject as
-                                          context │ section 2
-                                                  ▼
-                                          ┌─ prompt string ─┐
-                                          │ [SYSTEM]...      │
-                                          │ [CONTEXT]◄here   │
-                                          └──────────────────┘
-```
-
-**Section 3 — few-shot examples (constant; 2–3 frozen pairs).** Two example
-routes with their ideal one-line descriptions. These constrain tone harder
-than any instruction in the system prompt — covered in full in
-`08-few-shot.md`. They're constant: they ship with the build.
-
-**Section 4 — the user message (per-call; the actual ask).** Often trivial
-here: "Describe this route." It's per-call because in a real app it might
-carry the user's phrasing preference, locale, etc.
-
-### Move 2 variant — the load-bearing skeleton
-
-The irreducible kernel is **system + one per-call section**. Strip it down:
-
-- **Drop the system prompt** → the model has no role and no output contract;
-  it returns a paragraph when you wanted one line, and your parser (concept
-  07) breaks. *This is load-bearing.*
-- **Drop the context section** → the model has nothing to describe; it
-  hallucinates a route. *Load-bearing.*
-- **Drop few-shot** → still works, output is just less consistent. *Hardening,
-  not skeleton.*
-- **Drop the user message** → some APIs require it; mostly *hardening* for
-  this use case.
-
-So the skeleton is **system (role + contract) + context (the data)**. Few-shot
-and a rich user message are hardening you add when consistency matters.
+**User message — the per-call instruction.** "Describe this route." Short. The user message is *not* where the data goes (that's context) and *not* where the rules go (that's system). In a single-purpose chain like this, the user message is almost boilerplate — the work is in the system prompt and the context.
 
 ### Move 3 — the principle
 
-A prompt is a function with a constant config closure and per-call arguments.
-The bugs that take two weeks to find are always a per-call value that
-someone froze into the constant part, or vice versa. Name each section by its
-lifetime before you write a word of it.
+A prompt is a struct with four fields and two lifetimes. The discipline is: **one job per section, named explicitly, constant-before-per-call.** When a prompt fails 5% of the time and you can't figure out why, nine times out of ten someone put a per-call instruction in the system prompt or a constant rule in the user message, and the two lifetimes started fighting. Keep the sections clean and the failures become legible.
 
 ## Primary diagram
 
-The full Seam 1 prompt, every section labeled by lifetime, with the one real
-flattr wire marked.
+The full Seam 1 prompt, assembled, with every section's lifetime and source labeled.
 
 ```
-  Seam 1 "describe my route" — full anatomy (FUTURE)
+  "Describe my route" — the assembled prompt, sources and lifetimes
 
-  ┌──────────────────────────── PROMPT ─────────────────────────────┐
-  │ ┌─ 1 SYSTEM (constant, build-time) ────────────────────────────┐ │
-  │ │ "Describe self-powered routes. One sentence. Steep = honest." │ │
-  │ └───────────────────────────────────────────────────────────────┘ │
-  │ ┌─ 3 FEW-SHOT (constant, build-time) ──────────────────────────┐ │
-  │ │ in: d=2100 climb=10 steep=0 → "Flat 2.1 km, no climbs."       │ │
-  │ │ in: d=3400 climb=80 steep=2 → "3.4 km, mostly flat, 2 steep." │ │
-  │ └───────────────────────────────────────────────────────────────┘ │
-  │ ┌─ 2 CONTEXT (per-call) ◄══ from summary.ts RouteSummary ══════┐ │
-  │ │ "distance_m=3200 climb_m=45 steep_count=0 user_max_pct=8"     │ │
-  │ └───────────────────────────────────────────────────────────────┘ │
-  │ ┌─ 4 USER (per-call) ──────────────────────────────────────────┐ │
-  │ │ "Describe this route in one line."                            │ │
-  │ └───────────────────────────────────────────────────────────────┘ │
-  └──────────────────────────────┬───────────────────────────────────┘
-                                 ▼  LLM → "A flat 3.2 km route, no steep blocks."
+  ┌─ Runtime (routing) ──────────────────────────────────────────┐
+  │ routeSummary(graph, path, userMax)  →  RouteSummary           │
+  │   {distanceM, climbM, steepCount}  +  Path.steepEdges         │
+  └───────────────────────────────┬──────────────────────────────┘
+                                  │ per-call
+  ┌─ Prompt assembly (Seam 1) ────▼──────────────────────────────┐
+  │ ┌────────────────────────────────────────────────┐ constant  │
+  │ │ SYSTEM   role + output contract (≤1 sentence)   │ (deploy)  │
+  │ ├────────────────────────────────────────────────┤ constant  │
+  │ │ FEW-SHOT 2-3 pairs from fixtures.ts golden set  │ (deploy)  │
+  │ ├═══════════════════ caching seam ════════════════┤           │
+  │ │ CONTEXT  <route>{the RouteSummary struct}</route>│ per-call  │
+  │ ├────────────────────────────────────────────────┤ per-call  │
+  │ │ USER     "Describe this route in one sentence." │ per-call  │
+  │ └────────────────────────────────────────────────┘           │
+  └───────────────────────────────┬──────────────────────────────┘
+                                  │ HTTP
+  ┌─ Provider ────────────────────▼──────────────────────────────┐
+  │ LLM → "Mostly flat, 2.1km — one short climb you flagged."     │
+  └──────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-The four-section model is the spine of both the Anthropic prompt-engineering
-guide and the OpenAI cookbook, though they name the sections differently
-(Anthropic leans on XML-tag delimiters for the context section — relevant
-later for `12-prompt-injection-defense.md`). The lifetime split (constant vs
-per-call) is the same idea as prefix caching at the provider level: providers
-cache the constant prefix across calls, so keeping system + few-shot stable
-and at the front is both a cleanliness win and a cost win (see
-`04-token-budgeting.md`). Read `02-structured-outputs.md` next — it shows why,
-for flattr's classifier-shaped seams, the output contract in section 1 should
-be a schema, not a sentence.
+The four-section model is the lowest common denominator across providers. Anthropic and OpenAI both expose `system` and `user`/`assistant` roles; few-shot examples are conventionally encoded as prior `user`/`assistant` turns rather than a literal "examples" field. Anthropic's prompt guide leans on XML-style delimiters (`<route>`) for the context section, which is why I used them above — they make the data/instruction boundary explicit to the model and they're the cheapest injection defense you get for free. The deeper reason to keep sections clean is everything downstream: prefix caching (`04`) needs the constant prefix stable, evals (`05`) need to diff one section at a time, and injection defense (`12`) needs the data section to be unambiguously data.
+
+## Project exercises
+
+### EX-ANATOMY-1 — Build the Seam 1 prompt assembler
+
+- **Exercise ID:** EX-ANATOMY-1
+- **What to build:** A pure function `buildRouteDescriptionPrompt(summary: RouteSummary, steepEdges: string[]): Messages` that assembles the four sections, with system + few-shot constant and context + user per-call.
+- **Why it earns its place:** Forces you to physically separate the two lifetimes in code, which is where the discipline becomes real instead of theoretical.
+- **Files to touch:** new `features/routing/describe-prompt.ts`; import `RouteSummary` from `summary.ts`, `Path` from `types.ts`.
+- **Done when:** the constant sections are module-level constants and the per-call sections are function arguments — verifiable by reading the file.
+- **Estimated effort:** 1-2 hours.
 
 ## Interview defense
 
-**Q: "What's the difference between the system prompt and the user message?"**
-Lifetime. System is constant — role and output contract, decided at build
-time, version-controlled, cached as a prefix. User message is per-call. The
-tell that someone's never shipped: they put per-call data in the system
-prompt, and then can't explain why the prompt "drifts."
+**Q: What are the four sections of a production prompt and why does the order matter?**
+
+System, few-shot examples, context injection, user message. Order matters because the first two are constant (deploy-time) and the last two are per-call (request-time), and providers cache the constant prefix — so constant-before-per-call is what makes caching work.
 
 ```
-  ┌─ system ─┐ build-time, frozen, cached
-  │  ─seam─   │ ◄── lifetime flips
-  └─ user ───┘ request-time, varies
+  ┌ system ┐┌ few-shot ┐│┌ context ┐┌ user ┐
+  └────────┘└──────────┘│└─────────┘└──────┘
+   constant prefix      │  per-call suffix
+   (cacheable)      cache seam
 ```
 
-Anchor: *"In flattr's Seam 1, the role and 'be honest about steep blocks'
-rule are system; the three `RouteSummary` numbers are context. Swap them and
-you get drift."*
+Anchor: in flattr's Seam 1, the `RouteSummary` from `summary.ts:5` is the *context* section — per-call — never the system prompt.
 
-**Q: "Where would flattr's first prompt get its data?"** `RouteSummary` from
-`features/routing/summary.ts:11` — three numbers, serialized into the context
-section. Nothing else crosses the seam.
+**Q: What's the most common way this anatomy gets violated?**
+
+A per-call instruction sneaking into the system prompt, or vice versa. The two lifetimes start fighting and the prompt fails intermittently. The fix is the decomposition rule: one job per section, named explicitly.
 
 ## See also
 
-- [02-structured-outputs.md](02-structured-outputs.md) — make section 1's
-  contract a schema
-- [08-few-shot.md](08-few-shot.md) — section 3 in depth
-- [04-token-budgeting.md](04-token-budgeting.md) — why the constant sections
-  go at the front
-- [00-overview.md](00-overview.md) — the three-seam map
-</content>
+- `02-structured-outputs.md` — the `RouteSummary` as a typed contract
+- `04-token-budgeting.md` — why constant-before-per-call enables prefix caching
+- `08-few-shot.md` — filling the few-shot section from `fixtures.ts`
+- `12-prompt-injection-defense.md` — why the context section must be unambiguously data

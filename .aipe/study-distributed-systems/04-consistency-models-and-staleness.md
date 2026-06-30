@@ -1,241 +1,291 @@
-# Consistency Models & Staleness
+# 04 — Consistency Models and Staleness
 
-**Industry name(s):** stale reads / eventual consistency / read-repair / availability-over-consistency (the CAP choice) · *Industry standard*
+**Industry names:** consistency models (strong / eventual) / staleness / cache
+coherence / read-your-writes / convergence. **Type:** Industry standard.
 
 ## Zoom out, then zoom in
 
-This is the richest exercised concept in the repo. flattr makes two distinct consistency decisions, both deliberate, and one of them is a textbook CAP tradeoff you can point at in real code.
+You know how a `useState` value is *strongly consistent* with itself — you set it,
+the next read is the value you set, no question? The moment data lives somewhere
+you don't control and arrives over a network, that guarantee evaporates. The data
+you're holding might be old. Consistency models are the vocabulary for *how* old
+it's allowed to be, and what the system promises about catching up.
+
+flattr's data has two different staleness stories sitting in two different layers.
 
 ```
-  Zoom out — two layers of "how fresh is this data?"
+  Zoom out — flattr's two staleness layers
 
-  ┌─ Local state layer ─────────────────────────────────────────┐
-  │  graph.json (bundled)   ★ STALE BY DESIGN ★                  │ ← decision 1
-  │   frozen at build time, ships in the app bundle             │
-  └────────────────────────┬─────────────────────────────────────┘
-                           │ augmented at run time by ↓
-  ┌─ Local persistence layer ▼──────────────────────────────────┐
-  │  elevCache (AsyncStorage) ★ EVENTUALLY CONSISTENT LOCALLY ★  │ ← decision 2
-  │   degraded → self-heal retry → converges to real grades     │
-  └────────────────────────┬─────────────────────────────────────┘
-                           │ on miss, crosses to ↓
-  ┌─ Provider layer ───────▼──────────────────────────────────────┐
-  │  Open-Meteo (the source of truth for elevation)              │
-  └───────────────────────────────────────────────────────────────┘
+  ┌─ Build-time (you own) ────────────────────────────────────────┐
+  │  graph.json — baked once, read-only forever  ★ STALE BY DESIGN │ ← layer 1
+  └───────────────────────┬───────────────────────────────────────┘
+                          │  shipped as a static asset (no live link)
+                          ▼
+  ┌─ Runtime client (you own) ────────────────────────────────────┐
+  │  elevation cache + on-demand tiles                            │
+  │  best-effort, degraded-marked, self-healing  ★ EVENTUALLY     │ ← layer 2
+  │                                              CONSISTENT        │
+  └───────────────────────┬───────────────────────────────────────┘
+                          │  HTTP
+                          ▼
+  ┌─ Third parties — the source of truth (you don't own) ─────────┐
+  │  OSM streets (MUTABLE)      ·    DEM heights (IMMUTABLE)       │
+  └────────────────────────────────────────────────────────────────┘
 ```
 
-**Zoom in.** A consistency model answers: when you read, how fresh is the answer, and what's promised? Strong consistency = you always see the latest write. Eventual consistency = you might see a stale value now, but the system converges to fresh given time and no new writes. flattr uses *neither extreme uniformly* — it picks the right weakening for each layer: the base graph is intentionally frozen (staleness is acceptable for street geometry), and the elevation overlay is eventually consistent with an explicit convergence mechanism (because a throttle shouldn't break the map).
+Zoom in: the concept is **eventual consistency** — local data that may be stale
+right now but *converges* toward the source of truth over time. flattr exhibits
+two flavors: the graph is **stale-by-design** (baked at build, never refreshed at
+runtime — a deliberate strong-staleness choice), while the runtime elevation data
+is **eventually consistent** (best-effort, marked when degraded, self-healing
+until it matches the real DEM). Knowing *which layer is which* is the file.
 
-## Structure pass
+## The structure pass
 
-**Layers.** Bundled graph (frozen) → cache (converging) → provider (source of truth).
+**Layers.** Two, as the zoom-out shows: the baked graph (layer 1) and the runtime
+cache/tiles (layer 2). They have *opposite* consistency contracts and that
+opposition is the lesson.
 
-**The axis: `guarantees` — what's promised about freshness at each layer?** Hold that question constant and walk down:
+**Axis — trace `how does this layer catch up to the source of truth?` down the
+layers.**
 
 ```
-  One question down the layers: "how fresh, and what's promised?"
+  One axis — "how does stale data here become fresh?" — down the layers
 
-  ┌─ graph.json (bundled) ──────────────────┐
-  │  freshness: as of last `npm run build`   │  → STALE, promised stale
-  │  convergence: none (rebuild to refresh)  │     (acceptable: streets rarely move)
-  └──────────────────┬───────────────────────┘
-  ┌─ elevCache ──────▼───────────────────────┐
-  │  freshness: real value OR flat fallback   │  → EVENTUALLY fresh
-  │  convergence: self-heal retry (12s loop)  │     (degraded → real)
-  └──────────────────┬───────────────────────┘
-  ┌─ Open-Meteo ─────▼───────────────────────┐
-  │  freshness: authoritative (the DEM)       │  → SOURCE OF TRUTH
-  │  convergence: n/a                          │     (but DEM never changes, so
-  └───────────────────────────────────────────┘      cached forever is correct)
+  ┌─ baked graph (graph.json) ──────────┐
+  │ catches up ONLY when a human runs    │  → manual, coarse-grained,
+  │ `npm run build:graph` and reships    │     stale-by-design
+  └──────────────────┬───────────────────┘
+                     │  the answer flips ↓
+  ┌─ runtime tiles ──▼───────────────────┐
+  │ catches up AUTOMATICALLY: degraded    │  → automatic, fine-grained,
+  │ regions self-heal every 12s until     │     eventually consistent
+  │ real grades land (useTileGraph:209)   │
+  └──────────────────┬───────────────────┘
+                     │  the answer flips AGAIN ↓
+  ┌─ elevation cache ▼───────────────────┐
+  │ NEVER catches up — and never needs to │  → immutable: DEM heights don't
+  │ (elevCache.ts:4: "valid forever")     │     change, so "stale" is undefined
+  └───────────────────────────────────────┘
 ```
 
-**The seams.** Two. First seam: the bundle boundary — data is frozen on the dev side, read-only on the user side; freshness flips from "live" to "as-of-build." Second seam: the cache miss — `getElev` returns `undefined`, and the read crosses to the provider, where freshness flips from "maybe stale/flat" to "authoritative." Both seams are where a consistency decision got made.
+Three layers, three different convergence answers — manual, automatic, never-needed.
+*That* spread is what makes flattr a good consistency study: it shows that
+"stale" isn't one thing, it's a question you answer per-data-class.
+
+**Seam.** The load-bearing seam is the `degraded` flag (`useTileGraph.ts:75`) — it
+sits exactly at the boundary between "data I'm showing" and "data that's a
+placeholder," and it's what lets flattr serve *available-but-wrong* data without
+*lying* about it. That single boolean is flattr's entire consistency-marking
+mechanism.
 
 ## How it works
 
-### Move 1 — the mental model
+### Move 1 — the mental model: the consistency spectrum
 
-You know eventual consistency from any optimistic-UI pattern: you show the user *something* immediately (maybe slightly wrong), then reconcile with the server and correct it. flattr's elevation layer is exactly that shape — show flat grades now if the API is throttled, then quietly upgrade to real grades when it recovers.
-
-```
-  The convergence kernel — degraded read that self-heals
-
-  ┌──────────────────────────────────────────────────────────┐
-  │ 1. try real elevation                                     │
-  │ 2. throttled? → return FLAT (0m), mark region `degraded`  │ ← availability
-  │ 3. render immediately (streets connect, map usable)       │   over
-  │ 4. schedule a silent retry of the degraded region         │   consistency
-  │ 5. retry lands real grades → `degraded` clears → converge │ ← read-repair
-  │ 6. (capped at MAX_RETRIES so an outage can't loop forever)│
-  └──────────────────────────────────────────────────────────┘
-```
-
-Name each part by what breaks without it: drop step 2 and a throttle fails the whole build (no map). Drop step 4 and the flat grades are permanent — never converges. Drop step 6 and a sustained outage retries forever, draining battery and quota. All three are present in `useTileGraph.ts`.
-
-### Move 2 — the walkthrough
-
-**Part 1 — staleness by design (the bundled graph).** The base graph isn't fetched; it's baked and shipped:
-
-```ts
-// pipeline/run-build.ts:43-48 — built ONCE, on a dev machine
-const osm = await fetchOverpass(BBOX);
-const graph = await buildGraph("seattle-mvp", BBOX, osm, provider, maxSegM, sampleOpts);
-mkdirSync("data", { recursive: true });
-writeGraph(graph, "data/graph.json");   // frozen artifact
-```
-
-```ts
-// mobile/src/loadGraph.ts:7-11 — read-only at run time, no refresh path
-import graph from "../assets/graph.json";
-export function loadGraph(): Graph {
-  return graph as unknown as Graph;       // whatever the world looked like at build
-}
-```
-
-This is a *consistency decision*, not an accident. Street geometry changes on the order of years; a graph that's months stale routes you correctly the vast majority of the time. The cost — owned plainly — is that a new sidewalk built after the last `npm run build:graph` simply doesn't exist in the app until someone rebuilds and reships. That's an acceptable staleness window for this data, and choosing it deliberately is the lesson. (Contrast: you would *never* freeze a bank balance this way.)
-
-**Part 2 — the CAP choice, in one function.** Here's the availability-over-consistency decision as actual code:
-
-```ts
-// mobile/src/useTileGraph.ts:20-31
-function bestEffortElevation(p: ElevationProvider, onFallback: () => void): ElevationProvider {
-  return {
-    async sample(points) {
-      try {
-        return await p.sample(points);       // try for the consistent (real) answer
-      } catch {
-        onFallback();                        // mark: we gave up consistency
-        return points.map(() => 0);          // return AVAILABLE answer (flat) instead
-      }
-    },
-  };
-}
-```
-
-When Open-Meteo throttles, you have a partition (you can't reach the source of truth). CAP says: pick consistency (fail — show nothing until you can get real grades) or availability (return *an* answer — flat grades — and stay usable). flattr picks **availability**. The comment at `useTileGraph.ts:17-19` states it outright: *"Connectivity/coverage over fidelity... the streets still render and routing still connects."* This is the single clearest distributed-systems decision in the codebase.
-
-**Part 3 — but availability without convergence is just being wrong.** Returning flat grades and stopping there would be a bug — the user would see a permanently flat map. So `degraded` is tracked and drives a self-heal loop:
-
-```ts
-// mobile/src/useTileGraph.ts:209-218 — schedule the read-repair
-if (degraded && retryCountRef.current < MAX_RETRIES) {  // capped: no infinite loop
-  retryCountRef.current += 1;
-  if (retryRef.current) clearTimeout(retryRef.current);
-  retryRef.current = setTimeout(() => {
-    if (viewRef.current?.degraded)                       // still flat? re-queue it
-      pendingViewRef.current = { bbox: viewRef.current.bbox, silent: true };  // silent: no spinner
-    if (corridorRef.current?.degraded)
-      pendingCorridorRef.current = { bbox: corridorRef.current.bbox, silent: true };
-    pump();
-  }, RETRY_MS);                                          // RETRY_MS = 12000 (12s)
-}
-```
-
-The `silent: true` flag (set here, consumed at `useTileGraph.ts:183,196,223`) is a nice touch: the self-heal happens in the background without flashing the loading overlay, so grades just *appear* once the API recovers. This is **read-repair** — a stale/degraded value gets corrected on a later access, the same mechanism Dynamo-style stores use to converge replicas.
-
-**Part 4 — two graphs, two consistency policies.** The subtlest part: flattr keeps *two* derived graphs with *different* consistency rules, because routing and display have different tolerance for bad data:
-
-```ts
-// mobile/src/useTileGraph.ts — graph (routing) INCLUDES degraded regions:
-//   :132-145  flat grades are fine for CONNECTIVITY ("no route" must stay distinct)
-// displayGraph (heatmap) EXCLUDES degraded regions:
-//   :150-162  so bogus all-flat grades don't paint over real grades
-```
+Consistency runs on a spectrum from "always correct, possibly slow/unavailable"
+to "always available, possibly wrong":
 
 ```
-  Same data, two consistency policies — by use case
+  The pattern — the consistency spectrum, and where flattr sits
 
-  region X is `degraded` (flat fallback)
-        │
-        ├──► routing graph:  INCLUDE it
-        │      (you'd rather route over flat-but-connected streets
-        │       than tell the user "no route exists")
-        │
-        └──► display graph:  EXCLUDE it
-               (you'd rather show nothing than paint fake green
-                over the real grades the user is trying to read)
+  STRONG ◄─────────────────────────────────────────────► EVENTUAL
+  every read sees                                  reads may be stale;
+  the latest write                                 system converges later
+       │                                                    │
+       │                            flattr graph ───────────┤ stale-by-design
+       │                            flattr tiles ───────────┤ self-healing
+       │                            (and CAP: when the network splits,
+       │                             you pick A[vailable] or C[onsistent])
+       └─ a single in-memory                                │
+          variable lives here                               │
 ```
 
-That's a genuinely sharp call: *availability* wins for routing (include degraded), *consistency* wins for display (exclude degraded). Same underlying data, opposite policy, chosen per use case. Most engineers would use one merged graph and get a subtle "why is the whole hill green?" bug.
+The CAP theorem makes the tradeoff sharp: when a network partition happens (here:
+the elevation API is unreachable/throttled), a system can stay **C**onsistent
+(refuse to serve rather than serve stale/wrong data) **or** stay **A**vailable
+(serve something, accept it might be wrong). You cannot have both during the
+partition. flattr picks **A** every time — and the `degraded` flag is how it picks
+A *honestly*.
 
-**Part 5 — read-your-writes, and why it's trivial here.** A classic consistency hazard: you write, then read, and the read doesn't reflect your write (because it hit a stale replica). flattr can't hit this — there are no writes across the boundary (`03`), and the local cache is write-through in-process (`putElev` updates the in-memory `Map` immediately at `elevCache.ts:35-40`, persistence is just a debounced backup). So a value you just cached is readable instantly on the next `getElev`. Read-your-writes holds for free, locally. It'd become a real concern only with a remote store and multiple readers.
+### Move 2 — walk flattr's two consistency stories
 
-### Move 2.5 — current vs future
+**Story 1 — the graph is stale-by-design.** `run-build.ts` fetches OSM, builds
+the graph, and writes `data/graph.json` (`run-build.ts:46-48`). The app then only
+*reads* it — `mobile/assets/graph.json`, loaded once. There is no live link back
+to OSM.
 
 ```
-  Phase A (now)                         Phase B (multi-device sync)
-  ─────────────                         ───────────────────────────
-  graph frozen at build, reship to      graph still fine to freeze
-   refresh                              saved routes need a sync model:
-  elevCache: local, converges via        • last-writer-wins? (clock needed → 07)
-   self-heal retry                        • CRDT / merge?
-  read-your-writes: free (in-process)   read-your-writes: now HARD
-                                          (write on phone A, read on phone B)
+  layers-and-hops — the graph's one-way, build-time freshness
+
+  ┌─ OSM (source of truth, MUTABLE) ─┐
+  │  streets edited continuously     │
+  └──────────────┬───────────────────┘
+       hop 1: fetchOverpass (ONCE, at build) ↓
+  ┌─ build pipeline ─────────────────┐
+  │  buildGraph → graph.json         │
+  └──────────────┬───────────────────┘
+       hop 2: ship static asset ↓ (NO further hops — the link ends here)
+  ┌─ app ────────────────────────────┐
+  │  reads graph.json forever        │  ← frozen at build time
+  └──────────────────────────────────┘
+       a street added in OSM today is invisible until the next
+       `npm run build:graph` + reship. Staleness = time since last build.
 ```
 
-The base-graph staleness model survives untouched into Phase B. What breaks is the moment *user-generated* state (saved routes, preferences) needs to exist on two devices — then you inherit the full eventual-consistency problem and need clocks (`07`) to order writes.
+This is a deliberate choice, not a bug. The cost is honest: a street that changed
+in OSM after the last build is wrong in flattr until someone rebuilds. The benefit
+bought: zero runtime dependency on Overpass for the base map, instant startup,
+works offline. For a routing graph where streets change on the order of months,
+trading freshness for a static artifact is the right call — name it as
+"stale-by-design," not "out of date."
+
+**Story 2 — the runtime tiles are eventually consistent.** On-demand tile builds
+(`useTileGraph.ts`) layer fresher data on top, and *this* layer converges. Walk
+the three-state lifecycle of a region:
+
+```
+  state — a region's path from wrong-but-available to consistent
+
+  ┌─ fresh build, elevation OK ─┐   real grades, degraded=false
+  │   → routing + display both  │   → fully consistent with the DEM
+  └──────────────┬──────────────┘
+                 │ elevation API 429s during build
+                 ▼
+  ┌─ DEGRADED (flat 0m grades) ─┐   degraded=true (useTileGraph.ts:75)
+  │   routing graph: INCLUDES it │   → AVAILABLE: streets render, routes connect
+  │   display graph: EXCLUDES it │   → HONEST: heatmap won't paint fake-flat green
+  └──────────────┬──────────────┘      over real grades (:150-162)
+                 │ self-heal: every 12s, re-queue build (:209-218)
+                 ▼
+  ┌─ healed: real grades land ──┐   degraded=false again
+  │   → converged to the DEM    │   → eventual consistency reached
+  └──────────────────────────────┘
+```
+
+The two-graph split (`useTileGraph.ts:132-162`) is the cleverest part and worth
+reading closely:
+
+```
+  useTileGraph.ts:132-162 — two graphs, two consistency policies
+
+  graph (ROUTING):    includes degraded regions     (:140-143)
+    └ rationale (:130): flat grades are fine for CONNECTIVITY — excluding them
+      would re-break "no route". Availability wins: route through bad-grade data.
+
+  displayGraph (HEATMAP): EXCLUDES degraded regions  (:156-160)
+    └ rationale (:147): bogus all-green grades must NOT paint over real grades.
+      Honesty wins: show nothing rather than show a lie.
+```
+
+That's *the same data* given two different consistency policies depending on what
+it's used for: for routing (where wrong-but-connected beats disconnected) it's
+included; for the heatmap (where wrong-and-visible is a lie) it's hidden until
+real. This is what mature eventual-consistency looks like — the staleness policy
+is per-use, not global.
+
+**Why the elevation cache never invalidates.** The third consistency answer from
+the structure pass: `elevCache.ts:4` states it flatly — *"DEM samples never
+change, so cached values are valid forever."* The height of a point on Earth is
+immutable, so there's no staleness to manage and no invalidation logic to write.
+Contrast with the graph: streets *are* mutable upstream, which is exactly why the
+graph goes stale and the elevation cache doesn't. Same repo, two data classes,
+opposite consistency needs — pick the model per data class, never globally.
+
+**Read-your-writes — not exercised, and why.** Read-your-writes consistency (after
+*you* write something, *you* immediately see it) requires user writes, and flattr
+has none — every operation is a read (`03`). There's no "save" to read back. The
+trigger: the day a user saves a route or a preference to a shared backend, you owe
+them read-your-writes (they must see their own save immediately even if other
+replicas lag), and that's where session-stickiness or read-from-primary enters.
+`not yet exercised` — honestly.
 
 ### Move 3 — the principle
 
-Consistency is not one global setting — it's a per-data-class decision. flattr proves it by running three different policies in one app: frozen-stale for street geometry (cheap, acceptable), eventually-consistent-with-read-repair for elevation (availability + convergence), and strong-locally for the in-process cache (free read-your-writes). The skill isn't "pick strong consistency everywhere" — that's expensive and often impossible under partition. It's knowing which data can tolerate staleness, and engineering convergence for the data that can't.
+Consistency is not a property you turn up to "max" — it's a per-data-class
+decision about how much staleness you can tolerate and how the data catches up.
+flattr makes that decision three times correctly: the graph trades freshness for a
+static artifact (stale-by-design), the runtime tiles converge automatically
+(eventually consistent), the DEM cache needs no model at all (immutable). **The
+skill isn't achieving strong consistency everywhere — it's knowing which data can
+be stale, marking it when it is, and never letting wrong-but-available data
+masquerade as fresh.** The `degraded` flag is that discipline in one boolean.
 
 ## Primary diagram
 
-```
-  Consistency & staleness in flattr — full recap
+The full picture: three data classes, three consistency models, the `degraded`
+seam that keeps availability honest.
 
-  ┌─ Local state ───────────────────────────────────────────────┐
-  │  graph.json  — FROZEN at build, stale-by-design, reship=refresh│
-  └────────────────────────┬─────────────────────────────────────┘
-                           │ augmented per viewport/corridor
-  ┌─ Coordination ─────────▼─────────────────────────────────────┐
-  │  sample(points)                                              │
-  │    cache hit ─────────────────► real grade (instant, fresh)  │
-  │    cache miss ─► Open-Meteo ─┬─ ok    → cache + use (fresh)   │
-  │                              └─ 429   → FLAT + mark degraded  │ ← CAP: availability
-  │                                          │                    │
-  │   degraded region ──► silent retry (12s, capped) ──► converge │ ← read-repair
-  │                                                               │
-  │   routing graph:  include degraded (connectivity wins)        │ ← policy A
-  │   display graph:  exclude degraded (correctness wins)         │ ← policy B
-  └────────────────────────┬─────────────────────────────────────┘
-                           ▼
-  ┌─ Local persistence ──────────────────────────────────────────┐
-  │  elevCache (AsyncStorage): in-mem write-through + debounced disk│
-  │  DEM never changes → cached forever is CORRECT, not just cheap  │
-  └───────────────────────────────────────────────────────────────┘
+```
+  flattr — three data classes, three consistency models
+
+  ┌─ graph.json ─────────────┐  STALE-BY-DESIGN
+  │ baked at build, read-only│  converges only on manual rebuild + reship
+  └────────────┬─────────────┘  cost: a new OSM street is invisible till rebuild
+               │ overlaid by ↓
+  ┌─ runtime tiles ──────────┐  EVENTUALLY CONSISTENT
+  │ degraded flag (CAP: A)   │  ┌ routing graph: includes degraded (available)
+  │ self-heal every 12s ×6   │  └ display graph: excludes degraded (honest)
+  └────────────┬─────────────┘  converges as self-heal lands real grades
+               │ heights from ↓
+  ┌─ elevation cache ────────┐  IMMUTABLE — no consistency model needed
+  │ "valid forever" (:4)     │  DEM heights don't change → nothing to invalidate
+  └──────────────────────────┘
 ```
 
 ## Elaborate
 
-CAP (Brewer) says: under a network partition you must choose consistency *or* availability — you can't have both while partitioned. flattr's `bestEffortElevation` is a literal CAP choice: the throttle is the partition, flat-fallback is the availability pick. PACELC extends it: *else* (no partition) you trade latency vs consistency — which is exactly why the cache exists (cached-stale-but-instant beats fresh-but-slow). Read-repair and the convergence loop come from the Dynamo lineage (eventual consistency + anti-entropy). The reason flattr can get away with "cache forever" is domain-specific and worth saying out loud: a Copernicus DEM elevation sample for a fixed coordinate is immutable — the ground doesn't move — so there's no invalidation problem at all, which is the rare case where a cache has no staleness cost. Sibling `study-database-systems` covers the storage-engine side of the persisted cache; `study-performance-engineering` covers the latency tradeoff.
+The strong-vs-eventual split and CAP are the bedrock of distributed data. The
+nuance flattr illustrates well is that "eventual consistency" is meaningless
+without two things it actually has: a **convergence mechanism** (the self-heal
+retry — without it, "eventual" never arrives) and a **staleness marker** (the
+`degraded` flag — without it, you can't tell fresh from stale, so you can't serve
+stale safely). Many systems claim eventual consistency but skip the marker, then
+serve stale data as if it were fresh — the silent-corruption failure mode. flattr's
+`degraded` flag, splitting the routing graph from the display graph, is the
+textbook-correct version: serve stale where it's harmless (routing connectivity),
+hide it where it'd mislead (the heatmap). The PACELC extension (else, even with no
+partition, you trade Latency for Consistency) is the next concept up; flattr's
+build-time bake is a pure latency-for-consistency trade with no partition
+involved.
 
 ## Interview defense
 
-**Q: "What's your consistency model?"**
-Verdict first: three, one per data class.
+**Q: "What's the consistency model of this app's data?"**
+Verdict first: "There isn't one model — there are three, by data class. The base
+graph is stale-by-design (baked at build, refreshed only by a human rebuild). The
+runtime tile grades are eventually consistent (best-effort, marked `degraded` when
+the elevation API throttles, self-healing every 12s until real grades land). The
+elevation cache needs no model — DEM heights are immutable." Then the CAP framing:
+"At every elevation failure it picks Availability over Consistency — renders flat
+grades rather than failing — and the `degraded` flag keeps that honest." Naming
+three models instead of one is the senior signal.
 
 ```
-  three data classes, three policies
+  the sketch you draw
 
-  street graph  → frozen / stale-by-design  (reship to refresh)
-  elevation     → eventual + read-repair     (degraded→retry→converge)
-  local cache   → strong locally             (read-your-writes free)
+  graph   ─► stale-by-design   (human rebuild)
+  tiles   ─► eventual          (self-heal converges)   ── degraded flag
+  cache   ─► immutable         (never stale)              keeps A honest
 ```
 
-"I don't have one global model — I picked per data class. Street geometry is frozen at build time and shipped in the bundle; it's stale by design because streets barely change and reshipping is cheap enough. Elevation is eventually consistent: if the API throttles I fall back to flat grades to stay available, mark the region degraded, and a capped background retry converges it to real grades once the API recovers — that's read-repair. The in-process cache gives me read-your-writes for free because writes hit memory synchronously before the debounced disk flush."
+**Q: "Serving flat grades when elevation fails — isn't that wrong data?"**
+"Yes, and it's a deliberate CAP choice: Availability over Consistency. But it's
+*honest* wrong data — the `degraded` flag includes it in the routing graph (where
+wrong-but-connected beats no-route) and *excludes* it from the heatmap (where it'd
+paint a lie). Then the self-heal retry converges it to real grades. The crime
+would be serving stale data *unmarked*; flattr never does." Naming the
+two-graph split is the thing that proves you read the code.
 
-**Anchor:** *Frozen for geometry, eventual-with-repair for elevation, strong-locally for the cache — consistency is a per-data-class call.*
-
-**Q: "Defend showing the user flat grades — isn't that just wrong data?"**
-"It's a deliberate CAP choice. A throttle is a partition; I can either fail the whole map (consistency) or render flat-but-connected streets (availability). I pick availability because an unusable map is worse than a temporarily-flat one — and crucially it's not *permanently* wrong: it's marked degraded and self-heals. I also keep two graphs so the flat data is included for routing connectivity but excluded from the heatmap, so it never paints fake grades over real ones."
-
-**Anchor:** *Flat-but-converging beats failed — and the two-graph split keeps the lie out of the display.*
+**Anchor:** *Three data classes, three consistency models — and the `degraded`
+flag is what lets flattr stay Available without lying about which grades are real.*
 
 ## See also
 
-- `02-partial-failure-timeouts-and-retries.md` — the throttle that triggers the fallback.
-- `03-idempotency-deduplication-and-delivery-semantics.md` — the cache's *safety* side (this is its *freshness* side).
-- `07-clocks-coordination-and-leadership.md` — clocks become necessary the moment you sync writes across devices.
-- sibling `study-database-systems` — the persisted-cache storage view.
-- sibling `study-performance-engineering` — the latency-vs-freshness tradeoff.
+- `02` — the self-heal retry that drives convergence.
+- `03` — why the elevation cache is immutable (DEM heights never change).
+- `06` — backpressure: how the self-heal retries are paced so convergence doesn't
+  storm the API.
+- `09` — staleness risks ranked.
+- sibling **database-systems** — datastore-local consistency; sibling
+  **system-design** — the build-time-vs-runtime architectural split.

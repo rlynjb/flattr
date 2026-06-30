@@ -1,190 +1,181 @@
-# flattr — Hackathon Demo Book (Overview & Run-of-Show)
+# flattr — Hackathon Demo Book (Overview)
 
-You built a router that optimizes for **flat, not fast**. Type two
-addresses, hit Route, and a line draws across the map colored by grade —
-green where it's flat, red where it climbs — with one honest number on a
-card: how much you'll actually go uphill. The whole pitch fits in one
-sentence and one screen. This book choreographs the ten minutes around
-that, and it points at the single moment the room reacts: **the route
-visibly bending around a steep red block to keep you on the flat.**
+> The run-of-show. Read this first, then the six chapters in order. You hold the
+> one-page run sheets (bottom of each chapter) on stage. Coach's voice
+> throughout — that's me talking to you, second person, "you."
 
-This is the coach talking, not a narrator. I've watched a hundred of these.
-The demos that win open in motion and land the wow before minute three. The
-demos that lose spend ninety seconds on a title slide and bury the magic at
-minute eight. Everything below is built to keep you in the first camp.
+Here's the whole thing before any detail: flattr routes you the *flattest* way
+between two addresses, not the fastest, and it proves it by drawing the route
+**colored by grade** — green where it's flat, red where it climbs — with a climb
+number on a card. The single moment the room reacts is the route visibly
+**bending around a steep red block** to stay flat while the card shows only a
+small climb. That's the money shot, and it lands by 3:00. Everything else in the
+ten minutes is setup for it or payoff after it.
 
 ---
 
 ## The whole slot on one timeline
 
-This is the shape of your ten minutes. Read it left to right — every chapter
-owns a slice, the money shot is pinned inside the first third, and you plan
-to finish at 9:30 with breathing room, never at 10:00 on the buzzer.
+This is the shape of your ten minutes. Every chapter owns a slice; the buffer at
+the end is deliberate — you plan to finish early, not to use every second.
 
 ```
   flattr — THE TEN-MINUTE RUN-OF-SHOW
 
-  0:00 ┌────────────────────────────────────────────────────┐
-       │ 01  COLD OPEN + ONE-LINER                0:00–1:00  │ 1:00
-       │       open on the map, not a slide                  │
-  1:00 ├────────────────────────────────────────────────────┤
-       │ 02  THE DEMO  (centerpiece, largest budget)         │
-       │       1:00  type two addresses → Route              │
-       │       2:30  ★ MONEY SHOT ★  route bows AROUND       │ 5:00
-       │             the red block; card shows a small climb │
-       │       4:00  Max-grade knob re-routes live           │
-       │       5:00  grade heatmap toggle                    │
-  6:00 ├────────────────────────────────────────────────────┤
-       │ 03  UNDER THE HOOD   one diagram, three sentences   │ 2:00
-       │       A→B ≠ B→A : directional grade cost            │
-  8:00 ├────────────────────────────────────────────────────┤
-       │ 04  THE BUILD STORY   the "no route" debugging win  │ 0:45
-  8:45 ├────────────────────────────────────────────────────┤
-       │ 05  THE CLOSE + THE ASK   last line they repeat     │ 0:45
-  9:30 ├────────────────────────────────────────────────────┤
-       │     buffer / breathing room              9:30–10:00 │ 0:30
- 10:00 └────────────────────────────────────────────────────┘
+  0:00 ┌─────────────────────────────────────────────────────┐
+       │ 01  COLD OPEN + ONE-LINER              0:00–1:00      │  1:00
+  1:00 ├─────────────────────────────────────────────────────┤
+       │ 02  THE DEMO (centerpiece)             1:00–6:00      │  5:00
+       │      ★ MONEY SHOT — route bends around red ~2:45–3:00 │
+       │        type two addresses → Route → colored path      │
+       │        → flip the Max-grade preset → it re-routes      │
+  6:00 ├─────────────────────────────────────────────────────┤
+       │ 03  UNDER THE HOOD (directional cost)  6:00–8:00      │  2:00
+  8:00 ├─────────────────────────────────────────────────────┤
+       │ 04  THE BUILD STORY (the 'no route' win) 8:00–8:45    │  0:45
+  8:45 ├─────────────────────────────────────────────────────┤
+       │ 05  THE CLOSE + THE ASK                8:45–9:30      │  0:45
+  9:30 ├─────────────────────────────────────────────────────┤
+       │     buffer / breathing room            9:30–10:00     │  0:30
+ 10:00 └─────────────────────────────────────────────────────┘
 
-       06  THE Q&A  ← prep only. Runs AFTER the clock.
-                      Never eats the ten minutes.
+       06  THE Q&A  ← prep only; runs AFTER the clock stops.
+                       Never eats the ten minutes.
 ```
 
-The money shot lands at **~2:30 — comfortably inside the first third.** If
-you take nothing else from this book, take that: the bend-around-the-hill
-moment is non-negotiable and it happens early.
-
-**Scaling to a shorter slot.** If your hackathon gives you 5 minutes, halve
-everything *except* the demo — it keeps the lion's share. The 5-minute
-split: cold open 0:30, demo 0:30–3:00 (money shot still at ~1:30), under-the-
-hood 3:00–4:00, build story + close folded into 4:00–4:45. The rule never
-changes: the demo has a floor, everything else has a ceiling, and the money
-shot lands in the first third.
+The demo owns the largest share and the money shot sits in the first third —
+that ordering is the whole strategy. If you're tight on time, you cut from
+under-the-hood, build story, and close. You never cut the demo below the point
+where the room sees the route bend.
 
 ---
 
 ## The master demo diagram — what the app does, one screen
 
-This is the picture you're selling. Everything in chapter 02 happens on this
-one screen; come back here whenever you need to re-anchor on what the room
-is looking at.
+Keep this picture in your head. It's the app in one frame, and it recurs in
+Chapter 2 as your click-path. One input (two addresses + a max-grade knob); one
+output (a route colored by grade with an honest climb number).
 
 ```
-  flattr — ONE SCREEN, THE WHOLE PRODUCT
+  flattr — ONE SCREEN, INPUT → OUTPUT
 
-  ┌───────────────────────────────────────────────┐
-  │  From: [ 24th Ave E & E Galer ........ ]       │  ← address bar
-  │  To:   [ Volunteer Park ............. ] [Route]│    (AddressBar.tsx)
-  ├───────────────────────────────────────────────┤
-  │                                                 │
-  │            ░░░░░░  RED steep block  ░░░░░░       │  the hill
-  │          ╔══════════════════════════╗           │  routing avoids
-  │   start  ║   ▓▓▓ +12% uphill ▓▓▓    ║   end     │
-  │    ●─────╜   (router refuses this)   ╙────●      │
-  │     \                                  /        │
-  │      green ───── route bows AROUND ──── green   │  ← the route line,
-  │            the red block to stay flat           │    colored by grade
-  │                                                 │
-  │  ┌─────────────────────────────────┐  Max grade │
-  │  │ Flat all the way                │   🛴 5%     │  ← Max-grade knob
-  │  │ 1.40 km · +9 m climb            │   🚶 8%     │    (GradeSlider.tsx)
-  │  └─────────────────────────────────┘   🏔 15%    │
-  │   ↑ RouteSummaryCard.tsx — the honest number     │
-  │                                                 │
-  │  [ Off ] [ Grades ] [ Zones ]  ← heatmap toggle  │
-  └───────────────────────────────────────────────┘
+  ┌─ UI layer (Expo / React Native + MapLibre) ─────────────────┐
+  │                                                             │
+  │   AddressBar:  [ From: 5th & Pine        ]                  │
+  │               [ To:   Summit & Madison   ]  [ Route ▸ ]     │
+  │                                                             │
+  │   GradeSlider (Max grade):  🛴 5%   🚶 8%   🏔️ 15%          │
+  │                                                             │
+  │   ┌─ the MAP ───────────────────────────────────────────┐  │
+  │   │   ●━━━━━━━━━ green ━━━━━┓        ▓▓▓ steep red ▓▓▓    │  │
+  │   │                        ┃        ▓▓▓  block      ▓▓▓   │  │
+  │   │            route BENDS  ┗━ green ━┛  AROUND it        │  │
+  │   │                                         ●            │  │
+  │   └─────────────────────────────────────────────────────┘  │
+  │                                                             │
+  │   RouteSummaryCard:  "Flattest available · 1.4 km · +9 m   │
+  │                       climb"   (grades approximate)         │
+  └─────────────────────────────────────────────────────────────┘
+            │
+            │  one directedAstar() call per (start, end, userMax)
+            ▼
+  ┌─ Engine (pure TypeScript, no framework) ────────────────────┐
+  │  features/routing/  graph.ts · cost.ts · astar.ts           │
+  │  directional grade penalty → flat path costs less           │
+  └─────────────────────────────────────────────────────────────┘
 ```
 
-The line is green→red by grade. The card says `+9 m climb` instead of the
-straight-line route's much bigger number. The knob (🛴/🚶/🏔) re-routes
-live. That's the product — and the bend around the red block is the proof.
+Everything above the line is what the room sees; everything below is what you
+explain for exactly three sentences in Chapter 3, then stop.
 
 ---
 
 ## How to rehearse this book
 
-Three passes. Do not skip the timer — going long is the single most common
-way these demos die.
+Three passes. Do them in order — the night-before pass is the one that saves you.
 
 ```
-  REHEARSAL — three passes, each tighter
+  REHEARSAL — three passes
 
-  ┌─ PASS 1 ───────────────────────────────────────┐
-  │ Read all 7 chapters in order, once.            │
-  │ Then run the demo end-to-end ONCE with a timer. │
-  │ Goal: find where you run long. (It's the demo.) │
-  └────────────────────────┬───────────────────────┘
-                           │
-  ┌─ PASS 2 ──────────────▼─────────────────────────┐
-  │ Run it again holding ONLY the one-page run sheets│
-  │ (the last section of each chapter). No script.   │
-  │ Goal: the money shot lands by 2:30 on the clock. │
-  └────────────────────────┬───────────────────────┘
-                           │
-  ┌─ NIGHT BEFORE / MORNING OF ─────────────────────┐
-  │ Read only the run sheets. Time the money shot.   │
-  │ Pre-warm the demo neighborhood (see below).      │
-  └──────────────────────────────────────────────────┘
+  PASS 1  (read + run)     Read all six chapters in order. Run the demo once,
+                           end to end, with a timer. Find where you run long.
+
+  PASS 2  (run sheets)     Run it again holding ONLY the one-page run sheets at
+                           the bottom of each chapter. No script. Time it.
+
+  NIGHT-BEFORE / MORNING   Read only the run sheets. Time the money shot — it
+                           MUST land by 3:00. Do the one pre-demo warm-up below.
 ```
 
-### CRITICAL pre-demo step — warm the elevation cache
+### The one pre-demo step you cannot skip — warm the elevation cache
 
-flattr fetches elevation from the free **Open-Meteo API, which rate-limits**.
-Cold, it 429s and the app falls back to flat (0 m) grades — your route draws
-all-green and the money shot dies, because there's no red block to bend
-around. The fix is one minute of prep, the night before AND again the morning
-of:
+This is the single most important operational note in the book. flattr fetches
+real elevation from the free Open-Meteo API, which rate-limits (429s) under
+load. The app caches every elevation sample to disk
+(`mobile/src/elevCache.ts`), so **the fix is to route your demo neighborhood
+once, beforehand, on the same device.** That populates the cache; on stage the
+grades render from cache, instantly and real, with no live API call to throttle.
 
 ```
-  ┌──────────────────────────────────────────────────────────┐
-  │  PRE-WARM (do this before you present, on demo wifi)      │
-  │  1. Open the app on the exact demo phone + network.        │
-  │  2. Route your demo From → To once. Toggle Grades on.      │
-  │  3. Pan the demo neighborhood so the corridor loads.       │
-  │  4. Confirm you see RED edges (real grades, not all-green).│
-  │     The elevation cache now persists to disk (elevCache.ts)│
-  │     and survives restarts — grades render instantly + real.│
-  └──────────────────────────────────────────────────────────┘
+  ╔══════════════════════════════════════════════════════════════╗
+  ║ WARM THE CACHE BEFORE YOU PRESENT                            ║
+  ║ Open the app on your demo device. Type the SAME two          ║
+  ║ addresses you'll use on stage. Hit Route. Let the colored    ║
+  ║ route fully render (grades real, not all-green). Done — the  ║
+  ║ ~90 m elevation cells are now on disk and survive restarts.  ║
+  ║ Skip this and a throttled API gives you a flat (all-green)   ║
+  ║ fallback and the money shot DOESN'T LAND.                    ║
+  ╚══════════════════════════════════════════════════════════════╝
 ```
-
-If you skip this and the API throttles you live, the route summary shows
-*"Grades approximate — elevation unavailable, retrying"* and the line goes
-flat-green. That's the honest fallback working as designed — but it's not the
-demo you want the room to see. Warm the cache.
 
 ---
 
 ## Where this book sits in the study system
 
-This book helps you **show** the work in a room watching a clock. Two
-siblings help with the other rooms:
+This book is one of three ways to turn the flattr codebase into spoken
+performance. They share the codebase; they prep different rooms.
 
-- **`.aipe/rehearse-interview-defense/`** — the interview-defense book
-  answers the "how does it actually work / why this way" follow-ups that come
-  *after* the demo (admissible heuristic, lazy-deletion PQueue, BLOCKED vs
-  Infinity). When a judge drills deeper than chapter 03 goes, that's the
-  book. Cross-linked from chapters 03, 04, and 06.
-- **`.aipe/study-system-design/`** — the comprehension guides. Deepest
-  follow-ups live here:
-  `04-honest-fallback-routing.md` (no-route vs no-flat-route, the chapter-04
-  debugging story), `05-elevation-provider-fallback.md` (the flat fallback +
-  cache, the chapter-06 honesty answer), `03-tile-merge-stitch.md` (the
-  corridor/stitch mechanics behind chapter 04's "no route" win).
+```
+  .aipe/study-system-design/         UNDERSTAND it
+    (audit + 6 pattern files)        comprehension — how it works, deeply
 
-Read this book to present flattr. Reach for those two when the room wants to
-go deeper than ten minutes allows.
+  .aipe/rehearse-interview-defense/  DEFEND it
+                                     a hiring interviewer probes "why this way";
+                                     you hold ground under follow-ups
+
+  .aipe/rehearse-hackathon-demo/     SHOW it   ← you are here
+    (this book)                      a room watches a clock; you land the wow
+```
+
+Cross-links you'll reach for:
+
+- **Deeper "how does it work" answers** when a judge drills in →
+  `.aipe/rehearse-interview-defense/` (the defense book answers the follow-ups
+  this demo book deliberately keeps shallow).
+- **The directional cost mechanism** (Chapter 3's one diagram) walked in full →
+  `.aipe/study-system-design/06-parametric-search-engine.md` and
+  `.aipe/study-system-design/04-honest-fallback-routing.md`.
+- **The "no route → corridor stitch" win** (Chapter 4) walked in full →
+  `.aipe/study-system-design/03-tile-merge-stitch.md` and
+  `.aipe/study-system-design/02-on-device-pipeline-rerun.md`.
 
 ---
 
-## The chapter list (the contract)
+## Scaling to a shorter slot
+
+Most hackathons give 3–5 minutes, not 10. If your real slot is shorter, scale
+every budget proportionally but keep two things fixed: **the demo stays the
+largest share, and the money shot stays inside the first third.**
 
 ```
-  00-overview.md          ← you are here: the run-of-show
-  01-the-cold-open.md     ← first 60s: hook + one-liner
-  02-the-demo.md          ← centerpiece + the money shot (≤2:30)
-  03-under-the-hood.md    ← one diagram: A→B ≠ B→A
-  04-the-build-story.md   ← the "no route" debugging win + rough edges
-  05-the-close.md         ← vision, ask, last line
-  06-the-qa.md            ← judge questions (prep, post-clock)
+  SLOT SCALING — keep the demo dominant, money shot in first third
+
+  10 min  →  01:1:00  02:5:00  03:2:00  04:0:45  05:0:45  (money shot ~2:45)
+   5 min  →  01:0:30  02:3:00  03:0:45  04:0:20  05:0:25  (money shot ~1:30)
+   3 min  →  01:0:20  02:2:00  03:cut   04:cut   05:0:20  (money shot ~0:55)
+
+  Tightest cut order: under-the-hood → build story → close.
+  Never cut: the room seeing the route bend around the red block.
 ```
 
-Now go to chapter 01 and open in motion.
+Now go to Chapter 1.

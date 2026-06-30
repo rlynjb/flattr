@@ -1,240 +1,184 @@
-# 05 — Eval-driven prompt iteration
+# 05 · Eval-driven prompt iteration
 
-*Industry name(s): "evals," "eval-driven development," "golden set,"
-"regression suite," "LLM-as-judge." Type label: Industry standard.*
+> Industry name: evals / eval-driven development / golden sets · Type label: Industry standard
 
-> **Seam, not present.** flattr runs no LLM, so it has no eval set for one.
-> But it has the *exact substrate*: `features/routing/fixtures.ts` is a set
-> of hand-built graphs with known-correct answers (`diamondGraph()` comments
-> "Known: shortest S->G = S,A,G (200)"). That is a golden set. This file
-> teaches eval-driven iteration by showing how flattr's fixtures become a
-> prompt eval set.
+> **Status: seam, not feature.** flattr has no prompts to evaluate — but it has the *exact substrate* an eval set is made of. `features/routing/fixtures.ts` is a hand-curated set of graphs with *known correct answers* ("shortest S→G = S,A,G (200)"). That's a golden set. This file maps eval discipline onto Seam 1/Seam 2 using flattr's golden graphs as the model.
 
-## Zoom out — where evals sit in the iteration loop
+## Zoom out — where this concept lives
 
-An eval set is the thing that turns "this prompt feels better" into "this
-prompt scores 0.91, up from 0.87, no regressions." It sits between you and the
-prompt, gating every change. flattr already has the gate — for the router.
+This is the senior-vs-junior dividing line of prompt work, and flattr already practices its non-LLM twin. Its tests are golden cases with known outputs; its `bench/` harness records comparison metrics across versions. Here's where prompt evals would sit:
 
 ```
-  Zoom out — the eval gate, already present for the router
+  Zoom out — evals around a prompt (the iteration loop)
 
-  ┌─ source ─────────────────────────────────────────────────────────┐
-  │  astar.ts, summary.ts        prompts/describe-route.md (future)   │
-  └───────────────┬───────────────────────────┬──────────────────────┘
-                 │ gated by                   │ would be gated by
-  ┌─ eval gate ──▼───────────────────────────▼──────────────────────┐
-  │  fixtures.ts (EXISTS): diamond/grade/directional graphs           │
-  │    + *.test.ts assert known-correct paths                        │
-  │  ★ FUTURE: same fixtures → expected route descriptions ★         │
-  └──────────────────────────────────────────────────────────────────┘
+  ┌─ Source ─────────────────────────────────────────────────────┐
+  │  describe-prompt.ts  /  parse-destination.ts                 │
+  └─────────────────────────┬────────────────────────────────────┘
+                            │ change the prompt
+  ┌─ Eval harness (SEAM) ───▼────────────────────────────────────┐
+  │  ★ THIS FILE ★                                               │ ← we are here
+  │  golden set (like fixtures.ts) → run prompt → score → diff   │
+  │  keep change only if score ↑ AND no regression               │
+  └─────────────────────────┬────────────────────────────────────┘
+                            │ ship if green
+  ┌─ Production ────────────▼────────────────────────────────────┐
+  │  failures captured → added back to golden set, forever       │
+  └──────────────────────────────────────────────────────────────┘
 ```
 
-flattr's router is already eval-gated. A prompt would join the same gate.
+Now zoom in. The pattern is: **a junior iterates by vibes ("feels better now"); a senior iterates against an eval set — change prompt, run evals, diff outputs, keep the change only if the score improved without regressing a tracked case.** You write the eval *before* you touch the prompt. Let me build the loop.
 
-## Zoom in
+## Structure pass
 
-The pattern: **write the eval before you touch the prompt; iterate by running
-the eval, diffing outputs, and keeping a change only if the score improves
-with no regression on any tracked case.** The dividing line between junior and
-senior prompt work is exactly here. A junior iterates by vibes. A senior
-iterates against a set.
+**Layers.** Three: the *golden set* (curated input→expected pairs), the *scorer* (how you turn an output into a number), and the *regression suite* (production failures pinned as permanent cases). flattr's `*.test.ts` files are layers 1 and 3 fused — `diamondGraph` asserts `S,A,G` and any router change that breaks it fails CI forever.
 
-## The structure pass
-
-**Layers:** golden set → regression suite → judge.
-**Axis:** *measurability* — is "better" a number or a feeling?
-**Seam:** the change-decision boundary — the moment you decide to keep or
-revert a prompt edit. With evals it's a number; without, it's a vibe.
+**Axis — guarantees (what does a passing run actually promise?).**
 
 ```
-  axis = "is 'better' measurable here?"
+  One axis — "what does green mean?" — down the layers
 
-  ┌─ no eval ─────┐ measurable: NO — "feels better" (junior)
-  │  ── seam ──      ◄── this is the line that defines seniority
-  └─ eval set ────┘ measurable: YES — score 0.87 → 0.91, 0 regressions
+  ┌─ golden set ─────────────────┐  → "matches curated expectations"
+  └──────────────────────────────┘
+      ┌─ scorer ─────────────────┐  → "measures the RIGHT thing?" ← the trap
+      └──────────────────────────┘
+          ┌─ regression suite ───┐  → "no past failure came back"
+          └──────────────────────┘
+
+  the seam: a scorer can be green for 6 months while measuring the
+  wrong thing — that flip is invisible until you inspect outputs
 ```
+
+**Seam.** The load-bearing boundary is *between the score and the truth it's supposed to track*. A rubric can read 4/5 for six months and turn out to have been measuring the wrong thing the whole time. The number flips from "trustworthy" to "lying" without any visible event — which is why you periodically eyeball outputs even when the score is green.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You already do test-driven development. You write the failing test, then the
-code, then you trust the green. An eval is a test for non-deterministic output:
-you can't assert `output === expected` because the model phrases things
-differently each run, so you assert `score(output) >= threshold` or
-`judge(output, expected) == pass`. flattr's `fixtures.ts` + `*.test.ts` is
-already TDD for the router — `diamondGraph()` has a *known* answer and the test
-asserts it. The eval set is that, with a fuzzier assertion at the end.
+You already write a test before you trust a refactor — flattr's `diamondGraph` test exists so that when you rewrite the router, `S,A,G` proves you didn't break it. An eval is that test, for a prompt. The only differences: the output is fuzzy (prose, not a deterministic path), so the scorer is sometimes another model, and you *expect* some noise, so you track score *distributions*, not pass/fail on one case.
 
 ```
-  Pattern — the eval loop (write set FIRST, then iterate)
+  The eval-iteration kernel — the loop you never skip
 
-  ┌──────────────────────────────────────────────────────┐
-  │ 1. write golden set  (BEFORE touching the prompt)    │
-  │ 2. change prompt                                      │
-  │ 3. run set ──► scores + per-case diff                │
-  │ 4. improved AND no regression? ──► keep              │
-  │    regressed any case?         ──► revert            │
-  └────────────────────────┬─────────────────────────────┘
-                           └──► add prod failures back as cases, forever
+  ┌──────────────────────────────────────────────────┐
+  │ 1. write golden set (BEFORE touching the prompt)  │
+  │ 2. change prompt                                  │
+  │ 3. run prompt over golden set → outputs           │
+  │ 4. score outputs → number                         │
+  │ 5. diff vs previous: score ↑ AND no regression?   │
+  │      yes → keep    no → revert                    │
+  └──────────────────────────────────────────────────┘
+          ▲                                  │
+          └──── add production failures ◄────┘
+                back into the golden set
 ```
 
-### Move 2 — building the eval set from flattr's fixtures
+### Move 2 — the step-by-step walkthrough
 
-**Step 1 — the golden set: hand-curated cases with expected outputs.**
-flattr's fixtures *are* this, structurally. Look at the real one:
+**The golden set — flattr already wrote one.** Look at the comment on `diamondGraph`:
 
 ```ts
-// features/routing/fixtures.ts:42-65 — EXISTS
-/** 6-node graph... Known: shortest S->G = S,A,G (200). */
+// features/routing/fixtures.ts:42-46
+/**
+ * 6-node graph with a known shortest path by distance. Flat (all elevation 0).
+ * Known: shortest S->G = S,A,G (200).
+ */
 export function diamondGraph(): Graph { ... }
-
-// features/routing/fixtures.ts:67-83 — EXISTS
-/** Flat-vs-steep choice. Short path via H is steep; long path via L is flat. */
-export function gradeGraph(): Graph { ... }
 ```
 
-Each fixture has a known-correct outcome in its doc comment. For a Seam 1
-prompt eval, you pair each fixture's `RouteSummary` with its *expected
-description*:
+That `Known: shortest S->G = S,A,G (200)` is a golden case: a curated input (the graph) with a known-correct output (the path). `gradeGraph` (`:70`) adds a flat-vs-steep choice; `directionalGraph` (`:88`) adds directional asymmetry. Three hand-curated cases, each probing a *different behavior*. That is exactly the shape of a prompt golden set: 20-50 hand-picked inputs, each chosen to probe one behavior, each with an expected output. For Seam 2 (NL parse), a golden case is `("flat route near the water" → {placeText:"...", near:"water", preferFlat:true})`. For Seam 1 (describe), it's `(RouteSummary → an acceptable sentence)` — and "acceptable" is where scoring gets interesting.
+
+**The scorer — exact match for parse, judge for prose.** Seam 2's parse is structured (`02`), so the scorer is exact: did the struct match? Cheap and reliable, like asserting `S,A,G`. Seam 1's description is prose — there's no single right sentence — so you need either a rubric (mentions distance? mentions the climb iff `climbM>10`? ≤2 sentences?) or LLM-as-judge (a second model scores against the rubric). LLM-as-judge is appropriate *when the output is fuzzy and a rubric is hard to encode deterministically* — and it has the same blind spots as the model under test, so you validate the judge against human-labeled cases first (Hamel Husain's central point: your judge needs its own eval).
 
 ```
-  // FUTURE — prompts/describe-route.eval.ts
-  cases = [
-    { summary: {distanceM:200, climbM:0,  steepCount:0}, expect: "flat, no climbs" },
-    { summary: {distanceM:320, climbM:0,  steepCount:0}, expect: "flat" },         // gradeGraph flat route
-    { summary: {distanceM:200, climbM:9,  steepCount:1}, expect: "1 steep block, mention it" },
-  ]
+  Hop — scoring the two seams differently
+
+  Seam 2 (parse):    output ─► exact match vs expected struct ─► 1/0
+                     (deterministic, like asserting S,A,G)
+
+  Seam 1 (describe): output ─► LLM-as-judge vs rubric ─► 0..1
+                     (fuzzy — but VALIDATE the judge against humans first)
 ```
 
-20–50 of these, hand-curated. The flat-vs-steep fixture is gold: it forces the
-prompt to be *honest about steepness*, which is flattr's whole product
-promise — a description that says "flat all the way" when there's a steep
-block is the worst possible failure.
+**The regression suite — production failures, pinned forever.** When Seam 1 ships and a real route produces a bad description ("flat" when `steepCount` was 3), that exact case becomes a permanent golden entry. flattr does this already in spirit: its `BLOCKED = 1e9` constant (`cost.ts:5`) and the "no flat route vs no route" distinction exist because someone reasoned through a failure and pinned the behavior. A regression suite is that, accumulated: every bug, once fixed, becomes a test that can never silently return.
 
-**Step 2 — the regression suite: prod failures, added back forever.** When a
-user reports "it said flat but my legs disagree," that exact `RouteSummary`
-becomes case #51, and it stays in the set forever. flattr already has this
-instinct — the `directionalGraph()` fixture exists because directional grade
-is a subtle bug class someone had to pin down. Same move.
+**The iteration loop — write the eval first.** The order is the whole discipline. You write the golden set *before* you iterate the prompt, because otherwise you tune the prompt to your vibes and "discover" the cases that justify what you already did. flattr's `diamondGraph` was written knowing `S,A,G` *before* the router was optimized — that's why the optimization is trustworthy. Same here: golden set first, prompt second.
 
-**Step 3 — the iteration loop, gated.** Change prompt → run all cases → diff.
-The trap this catches:
+**The specific bug — average up, edge case down.** A "better" prompt improves the *average* score but regresses one critical edge case nobody tracked. This is why the keep-rule is `score ↑ AND no regression`, not `average ↑`. flattr's fixtures encode this exactly: `gradeGraph` exists so a router change that improves distance-routing can't silently break grade-routing. You don't average across `diamondGraph` and `gradeGraph` and call it 0.9 — you require *both* green. Aggregate scores hide the edge-case regression that gets you paged.
 
 ```
-  Execution trace — why "average improved" is not enough
+  Why "no regression" beats "average up"
 
-  prompt v1:  honest=0.80  concise=0.70  steep-honesty=1.00  avg=0.83
-  prompt v2:  honest=0.85  concise=0.95  steep-honesty=0.60  avg=0.80
-                                          ▲
-              avg LOOKS comparable, but steep-honesty CRATERED.
-              v2 calls steep routes "flat" 40% of the time.
-              SHIP v2 on average score → ship the worst bug.
+  prompt v3:  [case A: 1.0][case B: 0.9][edge case C: 1.0]  avg 0.97
+  prompt v4:  [case A: 1.0][case B: 1.0][edge case C: 0.2]  avg 0.73? no—
+              someone reordered cases, avg LOOKS like 0.97 again...
+  rule: track PER-CASE. C dropped 1.0→0.2 → REJECT, regardless of avg.
 ```
-
-This is the specific bug the spec names: a "better" prompt that improves the
-average but regresses a critical edge case nobody tracked. The fix is
-per-case tracking, not an average — exactly why flattr's fixtures are
-*separate named graphs*, not one blended benchmark.
-
-```
-  Layers-and-hops — the eval gate in CI (reuses vitest)
-
-  ┌─ prompt PR ──┐ change describe-route.md
-  │              │ ──► CI runs describe-route.eval.ts ──┐
-  └──────────────┘                                       ▼
-  ┌─ eval runner (extends vitest) ──────────────────────────────┐
-  │ for each fixture-derived case: model → score vs expected     │
-  │ any case regressed? ──► fail the PR                          │
-  └─────────────────────────────────────────────────────────────┘
-```
-
-**Step 4 — when LLM-as-judge is appropriate.** For "is this description
-honest and concise?" you can't string-match — phrasing varies. Use a second
-LLM call with a rubric to score it. Appropriate when the quality is
-subjective; *not* appropriate for `steepCount` honesty, which you can check
-mechanically (does the description mention steepness iff `steepCount > 0`?).
-Mechanical check where you can, judge only where you must.
-
-### Move 2 variant — load-bearing skeleton
-
-Kernel: **golden set + per-case (not averaged) scoring**. What breaks:
-
-- **No golden set** → you iterate by vibes, in circles, and "fix" regressions
-  you can't see. *Load-bearing.*
-- **Average instead of per-case** → you ship the steep-honesty regression
-  above. *Load-bearing — this is THE prompt-eval trap.*
-- **No regression suite** → you re-introduce fixed bugs. *Load-bearing over
-  time.*
-- **LLM-as-judge everywhere** → slow, expensive, and the judge has the same
-  blind spots; use mechanical checks where possible. *Hardening discipline.*
 
 ### Move 3 — the principle
 
-You write the eval before iterating the prompt, for the same reason you write
-the test before the code: without it, "better" is a feeling, and feelings
-regress critical edge cases silently. flattr's fixtures already prove the
-team believes this — for the router. The prompt deserves the same gate.
+Eval-driven iteration is the test-driven development you already do, ported to fuzzy outputs. You write the golden set before the prompt, score per-case not in aggregate, pin every production failure as a permanent case, and require score-up *with* no-regression. Skipping it is not faster — it's slower, because vibes-iteration loops in circles and you re-introduce yesterday's bug. flattr's `fixtures.ts` is the cleanest golden set I've seen in a router; the only thing it's missing is a prompt to point at.
 
 ## Primary diagram
 
-```
-  Eval-driven prompt iteration on flattr's fixtures (FUTURE)
+The full eval-driven loop, golden set to regression suite, with the scorer-trust seam marked.
 
-  ┌─ golden set (from fixtures.ts) ─────────────────────────────────┐
-  │ diamond → "flat" · grade-flat → "flat" · grade-steep → "1 steep"│
-  │ + regression cases from prod, forever                           │
-  └───────────────────────────┬─────────────────────────────────────┘
-                              ▼ run on every prompt change
-  ┌─ per-case scoring (NOT averaged) ───────────────────────────────┐
-  │ honest · concise · steep-honesty  ← each tracked separately     │
-  │ mechanical check: mentions steep ⟺ steepCount>0                  │
-  │ LLM-judge: only the subjective "is it natural" axis             │
-  └───────────────────────────┬─────────────────────────────────────┘
-                              ▼
-  improved AND zero regression → keep · any regression → revert
+```
+  Eval-driven iteration — the loop, anchored to fixtures.ts
+
+  ┌─ Golden set (like fixtures.ts) ──────────────────────────────┐
+  │ diamondGraph → S,A,G(200)   gradeGraph → flat path           │
+  │ directionalGraph → detour   + 17 more curated cases          │
+  └─────────────────────────┬────────────────────────────────────┘
+        change prompt        │ run prompt over every case
+  ┌─ Scorer ★trust seam★ ────▼────────────────────────────────────┐
+  │ Seam 2: exact match    Seam 1: LLM-as-judge vs rubric        │
+  │ (validate the judge against human labels — Hamel)            │
+  └─────────────────────────┬────────────────────────────────────┘
+                            │ per-case diff (NOT average)
+  ┌─ Keep-rule ─────────────▼────────────────────────────────────┐
+  │ score ↑ AND no case regressed?  yes→ship  no→revert          │
+  └─────────────────────────┬────────────────────────────────────┘
+                            │ prod failure
+  ┌─ Regression suite ──────▼────────────────────────────────────┐
+  │ every shipped bug → pinned golden case, forever (like BLOCKED)│
+  └──────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-Hamel Husain's writing is the canonical reference here — "Your AI Product
-Needs Evals" is the piece to read, and his point is exactly the per-case-vs-
-average trap above. The discipline maps one-to-one onto flattr's existing
-`bench/` harness (`bench/run.ts`, `bench/report.ts`), which already measures
-the algorithm progression with metrics — an eval set is a `bench/` for prompt
-quality. The reader has shipped intent-classifier eval sets in loopd; same
-muscle. Read `02-structured-outputs.md` for the mechanical-checkable axis
-(schema-fail rate is the easiest eval metric of all) and `03-prompts-as-code.md`
-for how the eval gates the prompt PR.
+Hamel Husain's writing on evals is the canonical reference and the source of the two hardest-won lessons here: (1) look at your data — eyeball real outputs, don't trust the aggregate score; (2) your LLM-judge needs its own eval against human labels, or you've just moved the trust problem one layer down. This is the discipline that is genuinely non-negotiable for production prompt work — every other concept in this folder is a technique, but evals are the *measurement* that tells you whether a technique helped. flattr is an unusually good teacher for it because its `fixtures.ts` already demonstrates the golden-set shape (curated input + known output + one-behavior-per-case) without any LLM in the picture — the discipline is visible in isolation.
+
+## Project exercises
+
+### EX-EVAL-1 — Golden set + judge for Seam 1 descriptions
+
+- **Exercise ID:** EX-EVAL-1
+- **What to build:** A golden set of `(RouteSummary → acceptable-sentence)` cases derived from `fixtures.ts` graphs, plus an LLM-as-judge scorer with a rubric (mentions distance, mentions climb iff `climbM>10`, ≤2 sentences), and a per-case keep-rule.
+- **Why it earns its place:** Forces the judge-validation step (does the judge agree with you on 10 hand-labeled cases?) and the per-case-not-average discipline.
+- **Files to touch:** new `features/routing/describe.eval.ts`; sources `RouteSummary` from `summary.ts`, graphs from `fixtures.ts`.
+- **Done when:** a prompt change that improves average but regresses one case is correctly rejected.
+- **Estimated effort:** 4-6 hours.
 
 ## Interview defense
 
-**Q: "How do you know a prompt change is actually better?"** It scores higher
-on a golden set with zero regressions on any tracked case. Not "it feels
-better" — that's how you ship a change that lifts the average while cratering
-a critical edge case. I track each axis separately for exactly that reason.
+**Q: How do you iterate on a prompt without going in circles?**
+
+Write a golden set *before* touching the prompt, then loop: change → run over the set → score per-case → keep only if score up with no regression. Vibes-iteration loops forever because there's no ground truth; the golden set is the ground truth.
 
 ```
-  avg up, one axis down → DO NOT SHIP
-  steep-honesty 1.0 → 0.6 hides under a flat average
+  junior:  change → "feels better" → ship → regress → repeat
+  senior:  golden set FIRST → change → score → diff → keep iff no regression
 ```
 
-**Q: "When is LLM-as-judge right?"** Only for subjective axes you can't check
-mechanically. flattr's steep-honesty check is mechanical (mention steepness
-iff `steepCount>0`) — use code. "Is the sentence natural?" — use a judge with
-a rubric. Never judge what you can assert.
+Anchor: flattr's `diamondGraph` asserts `S,A,G` *before* the router is optimized — that's why the optimization is trustworthy. Same order for prompts.
 
-Anchor: *"flattr's `fixtures.ts` is already a golden set — `diamondGraph` ships
-with its known answer in the doc comment. A prompt eval pairs each fixture's
-`RouteSummary` with an expected description. The flat-vs-steep fixture is the
-honesty regression guard."*
+**Q: A new prompt raised the average score. Ship it?**
+
+Not on average alone. Check per-case — a higher average can hide a critical edge-case regression. The keep-rule is score-up *and* no tracked case regressed. And periodically eyeball outputs, because a green score can measure the wrong thing for months.
 
 ## See also
 
-- [02-structured-outputs.md](02-structured-outputs.md) — schema-fail rate, the
-  easiest eval metric
-- [03-prompts-as-code.md](03-prompts-as-code.md) — the eval gates the PR
-- [10-self-critique.md](10-self-critique.md) — self-critique vs a real eval
-- `.aipe/study-testing/` — the fixtures + bench harness in depth
-</content>
+- `02-structured-outputs.md` — exact-match scoring for the parse seam
+- `03-prompts-as-code.md` — the eval run a prompt PR must trigger
+- `09-chain-of-thought.md` — evals tell you if CoT actually helped or just cost tokens
+- `10-self-critique.md` — self-critique's gains are claimed only if evals confirm them

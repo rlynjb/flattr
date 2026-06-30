@@ -1,317 +1,300 @@
-# Integrity without a database
+# Integrity Without a Database
 
-**Industry name:** referential integrity (FK constraints) and schema versioning —
-both absent here; the manual stand-ins are *producer-side validation* and a
-*missing version sentinel*. **Type label:** Industry standard (the concepts),
-Project-specific (what's missing).
+**Industry name(s):** referential integrity / schema validation at the trust
+boundary / schema versioning. **Type:** Industry standard (data integrity),
+applied to a serialized artifact instead of a DB.
 
 ---
 
 ## Zoom out, then zoom in
 
-A database enforces invariants for you: a foreign key *can't* point at a row that
-doesn't exist, a `NOT NULL` column *can't* be null, a `CHECK` *can't* be violated.
-flattr has no engine, so every one of those invariants is either enforced by build
-code or not enforced at all. Here's the trust boundary:
+In Postgres, a foreign key is enforced *by the engine* — you physically cannot
+insert an `edge` pointing at a `node` that doesn't exist. flattr has the same
+FK-shaped relations (`Edge.fromNode/toNode → Node.id`) but no engine, so nothing
+enforces them. The integrity question moves entirely onto the build pipeline and
+a single `as` cast. Here's the boundary where that cast happens.
 
 ```
-  Zoom out — where invariants are (and aren't) enforced
+  Zoom out — the trust boundary is one cast
 
-  ┌─ Build pipeline (producer) ─────────────────────────────────┐
-  │  computeGrades clamps |grade| ≤ 40   ✓ partial enforcement   │
-  │  splitWays skips zero-length edges    ✓                      │
-  │  buildAdjacency built from edges      ✓ (so adj is consistent)│
-  └───────────────────────────┬──────────────────────────────────┘
-                              │  graph.json  ── NO VALIDATION HERE ──
-  ┌─ loadGraph (consumer) ────▼──────────────────────────────────┐
-  │  graph as unknown as Graph   ✗ blind cast, no checks         │ ← we are here
-  └───────────────────────────┬──────────────────────────────────┘
-                              │  assumed-valid Graph
-  ┌─ A* / heatmap ────────────▼──────────────────────────────────┐
-  │  graph.nodes[edge.toNode]  ── crashes HERE if FK is dangling  │
-  └────────────────────────────────────────────────────────────── ┘
+  ┌─ Build layer (pipeline/, trusted) ─────────────────────────────┐
+  │  computeGrades derefs nodes[e.toNode] → crashes on a bad FK     │  guard #1
+  │                                  │ writes graph.json            │  (build-only)
+  └──────────────────────────────────┬─────────────────────────────┘
+                                      │ graph.json — plain JSON, no schema tag
+  ┌─ Trust boundary ───────────────────▼────────────────────────────┐
+  │  loadGraph(): return graph as unknown as Graph   ← ★ blind cast ★│  NO guard
+  └──────────────────────────────────┬─────────────────────────────┘
+  ┌─ Runtime layer (mobile/, assumes the shape is valid) ───────────┐
+  │  A* derefs graph.nodes[goalId] → undefined crash, far from cause│
+  └─────────────────────────────────────────────────────────────────┘
 ```
 
-Zoom in: the gap is the arrow between producer and consumer. `loadGraph` casts the
-JSON to `Graph` with zero validation, so any invariant the producer didn't enforce
-surfaces as a crash *deep in traversal*, not at load. The question: **which
-invariants does this model assume, which are actually guarded, and where does a
-violation blow up?**
+Zoom in: there's no referential-integrity check, no `not-null`/`unique`/`check`
+enforcement, and **no schema version** on the artifact. `loadGraph()` casts the
+JSON straight to `Graph` and trusts it. The question: *what holds the model's
+invariants, and what happens when they break?*
 
-## Structure pass
+---
 
-**Layers — the invariants the model depends on, by who (if anyone) enforces them:**
+## The structure pass
+
+**Layers.** Two: the *trusted* side (the build pipeline, which produces the
+artifact) and the *assuming* side (the app, which consumes it). The artifact
+sits between them with no validator.
+
+**Axis — "what enforces this invariant?"** Trace it across the invariants:
 
 ```
-  Invariant → enforcer → where a violation surfaces
+  One question across the invariants: who enforces it?
 
-  referential: every edge.fromNode/toNode ∈ nodes
-     enforcer: NONE        surfaces: A* deref, mid-search crash
-  field range: |gradePct| ≤ MAX_GRADE_PCT
-     enforcer: grade.ts:30 (producer)   surfaces: clamped at build, OK
-  no self-loops: fromNode ≠ toNode
-     enforcer: split.ts:65 (producer)   surfaces: skipped at build, OK
-  schema match: graph.json fields = types.ts
-     enforcer: NONE        surfaces: undefined arithmetic, silent
-  adjacency consistent with edges
-     enforcer: buildAdjacency (producer) surfaces: consistent by construction
+  invariant                          enforced by
+  ─────────                          ───────────
+  edge.fromNode resolves to a Node   build pipeline ONLY (grade.ts deref)
+  edge.toNode resolves to a Node     build pipeline ONLY
+  gradePct in [-40, 40]              computeGrades clamp (grade.ts:30) — at build
+  graph shape matches Graph type     NOTHING at runtime — `as unknown as Graph`
+  artifact version matches app       NOTHING — no version field exists
+
+  every runtime invariant is "assumed", not "enforced" — that's the seam
 ```
 
-**Axis traced — "if this invariant is violated, when do I find out?"** Hold it across
-the rows. Range and self-loop violations: found out *at build* (the producer fixes
-them). Schema-match and referential violations: found out *at use*, deep in
-traversal, as `undefined` — the worst time, because the symptom is far from the cause.
-The axis-answer flips between "producer-guarded → caught early" and "unguarded →
-caught late, or never."
+**Seam.** The whole finding lives at one boundary: `loadGraph()`
+(`mobile/src/loadGraph.ts:9-11`). Above it, the build pipeline guarantees a
+well-formed graph *if it ran*. Below it, the app trusts the bytes. The trust
+axis flips from "produced-by-trusted-code" to "assumed-valid" right at that
+cast — and a hand-edited file, a partial write, or a version skew crosses that
+seam undetected.
 
-**Seam:** the `loadGraph` cast (`mobile/src/loadGraph.ts:10`). That's the boundary
-where an external artifact becomes a trusted in-memory object — and it's where a
-validator *should* live and doesn't. Every late-surfacing bug crosses this seam
-unchecked. It's the one place to add a guard.
+---
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You know this from `fetch`. When you do `const data = await res.json() as User`,
-TypeScript believes you — the `as` is a *promise to the compiler*, not a check at
-runtime. If the API returns a different shape, nothing throws *there*; it throws three
-components later when you read `data.profile.name` and `profile` is undefined. That's
-exactly `loadGraph`'s `graph as unknown as Graph`: a promise, not a check. The bug
-lands far from the lie.
+A blind cast is `JSON.parse(x) as User` — you tell the compiler "trust me, this
+is the shape," and at runtime there's no check. You've felt this bug: the API
+returns a slightly different shape, the cast says nothing, and your code
+explodes three functions later on `user.profile.name` when `profile` is
+undefined. flattr's `loadGraph` is exactly that cast, on the whole graph.
 
 ```
-  the unchecked-boundary failure shape
+  The kernel: a cast moves the failure from the boundary to deep in the code
 
-  external data ──► cast `as Graph` ──► trusted everywhere ──► deref undefined
-   (graph.json)      (the lie)          (no guard)            (the crash, far away)
-                          ▲                                        ▲
-                          └────────── distance between ────────────┘
-                                      cause and symptom
+  graph.json ──► (as unknown as Graph) ──► app trusts it
+                       │ no validation here
+                       ▼
+        bad data flows DOWNSTREAM until a deref crashes
+        (the crash site is far from the actual cause)
 ```
-
-The strategy a validator would impose: **check the shape and the invariants at the
-boundary, once, so a violation fails loud and early instead of quiet and deep.**
 
 ### Move 2 — the walkthrough
 
-#### Gap 1 — no referential integrity on edge endpoints (worst)
-
-Every edge claims two foreign keys: `fromNode` and `toNode`, each supposedly a node
-id in `nodes`. Nothing checks that they exist. Walk what happens when one is
-dangling — say an edge points at `toNode: "n999"` that isn't in `nodes`. A\* expands:
-
-```ts
-// features/routing/astar.ts:64-72
-for (const edgeId of graph.adjacency[current] ?? []) {
-  const edge = byId.get(edgeId)!;
-  const next = otherEnd(edge, current);          // next = "n999" (dangling)
-  if (closed.has(next)) continue;
-  const tentative = g.get(current)! + costFn(edge, current, userMax);
-  if (tentative < (g.get(next) ?? Infinity)) {
-    g.set(next, tentative);
-    came.set(next, { edge, prev: current });
-    open.push(next, tentative + heuristicFn(graph.nodes[next], goal));
-    //                                       ▲ graph.nodes["n999"] = undefined
-    //                                       heuristicFn derefs .lat → CRASH
-  }
-}
-```
-
-`heuristicFn` is `haversineHeuristic` (`astar.ts:9`), which reads `node.lat` /
-`node.lng`. On `undefined`, that's a `Cannot read property 'lat' of undefined` —
-thrown deep in the search loop, with a stack trace pointing at the heuristic, not at
-the bad edge. The cause (a dangling FK in `graph.json`) is invisible from the symptom.
-A database would have refused the edge at insert; here nothing refuses it, ever.
-
-```
-  dangling FK: where the database would have stopped it
-
-  WITH FK constraint:  INSERT edge(to:n999) ──► REJECTED at write   (early, clear)
-  flattr (none):       edge(to:n999) ships ──► A* derefs nodes[n999]
-                                              ──► undefined.lat ──► CRASH  (late, cryptic)
-```
-
-The fix is a load-time validator: for every edge, assert `fromNode in nodes` and
-`toNode in nodes`. One pass, O(E), at `loadGraph`. Fails loud, names the bad edge,
-before any search runs.
-
-#### Gap 2 — no schema version on the artifact (silent drift)
-
-The shipped `graph.json` top-level keys are exactly `{city, bbox, nodes, edges,
-adjacency}` — verified, no `version` or `schemaVersion`. The type that reads it lives
-in `types.ts` and evolves with the code. So picture the drift: someone renames
-`gradePct` → `grade` in `types.ts` and the pipeline, ships an app build, but the
-bundled `graph.json` is the *old* one (forgot to re-run `build:graph` and re-copy).
+**The blind cast — where validation should be and isn't.**
 
 ```ts
 // mobile/src/loadGraph.ts:9-11
 export function loadGraph(): Graph {
-  return graph as unknown as Graph;   // old JSON, new type — cast says "trust me"
+  return graph as unknown as Graph;   // ← double cast: even TS's structural check is bypassed
 }
 ```
 
-The cast succeeds (it's compile-time only). Now `cost.ts` reads `edge.gradePct` and
-gets `undefined`, `1 + penalty(undefined, max)` is `NaN`, the whole route's cost is
-`NaN`, and A\* either returns a garbage path or no path — *silently*. No crash, no
-error, just wrong answers. There's no sentinel that says "this artifact was built for
-schema v2 and you're running v3, refuse to load." That sentinel is one integer field
-and one equality check, and it's absent.
+`as unknown as Graph` is the strongest possible "trust me" — the `unknown`
+intermediate strips even TypeScript's structural compatibility check, so *any*
+JSON satisfies it. There is no `nodes` presence check, no "every `edge.fromNode`
+is a key in `nodes`" check, no shape validation. The artifact is trusted whole.
 
-```
-  schema drift with no version field
-
-  types.ts (v3): edge.grade        graph.json (v2): edge.gradePct
-        │                                  │
-        └──────── loadGraph cast ──────────┘
-                       │ no version check
-                       ▼
-              edge.grade = undefined ──► NaN cost ──► silent wrong route
-```
-
-#### Gap 3 — what IS enforced (the producer's partial guard)
-
-Credit where due: the build pipeline *does* enforce two invariants, producer-side:
+**What breaks, and *where*.** Suppose `graph.json` has an edge whose `fromNode`
+is `"n9999"`, a node that doesn't exist. Nothing catches it at load. It surfaces
+later, far from the cause:
 
 ```ts
-// pipeline/grade.ts:30 — field-range constraint (a CHECK, by hand)
-const gradePct = Math.max(-MAX_GRADE_PCT, Math.min(MAX_GRADE_PCT, raw));
+// features/routing/astar.ts:39-42 — a missing start/goal node returns null (silent)
+const goal = graph.nodes[goalId];
+if (!graph.nodes[startId] || !goal) {
+  return { path: null, ... };   // route just "fails" — no error, no reason
+}
+// ...and a dangling edge endpoint crashes mid-expansion:
+// astar.ts:72  heuristicFn(graph.nodes[next], goal)  → graph.nodes[next] is undefined
+//              → haversine reads .lat of undefined → TypeError, deep in the search
 ```
+
+The failure mode is the worst kind: **distance between cause and symptom.** A
+bad FK in the data manifests as either a silent "no route" (`astar.ts:40`) or a
+`TypeError` inside A*'s heuristic call — neither names "your graph has a dangling
+edge."
+
+```
+  Cause → symptom distance (the integrity failure mode)
+
+  CAUSE (in data):  edge e7.fromNode = "n9999"  (no such node)
+        │ loadGraph casts it through, unchecked
+        ▼
+  SYMPTOM (in code): graph.nodes[next] === undefined  at astar.ts:72
+                     → TypeError reading .lat, deep in expansion
+  a referential-integrity check at load would fail HERE ──┐
+  with "edge e7 references missing node n9999"  ◄─────────┘  (named, at the boundary)
+```
+
+**The build pipeline is the *only* integrity guarantee.** It's a real one, but
+narrow. `computeGrades` derefs both endpoints:
 
 ```ts
-// pipeline/split.ts:65 — no self-loop edges
-if (fromNode === toNode) continue; // coincident after snapping
+// pipeline/grade.ts:27
+const riseM = nodes[e.toNode].elevationM - nodes[e.fromNode].elevationM;
+//                  ▲ throws if e.toNode isn't in nodes — build fails loudly
 ```
 
-And adjacency is *consistent by construction* — `buildAdjacency` derives it from
-edges, so it can't reference an edge that isn't in `edges` (`graph.ts:22`). These are
-real integrity guarantees; they're just all on the *producer* side. The asymmetry is
-the lesson: the producer guards what it can see at build time (grade range,
-self-loops), but nothing guards the *consumer* against a bad or stale artifact,
-because the consumer trusts the cast.
+So any graph *this pipeline produces* has resolvable endpoints — a dangling edge
+crashes the build (`grade.ts:27`) before it can be shipped. That covers the
+common case. What it doesn't cover: a hand-edited `graph.json`, a partial/
+corrupt write, or a file built by an *older* pipeline version against a *newer*
+app — none of those re-run `computeGrades`, so none get the guarantee.
 
-#### Transactions — honestly not exercised
+**The missing schema version — the silent-mis-read hazard.** Confirmed: there's
+no `version` or `schemaVersion` field in `types.ts`, in `build-graph.ts`, or in
+the shipped `graph.json` (it starts `{"city":"seattle-mvp","bbox":[...]`). So if
+the `Edge` shape changes — say `gradePct` is renamed, or a field is added that
+the app requires — an app binary bundled against the new shape and an old
+`graph.json` (or vice versa) doesn't refuse to load. It casts, reads `undefined`
+for the moved field, and produces wrong routes silently.
 
-There are no runtime writes to the graph. `loadGraph` reads; A\* and the heatmap read;
-`useTileGraph` builds *new* graph objects and merges, never mutating the base in place.
-So there's nothing to make atomic — no multi-write operation that could half-succeed.
-"No transactions" here isn't a gap; it's the correct answer for a read-only artifact.
-The integrity concern that *does* apply is the boundary check, not atomicity.
+```
+  No version tag → skew is silent
+
+  app expects Edge v2 (has `surfacePenalty`)
+  graph.json is v1     (no `surfacePenalty`)
+        │ loadGraph casts anyway — no version compared
+        ▼
+  edge.surfacePenalty === undefined → cost math goes NaN → silently wrong routes
+  a `version` field + a check at loadGraph would REFUSE to load instead
+```
 
 ### Move 2 variant — the load-bearing skeleton
 
-The kernel of "integrity without an engine" is a boundary validator. Three parts —
-what breaks without each:
+The kernel of integrity-at-a-boundary: **validate the contract where untrusted
+data enters, and version the contract so skew is detectable.**
 
-1. **A single check point at the trust boundary.** The `loadGraph` cast is where
-   external data becomes trusted. Drop the idea of checking here (validate scattered
-   in every consumer) and the checks rot — some paths validate, some don't, exactly
-   today's state where the producer guards some things and the consumer none.
-2. **Invariant assertions, not just shape.** "Has the right fields" (a shape check,
-   e.g. zod) is necessary but not sufficient — you also need "every FK resolves,"
-   "adjacency matches edges." Drop the invariant assertions and you catch typos but
-   not dangling references — the worst gap (Gap 1) survives.
-3. **A version sentinel that refuses on mismatch.** One integer in the artifact, one
-   equality check at load. Drop it and stale-artifact drift (Gap 2) is silent forever.
+- *No referential check at load* → a dangling FK surfaces as a deref crash deep
+  in A* (`astar.ts:72`), not at the boundary. The check that's missing:
+  "every `edge.fromNode/toNode` is a key in `nodes`."
+- *No schema version* → build/app skew mis-reads silently instead of refusing
+  to load. The field that's missing: `Graph.version`, compared in `loadGraph`.
+- *The build-time deref* (`grade.ts:27`) is the *only* present guard, and it
+  only protects artifacts this pipeline produced.
 
-Optional hardening: making the validator *run in CI on the built artifact*, so a bad
-`graph.json` never ships. None of the three parts exists today; the producer's
-build-time guards (Gap 3) are the closest thing, and they don't cover the consumer.
+The hardening that would close this is small: a `validateGraph(g)` called once
+inside `loadGraph` that (a) checks every edge endpoint resolves, (b) checks
+`g.version === EXPECTED_VERSION`. One pass over 1879 edges, run once at startup
+— cheap, and it moves every failure to the boundary with a named cause.
+
+### Move 2.5 — current state vs future state
+
+```
+  Phase A (now)                      Phase B (add the guard)
+  ─────────────                      ───────────────────────
+  loadGraph: `as unknown as Graph`   loadGraph: validateGraph(parsed)
+  dangling FK → crash deep in A*     dangling FK → throws at load, named
+  no version → silent skew           version check → refuses on mismatch
+  build-time deref is the only guard boundary validation + build guard
+  cost to add: ~1 pass, 1 field
+```
+The cost of Phase B is one O(E) validation pass at startup and one `version`
+field added to the type and the build (`build-graph.ts:29`). For a read-only
+single-artifact model, that's the entire migration story (see `05` and the
+audit's lens 5) — there's no live data to migrate, just a version tag to start
+stamping.
 
 ### Move 3 — the principle
 
-Integrity is about *when* you find out a fact is wrong, and the whole game is moving
-that moment earlier — to the write (a DB's FK), or failing that, to the load (a
-boundary validator), never to the deref three layers in. A database buys you "early
-and loud" for free; without one, you buy it by hand with a validator at the single
-seam where untrusted data becomes trusted. flattr skipped that buy: the cast is a
-promise, not a check, so its two real integrity bugs (dangling FK, schema drift) both
-surface late and cryptic. The transfer: **every `as` cast over external data is an
-unpaid integrity debt; pay it with one validator at the boundary, and the deep
-mysterious crash becomes a clear message before anything runs.**
+Validate at the trust boundary, and version the contract. Without a database
+enforcing FKs, the discipline a DB gave you for free has to move into one
+function at the seam where untrusted bytes become trusted objects. The cost of
+skipping it isn't "no integrity" — it's "integrity failures that surface far
+from their cause." A loud failure at the boundary is worth more than a silent
+one downstream.
+
+---
 
 ## Primary diagram
 
-The trust boundary, the invariants, and where each violation surfaces — the whole
-integrity story in one frame.
+The trust boundary, the one present guard, and the two missing ones.
 
 ```
-  Integrity in flattr — enforced, unenforced, and the crash sites
+  Integrity map — one guard present, two missing, all at the loadGraph seam
 
-  PRODUCER (build) ── enforces ──┐        graph.json        CONSUMER (runtime)
-  ┌──────────────────────────┐   │   ┌──────────────────┐   ┌────────────────────┐
-  │ grade.ts:30  |grade|≤40  │───┘   │ {city,bbox,nodes,│   │ loadGraph()        │
-  │ split.ts:65  no self-loop│       │  edges,adjacency}│──►│ `as Graph`         │
-  │ buildAdjacency consistent│       │  NO version field│   │ ✗ NO validation    │
-  └──────────────────────────┘       └──────────────────┘   └─────────┬──────────┘
-        ✓ caught at build                ✗ no FK check                 │
-                                         ✗ no version              trusted Graph
-                                                                       ▼
-                              ┌──────────────────────────────────────────────────┐
-                              │ A* / cost / heatmap                              │
-                              │  dangling FK → nodes[id]=undefined → CRASH (deep)│
-                              │  schema drift → field=undefined → NaN cost (silent)│
-                              └──────────────────────────────────────────────────┘
-        the fix: one validator at the loadGraph seam — assert FKs resolve,
-                 assert version matches — turns "deep/silent" into "early/loud"
+  ┌─ BUILD (trusted) ──────────────────────────────────────────────┐
+  │  computeGrades derefs nodes[e.toNode]  ── GUARD #1 (build-only) │
+  │     dangling FK → build crashes loudly (grade.ts:27)           │
+  └──────────────────────────────────┬─────────────────────────────┘
+                                      │ graph.json (no version field)
+  ┌─ loadGraph (THE trust boundary) ───▼────────────────────────────┐
+  │  return graph as unknown as Graph   ← blind cast, NO validation │
+  │     ✗ MISSING: referential check (every FK resolves)           │
+  │     ✗ MISSING: version check (g.version === EXPECTED)          │
+  └──────────────────────────────────┬─────────────────────────────┘
+  ┌─ RUNTIME (assumes valid) ──────────▼────────────────────────────┐
+  │  A* derefs graph.nodes[next] → undefined crash (astar.ts:72)   │
+  │     symptom far from cause; "no route" or TypeError, unnamed    │
+  └─────────────────────────────────────────────────────────────────┘
 ```
+
+---
 
 ## Elaborate
 
-Referential integrity is the database promise that a relationship can't point at
-nothing — implemented as a FK constraint the engine checks on every write. Schema
-versioning is the same idea over time: a stored format version so a reader can refuse
-data it wasn't built for (every migration framework stamps one; every binary format
-from PNG to Protobuf carries one). flattr has neither because it has no engine and no
-migration framework — and that's a *defensible* place to be for a hand-built static
-artifact, right up until the artifact is wrong. The honest framing: the producer-side
-guards (grade clamp, self-loop skip) show the team thinks about integrity; the missing
-consumer-side validator shows where the no-database choice left a hole. A zod schema +
-an FK-resolution pass + a version int at `loadGraph` closes all three gaps in one
-function.
+This is the serialized-artifact version of the oldest data rule: enforce
+invariants at the boundary, not by hoping callers are careful. A DB gives you
+FK/`not-null`/`check`/`unique` for free; a JSON artifact gives you nothing, so
+the boundary check is yours to write (libraries like `zod` exist for exactly
+this — parse, don't cast). The schema-version gap is the same lesson applied to
+*time*: serialized data outlives the code that wrote it, so it needs a version
+tag the reader checks, the way a wire protocol carries a version byte. flattr's
+model is small enough that both fixes are a few lines — which is precisely why
+they're worth adding before the model grows.
 
-Read next: `05` — how the artifact is built and evolved, which is where the missing
-version field would get stamped.
+Cross-link: how a dangling-edge failure actually surfaces and gets diagnosed is
+`study-debugging-observability`; the trust-boundary framing is `study-security`.
+
+---
 
 ## Interview defense
 
-**Q: There's no database. What enforces that an edge's `fromNode` and `toNode`
-actually exist?**
-
-Nothing — that's the worst gap. There's no FK constraint and no load-time check.
-`loadGraph` casts the JSON `as Graph` with zero validation (`loadGraph.ts:10`), so a
-dangling endpoint ships fine and crashes deep in A\*: `graph.nodes[danglingId]` is
-`undefined`, the haversine heuristic derefs `.lat`, and you get a cryptic
-"undefined.lat" with a stack trace pointing at the heuristic, not the bad edge. A
-database would've rejected the edge at insert. The fix is one O(E) pass at load
-asserting every FK resolves — turns a deep cryptic crash into an early named error.
+**Q: There's no database — so where does integrity live?**
+Almost nowhere enforced at runtime. The relations are FK-shaped
+(`Edge.fromNode/toNode → Node.id`) but nothing checks they resolve. `loadGraph`
+is `graph as unknown as Graph` (`loadGraph.ts:10`) — a blind cast. The only real
+guard is the build pipeline: `computeGrades` derefs both endpoints
+(`grade.ts:27`), so a dangling edge crashes the build. That protects artifacts
+this pipeline made, not hand-edited or version-skewed ones.
 
 ```
-  WITH FK:   reject at write   (early, clear)
-  flattr:    crash at deref    (late, cryptic)  ← one load-time validator fixes this
+  build deref = the ONLY guard (build-time)
+  loadGraph cast = the trust boundary with NO check
+  dangling FK → crashes deep in A*, not at load
 ```
+Anchor: "integrity lives in the build pipeline's deref and nowhere else — the
+load boundary trusts the bytes."
 
-Anchor: *"No referential integrity — a dangling edge endpoint crashes deep in A\* as
-undefined.lat; the fix is one FK-resolution pass at the loadGraph boundary."*
+**Q: What's the cheapest thing to add, and why that one first?**
+A schema `version` field plus a `validateGraph` at `loadGraph`. Version first,
+because serialized data outlives the code: with no version tag, a build/app
+shape skew mis-reads *silently* (`undefined` for a moved field → NaN cost →
+wrong routes). One field plus one comparison turns silent corruption into a
+loud refusal. The referential check is the same O(E) pass, run once at startup.
 
-**Q: The graph is a bundled JSON file and the type is in code. What stops them from
-drifting?**
+```
+  add: Graph.version + check in loadGraph
+  silent skew → loud refusal at the boundary
+```
+Anchor: "version the serialized contract first — silent skew is the worst
+failure, and it's one field to fix."
 
-Nothing — `graph.json` has no schema version field (verified: keys are just
-`city/bbox/nodes/edges/adjacency`). Rename a field in `types.ts` without re-building
-and re-bundling the artifact, and the cast still succeeds while the renamed field
-reads `undefined` — `NaN` costs, silently wrong routes, no error. The standard guard
-is a version sentinel: one integer in the artifact, one equality check at load that
-refuses a mismatch. It's absent. That's the single cheapest integrity win available
-here.
-
-Anchor: *"No version on the artifact — a stale graph.json against a renamed type
-fails silently as NaN costs; one version int + an equality check at load stops it."*
+---
 
 ## See also
 
-- `01-graph-as-the-schema.md` — the FKs (`fromNode`/`toNode`) this file guards.
-- `03-missing-indexes-and-scans.md` — `edgeById`'s throw is the one place a missing
-  edge *does* fail loud.
-- `05-build-and-evolve-the-artifact.md` — where the version sentinel would be stamped.
-- `study-security` — the trust boundary at `loadGraph`; the cast as an unchecked input.
+- `01-graph-as-entity-model.md` — the FK-shaped relations this file says nothing enforces
+- `05-tile-prefixing-and-id-namespacing.md` — id collisions on merge (a different integrity concern, handled)
+- `study-debugging-observability` — how a dangling edge actually surfaces and gets traced
+- `study-security` — validation at the trust boundary as a security posture

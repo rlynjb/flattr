@@ -1,311 +1,319 @@
 # Recursion, Backtracking & Dynamic Programming
 
-**Industry names:** path reconstruction, back-pointer chasing,
-backtracking, memoization, tabulation, optimal substructure.
-**Type:** Industry standard.
+**Industry names:** path reconstruction via back-pointers · iterative vs
+recursive traversal · memoization / tabulation (DP) · backtracking. **Type:**
+Industry standard.
 
----
+## Zoom out, then zoom in
 
-## Zoom out — where this concept lives
-
-flattr's clearest member of this family is **path reconstruction** — the
-backtrack from goal to start through the `came` map. It's written
-iteratively, but it *is* the backtracking shape, and it's the place to
-anchor. Dynamic programming proper isn't in the repo — but A* itself
-quietly has DP's defining property (optimal substructure), which is worth
-naming precisely rather than skipping.
-
-```
-  Zoom out — recursion/backtracking/DP in flattr
-
-  ┌─ Search produces back-pointers ─────────────────────────────┐
-  │  astar.ts: came: Map<id, {edge, prev}>  (file 02)          │
-  └───────────────────────────┬──────────────────────────────────┘
-                              │ goal popped
-  ┌─ Reconstruction (backtrack) ────────────────────────────────┐
-  │  ★ reconstruct(came, start, goal)  → walk prev to start ★  │ ← we are here
-  │     (iterative, but the backtrack-to-base-case shape)      │
-  └──────────────────────────────────────────────────────────────┘
-  ┌─ DP-adjacent (the property, not the technique) ─────────────┐
-  │  A* relaxation: g[next] = min over paths   = optimal substr.│
-  │  not yet exercised: tabulation / memoized recurrence        │
-  └──────────────────────────────────────────────────────────────┘
-```
-
-**Zoom in.** Reconstruction is a backtrack: start at the goal, follow
-`prev` pointers until you hit the base case (the start), collecting edges
-as you go. This file walks that, then names where DP would belong and why
-A* already embodies its core idea without being "a DP."
-
----
-
-## Structure pass — one axis across the family
-
-These three are usually taught together because they share one axis:
-**how is a big answer built from smaller answers?**
+flattr's relationship to recursion is the interesting part: it has the
+*recursion-shaped problem* — walking a came-from chain backward from goal to
+start — but solves it **iteratively** with a `while` loop. That's a deliberate
+choice you'll recognize from your reincodes BST, where you wrote both recursive
+and iterative `delete`. There's **no dynamic programming** here, and no
+backtracking — and that's not an omission, it's because best-first search is a
+*greedy* frontier expansion, not a subproblem-table fill. This file covers the
+one recursion-shaped thing flattr does, and why DP genuinely doesn't fit.
 
 ```
-  Axis: "how does the solution compose from subproblems?"
+  Zoom out — recursion in flattr: one chain-walk, no DP
 
-  recursion     → solve(n) calls solve(smaller)    base case stops it
-  backtracking  → recursion that UNDOES choices    explore → retreat
-  DP            → recursion + remember subanswers   overlapping subproblems
-  reconstruction→ follow a chain of stored sub-answers to a base case
+  ┌─ Algorithm layer ─────────────────────────────────────────┐
+  │  reconstruct()  astar.ts:86   goal → start chain walk      │ ★
+  │     while (cur !== startId) { ... cur = entry.prev }       │
+  │     iterative, not recursive — but recursion-SHAPED        │
+  │                                                            │
+  │  bidirectional reconstruct  bidirectional.ts:122-144       │
+  │     same shape, two chains (forward + reverse) joined      │
+  └────────────────────────────────────────────────────────────┘
+
+  not present:  memoization tables · tabulation · backtracking search
 ```
 
-The seam in flattr: reconstruction has the recursion/backtracking
-*shape* (chain to a base case) but **no overlapping subproblems**, so it
-needs no memoization — it's a single linear walk, not a tree of repeated
-work. A* has the *optimal-substructure* half of DP (best path to a node =
-best path to its predecessor + one edge) but builds it iteratively with a
-priority queue instead of a recurrence. Naming which half each piece has
-is the whole lesson.
+Zoom in: recursion and iteration are two encodings of the same thing — a stack
+of deferred work. Reconstruction is a linear back-walk (each node has exactly
+one predecessor), so it's the case where iteration is *strictly better* than
+recursion: no call-stack risk, same logic. We'll walk it, then be honest about
+why DP has nothing to do here.
 
----
+## The structure pass
+
+One recursion-shaped operation; DP and backtracking absent. Trace the
+**"where is the deferred work stored"** axis.
+
+```
+  Axis: where does the "remember to come back to this" state live?
+
+  technique          state lives in        flattr uses it?
+  ────────────────   ───────────────────   ──────────────────────────
+  recursion          the call stack        no (chose iteration)
+  iteration          explicit loop var     YES — reconstruct() while loop
+  backtracking       call stack + undo     not yet exercised
+  DP memoization     a results cache       not yet exercised
+  DP tabulation      a filled table        not yet exercised
+```
+
+**The seam:** the boundary between `search()` (forward, builds the `came` map)
+and `reconstruct()` (backward, reads it). The contract: `search` promises every
+reachable node has exactly one `came` entry pointing at its optimal
+predecessor; `reconstruct` relies on that to walk a single unambiguous chain
+from goal to start. Because each node has *one* predecessor (not many),
+there's no branching to explore — which is precisely why this is a simple
+back-walk and not backtracking.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-Backtracking is recursion that retraces its steps: you go forward making
-choices, hit a base case or a dead end, and walk back. Reconstruction is
-the *walk-back* without the forward exploration — the search already did
-the forward part, leaving a trail of `prev` pointers. You just follow the
-trail home.
+You've built recursion call-stack visualizers in reincodes (`Tree.ts`
+generators) — you've *watched* a recursion defer and unwind. Reconstruction is
+the unwind without the defer: each node points at exactly one predecessor via
+the `came` map, so following the chain is just "keep asking 'who came before
+me' until you hit the start."
 
 ```
-  Reconstruction — follow prev to the base case
+  Path reconstruction — follow one back-pointer per node
 
-  goal ──prev──► N3 ──prev──► N2 ──prev──► N1 ──prev──► start
-   │                                                      │
-   │  collect edge at each hop                            │
-   └──────────── base case: cur == start ────────────────┘
-   then reverse → [start, N1, N2, N3, goal]
+  came map (built forward during search):
+    G ──prev──► A ──prev──► S        (each node: exactly ONE predecessor)
+
+  reconstruct walks it BACKWARD from goal:
+    cur = G  → came[G] = {edge ag, prev A}  → record ag, cur = A
+    cur = A  → came[A] = {edge sa, prev S}  → record sa, cur = S
+    cur = S  → cur === start → stop
+  then reverse → [S, A, G] with edges [sa, ag]
 ```
 
-It's a linked-list traversal where the list is threaded through a hash map
-(`came`). The base case is `cur === startId` — the equivalent of a
-recursion's stopping condition.
+This is a *linear* recursion (one recursive call per step), which is the
+textbook case for converting to a loop — no branching means no real stack
+needed.
 
-### Move 2 — reconstruction, then the DP gap
+### Move 2 — the walkthrough
 
-#### `reconstruct()` — the backtrack walk
+#### reconstruct — the iterative back-walk
+
+Here's the code, `astar.ts:86-103`:
 
 ```ts
-// features/routing/astar.ts:86-103
-function reconstruct(came, startId, goalId) {
-  const nodes = [goalId];
+// astar.ts:86-103 — walk came backward, iteratively
+function reconstruct(came, startId, goalId): { nodes, edges } {
+  const nodes = [goalId];        // start the answer at the goal
   const edges = [];
   let cur = goalId;
-  while (cur !== startId) {            // ← base case: reached the start
-    const entry = came.get(cur)!;
-    edges.push(entry.edge);            // collect the EXACT edge relaxed
-    cur = entry.prev;                  // step backward one hop
+  while (cur !== startId) {       // ← the loop that replaces recursion
+    const entry = came.get(cur)!; // who came before cur, on which edge
+    edges.push(entry.edge);       // record the EXACT relaxed edge (file 05)
+    cur = entry.prev;             // step back one node
     nodes.push(cur);
   }
-  nodes.reverse();                     // goal→start becomes start→goal
+  nodes.reverse();                // we built goal→start; flip to start→goal
   edges.reverse();
   return { nodes, edges };
 }
 ```
 
-Execution trace — reconstruct a 3-node path S→A→G:
+Walk it step by step:
+
+- **Start at the goal, walk to the start.** The `came` chain only points
+  *backward* (each node knows its predecessor, not its successor), so you must
+  start at the goal end.
+- **`cur = entry.prev`** — the single step that, in a recursive version, would
+  be the recursive call `reconstruct(prev)`. Here it's just reassigning a loop
+  variable.
+- **`reverse()`** — because you built the list goal-first, flip it to the
+  start→goal order the rest of the system expects.
+
+**Why iterative, not recursive?** A recursive `reconstruct` would push one stack
+frame per node on the path. For a cross-city route that's potentially thousands
+of frames — a real stack-overflow risk in a JS engine. The iterative loop has
+*zero* stack growth: same logic, bounded memory. *This is the case where the
+"recursion is elegant" instinct is wrong — a linear chain-walk should be a
+loop.* You made the same call in your reincodes BST's iterative delete.
 
 ```
-  reconstruct trace (came: G→{prev:A}, A→{prev:S})
+  Recursive (stack grows with path length) vs iterative (flat)
 
-  cur=G   nodes=[G]
-    G != S → entry=came[G]={edge:ag, prev:A}
-             edges=[ag], cur=A, nodes=[G,A]
-  cur=A   A != S → entry=came[A]={edge:sa, prev:S}
-             edges=[ag,sa], cur=S, nodes=[G,A,S]
-  cur=S   S == S → stop (base case)
-  reverse: nodes=[S,A,G], edges=[sa,ag]
+  recursive:  reconstruct(G) → reconstruct(A) → reconstruct(S)
+              └─ N stack frames for an N-node path → overflow risk
+
+  iterative:  while loop, one `cur` variable
+              └─ O(1) stack, O(N) loop iterations → no overflow
 ```
 
-This is the backtracking skeleton written as a `while` loop instead of a
-recursive call — same shape, no stack-overflow risk on long paths. A
-recursive version would call `reconstruct(came[cur].prev)` and unwind;
-the iterative version makes the unwinding explicit with `.reverse()`.
+#### The bidirectional twist — two chains joined at the meeting node
 
-#### The exact-edge subtlety — why it stores the edge, not the pair
-
-Here's the part that's easy to get wrong and the repo gets right. `came`
-stores the **exact edge object** that was relaxed, not just the previous
-node. Why does that matter? Because two parallel edges can connect the
-same node pair — a short-steep street and a long-flat one between the same
-intersections.
+`bidirectional.ts` does the same back-walk *twice* and stitches the halves. The
+forward chain walks `meet → start` (via `cameF.prev`), the reverse chain walks
+`meet → goal` (via `cameR.next`), `bidirectional.ts:122-144`:
 
 ```ts
-// astar.ts:71 — stores the edge, not just the node pair
-came.set(next, { edge, prev: current });
+// bidirectional.ts:122-130 — forward half: meet back to start
+let cur = meet;
+while (cur !== startId) {
+  const entry = cameF.get(cur)!;
+  frontEdges.push(entry.edge);
+  cur = entry.prev;          // ← walk toward start
+  front.push(cur);
+}
+front.reverse();             // [start, ..., meet]
+
+// bidirectional.ts:133-141 — reverse half: meet forward to goal
+cur = meet;
+while (cur !== goalId) {
+  const entry = cameR.get(cur)!;
+  backEdges.push(entry.edge);
+  cur = entry.next;          // ← walk toward goal (note: .next, not .prev)
+  back.push(cur);
+}
+const nodes = [...front, ...back];   // join at meet
 ```
 
 ```
-  Parallel edges — why the exact edge must be stored
+  Bidirectional reconstruction — two back-walks, one join
 
-  A ═══[short-steep, 50m, 20%]═══► B
-  A ───[long-flat,  100m,  0%]───► B
-
-  directed grade router relaxes the LONG-FLAT edge (steep is penalized)
-
-  ┌─ store node pair only ──────────┐  ┌─ store exact edge (actual) ─────┐
-  │ reconstruct re-resolves (A,B)   │  │ reconstruct reports long-flat   │
-  │ → might pick short-steep        │  │ → correct edge, correct length, │
-  │ → wrong length, wrong steepEdge │  │   correct steepEdges            │
-  └─────────────────────────────────┘  └──────────────────────────────────┘
+  start ●───►───►───► [meet] ◄───◄───◄───● goal
+        │ cameF.prev          cameR.next │
+        │ (walk to start)    (walk to goal)
+        ▼                                ▼
+     front = [start,…,meet]     back = [nodeAfterMeet,…,goal]
+                  └────── concatenate at meet ──────┘
+                  nodes = [start, …, meet, …, goal]
 ```
 
-The test pins this exactly: a graph with two parallel A→B edges, the grade
-router picks the flat one, and reconstruction must report `["long-flat"]`
-with `lengthM: 100` and empty `steepEdges` (`astar.test.ts:102-128`). The
-docstring on `reconstruct` says it outright: *"Using the relaxed edges —
-not re-resolving by node pair — keeps cost/steepEdges correct when parallel
-edges share a node pair"* (`astar.ts:80-85`). `bidirectional.ts:119-144`
-does the same thing on both halves of its split path.
+The subtlety: the forward map stores `prev` (predecessor) and the reverse map
+stores `next` (successor) — because the reverse search ran *from the goal*, so
+"the node it came from" is actually the node *toward the goal*. Both halves
+collect the exact relaxed edges, same parallel-edge correctness as `05`.
 
-#### not yet exercised — dynamic programming
+#### Dynamic programming — not yet exercised, and why it doesn't fit
 
-There's no DP in flattr: no memoization table, no tabulation, no recurrence
-solved bottom-up. But here's the precise thing to say in an interview
-rather than just "no DP": **A* has optimal substructure** — DP's first
-prerequisite — but **not overlapping subproblems** in the DP sense.
+This is worth being precise about, because it's tempting to call shortest-path
+"DP." Here's the honest distinction:
 
 ```
-  A* vs dynamic programming — what's shared, what isn't
+  Why flattr's search is greedy best-first, NOT dynamic programming
 
-  shared:    optimal substructure
-             best path to N = best path to N's predecessor + edge(pred→N)
-             (this is the relaxation: g[next] = min(g[next], g[cur]+cost))
-
-  NOT shared: DP solves a fixed table of subproblems bottom-up
-             A* solves them lazily, priority-ordered, pruned by heuristic
-             → A* is "DP guided by a heuristic over an implicit graph"
+  ┌─ DP (Bellman-Ford / Floyd-Warshall) ──┐  ┌─ flattr (Dijkstra/A*) ──┐
+  │ fill a table of subproblem answers     │  │ expand a frontier in     │
+  │ in a fixed order, every cell computed  │  │ cheapest-first order,     │
+  │ relaxes ALL edges V times              │  │ each node finalized ONCE  │
+  │ handles negative edges                 │  │ requires non-negative     │
+  │ O(V·E)                                 │  │ O((V+E) log V)            │
+  └────────────────────────────────────────┘  └───────────────────────────┘
 ```
 
-`g.set(next, tentative)` in `astar.ts:70` *is* the optimal-substructure
-update — it's the same `dist[v] = min(dist[v], dist[u]+w)` you'd write in a
-DP shortest-path table. The difference: a DP (Bellman-Ford, Floyd-Warshall)
-computes *all* subproblems in a fixed order; A* computes only the ones the
-heuristic says are promising, in priority order. So flattr doesn't "use DP"
-— but its relaxation is the DP recurrence, evaluated lazily.
+There *is* a DP shortest-path family — Bellman-Ford fills a table relaxing
+every edge V times; Floyd-Warshall tabulates all-pairs distances. flattr uses
+**neither**. Its `g` map looks table-ish, but it's filled in *priority order by
+a greedy frontier*, with each node finalized exactly once — that's the Dijkstra
+discipline, not DP's fixed-order table fill. The reason flattr can be greedy:
+edge costs are non-negative (the `penalty` is always ≥ 0, `cost.ts:16-22`),
+which is exactly the condition that lets Dijkstra's greedy choice be optimal and
+removes the need for DP's repeated relaxation. *So "no DP" isn't a gap — it's
+the correct consequence of having non-negative edges.* `not yet exercised`,
+and rightly so.
 
-**Where actual DP would belong:** if flattr added a constraint like "route
-with at most K steep segments" or "minimize climb subject to a distance
-budget," that's a multi-dimensional state (`node × budget`) with
-overlapping subproblems — textbook DP. It's not in the product today.
+#### Backtracking — not yet exercised
 
-#### not yet exercised — backtracking search
-
-No backtracking *search* (the explore-then-undo kind — N-queens,
-Sudoku, subset-sum). flattr's state space is explored by best-first A*,
-not depth-first backtracking. Your reincodes `PG.ts` (river-crossing puzzle
-via BFS over a state graph) is the closest relative — it's state-space
-search, just breadth-first rather than backtracking. The shape transfers;
-flattr just picks the priority-queue frontier over the recursion stack.
+Backtracking is DFS that *undoes* choices when a branch fails — the N-queens,
+sudoku, maze-with-deadends shape. flattr's reconstruction never backtracks
+because there's nothing to undo: each node has exactly one predecessor, so the
+chain is unambiguous. Backtracking would appear if flattr searched over a
+*branching* state space with dead-ends to retreat from — which is what your
+reincodes river-crossing puzzle (`PG.ts`) does, but flattr's router doesn't.
+`not yet exercised`.
 
 ### Move 3 — the principle
 
-Reconstruction is backtracking with the forward search already done — you
-follow stored sub-answers to a base case. The detail that separates a
-correct implementation from a subtly-broken one is *what* you store: the
-exact decision (the edge), not a re-derivable summary (the node pair),
-because re-derivation can pick a different valid-looking answer. And the
-deeper point: A*'s relaxation is the dynamic-programming recurrence
-evaluated lazily — flattr gets DP's optimal-substructure guarantee without
-ever building a DP table, by letting the priority queue decide evaluation
-order.
-
----
+A linear recursion — one call per step, no branching — is a loop in disguise,
+and converting it removes the stack-overflow risk for free; that's the
+`reconstruct` lesson. The deeper one is the DP boundary: shortest path is only
+"DP" when edges can be negative (Bellman-Ford's repeated relaxation) or you want
+all-pairs (Floyd-Warshall's table). With non-negative edges, the greedy
+frontier (Dijkstra/A*) is both correct *and* faster, so flattr correctly avoids
+DP. Recognizing *when a problem is greedy-solvable vs needs DP* is the
+generalizable judgment — and the deciding question is almost always "can a cost
+be negative?"
 
 ## Primary diagram
 
-Reconstruction's backtrack walk plus where it sits relative to DP, in one
-frame.
+The reconstruction story, both flavors, plus the DP boundary.
 
 ```
-  Reconstruction (backtrack) + the DP-adjacency
+  Recursion & its absence in flattr
 
-  ┌─ during search: build the trail (astar.ts:71) ──────────────┐
-  │  relax edge → came.set(next, {edge: EXACT, prev: current})  │
-  │  this update = optimal substructure (the DP recurrence)     │
-  └───────────────────────────┬──────────────────────────────────┘
-                              │ goal popped
-  ┌─ reconstruct (astar.ts:86-103) — the backtrack ─────────────┐
-  │  cur = goal                                                  │
-  │  while cur != start:        ◄── base case                  │
-  │     edges.push(came[cur].edge)   ◄── EXACT edge (parallel-  │
-  │     cur = came[cur].prev              edge correctness)     │
-  │  reverse() → [start ... goal]                              │
-  └──────────────────────────────────────────────────────────────┘
-  ┌─ not yet exercised ─────────────────────────────────────────┐
-  │  DP table / tabulation  (would need K-steep or budget state)│
-  │  backtracking search    (A* uses a frontier, not the stack) │
-  └──────────────────────────────────────────────────────────────┘
+  RECONSTRUCTION (iterative back-walk)
+  ┌──────────────────────────────────────────────────────────┐
+  │  single search:  goal ─came.prev─► … ─► start  (reverse)  │
+  │    astar.ts:86   while loop, O(1) stack                   │
+  │                                                            │
+  │  bidirectional:  start ◄─cameF.prev─ meet ─cameR.next─► goal│
+  │    bidirectional.ts:122   two walks joined at meet        │
+  └──────────────────────────────────────────────────────────┘
+
+  NOT YET EXERCISED — and why
+  ┌──────────────────────────────────────────────────────────┐
+  │  DP (Bellman-Ford/Floyd-Warshall)                         │
+  │    → not needed: edges non-negative → greedy Dijkstra wins│
+  │  backtracking                                             │
+  │    → not needed: each node has ONE predecessor, no undo   │
+  └──────────────────────────────────────────────────────────┘
 ```
-
----
 
 ## Elaborate
 
-Path reconstruction via predecessor pointers is the standard companion to
-Dijkstra/A* — the search computes `came`, a separate walk extracts the
-path, keeping the search loop clean. The exact-edge-vs-node-pair distinction
-is a real-world routing gotcha: OSM graphs have genuine parallel edges
-(two ways between the same junctions), so re-resolving by endpoints is a
-known bug source — flattr sidesteps it by construction. DP and A* are
-cousins: both rest on optimal substructure, and Dijkstra is sometimes
-taught as "DP on a graph with a priority queue." The honest framing for
-flattr is "the recurrence is here, the table isn't." You've built the
-state-space-search relative in reincodes (`PG.ts`, BFS over an implicit
-graph) and recursion-with-call-stack visualizers (`Tree.ts` generators) —
-backtracking is the same recursion with an undo step, and memoized DP is
-that recursion with a cache. Read file 05 for the search that fills `came`,
-file 08 for where DP enters the practice plan.
+Path reconstruction via back-pointers is the standard companion to any
+shortest-path search — the search builds the predecessor map forward, a walk
+reads it backward. The recursion-to-iteration conversion is general: any
+*tail* or *linear* recursion converts to a loop with no behavior change, and
+should when depth is unbounded (here, path length). Dynamic programming
+(Bellman, 1950s) and greedy algorithms are the two pillars of optimization;
+the dividing line for shortest paths is edge sign — Dijkstra's greedy proof
+requires non-negative weights, and Bellman-Ford's DP exists precisely to handle
+the negative case flattr's `penalty ≥ 0` rules out. flattr sits cleanly on the
+greedy side by construction.
 
----
+Read next: `05` (the forward search that builds the `came` map) and `01` (the
+non-negative `penalty` that makes greedy correct, no DP needed).
 
 ## Interview defense
 
-**Q: How is the route reconstructed, and why store the edge instead of the
-node pair?**
+**Q: Why is your path reconstruction a loop instead of recursion?**
+
+Because it's a *linear* back-walk — each node has exactly one predecessor in the
+`came` map, so there's no branching, just "follow the chain from goal to start"
+(`astar.ts:86`). A recursive version would push one stack frame per node, and a
+cross-city path is thousands of nodes — a real overflow risk. The loop is the
+same logic with O(1) stack.
 
 ```
-  came[cur] = {edge, prev}  → walk prev to start, collect EXACT edges
-  parallel edges: short-steep vs long-flat between same (A,B)
-  node-pair re-resolution could pick the wrong one → wrong steepEdges
+  recursive: N frames for an N-node path → overflow
+  iterative: one `cur` var, while-loop → flat stack
 ```
 
-*Model answer:* "When the search relaxes an edge it records `{edge, prev}`
-in `came`. Reconstruction starts at the goal and follows `prev` to the
-start — the base case — collecting edges, then reverses. It stores the
-*exact* edge object because OSM graphs have parallel edges: a short-steep
-and a long-flat street between the same two junctions. If reconstruction
-re-resolved by node pair, it might report the steep one even though the
-grade router chose the flat one, corrupting the length and `steepEdges`.
-There's a test that pins exactly this."
+Anchor: "linear recursion is a loop in disguise — convert it when depth is
+unbounded."
 
-*Anchor:* store the exact relaxed edge; node-pair re-resolution breaks on
-parallel edges.
+**Q: Isn't shortest-path just dynamic programming?**
 
-**Q: Does flattr use dynamic programming?**
+No — flattr's is greedy best-first, not DP, and the reason is edge sign. DP
+shortest-path (Bellman-Ford) relaxes every edge V times to handle negative
+edges; flattr's `penalty` is always ≥ 0 (`cost.ts:16`), so Dijkstra's greedy
+"finalize the cheapest frontier node once" is provably optimal and far faster —
+`O((V+E) log V)` vs `O(V·E)`. The `g` map looks like a DP table but it's filled
+in greedy priority order, each node finalized exactly once.
 
-*Model answer:* "Not as a technique — no memoization table, no tabulation.
-But A*'s relaxation, `g[next] = min(g[next], g[cur] + cost)`, *is* the
-dynamic-programming shortest-path recurrence; it has optimal substructure.
-The difference is A* evaluates subproblems lazily in priority order over an
-implicit graph, pruned by the heuristic, instead of filling a fixed table
-bottom-up. So flattr has DP's core property without a DP table. Real DP
-would enter if I added a constraint like 'at most K steep segments,' which
-makes the state `node × budget` — overlapping subproblems."
+```
+  negative edges possible?  → DP (Bellman-Ford), relax V times
+  non-negative (flattr)?     → greedy Dijkstra/A*, finalize once
+```
 
-*Anchor:* the recurrence is present, the table isn't; A* is lazy,
-heuristic-guided DP over an implicit graph.
-
----
+Anchor: "the deciding question is always 'can a cost go negative?' — flattr's
+can't, so greedy wins and DP isn't needed."
 
 ## See also
 
-- `05-graphs-and-traversals.md` — the search that builds `came`.
-- `02-arrays-strings-and-hash-maps.md` — `came` as a hash-threaded list.
-- `08-dsa-foundations-practice-map.md` — where DP enters the plan.
+- `05-graphs-and-traversals.md` — the forward search that builds `came`.
+- `01-complexity-and-cost-models.md` — the non-negative `penalty` enabling greedy.
+- `02-arrays-strings-and-hash-maps.md` — the `came` map structure.
+- `08-dsa-foundations-practice-map.md` — DP and backtracking as ranked gaps.

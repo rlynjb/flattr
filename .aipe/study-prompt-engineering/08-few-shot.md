@@ -1,205 +1,182 @@
-# 08 — Few-shot prompting
+# 08 · Few-shot prompting
 
-*Industry name(s): "few-shot prompting," "in-context examples,"
-"demonstrations," "k-shot." Type label: Industry standard.*
+> Industry name: few-shot prompting / in-context examples · Type label: Industry standard
 
-> **Seam, not present.** flattr has no prompt to add examples to. But it has
-> the perfect example *source*: `features/routing/fixtures.ts` already pairs
-> structured inputs (graphs) with known outputs. Those pairs are exactly what
-> few-shot examples are made of. This file teaches few-shot against Seam 1's
-> "describe my route" prompt, with examples drawn from real fixtures.
+> **Status: seam, not feature.** flattr has no prompts to put examples in — but it has the perfect *source* of examples: `features/routing/fixtures.ts` produces routes with known, hand-checkable outputs. This file maps few-shot onto Seam 1 and Seam 2, drawing examples from those golden graphs.
 
-## Zoom out — where examples sit in the prompt
+## Zoom out — where this concept lives
 
-Few-shot is the few input→output pairs you put in the prompt to show the model
-the shape of a good answer. They sit in the prompt's example section (concept
-01, section 3), between the rules and the per-call data.
+Few-shot examples live in the constant section of the prompt (`01-anatomy.md`), between the system prompt and the per-call context. Here's where they'd sit and where they'd come from:
 
 ```
-  Zoom out — few-shot examples in the Seam 1 prompt
+  Zoom out — few-shot examples, sourced from fixtures.ts
 
-  ┌─ prompt ────────────────────────────────────────────────────────┐
-  │ [system]   rules: one sentence, honest about steep              │
-  │ [FEW-SHOT] ★ in: {d=200,climb=0,steep=0} → "Flat 0.2 km."  ★    │
-  │            ★ in: {d=200,climb=9,steep=1} → "0.2 km, 1 steep." ★ │
-  │ [context]  {d=3200, climb=45, steep=0}   ← this call            │
-  └──────────────────────────────────────────────────────────────────┘
-        examples DRAWN FROM fixtures.ts (diamond / grade graphs)
+  ┌─ Source: fixtures.ts (golden graphs) ────────────────────────┐
+  │ diamondGraph → known path  gradeGraph → flat path            │
+  │ → compute real RouteSummary → hand-write ideal sentence      │
+  └─────────────────────────┬────────────────────────────────────┘
+                            │ baked into the prompt (deploy-time)
+  ┌─ Prompt (Seam 1) ───────▼────────────────────────────────────┐
+  │ system │ ★ FEW-SHOT: 2-3 (RouteSummary → sentence) pairs ★   │ ← we are here
+  │        │ context (this call's route) │ user                  │
+  └─────────────────────────┬────────────────────────────────────┘
+                            │ HTTP
+  ┌─ Provider ──────────────▼────────────────────────────────────┐
+  │ LLM matches the example FORMAT more tightly than instructions │
+  └──────────────────────────────────────────────────────────────┘
 ```
 
-## Zoom in
+Now zoom in. The pattern is: **examples constrain output more tightly than instructions do — show the model two or three ideal input→output pairs and it copies the format, where a prose instruction would be interpreted loosely.** 3-5 good examples beat 20 mediocre ones, and they cost context tokens, so you pick them deliberately. Let me build it.
 
-The pattern: **show 3–5 input→output pairs and the model imitates the shape —
-examples constrain output harder than instructions do.** You can write "be
-concise and honest about steepness" in the system prompt all day; one example
-of a steep route described honestly teaches it more reliably than the
-sentence. The cost: examples eat context tokens (concept 04), so 3–5 good ones
-beat 20 mediocre ones.
+## Structure pass
 
-## The structure pass
+**Layers.** Two: the *example source* (where the pairs come from — for flattr, computed from `fixtures.ts`) and the *example slot* (the constant section they live in). The quality of layer 1 determines everything; bad examples teach bad format faster than instructions could.
 
-**Layers:** instruction → example → output.
-**Axis:** *constraint strength* — how hard does this pin the output shape?
-**Seam:** the instruction→example boundary, where vague guidance becomes a
-concrete pattern the model copies.
+**Axis — control (what shapes the output more, instructions or examples?).**
 
 ```
-  axis = "how hard does this constrain the output?"
+  One axis — "what controls the output format?" — instructions vs examples
 
-  ┌─ instruction ─┐ constraint: SOFT — "be concise" is interpretable
-  │  ── seam ──      ◄── constraint strength JUMPS at the example
-  └─ example ─────┘ constraint: HARD — model copies the exact shape
+  instruction only:  "return one concise sentence"
+    → model interprets "concise" loosely, format drifts
+
+  + 3 examples:      {dist:1200,climb:8} → "Flat, 1.2km."
+                     {dist:2100,climb:14}→ "Mostly flat, 2.1km, one climb."
+    → model COPIES the format. control flips from prose→demonstration
+
+  the seam: examples out-constrain instructions for format-sensitive output
 ```
+
+**Seam.** The load-bearing boundary is *between instruction-controlled and example-controlled output*. For format-sensitive tasks (classifiers, fixed output shapes), examples win — the model pattern-matches the demonstration more reliably than it parses an adjective like "concise."
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You know that a Storybook story or a test fixture communicates "what good looks
-like" faster than a paragraph of prop docs. A reviewer learns your component's
-intended use from one good example faster than from the README. Few-shot is
-that: the example is the spec. flattr's `fixtures.ts` already encodes
-"what good looks like" for the router — `gradeGraph()` *is* a demonstration of
-the flat-vs-steep tradeoff. Few-shot reuses that instinct for the prompt.
+You know that a unit test communicates intent better than a doc comment — `expect(sum([1,2])).toBe(3)` pins behavior more precisely than "adds the numbers." A few-shot example is that, for an LLM: a worked input→output pair pins the format more precisely than an instruction. The model is a pattern-matcher; show it the pattern.
 
 ```
-  Pattern — few-shot as imitation
+  The few-shot kernel — demonstrations pin the format
 
-  [ example_in_1 → example_out_1 ]  ┐
-  [ example_in_2 → example_out_2 ]  ├─ model infers the mapping
-  [ example_in_3 → example_out_3 ]  ┘
-  [ real_in              → ? ]  ──► output matches the demonstrated shape
+  ┌─ examples (constant) ──────────────────────────────┐
+  │ in: {distanceM:1200, climbM:8,  steepCount:0}       │
+  │ out: "Flat, 1.2km — easy ride."                    │
+  │ in: {distanceM:2100, climbM:14, steepCount:1}       │
+  │ out: "Mostly flat, 2.1km, one short climb you flagged."│
+  └────────────────────────────────────────────────────┘
+              │ then the real input
+  ┌─ this call ▼───────────────────────────────────────┐
+  │ in: {distanceM:3400, climbM:2, steepCount:0}        │
+  │ → model copies the format → "Flat, 3.4km."          │
+  └────────────────────────────────────────────────────┘
 ```
 
-### Move 2 — building few-shot from flattr's fixtures
+### Move 2 — the step-by-step walkthrough
 
-**Step 1 — pull examples from real fixtures.** The fixtures already pair a
-structured situation with a known answer:
+**Why examples beat instructions.** An instruction is a description of the output; an example *is* the output. "Be concise" is an adjective the model interprets; `"Flat, 1.2km."` is a format the model copies. For Seam 1's description, the difference is whether every route comes out in the same clean shape or whether the model wanders into "Well, this route is fairly flat and spans about..." Examples nail the register.
+
+**Where flattr's examples come from — `fixtures.ts` is the source.** This is the part that makes flattr a good teacher. The golden graphs produce *real, verifiable* routes:
 
 ```ts
-// features/routing/fixtures.ts:67-83 — EXISTS
-/** Flat-vs-steep choice. Short path via H is steep; long path via L is flat. */
+// features/routing/fixtures.ts:70-83 — gradeGraph: flat-vs-steep
+// known: short path via H is steep; long path via L is flat
 export function gradeGraph(): Graph { ... }
 ```
 
-Run the router on it, get the `RouteSummary`, and pair it with a hand-written
-ideal description. That pair is a few-shot example grounded in real flattr
-behavior — not invented:
+Run A\* over `gradeGraph`, call `routeSummary` (`summary.ts:11`), and you get a *real* `{distanceM, climbM, steepCount}` for a route you understand. Hand-write the ideal sentence for it. Do that for `diamondGraph` (flat, simple) and `directionalGraph` (one steep edge flagged) and you have three examples that each demonstrate a different case — flat, steep-flagged, directional. That's a deliberately *diverse* example set, not three near-duplicates.
 
 ```
-  // FUTURE — few-shot section, derived from fixtures
-  in:  {distanceM:320, climbM:0, steepCount:0}  → "Flat 0.3 km, no climbs."
-  in:  {distanceM:200, climbM:9, steepCount:1}  → "0.2 km — 1 steep block, mostly flat."
+  Hop — fixtures.ts as the few-shot source
+
+  ┌─ fixtures.ts ─┐  A* + routeSummary  ┌─ real RouteSummary ─┐
+  │ gradeGraph()  │ ──────────────────► │ {dist, climb, steep}│
+  └───────────────┘                     └──────────┬──────────┘
+                                                   │ hand-write ideal output
+                                        ┌─ few-shot pair ─────┐
+                                        │ struct → sentence   │ → into prompt
+                                        └─────────────────────┘
 ```
 
-**Step 2 — choose examples that cover the decision boundaries.** Few-shot
-quality is about *coverage*, not count. The two examples above teach the model
-the most important flattr distinction: the honesty pivot at `steepCount > 0`.
-Pick examples that sit on either side of the boundary you care about — exactly
-why flattr's fixtures are *separate named graphs* for diamond / grade /
-directional, each isolating one behavior.
+**When to use vs when not.** Use few-shot for format-sensitive tasks: Seam 2's *parse* (classifiers love examples — "flat near water" → `{preferFlat:true, near:"water"}` as a demonstrated pair) and Seam 1's *describe* if you need a consistent register. Don't bother for open-ended generation where you *want* variety, or for a task already pinned by a tight schema (`02`) — if the output is schema-constrained JSON, the schema does the format work and examples mostly add token cost.
 
-**Step 3 — 3–5 good beats 20 mediocre.** Each example costs context tokens
-(concept 04). More examples isn't better past a point — redundant examples
-("here are five more flat routes") add tokens without adding constraint. Pick
-examples that each teach something the others don't.
+**Cost — examples consume context tokens.** Every example is in the constant section, billed every call (unless prefix-cached — see `04`). So examples trade tokens for reliability. The rule: 3-5 *good, diverse* examples beat 20 mediocre ones. Twenty examples that are all the flat case teach the model "everything is flat"; three examples covering flat / steep-flagged / directional teach it the actual decision boundary. flattr's three fixtures are *already* the diverse set — they were hand-built to probe three different behaviors.
 
 ```
-  Layers-and-hops — few-shot examples crossing into the prompt
+  Quality over quantity — diversity is the lever
 
-  ┌─ fixtures.ts ─┐ run router  ┌─ RouteSummary ─┐ hand-write ideal
-  │ gradeGraph()  │ ──────────► │ {d,climb,steep}│ ──────────────┐
-  └───────────────┘             └────────────────┘                ▼
-                                            ┌─ prompt few-shot section ─┐
-                                            │ in → out (×3-5, on the    │
-                                            │ honesty boundary)         │
-                                            └───────────────────────────┘
+  20 examples, all flat routes:    model learns "flat" is the only answer
+   3 examples, one each:
+     diamondGraph  → flat
+     gradeGraph    → flat-chosen-over-steep
+     directionalGraph → directional climb
+   → model learns the DECISION BOUNDARY, at 1/6 the token cost
 ```
 
-**Step 4 — the interaction with structured output.** When Seam 2 parses NL
-into `{lat,lng}` JSON (concept 02), a few-shot example *is* the structured
-form: `"flat park near the lake" → {queryHint:"park", near:"lake"}`. The
-example demonstrates the schema and the parse simultaneously. Few-shot +
-structured output compound.
-
-### Move 2 variant — load-bearing skeleton
-
-Kernel: **examples that straddle the decision boundary**. What breaks:
-
-- **No examples** → output drifts in tone and structure; "be honest" alone
-  doesn't pin steepness honesty. *Load-bearing for format-sensitive output.*
-- **Examples all on one side of the boundary** → model never learns the pivot;
-  describes a steep route as flat. *Load-bearing — coverage, not count.*
-- **20 redundant examples** → burns tokens (concept 04), no extra constraint.
-  *Anti-hardening — actively worse.*
-
-### When NOT to use few-shot
-
-Open-ended generation where you *want* variety (concept 13's rotation) — heavy
-few-shot pins the output too hard and every route sounds like the examples.
-And simple structured classifiers where the schema (concept 02) already
-constrains fully. Few-shot is for format-sensitive output where instructions
-underspecify.
+**The interaction with structured output.** A few-shot example can *be* the structured form itself. For Seam 2, the example pair is `("flat near water" → {placeText, near:"water", preferFlat:true})` — the output side is the literal JSON struct. This teaches the model both the format *and* the schema simultaneously, and it's the most reliable way to get clean structured output from a model that doesn't have native schema mode: demonstrate the JSON shape as an example.
 
 ### Move 3 — the principle
 
-An example is a stronger spec than an instruction because it removes
-interpretation. Spend your few examples on the decision boundaries that matter,
-not on volume — coverage beats count, and every example costs tokens.
+Examples out-constrain instructions for format-sensitive output, because a model is a pattern-matcher and an example is the pattern. The discipline is *diverse and few*: 3-5 examples that each probe a different case beat 20 that repeat one. flattr hands you the example source for free — `fixtures.ts` is a hand-built, behavior-diverse golden set, the same set you'd use for evals (`05`). The example set and the eval set come from the same place, which is the tell that you've built it right.
 
 ## Primary diagram
 
-```
-  Few-shot for Seam 1, examples from fixtures.ts (FUTURE)
+The full few-shot setup for Seam 1, from `fixtures.ts` source to the model's format-copying behavior.
 
-  ┌─ prompt ────────────────────────────────────────────────────────┐
-  │ [system] one sentence; honest about steep                       │
-  │ [few-shot] ←── from fixtures.ts ──→                             │
-  │   {d=320,climb=0,steep=0} → "Flat 0.3 km, no climbs."           │
-  │   {d=200,climb=9,steep=1} → "0.2 km — 1 steep block."  ← BOUNDARY│
-  │ [context] {d=3200,climb=45,steep=0}  ← this call                │
-  └───────────────────────────┬─────────────────────────────────────┘
-                              ▼  output imitates the demonstrated shape
-                    "Flat 3.2 km route, no steep blocks."
+```
+  Few-shot at Seam 1 — diverse examples from fixtures.ts
+
+  ┌─ Source (fixtures.ts) ───────────────────────────────────────┐
+  │ diamondGraph→flat  gradeGraph→flat-over-steep  directional→climb│
+  │   A* + routeSummary → real structs → hand-written sentences   │
+  └─────────────────────────┬────────────────────────────────────┘
+                            │ 3 diverse pairs (deploy-time, cacheable)
+  ┌─ Prompt (Seam 1) ───────▼────────────────────────────────────┐
+  │ system │ FEW-SHOT: 3 (struct→sentence) pairs ║ context │ user │
+  │        │  ↑ pins format > instructions       ║ this route     │
+  └─────────────────────────┬────────────────────────────────────┘
+                            │
+  ┌─ Provider ──────────────▼────────────────────────────────────┐
+  │ LLM copies the demonstrated format → consistent route prose   │
+  └──────────────────────────────────────────────────────────────┘
+   cost: examples bill every call (unless prefix-cached, 04)
+   rule: 3-5 diverse > 20 mediocre
 ```
 
 ## Elaborate
 
-Few-shot is the original "prompt engineering" technique from the GPT-3 paper
-("Language Models are Few-Shot Learners") and remains the highest-leverage
-move for format-sensitive output. The reader has shipped it in loopd's intent
-classifier (explicit examples) — same pattern. The modern caveat: frontier
-models need *fewer* examples than they used to for simple tasks, but for
-honesty-on-a-boundary (flattr's steep pivot) a couple of well-chosen examples
-still earn their tokens. Read `02-structured-outputs.md` for the few-shot +
-schema interaction and `13-forbidden-patterns.md` for why too-strong few-shot
-makes every output identical.
+Few-shot is the oldest technique in this folder (it predates structured-output modes), and its role has shifted: where the output is schema-constrained, the schema now does much of what examples used to do, so few-shot's strongest remaining use is *format register* (the describe seam) and *teaching the schema by demonstration* on models without native schema mode. The interaction with structured output (`02`) is the modern nuance — the example's output side *is* the JSON. The canonical source is the original GPT-3 few-shot paper and the OpenAI cookbook's classification recipes. flattr's `fixtures.ts` is an unusually clean example source because it was built for a different reason (router tests) and happens to be exactly the diverse, verified, behavior-probing set few-shot wants.
+
+## Project exercises
+
+### EX-FEWSHOT-1 — Build the example set from fixtures
+
+- **Exercise ID:** EX-FEWSHOT-1
+- **What to build:** `describeExamples()` that runs A\* over `diamondGraph`/`gradeGraph`/`directionalGraph`, computes each `RouteSummary`, and pairs it with a hand-written ideal sentence — three diverse few-shot pairs.
+- **Why it earns its place:** Demonstrates that the example source and the eval source are the same golden set, and forces the diversity discipline (one pair per behavior).
+- **Files to touch:** new `features/routing/few-shot.ts`; uses `fixtures.ts`, `astar.ts`, `summary.ts`.
+- **Done when:** the three pairs each probe a distinct case (flat / steep-flagged / directional) and feed directly into the Seam 1 prompt.
+- **Estimated effort:** 2 hours.
 
 ## Interview defense
 
-**Q: "Instructions or examples to constrain output?"** Examples, when the
-output is format-sensitive — they remove interpretation. "Be honest about
-steepness" is interpretable; one example of a steep route described honestly is
-not. But spend examples on the decision boundary (flattr: `steepCount>0`), not
-on volume — 3–5 well-chosen beats 20 redundant, because each costs tokens.
+**Q: Why do examples constrain output better than instructions?**
+
+Because the model is a pattern-matcher and an example is the pattern. "Be concise" is an adjective it interprets loosely; `"Flat, 1.2km."` is a format it copies. For format-sensitive output, demonstrations beat descriptions.
 
 ```
-  instruction "be concise"  → soft, interpretable
-  example {steep=1}→"1 steep" → hard, copied. Cover BOTH sides of the pivot.
+  instruction "concise" → loose interpretation, drift
+  3 examples            → model copies the demonstrated format
 ```
 
-Anchor: *"flattr's `fixtures.ts` is a ready-made example source — run the
-router on `gradeGraph()`, pair the `RouteSummary` with an ideal description,
-and you have a few-shot example grounded in real behavior, sitting right on the
-honesty boundary."*
+Anchor: flattr's `fixtures.ts` produces three behavior-diverse routes — the ideal few-shot source, one pair per case.
+
+**Q: 20 examples or 3?**
+
+Three diverse beats twenty mediocre. Twenty examples of the same case teach the model that case is the only answer; three covering the decision boundary (flat / steep / directional) teach the actual distinction, at a fraction of the token cost.
 
 ## See also
 
-- [02-structured-outputs.md](02-structured-outputs.md) — examples can BE the
-  schema
-- [04-token-budgeting.md](04-token-budgeting.md) — examples cost context tokens
-- [13-forbidden-patterns.md](13-forbidden-patterns.md) — when examples
-  over-constrain
-- [05-eval-driven-iteration.md](05-eval-driven-iteration.md) — fixtures feed
-  both evals and examples
-</content>
+- `01-anatomy.md` — the constant section examples live in
+- `02-structured-outputs.md` — the example output can be the JSON schema itself
+- `04-token-budgeting.md` — examples cost tokens; prefix caching offsets it
+- `05-eval-driven-iteration.md` — same golden set, different use

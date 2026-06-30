@@ -1,103 +1,133 @@
-# Agent architecture — overview
+# Agent architecture in flattr — overview
 
-## The honest verdict, up front
+> Topic: agent architecture and orchestration, studied against the
+> flattr codebase. Written in the teacher voice from `teacher.md`,
+> calibrated to the reader profile in `me.md`, structured per
+> `format.md`.
 
-flattr has **no LLM, no agent, no tool-calling, no multi-agent
-orchestration.** There is nothing in this repo that hands a model a set of
-tools and lets it decide what to do next. Don't go looking for a ReAct loop
-or a supervisor — there isn't one, and this guide will not pretend there is.
+## The honest verdict first
 
-So why does flattr get an agent-architecture guide at all? Because it
-contains the two things that make this topic *click* when you finally do
-build an agent:
+flattr has **no LLM agent**. No tool-calling loop, no ReAct, no
+supervisor-worker, no multi-agent anything. There is no model in the
+codebase at all — the only network calls are to OSM's Nominatim
+(geocoding) and Overpass (graph building), both plain HTTP, both
+build-time or UI-time, neither an LLM.
 
-1. **A control loop where CODE decides each step.** `search()` in
-   `features/routing/astar.ts` is a textbook control loop — pop a frontier,
-   expand, decide the next move, repeat until a termination condition. That
-   is the *exact same skeleton* as an agent loop. The only difference is who
-   fills in the `step` function: in flattr, deterministic code; in an agent,
-   a model. Learn the loop here, where it's transparent and testable, and
-   the agent loop is a one-line substitution away.
+So why an agent-architecture guide for a routing engine? Because flattr
+already contains the *exact skeleton* an agent loop is built on, and it
+fills that skeleton with code instead of a model. That makes it the
+best possible teaching contrast: you learn the agent loop by holding it
+next to a loop you can read end to end, where every decision is
+deterministic and every termination condition is visible.
 
-2. **A set of well-typed functions that are already shaped like agent
-   tools.** `search()`, `routeSummary()`, `geocode()`, `nearestNode()` —
-   each takes typed inputs, returns typed outputs, has no hidden side
-   effects, and does one thing. That is the exact contract an LLM agent
-   needs from a tool. A future "plan me a flat afternoon with three coffee
-   stops" feature would wrap these as tools and let a model orchestrate
-   them. The seam is already there; nothing in the router has to change.
-
-This guide teaches agent architecture through those two anchors: the
-**control-loop contrast** and the **router-as-tool seam.** Everything else
-in the spec's catalog (agentic retrieval, multi-agent topologies, agent
-memory, planning loops) is marked *not yet exercised* with the concrete
-attachment point named.
-
-## Where flattr sits on the three shapes
+Two things carry this whole guide:
 
 ```
-  The three agent shapes — where flattr lands
+  The two anchors this guide is built on
 
-  ┌──────────────────┬───────────────────────────────┬─────────┐
-  │ Shape            │ What it exercises             │ flattr? │
-  ├──────────────────┼───────────────────────────────┼─────────┤
-  │ Workflow / chain │ Engineer writes the steps;    │ ◄── THIS│
-  │                  │ no autonomous loop. (flattr   │   (minus│
-  │                  │ has a build PIPELINE + a       │   the   │
-  │                  │ deterministic search loop)    │   LLM)  │
-  ├──────────────────┼───────────────────────────────┼─────────┤
-  │ Single-agent     │ One model loop with tools     │   no    │
-  │                  │ (ReAct). Model picks tools.   │         │
-  ├──────────────────┼───────────────────────────────┼─────────┤
-  │ Multi-agent      │ Many agents in a topology.    │   no    │
-  └──────────────────┴───────────────────────────────┴─────────┘
+  ┌─ CONTRAST ──────────────────────────────────────────────┐
+  │  flattr's A* search IS a control loop.                   │
+  │  features/routing/astar.ts:48 — the while loop.          │
+  │  Same skeleton as an agent loop:                         │
+  │    state · step · execute · terminate                    │
+  │  Difference: CODE fills the step slot (g+h decision),    │
+  │  not a MODEL. Learn the agent loop by swapping that      │
+  │  one slot.                                                │
+  └─────────────────────────────────────────────────────────┘
+
+  ┌─ SEAM ──────────────────────────────────────────────────┐
+  │  search() · routeSummary() · geocode() · nearestNode()   │
+  │  are already well-typed, single-purpose, mostly-pure     │
+  │  functions = pre-cut agent TOOLS.                        │
+  │  A "plan a flat afternoon with 3 coffee stops" feature   │
+  │  wraps them in ONE ReAct loop — without touching the     │
+  │  router. geocode = the one network/side-effect tool →    │
+  │  the circuit-breaker boundary.                           │
+  └─────────────────────────────────────────────────────────┘
 ```
 
-flattr is a workflow/chain codebase — except even the "chain" part has no
-model in it. The build pipeline (`pipeline/run-build.ts`) is a fixed
-sequence of pure steps (OSM fetch → split → elevation → grade →
-build-graph). The runtime is a single deterministic search call. No slot in
-either is filled by an LLM. That makes flattr the *cleanest possible
-teaching surface* for the agent loop, because you can see the whole control
-flow with no model hiding inside it.
+## Which shape is flattr?
 
-## A note on Rein's portfolio
+Per the three-shapes framing (`study-agent-architecture.md`):
 
-From `me.md`: the closest thing to agent-adjacent work in the portfolio is
-**aipe itself** — this tooling. aipe is "describe → diagnose → act" layering
-over markdown prompt templates and slash commands; it's prompt-orchestration
-infrastructure, not a shipped autonomous agent. **AdvntrCue** ships
-tool-calling and session memory (MemoRAG) — that's the single-agent surface,
-and it's covered in `study-ai-engineering`, not here. **No multi-agent system
-has shipped.** So SECTION C (multi-agent orchestration) is genuinely new
-ground for the reader, and this guide teaches it as new ground — but anchored
-to flattr's deterministic loop, which is the part the reader *has* built.
+```
+  ┌──────────────────┬─────────────────────────────────────┐
+  │ Shape            │ Is flattr this?                     │
+  ├──────────────────┼─────────────────────────────────────┤
+  │ Workflow / chain │ Closest match — but with NO LLM.    │
+  │                  │ pipeline/ is a fixed-order build    │
+  │                  │ chain (osm → elevation → split →    │
+  │                  │ grade → graph). Engineer wrote      │
+  │                  │ every step. No model fills slots.   │
+  ├──────────────────┼─────────────────────────────────────┤
+  │ Single-agent     │ NOT present. No reasoning loop with │
+  │                  │ tools. (The router IS a loop, but   │
+  │                  │ code decides, not a model.)         │
+  ├──────────────────┼─────────────────────────────────────┤
+  │ Multi-agent      │ NOT present. No coordinating agents.│
+  └──────────────────┴─────────────────────────────────────┘
+```
+
+flattr is a **deterministic workflow** with one hand-rolled search
+*control loop* at its center. It is not even the workflow-with-LLM shape
+the spec names — there is no LLM. That's the framing for the whole
+guide: every agent pattern is taught as *study material*, with flattr's
+deterministic analogue (where it has one) as the anchor, and the
+"plan-an-afternoon" feature as the single concrete seam where flattr
+would grow a real agent.
+
+## What's actually grounded vs what's contrast-only
+
+```
+  Grounded in flattr's real code
+  ──────────────────────────────
+  • The agent-loop skeleton — taught against astar.ts:48 (the while
+    loop), :30-33 (state: open/g/came/closed), :68-72 (the g+h
+    decision = the "step" slot), :52 (success exit), :48/:77 (budget
+    exit, which flattr gets FREE — finite graph + closed set).
+  • Chains vs agents — pipeline/ is the chain; the router loop is the
+    deterministic cousin of the agent loop.
+  • The tool seam — search(), routeSummary(), geocode(), nearestNode()
+    are pre-cut tools (real signatures, real file:line).
+  • Per-tool circuit breaking — geocode() is the one network/
+    side-effect call → the real breaker boundary.
+
+  Contrast-only / not yet exercised (taught as study material,
+  with the attachment point named)
+  ─────────────────────────────────────────────────────────────
+  • ReAct, plan-and-execute, reflexion, tree-of-thoughts, routing
+  • agentic RAG, self-corrective RAG, retrieval routing
+  • every multi-agent topology (SECTION C)
+  • context engineering, memory tiers, MCP, guardrails
+  • trajectory evals — attachment point: bench/ (already a
+    stage-comparison harness; trajectory evals slot in here)
+```
+
+## A note on aipe itself
+
+This guide is generated by aipe — a markdown-as-source-of-truth meta
+tool (one of the reader's five system shapes, per `me.md`). aipe is
+*agent-adjacent*: slash commands drive a describe → diagnose → act
+layering, and the generation you're reading is a single LLM pass over a
+spec. But aipe ships **no multi-agent system** either. It's worth naming
+because it's the nearest thing in the reader's portfolio to an agent
+orchestration — and it stops short of one, the same way flattr does.
 
 ## Reading order
 
 ```
-  00-overview.md                       ← you are here
-  01-reasoning-patterns/
-    01-chains-vs-agents.md             ← the boundary: written steps vs a loop
-    02-agent-loop-skeleton.md          ← THE CONTRAST: search() IS the loop
-  03-multi-agent-orchestration/
-    01-when-not-to-go-multi-agent.md   ← the escalation gate (flattr: don't)
-  06-orchestration-system-design-templates/
-    01-multi-agent-research-assistant.md
-    02-agentic-support-system.md
-    03-agentic-coding-system.md
-  agent-patterns-in-this-codebase.md   ← THE SEAM: router-as-tool, mapped
-  audit.md                             ← every spec lens, honestly marked
+  00-overview.md            ← you are here
+  README.md                 ← index + cross-links
+  01-reasoning-patterns/    ← A: the loop skeleton (THE contrast lives here)
+  02-agentic-retrieval/     ← B: retrieval as a loop (not exercised)
+  03-multi-agent-orchestration/ ← C: topologies (not exercised)
+  04-agent-infrastructure/  ← D: context, memory, tools, evals, guardrails
+  05-production-serving/     ← E: cross-turn cache, backpressure, breakers
+  06-orchestration-system-design-templates/ ← F: 3 interview templates
+  agent-patterns-in-this-codebase.md ← the honest per-repo audit
 ```
 
-Start with `01-chains-vs-agents.md` (where flattr's loop sits relative to a
-real agent), then `02-agent-loop-skeleton.md` (the load-bearing contrast),
-then `agent-patterns-in-this-codebase.md` (the tool seam, concretely mapped).
-
-## Cross-links to sibling guides
-
-- Deterministic A* search mechanics (the loop's internals): `study-dsa-foundations`
-- The router as a system boundary, request flow: `study-system-design`
-- Tool-calling / single-agent mechanics (the model side of the seam): `study-ai-engineering`
-- Prompt-orchestration as agent-adjacent (aipe shape): `study-prompt-engineering`
-- The pipeline as a fixed-order build chain: `study-runtime-systems`
+Recommended path: A → (the seam) → start with
+`01-reasoning-patterns/02-agent-loop-skeleton.md` (the contrast),
+then `agent-patterns-in-this-codebase.md` (what flattr really is),
+then the rest as study material.

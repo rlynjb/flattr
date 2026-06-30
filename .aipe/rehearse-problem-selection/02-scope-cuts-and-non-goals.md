@@ -1,132 +1,181 @@
-# Scope, Cuts, and Non-Goals — flattr
+# Scope, Cuts, and Non-Goals
 
-> The narrowest slice that validates the *premise* (not the engine), and an
-> explicit list of what NOT to build. Coach posture: prefer a validated slice
-> over a feature wishlist. Every cut here is a time-back-to-discovery decision.
+The skill a review room is testing here isn't "can you list features."
+It's "can you draw the smallest box that still validates the premise,
+and refuse everything outside it?" You're in a strong position: the
+smallest box is **already built**. Your job is to name it precisely and
+fence it hard.
 
-## The discipline: validate the premise, not the engine
+---
 
-The engine is done and proven (`01` §2). So the slice is **not** "build more
-routing." The slice is the cheapest thing that answers *"does a real
-self-powered traveler prefer flattr's flat route over the default route?"* —
-which the repo has never tested.
-
-```
-  two different "smallest slices" — pick the right one
-
-  ┌─ WRONG slice (more of what's proven) ──────────────────┐
-  │  add bidirectional · add k-alternatives · add zones     │  ← engine work,
-  │  → proves the engine is better. demand still unknown.   │    zero demand signal
-  └─────────────────────────────────────────────────────────┘
-
-  ┌─ RIGHT slice (tests the unproven thing) ───────────────┐
-  │  ONE neighborhood, set A→B, colored path + climb number │  ← already built
-  │  → put in front of 5 real travelers, measure preference │  ← the NEW work
-  └─────────────────────────────────────────────────────────┘
-```
-
-## The smallest validating slice — spelled out
-
-Everything in the box already exists in the repo except the last line.
+## Where scope sits in the system
 
 ```
-  flattr validating slice — bundle once, test with humans
+  Zoom out — the validating slice vs everything around it
 
-  ┌─ Build (offline, ONCE) ─────────────────────────────────┐
-  │  one bbox: a known-hilly neighborhood                    │
-  │  (spec §10 Phase 0: downtown + Capitol Hill)             │
-  │  pipeline/run-build.ts → graph.json  (bundled, offline)  │  ✓ exists
-  └───────────────────────────────┬─────────────────────────┘
-                                  │
-  ┌─ Client (Expo, on device) ────▼─────────────────────────┐
-  │  AddressBar: set start + end (geocoded into the bbox)    │  ✓ exists
-  │  MapScreen: draw the route, color segments by            │
-  │             directedGrade (green/yellow/red)             │  ✓ exists
-  │  RouteSummaryCard: ONE climb number + distance +         │
-  │                    steepCount  (summary.ts routeSummary) │  ✓ exists
-  └───────────────────────────────┬─────────────────────────┘
-                                  │
-  ┌─ The actual experiment ───────▼─────────────────────────┐
-  │  show 5 real self-powered travelers the same A→B in      │  ✗ NEVER DONE
-  │  flattr AND in Google Maps. ask which they'd take and    │     ← this is the
-  │  why. record the answer.                                 │       whole slice
-  └─────────────────────────────────────────────────────────┘
+  ┌─ what a full product would be (OUT) ───────────────────┐
+  │  city coverage · turn-by-turn · accounts · transit     │
+  │  ┌─ the validating slice (IN — already built) ───────┐ │
+  │  │  one neighborhood · two endpoints · colored path  │ │
+  │  │  · climb number                                    │ │
+  │  │  ★ THIS is all you defend ★                        │ │
+  │  └────────────────────────────────────────────────────┘ │
+  └────────────────────────────────────────────────────────┘
 ```
 
-Why this is the right slice:
+Everything in the inner box is provable from the repo. Everything in the
+outer ring is a non-goal — and naming it as a deliberate cut is the
+signal, not an admission.
 
-- **It's bounded.** One bbox keeps `graph.json` small (the shipped artifact is
-  already 544 KB for its current extent) and offline. No city-scale pipeline,
-  no tiling work, no server.
-- **It reuses everything proven.** The colored path comes from
-  `grade/classify.ts` over `directedGrade`; the climb number comes from
-  `summary.ts` `routeSummary` (`climbM` = sum of positive directed rise). You
-  write no new engine code.
-- **It targets the empty column.** The output of the experiment is the first
-  real demand datum flattr has ever had. That is the entire point.
+---
 
-## What "done" looks like for the slice
+## The smallest useful scope (it ships today)
 
-You are done when you can answer, with evidence not assertion:
-
-- Did the flat route differ meaningfully from the default route for these A→B
-  pairs? (Engine-side, measurable now — see `04`.)
-- When shown both, did real travelers prefer flattr's route, and was their
-  stated reason "the grade"? (Demand-side, only measurable via the experiment.)
-
-If the answer to the second question is "no" or "they didn't care," that is a
-*successful* experiment — it cheaply told you not to invest more.
-
-## Non-goals — what NOT to build (and why)
-
-These are cuts, stated without apology. Each one is hours returned to discovery.
-The first group is from `docs/flattr-spec.md` §13; the framing is this book's.
+The narrowest slice that can validate "people want flatter-over-faster"
+is one neighborhood, two endpoints, a grade-routed path, and a climb
+number. That is exactly what the Expo app does.
 
 ```
-  non-goals — each is a deliberate cut, not a missing feature
+  The slice — four parts, all live
 
-  ┌───────────────────────┬────────────────────────────────────────┐
-  │ NON-GOAL              │ WHY it's cut (now)                      │
-  ├───────────────────────┼────────────────────────────────────────┤
-  │ city-wide coverage    │ premise is unproven; coverage is a      │
-  │                       │ cost you pay AFTER demand, not before.  │
-  │                       │ one bbox tests the premise for free.    │
-  ├───────────────────────┼────────────────────────────────────────┤
-  │ turn-by-turn nav      │ a navigation product, not a routing     │
-  │                       │ premise test. huge surface, zero        │
-  │                       │ bearing on "is flat-first wanted?"      │
-  ├───────────────────────┼────────────────────────────────────────┤
-  │ accounts / sync       │ no user → no account. pure overhead     │
-  │                       │ until there's someone to save state for.│
-  ├───────────────────────┼────────────────────────────────────────┤
-  │ multi-modal / transit │ different problem entirely. flattr is   │
-  │                       │ self-powered travel; transit dilutes    │
-  │                       │ the one thing being tested.             │
-  └───────────────────────┴────────────────────────────────────────┘
+  ┌─ 1. one bundled neighborhood ─────────────────────────┐
+  │  Capitol Hill, ~0.35 km², 1621 nodes / 1879 edges     │
+  │  data/graph.json → mobile/assets/graph.json           │
+  │  steep area on purpose (spec's Pine St reference)     │
+  └────────────────────────┬──────────────────────────────┘
+  ┌─ 2. set two endpoints ─▼──────────────────────────────┐
+  │  address bar (Nominatim) OR tap map OR "current loc"  │
+  │  mobile/src/MapScreen.tsx + AddressBar.tsx            │
+  └────────────────────────┬──────────────────────────────┘
+  ┌─ 3. grade-routed path ─▼──────────────────────────────┐
+  │  directedAstar(graph, startId, endId, userMax)        │
+  │  MapScreen.tsx:155 — color-coded green/yellow/red     │
+  └────────────────────────┬──────────────────────────────┘
+  ┌─ 4. the climb number ──▼──────────────────────────────┐
+  │  RouteSummaryCard.tsx:26-27 — distance + climbM       │
+  │  "Flat all the way" or "⚠ flattest available + N      │
+  │  steep blocks (>userMax%)"                            │
+  └────────────────────────────────────────────────────────┘
 ```
 
-Also explicitly cut for the validating slice (engine-side temptations):
+**Why this is the smallest *useful* slice and not smaller:** drop part 4
+(the climb number / honest fallback) and the user can't tell "flat
+route" from "least-bad route through a hill" — the demo lies. That's why
+the BLOCKED-finite distinction matters at the product layer, not just
+the algorithm layer. → `../study-system-design/04-honest-fallback-routing.md`.
 
-- **Bidirectional A*, k-alternatives, contraction hierarchies** (spec §14.5) —
-  search-speed and route-variety refinements. Real DSA depth, zero demand
-  signal. They make a *better* engine, not a *validated* problem. Keep them as
-  portfolio stretch, not as the next investment.
-- **Zone choropleth** (spec §11, `grade/zones.ts`) — nice map polish; doesn't
-  test whether a traveler prefers the route.
-- **Multi-city pipeline** (spec §10 Phase 4) — pure cost-before-demand.
+**What makes it a *validating* slice, not just a demo:** the experiment
+it enables is "put this in front of one real walker on a route they know
+and ask: is this the path you'd actually take?" One person, one
+afternoon, no infrastructure. That single qualitative session moves more
+than any number you can compute on your laptop.
 
-## The cut that matters most
+---
 
-If you build *anything* before the 5-traveler experiment, you are spending the
-one resource you can't get back (solo-dev hours) on the column the repo already
-fills. The hardest, most senior cut here is cutting *more engineering*.
+## The Capitol Hill choice is deliberate
 
-## See also
+A reviewer might say "you only proved it on a tiny patch." Pre-empt it:
+the patch was chosen *because* it's steep.
 
-- `03-options-and-opportunity-cost.md` — `do nothing more on features` as a real
-  option, with opportunity cost named.
-- `04-success-metrics-and-feedback-loop.md` — how to measure the slice.
-- `.aipe/study-system-design/00-overview.md` — the build-time/runtime split that
-  makes the one-bbox bundle cheap.
-- `.aipe/study-data-modeling/05-build-and-evolve-the-artifact.md` — how the
-  graph.json artifact is built and bounded.
+```
+  Why Capitol Hill is the right validating ground
+
+  ┌────────────────────────────────────────────────────────┐
+  │  flat neighborhood  →  every route is flat  →  the      │
+  │                        product does nothing visible     │
+  │                                                          │
+  │  steep neighborhood →  grade actually constrains the    │
+  │  (Capitol Hill)        path → the router earns its keep │
+  │                        AND the honest-fallback fires    │
+  │                        ("no flat route exists from      │
+  │                         downtown" — spec §12)            │
+  └────────────────────────────────────────────────────────┘
+```
+
+`pipeline/config.ts` documents the choice: a small steep Capitol Hill
+slice, "kept small so the free Open-Meteo build stays under rate limits
+and the bundled graph.json stays phone-friendly." That's the free-tier
+constraint and the offline constraint shaping scope — name both.
+
+---
+
+## Non-goals — what NOT to build
+
+Four explicit cuts. Each is a deliberate "no," and saying *why* is the
+signal.
+
+```
+  Non-goals — the fence, with the reason for each post
+
+  ┌─ city / multi-city coverage ──────────────────────────┐
+  │  WHY NOT: build is free but rate-limited; offline      │
+  │  bundle must stay phone-friendly. Coverage is a SCALE  │
+  │  problem you only earn after demand is shown. Spec     │
+  │  even diverges here — proposed Next.js web, shipped     │
+  │  a one-neighborhood Expo app instead.                  │
+  └────────────────────────────────────────────────────────┘
+  ┌─ turn-by-turn navigation ─────────────────────────────┐
+  │  WHY NOT: the thesis is "show me where flat is," not    │
+  │  "guide me step by step." Nav is a different product   │
+  │  with GPS-tracking, re-routing, voice. Pure scope creep │
+  │  against the wedge.                                    │
+  └────────────────────────────────────────────────────────┘
+  ┌─ user accounts / history / sync ──────────────────────┐
+  │  WHY NOT: spec §13 lists accounts as out of scope. The │
+  │  app is offline-first with no backend (no DB, graph is │
+  │  a static asset). Accounts add a whole server tier to   │
+  │  validate a hypothesis that needs zero of it.          │
+  └────────────────────────────────────────────────────────┘
+  ┌─ multi-modal / transit routing ───────────────────────┐
+  │  WHY NOT: "self-powered travel" is the framing (spec    │
+  │  §12). Adding bus/train changes the cost model, the    │
+  │  data sources, and the user entirely. Different problem.│
+  └────────────────────────────────────────────────────────┘
+```
+
+**The discipline here:** every one of these would be *fun* to build, and
+every one would let you avoid the uncomfortable question of whether
+anyone wants the core thing. That's exactly why they're cuts. You don't
+get to add coverage until one real user says "yes, this route is the one
+I'd take."
+
+---
+
+## What's tempting but premature
+
+A specific trap worth naming, because the repo already drifted toward it:
+**polishing the grade-control UX before validating the grade concept.**
+
+Commit `b24797c` dropped the continuous slider for three presets. That's
+a UX refinement on a control whose underlying value (`userMax`) hasn't
+been validated with a single user. Refining how someone picks their
+threshold, before knowing whether *threshold-based routing* is what they
+want, is motion without progress. → chapter 05 has the full read on what
+b24797c signals.
+
+---
+
+## Scope in one frame
+
+```
+  Scope — the whole decision, one picture
+
+           OUT (non-goals)
+   ┌───────────────────────────────────┐
+   │ city coverage   turn-by-turn      │
+   │   accounts      multi-modal       │
+   │   ┌───────────────────────────┐   │
+   │   │  IN — and already shipped: │   │
+   │   │  1 neighborhood            │   │
+   │   │  2 endpoints               │   │
+   │   │  grade-routed colored path │   │
+   │   │  climb number + honest     │   │
+   │   │  fallback                  │   │
+   │   └───────────────────────────┘   │
+   │  validate the inner box on ONE     │
+   │  real user before touching the     │
+   │  outer ring.                       │
+   └───────────────────────────────────┘
+```
+
+Next: `03-options-and-opportunity-cost.md`.

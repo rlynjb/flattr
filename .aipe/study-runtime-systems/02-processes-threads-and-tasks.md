@@ -1,256 +1,237 @@
-# Processes, Threads & Tasks — where work runs
+# Processes, Threads, and Tasks — where work actually runs
 
-**Industry name(s):** single-flight / mutex-gated work queue · cooperative task
-scheduling. **Type:** Industry standard (the pattern); Project-specific (the
-`pump()` implementation).
+**Industry name:** execution context / threading model — *Industry standard*.
 
 ## Zoom out, then zoom in
 
-flattr has no thread pool, no worker, no job queue library. What it *does* have is
-one hand-rolled single-slot scheduler that decides which network-bound graph
-build runs next. That scheduler is `pump()`, and it sits squarely in the run-time
-JS thread.
+Where does flattr's work *physically* run? The honest answer is short: on one JS thread per
+process, always. Here's where that thread sits in the stack.
 
 ```
-  Zoom out — where the "scheduler" lives in the stack
+  Zoom out — the threading model in the layer stack
 
-  ┌─ UI layer (React components) ───────────────────────┐
-  │  MapScreen: pan event, route effect, grade toggle   │
-  └───────────────────────┬──────────────────────────────┘
-                          │  enqueue a build request
-  ┌─ Orchestration (useTileGraph hook) ─────────────────┐
-  │  debounce timer → pendingViewRef / pendingCorridorRef│
-  │            ★ pump()  ←─ THIS CONCEPT ★               │ ← we are here
-  │            busyRef gates ONE build at a time         │
-  └───────────────────────┬──────────────────────────────┘
-                          │  the one build that's allowed to run
-  ┌─ Work (async, network-bound) ───────────────────────┐
-  │  fetchOverpass → buildGraph → setState              │
-  └──────────────────────────────────────────────────────┘
+  ┌─ App code (yours) ───────────────────────────────────────────┐
+  │  MapScreen, useTileGraph, astar, buildGraph                  │
+  └───────────────────────────────┬──────────────────────────────┘
+                                  │ all runs on ↓
+  ┌─ JS runtime ─────────────────▼───────────────────────────────┐
+  │  ★ ONE JS THREAD ★  (Hermes in app · Node in pipeline)       │ ← we are here
+  │  event loop schedules tasks cooperatively                    │
+  └───────────────────────────────┬──────────────────────────────┘
+                                  │ delegates blocking I/O / render to ↓
+  ┌─ Native threads (not yours) ─▼───────────────────────────────┐
+  │  GC · MapLibre render · AsyncStorage disk · network sockets  │
+  └───────────────────────────────────────────────────────────────┘
 ```
 
-Zoom in: there are no OS threads to schedule here. The "task" is a graph build
-(an async function), and the question this file answers is **how does flattr
-decide which task runs, and why is only one allowed at a time?** The answer is
-free-tier rate limits — run two Overpass/Open-Meteo builds at once and you get
-429'd into uselessness.
+Zoom in: the question this file answers is **"how many threads, and what runs on each?"**
+The answer — one JS thread doing all your logic, native threads underneath doing I/O and
+rendering you never directly touch — determines everything about how you reason about
+races (`04`), blocking (`03`), and memory (`05`). Get this layer right and the rest follows.
 
-## Structure pass
+## Structure pass — layers, one axis, the seams
 
-**Layers.** Two: the *producers* (any UI event that wants graph data — pan,
-route, grade-toggle, self-heal retry) and the *single consumer* (`pump`, which
-runs exactly one build then drains the next).
-
-**Axis traced — "how many of these run concurrently (guarantees)?"** Hold it
-across the work types:
+**The layers** are process → JS thread → native threads, already drawn above. **The axis:
+"can two pieces of *my* code run at the same instant?"** Trace it down:
 
 ```
-  One axis — "how many run at once?" — across work types
+  Axis: "can two pieces of MY code run simultaneously?"  — held constant
 
-  pan debounce        → at most 1 timer pending  (clearTimeout collapses)
-  pending requests    → at most 1 view + 1 corridor SLOT (newer overwrites)
-  in-flight build     → EXACTLY 1 (busyRef lock)        ← the hard limit
-  A* search           → 1 (it's synchronous; nothing else runs during it)
-  native render/GPS   → parallel (platform threads, uncounted)
+  ┌─ process ────────────────────────────────────┐
+  │  two processes, but never co-resident         │  → N/A (build then run)
+  └────────────────────────────────────────────────┘
+      ┌─ JS thread ──────────────────────────────┐
+      │  one thread, cooperative scheduling       │  → NO. Never. This is the
+      └────────────────────────────────────────────┘    load-bearing answer.
+          ┌─ native threads ─────────────────────┐
+          │  GC / render / I/O run concurrently   │  → YES, but you can't touch
+          └────────────────────────────────────────┘    their state from JS
 ```
 
-Every layer the code owns is serialized to one. The only concurrency is the
-native side, which flattr doesn't schedule.
+The answer is **NO at the layer that matters** (your JS code) and YES only at the native
+layer you can't reach. That single fact is why flattr has no mutexes and no data races
+(`04`) — and why a synchronous A\* freezes the *whole* app, not just one worker (`03`).
 
-**Seam — `busyRef` (`useTileGraph.ts:113`).** This boolean is the entire
-synchronization primitive. On one side, producers freely call `pump()`; on the
-other, at most one build runs. The axis (concurrency count) flips from "many
-callers" to "one execution" exactly here. → `04-shared-state-races-and-synchronization.md`
-for why a plain boolean is safe.
+**The seams:**
+
+```
+  Two seams where the threading answer flips
+
+  seam 1: JS thread ═╪═► native I/O thread
+    at every `await`: your code pauses, native does the work concurrently,
+    a microtask resumes you LATER — never interleaved mid-statement
+
+  seam 2: JS thread ═╪═► MapLibre render thread
+    you hand GeoJSON across; MapLibre renders on its own thread.
+    a sync A* that blocks JS does NOT block MapLibre's existing frame —
+    but blocks the NEXT GeoJSON update you'd send it
+```
+
+Hand off to How it works with the model named: one JS thread, native concurrency you
+delegate to but never share state with.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You've written this before without naming it: a **single-flight guard** — the
-`if (loading) return;` you put at the top of a submit handler so a double-click
-doesn't fire two requests. `pump()` is that pattern promoted to a real scheduler:
-a boolean lock, a couple of pending slots, and a drain-on-finish.
+You've felt this exact model every time a heavy `.map()` over 50k items froze a React page.
+React runs on one thread; a long synchronous loop blocks paint, input, everything, until it
+returns. flattr's app is the same runtime with the same rule. The strategy isn't "use
+threads" — it's **"keep every task short enough that the event loop can breathe between
+them, and push anything blocking to a native thread via `await`."**
 
 ```
-  Pattern — single-flight work slot with priority + drain
+  The one-thread cooperative model — the kernel
 
-   producers                 the slot                consumer
-  ┌──────────┐  set pending  ┌────────────┐         ┌──────────┐
-  │ pan      │ ────────────► │ corridor ▒ │ ─pick──► │ run ONE  │
-  │ route    │               │ view     ▒ │ priority│ build     │
-  │ retry    │               └────────────┘  (corr  └────┬─────┘
-  └──────────┘                  busyRef=true   first)     │ finally
-        ▲                                                 │ busyRef=false
-        └──────────────── pump() again (drain) ◄──────────┘
+   event loop owns control
+        │
+        ▼
+   ┌─────────────┐   task runs to completion or to an await
+   │  run task   │──────────────────────────────────────────┐
+   └─────────────┘                                           │
+        ▲                                                    │
+        │  loop picks next ready task                        │
+        └────────────────────────────────────────────────────┘
+
+   RULE: no task is preempted mid-statement.
+   A task that never yields (sync A* over a huge graph) starves every other task.
 ```
 
-The kernel: **lock + pending slots + priority pick + drain-on-finish.** Drop any
-one and it breaks — that's the next move.
+### Move 2 — the parts, one at a time
 
-### Move 2 — the load-bearing skeleton
-
-**Part 1 — the lock (`busyRef`).** First line of `pump`:
+**Part 1 — the two processes (build vs run).** These are genuinely separate OS processes
+that never run at the same time. The build process is Node, launched by `tsx`:
 
 ```ts
-// mobile/src/useTileGraph.ts:166-167
-const pump = useCallback(() => {
-  if (busyRef.current) return;   // ← already building? bail. THIS is the mutex.
+// package.json (scripts) — the build-time process entry
+"build:graph": "tsx pipeline/run-build.ts"
 ```
 
-What breaks if removed: every pan during a build would launch a parallel build.
-Two simultaneous Overpass POSTs from the same IP is exactly what gets you
-429'd. The lock is the whole reason builds stay under rate limits.
+```
+  Process lifecycle — build dies before run starts
 
-**Part 2 — the priority pick.** Corridor (an active route) beats viewport (mere
-panning):
+  developer runs `npm run build:graph`
+    └─► Node process spawns ─► main() ─► writes graph.json ─► EXITS
+                                                                │
+  developer ships the app; user opens it                       │ (later, different machine)
+    └─► Hermes process spawns ─► loads graph.json ──────────────┘
+```
+
+What breaks if you conflated them? Nothing technically — but you'd reach for shared memory
+or a lock between build and run that can't exist, because they're not even on the same
+device. The artifact (`graph.json`) is the only thing that crosses. *This is the load-bearing
+isolation: drop it and you'd have to keep the pipeline running as a server.* (See `01`.)
+
+**Part 2 — the one JS thread (per process).** This is where every line of *your* code runs.
+There are no worker threads in the repo — verified: zero hits for `Worker`, `worklet`,
+`Atomics`, `SharedArrayBuffer` across the whole codebase. Hermes is the engine in the app
+(Expo SDK 56 default, no `jsEngine` override in `mobile/app.json` — *inferred from Expo 56
+defaults*); Node's V8 in the pipeline. Both single-threaded for your purposes.
 
 ```ts
-// mobile/src/useTileGraph.ts:170-180
-if (pendingCorridorRef.current) {            // ① route corridor wins
-  kind = "corridor"; req = pendingCorridorRef.current;
-  pendingCorridorRef.current = null;
-} else if (pendingViewRef.current) {         // ② else the viewport
-  kind = "view"; req = pendingViewRef.current;
-  pendingViewRef.current = null;
-} else { return; }                           // ③ nothing pending → idle
+// mobile/src/MapScreen.tsx:151-162 — A* runs ON the JS thread, synchronously
+const routed = useMemo(() => {
+  if (!graph || !startId || !endId) { /* ... */ }
+  const r = directedAstar(graph, startId, endId, userMax);  // ← CPU-bound, blocking
+  // ... build GeoJSON + summary, all sync
+}, [graph, startId, endId, userMax]);
 ```
 
-What breaks if removed: a user who taps two route endpoints while panning could
-have their route starved indefinitely by a stream of viewport requests. Priority
-is what guarantees the thing the user is *waiting on* runs first.
+`directedAstar` is the heaviest synchronous task in the app. While it runs, the JS thread
+does nothing else — no input handling, no debounce timers firing, no promise callbacks.
+For a city-sized graph this is microseconds-to-milliseconds and invisible. The boundary
+where it breaks: a graph large enough that one search exceeds a frame budget (~16ms). Then
+you'd see input lag, and the fix is Part 3.
 
-**Part 3 — drain on finish (`finally` → `pump()`).** The slot is single-entry,
-so something has to re-trigger it:
-
-```ts
-// mobile/src/useTileGraph.ts:221-225
-} finally {
-  busyRef.current = false;     // release the lock
-  if (!silent) setLoadingStep(null);
-  pump();                      // ← re-enter: run the next pending request
-}
-```
-
-What breaks if removed: one build runs, the lock releases, and any request that
-arrived *during* that build sits in its pending slot forever — the scheduler
-deadlocks itself. The recursive `pump()` in `finally` is what makes it a queue
-rather than a one-shot.
-
-**Part 4 (hardening, not skeleton) — the pending *slots* collapse work.** Note
-the slots are single values, not arrays (`pendingViewRef`, `pendingCorridorRef`).
-A newer request overwrites an older un-started one. Combined with the upstream
-debounce (`onRegionDidChange`, line 254-255), three fast pans become one build.
-This is throughput optimization layered on the skeleton — remove it and the
-scheduler still works, it just does more redundant builds.
+**Part 3 — native threads you delegate to (not yet exercised for *your* work).** Hermes
+runs GC on its own thread; MapLibre renders on a render thread; AsyncStorage does disk I/O
+off-thread. You never write code that runs there — you hand work across via `await` (I/O)
+or props (render). The repo has **no** mechanism to run *your* CPU work on another thread.
 
 ```
-  Execution trace — three fast pans during one in-flight build
+  Move 2.5 — current vs future: where A* runs
 
-  t0  pan A → debounce timer set
-  t1  pan B → clearTimeout(A), timer reset        (A's request never forms)
-  t2  pan C → clearTimeout(B), timer reset
-  t3  timer fires → queueViewport(C) → pendingView = C; pump()
-  t4  busyRef already true (build X running) → pump() bails
-  t5  build X finishes → finally → pump() → runs C
-      result: 3 pans → 1 extra build, not 3
+  ┌─ NOW ───────────────────────┐   ┌─ IF the graph grew (not yet) ──────┐
+  │ A* in useMemo, JS thread,   │   │ A* in a Worker / worklet           │
+  │ synchronous, blocks frame   │   │ JS thread posts {graph, s, e} →    │
+  │                             │   │ worker runs A* → posts path back   │
+  │ fine for city-sized graphs  │   │ JS thread never blocks             │
+  └─────────────────────────────┘   └─────────────────────────────────────┘
+   Migration cost: A* is already pure (astar.ts:22-78, no I/O, no React).
+   It would move to a worker almost unchanged — the cost is the message
+   plumbing + serializing the graph, not the algorithm.
 ```
 
-### Move 2.5 — current vs future state
-
-This is a one-thread scheduler. The obvious future state is moving the *build* or
-the *A\** off the JS thread. What that would cost — and what wouldn't change:
-
-```
-  Comparison — today vs an off-thread future
-
-  TODAY                         FUTURE (worker / worklet)
-  ─────                         ─────
-  build runs on JS thread       build runs on a worker thread
-  busyRef boolean is enough     need real message-passing + serialization
-  no data races (one thread)    must copy graph across the thread boundary
-  pump() unchanged ────────────► pump() unchanged (it just posts a message)
-```
-
-The takeaway: `pump()`'s shape survives the move. The lock/priority/drain logic
-is transport-agnostic — only the body inside the `try` changes from a direct
-`await buildGraph` to `await worker.run(...)`.
+*Trigger:* a measured frame drop during routing. Until then, on-thread is the right call —
+no worker plumbing, no graph serialization cost, simpler to reason about.
 
 ### Move 3 — the principle
 
-When you have exactly one scarce resource — here, your free-tier rate budget — you
-don't need a thread pool, you need a *single-flight gate with a drain*. The
-smallest correct scheduler is a boolean, two slots, a priority rule, and a
-recursive re-entry. Everything fancier (real queues, worker pools, backpressure
-signals) is earned by having more than one unit of concurrency to manage, and
-flattr deliberately has one.
+In a single-threaded runtime, "where does work run" has exactly one answer for your code —
+*here, on this thread* — and the entire discipline becomes **keeping each task short enough
+to yield.** You don't get parallelism; you get cooperative concurrency, and the failure
+mode is starvation, not a race. The skill is spotting the one synchronous CPU task hiding
+among the async ones (here, A\* in a `useMemo`) and knowing the escape hatch (a worker) and
+its cost before you need it.
 
 ## Primary diagram
 
-```
-  pump() — the complete single-flight scheduler
+Every thread in flattr and what runs on it, in one frame.
 
-  UI events (producers)                  Orchestration (useTileGraph)
-  ┌─────────────────┐  setTimeout 600ms  ┌──────────────────────────────┐
-  │ onRegionDidChange├───debounce───────►│ queueViewport → pendingViewRef│
-  │ route effect     ├──────────────────►│ ensureBbox → pendingCorridorRef│
-  │ self-heal retry  ├──────────────────►│ (silent) → both pending refs   │
-  └─────────────────┘                    └───────────────┬───────────────┘
-                                                         │ pump()
-                                          ┌──────────────▼───────────────┐
-                                          │ busyRef? ──yes──► return      │
-                                          │   no ↓                        │
-                                          │ pick: corridor > view         │
-                                          │ busyRef = true                │
-                                          └──────────────┬───────────────┘
-                                                         │ async (Work layer)
-                              ┌──────────────────────────▼──────────────┐
-                              │ fetchOverpass → buildGraph → setState    │
-                              │ finally: busyRef=false; pump() (drain)   │
-                              └──────────────────────────────────────────┘
+```
+  flattr threading model — one JS thread per process, native underneath
+
+  BUILD PROCESS (Node)              RUN PROCESS (Hermes)
+  ┌─────────────────────┐          ┌──────────────────────────────────┐
+  │ JS thread:          │          │ JS thread (event loop):          │
+  │  fetch→build→write  │          │  region/route/geocode tasks      │
+  │  (sequential)       │          │  directedAstar (SYNC, blocks)    │
+  └─────────────────────┘          └──────────────┬───────────────────┘
+       │ native: net socket                       │ delegates via await/props
+       ▼                                          ▼
+  (transient, exits)               ┌─ native threads (not your code) ─┐
+                                   │ GC · MapLibre render · disk I/O  │
+                                   └──────────────────────────────────┘
 ```
 
 ## Elaborate
 
-Single-flight is most famous from Go's `golang.org/x/sync/singleflight` and from
-SWR/React Query's request dedup. The shared idea: when many callers want the same
-expensive thing, collapse them to one execution. flattr's variant adds *priority*
-(corridor over view) because not all builds are equal — one is blocking a user's
-route, the others are cosmetic. The pattern generalizes anywhere a scarce
-downstream (rate limit, DB connection, GPU) can't take concurrent callers.
+The "one JS thread + native delegation" model is the **Node/browser event-loop model**,
+and React Native inherits it directly — your JS runs on a single thread and crosses a
+bridge (or JSI, in newer RN) to native modules that have their own threads. The classic
+escape hatches when CPU work won't fit are Web Workers (browser), `worker_threads` (Node),
+and RN's reanimated worklets or `react-native-worklets-core` — the last is exactly what
+flattr's sibling project `contrl` uses for its on-device ML pipeline (per `me.md`). flattr
+hasn't needed it because its CPU task (A\*) is small. For how the *async* tasks get
+scheduled on this one thread, see `03`; for why no threads means no races, see `04`.
 
 ## Interview defense
 
-**Q: How does flattr keep from getting rate-limited by Overpass and Open-Meteo?**
+**Q: "How many threads does this app use for your code, and what's the risk?"**
 
-A single-flight scheduler — `pump()` in `useTileGraph.ts`. A `busyRef` boolean
-guarantees exactly one graph build is in flight; everything else waits in a
-single pending slot. Corridor builds (active routes) preempt viewport builds.
+One. All app logic — React, A\*, on-device graph building — runs on a single Hermes JS
+thread. The risk is starvation: any synchronous task that runs too long blocks input,
+rendering, and timers. The candidate is `directedAstar` in a `useMemo`.
 
 ```
-  the one-liner answer
-
-  many callers ──► [ busyRef lock ] ──► exactly 1 Overpass POST at a time
-                        │
-                   the rate-limit guard
+  one JS thread:  [render][A* sync][timer][input]...
+                          └─ if this is long, everything after it waits
 ```
 
-Anchor: *"The load-bearing line is the recursive `pump()` in the `finally` block,
-`useTileGraph.ts:224` — without it the scheduler runs one build and then
-deadlocks, because the pending slot never gets re-checked."*
+*Anchor:* "Single-threaded means the bug isn't a race, it's a freeze — and the freeze
+source is the one synchronous CPU task among the async ones."
 
-**Q: Why a boolean instead of a real queue or mutex library?**
+**Q: "If A\* got too slow, what would you do?"**
 
-Because there's exactly one resource to protect and one thread accessing it. A
-mutex library buys you nothing when there are no other threads to contend with —
-the boolean *is* the mutex, and it's race-free because JS is single-threaded.
-Anchor: the pending *slots* are single values, not arrays — flattr doesn't even
-queue redundant work, it overwrites it.
+Move it to a worker. It's already a pure function (`astar.ts:22-78`) with no I/O and no
+React, so it ports almost unchanged — the cost is message plumbing and serializing the
+graph across, not rewriting the search.
+
+*Anchor:* "The algorithm's already isolated; the work is the boundary, not the code."
 
 ## See also
 
-- `03-event-loop-and-async-io.md` — why the boolean lock is safe (no preemption).
-- `07-backpressure-bounded-work-and-cancellation.md` — what this scheduler does
-  *not* do: cancel the in-flight build.
-- `04-shared-state-races-and-synchronization.md` — `busyRef` as cooperative state.
-- `.aipe/study-networking/` — the rate limits this scheduler exists to respect.
+- `01-runtime-map.md` — where these threads sit in the full topology.
+- `03-event-loop-and-async-io.md` — how tasks on the one thread are scheduled.
+- `04-shared-state-races-and-synchronization.md` — why one thread means no real races.
+- `study-system-design` (sibling) — the build/run process split as an architecture seam.

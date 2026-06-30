@@ -1,125 +1,117 @@
 # Runtime Systems — flattr
 
-> Where does work execute, what resources does it own, and what breaks under
-> concurrency or overload? This guide audits flattr's execution model: the two
-> single-threaded JS runtimes it runs on, the work each one schedules, and the
-> places that work is unbounded, uncancellable, or run on the wrong thread.
+> Where work executes, what resources it owns, and what breaks under concurrency or overload.
+> Every claim is grounded in `file:line`. Inferences are labeled. Mechanisms the repo
+> doesn't have are marked `not yet exercised` with the trigger that would introduce them.
 
-flattr has **no servers, no database engine, no threads, no worker pools, no
-LLM**. That sounds like it removes runtime concerns. It doesn't — it concentrates
-them. Everything runs on a single JS thread in one of two runtimes, and the most
-interesting decisions in this repo are about *what not to run on that thread* and
-*how to serialize the work that crosses the network*.
+## The verdict, first
 
-## The two runtimes — one diagram
+flattr is a **single-threaded JavaScript runtime, top to bottom.** There are two
+distinct runtimes — but neither uses real threads:
 
-flattr is two programs sharing one TypeScript core. They never run at the same
-time, and they have completely different execution models.
+- **Build-time pipeline** runs in **Node** via `tsx` (`pipeline/run-build.ts:54`,
+  `package.json` → `build:graph`). One process, sequential async I/O, exits when done.
+- **Mobile app** runs in **Hermes** (the Expo SDK 56 / RN 0.85 default — `mobile/app.json`
+  declares no `jsEngine` override, so Hermes is in force; *inferred from Expo 56 defaults*).
+  One JS thread, an event loop, MapLibre rendering on the native side.
+
+There is no backend, no database server, no worker pool, no LLM. The "graph" the app
+routes over is a static JSON artifact read off disk (`mobile/src/loadGraph.ts:7-11`).
+
+The single most consequential runtime fact: **A\* runs synchronously on the JS thread,
+inside a `useMemo`** (`mobile/src/MapScreen.tsx:151-162`). It is not offloaded, not
+chunked, not cancellable. For a city-sized merged graph that's fine; it's the first thing
+that bites if the graph grows.
+
+The second: **`pump()` is a hand-rolled single-flight queue** with no real lock —
+correctness rests entirely on the JS event loop being single-threaded
+(`mobile/src/useTileGraph.ts:166-227`). The third: **there is no cancellation anywhere** —
+no `AbortController`, no `AbortSignal` in the whole repo (verified by grep). Stale network
+builds run to completion and their results are written even when the user has moved on.
+
+## The runtime map — one frame
+
+The whole execution model in one picture: two single-threaded runtimes, a static artifact
+between them, and the network calls the app makes at runtime.
 
 ```
-  flattr's two runtimes — same code, two execution models
+  flattr — two single-threaded runtimes, one shared artifact
 
-  ┌─ BUILD TIME · Node (tsx) ───────────────────────────────┐
-  │  process: `npm run build:graph` → pipeline/run-build.ts  │
-  │  one process, runs once, exits                           │
-  │  fetch OSM → sample elevation → compute grades →         │
-  │  write data/graph.json (the artifact)                    │
-  │  lifetime: seconds-to-minutes, then process dies         │
-  └────────────────────────┬────────────────────────────────┘
-                           │ produces a static file
-                           ▼  mobile/assets/graph.json (544 KB)
-  ┌─ RUN TIME · Hermes / React Native ──────────────────────┐
-  │  process: the Expo app on the phone                      │
-  │  long-lived, one UI thread (the JS thread)               │
-  │  reads graph.json → A* on the render thread →            │
-  │  pan loads more tiles (network) → merge → re-route       │
-  │  lifetime: as long as the app is open                    │
-  └──────────────────────────────────────────────────────────┘
+  ┌─ BUILD TIME (Node process, via tsx) ─────────────────────────┐
+  │  run-build.ts main()                                         │
+  │    fetchOverpass ──► parseOsm ──► splitWays                  │
+  │      ──► sampleElevations (sequential batches + backoff)     │
+  │      ──► computeGrades ──► buildAdjacency                    │
+  │  writes ─────────────────────────────────────────────┐      │
+  └───────────────────────────────────────────────────────┼──────┘
+                                                           ▼
+                                            ┌─ ARTIFACT ──────────┐
+                                            │ mobile/assets/      │
+                                            │   graph.json        │ ← static, read-only
+                                            └──────────┬──────────┘
+                                                       │ bundled, loaded once
+  ┌─ RUN TIME (Hermes JS thread, RN app) ───────────────▼─────────┐
+  │  loadGraph() ──► baseGraph (in-memory, never evicted)         │
+  │                                                               │
+  │  event loop:                                                  │
+  │    pan ─debounce 600ms─► queueViewport ─► pump() ─┐           │
+  │    route ──────────────► ensureBbox ────► pump() ─┤ 1-at-a-   │
+  │                                                   │ time      │
+  │    pump(): fetchOverpass ──► buildGraph (on device)│          │
+  │             (sequential I/O, no cancel)            │          │
+  │                                                               │
+  │    A* (directedAstar) runs SYNC in useMemo ◄── render thread  │
+  └───────────────────────────────────────────────────────────────┘
+        │ network hops (runtime)        │ persistent store
+        ▼                               ▼
+  Overpass API · Open-Meteo ·     AsyncStorage (elevCache)
+  Nominatim (geocode)
 ```
 
-The seam between them is `graph.json` — a file. The build-time process owns all
-the network I/O and elevation math; the run-time process owns the interactive
-A* and the on-device tile builds. The same `pipeline/build-graph.ts` runs in
-*both* (Node at build time, Hermes when the phone fetches a new viewport), which
-is why it carefully avoids `node:fs` (see its header comment, line 2).
+## Ranked findings
 
-## Ranked findings — what's most consequential
-
-**1. A\* runs synchronously on the render thread (`MapScreen.tsx:151-162`).**
-`directedAstar` is called inside a `useMemo` in the component body. There is no
-worker, no `InteractionManager`, no yielding. On the bundled Capitol Hill graph
-(544 KB, thousands of nodes) it's fast enough; the heuristic keeps expansions
-low. But the cost is unbounded by design — a wide corridor merged from many
-tiles grows the graph, and the search blocks the JS thread for its full
-duration. There is no frame budget and no cancellation. This is the single most
-load-bearing runtime decision in the app.
-→ see `03-event-loop-and-async-io.md` and `07-backpressure-bounded-work-and-cancellation.md`.
-
-**2. The single-flight `pump()` is the app's entire scheduler
-(`useTileGraph.ts:166-227`).** One graph build runs at a time. A `busyRef`
-boolean is the lock; corridor requests preempt viewport requests; the `finally`
-block drains the next pending request. This is a hand-rolled, single-slot work
-queue — the closest thing flattr has to a task scheduler, and it exists entirely
-to stay under free-tier rate limits.
-→ see `02-processes-threads-and-tasks.md`.
-
-**3. Stale work is never cancelled — it's superseded
-(`useTileGraph.ts`, `MapScreen.tsx`).** Pan three times quickly and the debounce
-collapses it to one queued request, but a build already *in flight* runs to
-completion even though its result is about to be irrelevant. `fetch` is never
-aborted. A* from an old `startId` runs to completion before React re-renders with
-the new one. flattr leans on debounce + single-flight + React's
-recompute-on-change to make stale work cheap, not to cancel it.
-→ see `07-backpressure-bounded-work-and-cancellation.md`.
-
-## not yet exercised
-
-These runtime lenses don't appear in the repo. Named honestly so the audit is
-complete, with the trigger that would make each relevant:
-
-- **Real threads / worker pools / parallelism** — `not yet exercised`. Both
-  runtimes are single-threaded JS. No `Worker`, no `worklet`, no
-  `InteractionManager`. Becomes relevant the moment A* is moved off the render
-  thread (the obvious next move).
-- **Shared mutable state across threads / locks / atomics** —
-  `not yet exercised`. With one thread there are no data races. The only
-  "synchronization" is a `busyRef` boolean, which is cooperative, not a lock.
-  → `04-shared-state-races-and-synchronization.md`.
-- **Manual memory management / explicit lifetimes** — `not yet exercised`. JS is
-  GC'd. The interesting memory story is *retention* (the merged graph never
-  evicts), not allocation.
-- **Streaming I/O / backpressure on a stream** — `not yet exercised`. All I/O is
-  request/response `fetch` with whole-body `await res.json()`. No streams, no
-  `ReadableStream`, no chunked processing.
-- **Graceful shutdown / signal handling** — `not yet exercised` in the app
-  (the OS kills it). The build process exits via `process.exitCode = 1` on error
-  (`run-build.ts:56`) — that's the extent of it.
+| # | Finding | Where | Consequence |
+|---|---------|-------|-------------|
+| 1 | A\* runs synchronously on the JS/render thread | `MapScreen.tsx:151-162` | A large graph blocks the frame; UI stutters. Bounded today by city-sized graphs. |
+| 2 | No cancellation anywhere (no `AbortController`) | grep: zero hits | Stale pan/route builds run to completion and write their result; wasted network + possible visual flicker. |
+| 3 | Single-flight `pump()` relies on JS being single-threaded | `useTileGraph.ts:166-227` | Correct today; the `busyRef` "lock" is not a real lock. Breaks the instant work moves off-thread. |
+| 4 | In-memory graph never evicted | `useTileGraph.ts:132-162` | Merged graph grows monotonically as you pan; unbounded memory over a long session. |
+| 5 | Sequential network I/O with backoff, no concurrency cap needed | `elevation.ts:100-125`, `overpass.ts:32-47` | Slow but rate-limit-safe; serialization *is* the backpressure. |
+| 6 | Persistent elevation cache, debounced writes, FIFO cap | `elevCache.ts` | Bounded disk; survives restarts; the one place with real lifecycle management. |
 
 ## Reading order
 
-1. `01-runtime-map.md` — the process/task/resource map as-built (start here).
-2. `02-processes-threads-and-tasks.md` — where work runs; the `pump()` scheduler.
-3. `03-event-loop-and-async-io.md` — the event loop, microtasks, and the
-   blocking A* hazard.
-4. `04-shared-state-races-and-synchronization.md` — the ref/state split and why
-   there are no races (yet).
-5. `05-memory-stack-heap-gc-and-lifetimes.md` — the no-eviction merged graph and
-   the persistent elev cache.
-6. `06-filesystem-streams-and-resource-lifecycle.md` — `graph.json`, AsyncStorage,
-   timers as resources.
-7. `07-backpressure-bounded-work-and-cancellation.md` — the bounded-work and
-   no-cancellation story.
-8. `08-runtime-systems-red-flags-audit.md` — ranked execution-model risks.
+1. `01-runtime-map.md` — the as-built process/task/resource map (start here).
+2. `02-processes-threads-and-tasks.md` — two runtimes, one JS thread each, where work runs.
+3. `03-event-loop-and-async-io.md` — the event loop, debounce timers, async I/O, blocking hazards.
+4. `04-shared-state-races-and-synchronization.md` — `busyRef`/refs, the single-flight "lock", why there are no real races.
+5. `05-memory-stack-heap-gc-and-lifetimes.md` — heap growth, the un-evicted graph, A\*'s stack.
+6. `06-filesystem-streams-and-resource-lifecycle.md` — `graph.json`, AsyncStorage, no streams, no descriptors.
+7. `07-backpressure-bounded-work-and-cancellation.md` — the single-flight queue, debounce, missing cancellation.
+8. `08-runtime-systems-red-flags-audit.md` — ranked execution-model risks with evidence.
 
-## Cross-links to sibling guides
+## `not yet exercised` — and the trigger for each
 
-- **Where requests cross boundaries** (Overpass, Open-Meteo, Nominatim) →
-  `.aipe/study-networking/` and `.aipe/study-system-design/`.
-- **The A\* algorithm itself** (heap, frontier, admissible heuristic) →
-  `.aipe/study-dsa-foundations/`.
-- **Frame budget, profiling, the cost of the synchronous A\*** →
-  `.aipe/study-performance-engineering/`.
-- **The static-artifact storage model** (`graph.json`, AsyncStorage as a KV
-  store) → `.aipe/study-database-systems/`.
-- **How runtime behavior is verified deterministically** (injected `fetch`,
-  fixture providers) → `.aipe/study-testing/`.
+These are real runtime mechanisms the repo does **not** contain. Named honestly so the
+guide teaches them without pretending flattr uses them.
+
+- **Real threads / worker pools** — no `Worker`, no `worklets`, no thread pool (grep: zero).
+  *Trigger:* moving A\* or on-device graph builds off the JS thread to stop frame drops.
+- **Locks / atomics / channels** — no `Mutex`, `Atomics`, `SharedArrayBuffer` (grep: zero).
+  *Trigger:* the moment any shared state is touched from a second thread (see worker trigger).
+- **Cancellation / `AbortController` / deadlines** — none anywhere (grep: zero).
+  *Trigger:* superseding a stale pan/route build, or a per-request timeout budget.
+- **Streaming / backpressure on streams** — no Node streams, no `ReadableStream` in the hot
+  path; responses are buffered whole (`overpass.ts:41`, `elevation.ts:111`).
+  *Trigger:* responses too large to hold in memory, or incremental render of partial results.
+- **Graceful shutdown** — the pipeline process just exits (`run-build.ts:54-57`); the app
+  has no teardown of in-flight builds. *Trigger:* a long-lived server, or unmount cleanup.
+- **GC tuning / explicit lifetimes** — JS GC is implicit; nothing is tuned or pinned.
+  *Trigger:* a measured memory-pressure problem (the un-evicted graph is the candidate).
+
+## Partition note
+
+This guide owns **how code executes inside one runtime**. *Where* components live and how
+requests cross boundaries is `study-system-design`. *How* the network behaves (DNS, TLS,
+retries as protocol) is `study-networking`. *How* this is verified deterministically is
+`study-testing`. Cross-links point there rather than re-teaching.

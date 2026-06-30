@@ -1,138 +1,101 @@
-# Study — Debugging & Observability (flattr)
+# Overview — Debugging & Observability in flattr
 
-> The question this guide answers: **when the router returns a wrong, weird, or
-> empty answer, what evidence already exists to explain it — and what's missing?**
+One page to orient before the audit. Where can you *see* what flattr is doing,
+where can't you, and what's worth studying first.
 
-flattr has no Sentry, no structured logger, no metrics backend, no traces. And
-yet it is *more* observable than most apps that ship all four. The reason is that
-the observability is baked into the **return values**, not bolted on as a side
-channel: every search hands back the counters that explain its own work
-(`nodesExpanded`, `pushes`, `pops`), every route hands back the list of edges it
-had to compromise on (`steepEdges`), and every degraded build hands back a flag
-that says "the grades I'm showing you are fake" (`degraded`).
+## The evidence map — where behavior surfaces
 
-That's the spine of this guide: **flattr's evidence travels in-band, as data the
-caller can assert on, render, or page off of.** The counters aren't logged — they
-are the function's contract.
-
----
-
-## The seam that splits this from its neighbors
+flattr has three live runtimes and they observe themselves very differently.
+Here's the whole thing in one frame, with each boundary labelled by what
+evidence crosses it.
 
 ```
-  ┌─ study-testing ─────────────────────────────────────────────┐
-  │  KNOWN failure conditions caught before release.            │
-  │  "A* cost EQUALS Dijkstra cost" — the optimality oracle.    │
-  └─────────────────────────────────────────────────────────────┘
-            seam = known vs unknown
-  ┌─ study-debugging-observability (HERE) ──────────────────────┐
-  │  UNKNOWN behavior explained with evidence.                  │
-  │  "why did A* expand 6× more nodes here?" — read the counters.│
-  │  "why is the whole map green?" — curl the API, check degraded.│
-  └─────────────────────────────────────────────────────────────┘
-            seam = explain vs measure
-  ┌─ study-performance-engineering ─────────────────────────────┐
-  │  the SAME counters, read as a budget, not a diagnosis.      │
-  └─────────────────────────────────────────────────────────────┘
+  flattr — what can be observed at each boundary
+
+  ┌─ BUILD-TIME (Node CLI) ────────────────────────────────────────┐
+  │  pipeline/run-build.ts                                          │
+  │   console.log "Fetching OSM…", "Wrote N nodes, M edges"         │ ← stdout only,
+  │   console.warn "Elevation: FLAT (0m)"   console.error(err)      │   not persisted
+  └───────────────────────────┬────────────────────────────────────┘
+                              │ writes static artifact: graph.json
+                              ▼
+  ┌─ TEST / BENCH (Node) ──────────────────────────────────────────┐
+  │  bench/run.ts → prints expanded/pushes/pops/ms/cost table       │ ← MEASURED
+  │  astar.test.ts → A*.cost == Dijkstra.cost (optimality oracle)   │   evidence,
+  │  search() counts nodesExpanded / pushes / pops as it runs       │   on demand
+  └───────────────────────────┬────────────────────────────────────┘
+                              │ same engine, synced into mobile/
+                              ▼
+  ┌─ RUNTIME (Expo / React Native app) ────────────────────────────┐
+  │  useTileGraph.ts: degraded flag on flat-fallback regions        │ ← IN-BAND only
+  │  RouteSummaryCard.tsx: "Flat all the way" / "⚠ Flattest         │   (rendered to
+  │   available" / "No route between those points"                  │   the screen),
+  │  MapScreen.tsx: "Grades approximate — elevation unavailable"    │   nothing logged
+  └────────────────────────────────────────────────────────────────┘
+        ▲                                              ▲
+        │  catch {} swallows Overpass/elevation errors │  no console, no
+        │  (useTileGraph.ts:219, MapScreen.tsx:86)     │  Sentry, no crash report
 ```
 
-The optimality oracle is shared with `study-testing` — it lives there as a
-*correctness gate*. Here it shows up again as a *correctness probe*: the same
-"compute it a second way and demand agreement" move, used to explain an unknown
-discrepancy rather than guard a known one. Same mechanism, two postures. The
-bench counters are shared with `study-performance-engineering` — there they're a
-budget, here they're a diagnosis. Cross-link, don't re-teach.
+The pattern jumps out: **evidence is richest exactly where it's cheapest to
+produce in-band, and absent everywhere it would need to be persisted.** The
+search counts its own work for free (three integer increments). The UI paints
+honesty signals for free (it's rendering anyway). But nothing is written to a
+log, a metric, or an error tracker — so the moment the app is on a real phone
+and a route is wrong, the only evidence is what the user can see on screen.
 
----
+## Ranked findings — what to study first
 
-## What the repo actually exercises (ranked by consequence)
+1. **Search instrumentation counters** (`01-`) — the most load-bearing
+   observability mechanism in the repo. `nodesExpanded / pushes / pops` are
+   threaded straight through the A* loop (`astar.ts:35-77`) and read by the
+   bench (`bench/run.ts`). This is how "is A* actually pruning?" becomes a
+   measured number instead of a belief. **Measured:** A* expands 32 nodes where
+   Dijkstra expands 203 on grid30 — 6.3× fewer, same cost.
 
-1. **In-band search instrumentation** — every search returns
-   `nodesExpanded / pushes / pops` (`features/routing/types.ts:45-51`),
-   incremented inside the loop (`features/routing/astar.ts:35-77`), reported
-   side-by-side across five algorithm stages by the bench harness
-   (`bench/run.ts:29-56`). This is the repo's strongest observability asset.
-   → `01-in-band-search-instrumentation.md`
+2. **The optimality oracle** (`02-`) — `astar.test.ts:38` asserts A*'s cost
+   *equals* Dijkstra's. A differential probe: the simple-but-slow algorithm is
+   the reference oracle for the fast-but-subtle one. The single highest-value
+   correctness signal in the codebase.
 
-2. **The optimality oracle as a correctness probe** — A* vs Dijkstra, asserted
-   equal in cost (`features/routing/astar.test.ts:38-46`). Compute the answer a
-   second, dumber way; if they disagree, the heuristic is broken. The single
-   most powerful debugging tool in the repo.
-   → `02-optimality-oracle-probe.md`
+3. **Degrade-and-surface at the network seam** (`03-`) — elevation 429 → flat
+   fallback → `degraded` flag → user-visible "Grades approximate" note
+   (`useTileGraph.ts:20-30, 75, 209-218` → `MapScreen.tsx:375`). The repo's one
+   end-to-end "a failure became visible" chain.
 
-3. **Route-honesty signals** — `BLOCKED = 1e9` finite-not-infinite
-   (`features/routing/cost.ts:4-5`) keeps "no flat route" distinct from "no
-   route"; `steepEdges` (`features/routing/astar.ts:117-128`) carries the
-   compromise list; `RouteSummaryCard.tsx:28-42` surfaces it to the user as
-   three honest states.
-   → `03-route-honesty-signals.md`
+4. **Finite `BLOCKED` as a diagnostic** (`04-`) — `BLOCKED = 1e9`, not
+   `Infinity` (`cost.ts:5`). This single choice keeps two failure states
+   distinguishable: "no flat route" (returns a path, flags steep edges) vs "no
+   route at all" (returns `null`). Conflate them and you can't tell a user
+   anything true.
 
-4. **Degrade-and-surface at the network seam** — Open-Meteo 429 → flat fallback
-   → `degraded` flag → user-visible "Grades approximate" note → self-heal retry
-   (`mobile/src/useTileGraph.ts:16-31, 189-218`; `mobile/src/MapScreen.tsx:372-379`).
-   → `04-degrade-and-surface-seam.md`
+5. **Curl-the-API-first** (`05-`) — a documented operational discipline
+   (`.aipe/project/context.md`, user memory): probe Open-Meteo with `curl`
+   before debugging your own pipeline, because a 429 masquerades as a grade bug.
+   Instruments the *human* process, not the code.
 
----
+## What's `not yet exercised` (honest gaps)
 
-## not yet exercised — and when it starts to matter
+These are real observability capabilities the repo does not have. The audit's
+red-flags lens ranks them by consequence; here's the short list with triggers.
 
-These are honest gaps, not failures. flattr is a pure-engine + on-device app
-with no server, so most production-observability machinery has nothing to attach
-to *yet*. Each gets a trigger that flips it on.
+| Capability | State | Becomes relevant when… |
+|---|---|---|
+| Structured logging (levels, fields, JSON) | `not yet exercised` — only raw `console.log` in two build scripts | the app ships and you need to know what happened on a user's device |
+| Metrics / SLIs / SLOs / alerts | `not yet exercised` — counters exist but are printed, never aggregated | route latency or fallback rate needs a threshold that pages someone |
+| Distributed traces / spans | `not yet exercised` — no request lifecycle crosses a service | a backend is added and one request fans out across services |
+| Error tracking / crash reporting | `not yet exercised` — runtime errors are `catch {}`-swallowed | a crash on a real phone has to reach you, not just disappear |
+| Correlation IDs | `not yet exercised` — no request to correlate | concurrent route requests need to be told apart in evidence |
 
-```
-  ┌─────────────────────────────┬──────────────────────────────────────┐
-  │ machinery                   │ trigger that makes it relevant         │
-  ├─────────────────────────────┼──────────────────────────────────────┤
-  │ structured logging          │ first time a build fails in CI and you │
-  │ (levels, fields, JSON)      │ can't reproduce — 8 console.* calls    │
-  │                             │ (pipeline/run-build.ts, bench/run.ts)  │
-  │                             │ are all there is today.                │
-  ├─────────────────────────────┼──────────────────────────────────────┤
-  │ metrics / SLIs / SLOs /     │ first deploy to real users — you'd     │
-  │ alerts                      │ want p95 route latency + degraded-rate │
-  │                             │ as a paging signal. Counters exist;    │
-  │                             │ nothing collects them over time.       │
-  ├─────────────────────────────┼──────────────────────────────────────┤
-  │ traces / request lifecycle  │ first multi-service hop. Today the     │
-  │ (spans, correlation IDs)    │ longest causal chain is one in-process │
-  │                             │ pipeline; no IDs needed.               │
-  ├─────────────────────────────┼──────────────────────────────────────┤
-  │ error tracking (Sentry etc.)│ first time a user hits a crash you     │
-  │ + crash reporting           │ never see. No DSN, no dep, in either   │
-  │                             │ package.json.                          │
-  └─────────────────────────────┴──────────────────────────────────────┘
-```
+None of these are *bugs*. flattr is a pre-backend, single-artifact app — most of
+this infrastructure has nothing to instrument yet. The honest framing: the
+in-band signals are well-designed for what exists; the persistence layer of
+observability simply hasn't been reached.
 
-The audit (`audit.md`) walks all eight lenses and marks each `not yet exercised`
-honestly with its trigger.
+## How to read the rest
 
----
-
-## The one operational habit worth copying
-
-**curl the API before you debug the pipeline.** It's written into the project
-memory and the context doc: Open-Meteo 429s under heavy testing, and when it
-does, every grade comes back flat — which looks exactly like a grade-computation
-bug. The discipline (`curl` the upstream first, confirm it's the source, *then*
-debug your code) is the cheapest "instrument before you fix" move in the repo.
-This is the through-line behind the "all grades green" incident in
-`04-degrade-and-surface-seam.md`.
-
----
-
-## Reading order
-
-```
-  00-overview.md                       ← you are here
-  audit.md                             ← 8-lens audit, gaps named honestly
-  01-in-band-search-instrumentation.md ← the counters that explain the search
-  02-optimality-oracle-probe.md        ← compute it twice, demand agreement
-  03-route-honesty-signals.md          ← BLOCKED-finite + steepEdges + the card
-  04-degrade-and-surface-seam.md       ← 429 → flat fallback → degraded → UI
-```
-
-Cross-links: `study-testing` (the oracle as a gate), `study-performance-engineering`
-(the counters as a budget), `study-system-design`
-(`04-honest-fallback-routing.md`, `05-elevation-provider-fallback.md` — the
-architecture these debugging signals ride on).
+`audit.md` walks all eight lenses and is the systematic record. The pattern
+files go deep on the five mechanisms above. If you only read two things, read
+`01-search-instrumentation-counters.md` and `03-degrade-and-surface.md` — they
+are the two ends of the spectrum: free in-band measurement, and a failure made
+visible end-to-end.

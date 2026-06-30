@@ -1,235 +1,278 @@
-# Event Loop & Async I/O — the JS thread and the blocking hazard
+# Event Loop and Async I/O — scheduling on the one thread
 
-**Industry name(s):** event loop · microtask queue · cooperative concurrency ·
-CPU-bound work on the UI thread. **Type:** Industry standard.
+**Industry name:** event loop / cooperative scheduling / async I/O — *Industry standard*.
 
 ## Zoom out, then zoom in
 
-Both of flattr's runtimes are single-threaded event loops — Node's libuv loop at
-build time, Hermes's loop on the phone. Everything is either a synchronous run to
-completion or an `await` that yields the loop. The whole story of this file lives
-in the run-time loop, where one specific synchronous block — A* — competes with
-the next animation frame.
+The one JS thread from `02` doesn't sit idle waiting for the network — it runs an event
+loop that interleaves work. Here's where that loop lives.
 
 ```
-  Zoom out — the event loop owns the run-time JS thread
+  Zoom out — the event loop under the app code
 
-  ┌─ UI layer ──────────────────────────────────────────┐
-  │  user pans, taps, drags slider → native events       │
-  └───────────────────────┬───────────────────────────────┘
-                          │ marshalled to JS as callbacks
-  ┌─ JS thread = ONE event loop (Hermes) ───────────────┐
-  │  ┌ macrotasks: timers, native callbacks ─────────┐  │
-  │  │  onRegionDidChange, setTimeout, GPS fix        │  │ ← we are here
-  │  ├ microtasks: Promise .then / await resumptions ─┤  │
-  │  │  fetch resolution, async build steps           │  │
-  │  ├ render: React reconcile + paint ───────────────┤  │
-  │  │  ★ A* runs HERE, synchronously, no yield ★      │  │
-  │  └────────────────────────────────────────────────┘  │
-  └──────────────────────────────────────────────────────┘
+  ┌─ App tasks ──────────────────────────────────────────────────┐
+  │  pan handler · route handler · geocode typeahead · A* memo   │
+  └───────────────────────────────┬──────────────────────────────┘
+                                  │ all queued onto ↓
+  ┌─ Event loop (the one JS thread) ─────────────────────────────┐
+  │  ★ macrotask queue (timers, I/O callbacks)                   │ ← we are here
+  │  ★ microtask queue (resolved promises) — drained first       │
+  └───────────────────────────────┬──────────────────────────────┘
+                                  │ await delegates blocking I/O to ↓
+  ┌─ Native I/O (off-thread) ────▼───────────────────────────────┐
+  │  network sockets · disk · resolve a promise when done        │
+  └───────────────────────────────────────────────────────────────┘
 ```
 
-Zoom in: the question is **what runs to completion without yielding, and what
-yields the loop?** Async I/O (`fetch`, `await sleep`) yields — that's why the
-single-flight scheduler works without blocking the UI. But A* does *not* yield,
-and it runs during render. That contrast is the lesson.
+Zoom in: the question here is **"in what order do tasks run, and what can stall the
+loop?"** flattr's answers are concrete — debounce timers gate pan and typeahead work,
+`await` chains serialize network I/O, and exactly one task (A\*) is synchronous and can
+stall the loop. Name the queues, then find the blocking hazard.
 
-## Structure pass
+## Structure pass — layers, one axis, the seams
 
-**Layers.** Three kinds of work share the one loop: (1) async I/O — yields at
-every `await`; (2) timer callbacks — macrotasks scheduled by `setTimeout`;
-(3) synchronous compute — runs start-to-finish, blocking everything, including A*
-and the graph-merge `useMemo`s.
-
-**Axis traced — "does this yield the event loop (control)?"**
+**The layers** are the two queues the loop drains (microtask → macrotask) plus the native
+I/O it delegates to. **The axis: "does this task yield the thread, or hold it?"**
 
 ```
-  One axis — "does it yield?" — across the work types
+  Axis: "yield or hold?"  — traced across task types
 
-  fetchOverpass / await sleep   → YES, yields at every await   (I/O-bound)
-  buildGraph (mostly awaits)    → YES, yields during sampling   (I/O-bound)
-  setTimeout debounce/retry     → schedules a future macrotask  (yields now)
-  stitchGraph + mergeGraphs     → NO, synchronous useMemo       (CPU-bound)
-  directedAstar                 → NO, tight while-loop, no yield (CPU-bound) ★
+  ┌─ async task (await chain) ───────────────────┐
+  │  fetchOverpass, geocode, sampleElevations     │  → YIELDS at every await
+  └────────────────────────────────────────────────┘    (native does the wait)
+  ┌─ timer task (setTimeout) ────────────────────┐
+  │  debounce 600ms / 400ms, retry 12s, persist 4s│  → YIELDS (fires later)
+  └────────────────────────────────────────────────┘
+  ┌─ sync CPU task (A*) ─────────────────────────┐
+  │  directedAstar in useMemo                     │  → HOLDS until it returns ★
+  └────────────────────────────────────────────────┘    the lone blocking hazard
 ```
 
-**Seam — the `await` keyword itself.** Every `await` in `pump`'s async body
-(`useTileGraph.ts:184-226`) is a point where the loop is handed back so the UI
-stays responsive *during the network build*. The seam flips control from "this
-task" to "whatever else is queued." The places with **no** `await` —
-`directedAstar`, `stitchGraph`, `nearestNode` — are the seams that *don't* exist,
-and that's the hazard.
+**The seam that matters** is `await` itself:
+
+```
+  The await seam — where the loop reclaims the thread
+
+  your code         await fetch(...)        native I/O
+  ┌──────────┐  ═════╪═════════════════►  ┌──────────────┐
+  │ runs ... │      (loop FREE here:      │ socket waits │
+  │ pauses   │ ◄═══  microtask resumes    │ resolves ──► │
+  └──────────┘       you when it resolves) └──────────────┘
+```
+
+Everything async in flattr crosses this seam and frees the loop. The one thing that
+*doesn't* is A\*. That contrast is the lesson. Hand off to How it works.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You know this from the browser: a `fetch()` doesn't freeze the page because it
-yields; a `while(true){}` does freeze it because it never yields. The event loop
-can only switch tasks at yield points, and a synchronous function has none.
-flattr's network work is full of yields (so the spinner animates while streets
-load); its A* has zero (so a big search would freeze the map).
+You know this from `fetch()` already: when you `await fetch(url)`, the line "pauses" but
+your *app* doesn't freeze — clicks still register, spinners still spin. That's the event
+loop reclaiming the thread while native waits on the socket. flattr's whole async story is
+that primitive, applied repeatedly, plus `setTimeout` to *delay* tasks (debounce) and a
+`for` loop with `await sleep()` to *space out* tasks (backoff). The strategy: **never block
+the loop on I/O — delegate it and let the loop run other tasks; and shape *when* tasks fire
+with timers.**
 
 ```
-  Pattern — the single loop, two fates for a task
+  The event-loop kernel: one thread, two queues, native I/O outside
 
-   ┌──────────────── event loop tick ────────────────┐
-   │                                                  │
-   │  async task:  ──work──await──[YIELD]──work──done │  loop free here ↑
-   │                                                  │
-   │  sync  task:  ──────────work to completion───────│  loop BLOCKED entire time
-   │               (A*, stitchGraph)        no yield  │
-   └──────────────────────────────────────────────────┘
+   ┌──────────────────── JS THREAD ────────────────────┐
+   │  [microtasks]  drained fully  →  [macrotasks] one  │
+   │   promise .then                  timer / I/O cb    │
+   └───────────────────────┬───────────────────────────┘
+                           │ await hands off
+                           ▼
+                  ┌─ native (off-thread) ─┐
+                  │ socket / disk waits   │ ──resolves──► enqueues a microtask
+                  └───────────────────────┘
 ```
 
-### Move 2 — the walkthrough
+### Move 2 — the parts, one at a time
 
-**Part 1 — async I/O yields, so the build never freezes the UI.** Inside `pump`,
-every network step is awaited. While `fetchOverpass` is in flight, the loop is
-free to animate the spinner, handle a pan, fire a timer:
+**Part 1 — debounce timers shape *when* work fires.** Two of them, both `setTimeout`. Pan
+events fire dozens of times a second; you don't want a graph build per event. So the region
+handler resets a timer and only acts after motion stops:
 
 ```ts
-// mobile/src/useTileGraph.ts:185-197
-const osm = await fetchOverpass(bbox);     // ① yields ~seconds while network runs
-...
-const g = await buildGraph(kind, bbox, osm, elev, MAX_SEG_M, ..., onPhase); // ② yields
+// mobile/src/useTileGraph.ts:245-258 — debounce: collapse a burst of pans into one build
+const onRegionDidChange = useCallback((e: RegionEvent) => {
+  const { bounds } = e.nativeEvent;
+  // ... span/grades guards ...
+  if (timerRef.current) clearTimeout(timerRef.current);          // ← cancel the pending one
+  timerRef.current = setTimeout(() => queueViewport(bounds), DEBOUNCE_MS); // 600ms
+}, [queueViewport]);
 ```
 
-At ① and ②, the JS thread is *not* busy — it's parked, waiting on a microtask
-that resolves when the socket delivers bytes. This is why `setLoadingStep` can
-update a spinner mid-build: the render loop gets turns between awaits. The
-boundary condition: nothing here is CPU-heavy on the JS side, so the loop is
-genuinely idle during I/O.
+```
+  Debounce — a burst of macrotasks collapses to one
 
-**Part 2 — the backoff sleeps are macrotasks, not busy-waits.** When Open-Meteo
-429s, the retry waits without burning CPU:
+  pan pan pan pan pan ............(quiet)
+   │   │   │   │   │
+   reset reset reset reset reset
+                              └─600ms─► queueViewport fires ONCE
+```
+
+The typeahead does the identical move with a 400ms timer (`MapScreen.tsx:73-89`). What
+breaks if you remove the `clearTimeout`? Every pan event queues its own build — the pump
+serializes them, but you'd do dozens of redundant network builds for one gesture. The
+debounce is the first stage of backpressure (see `07`).
+
+**Part 2 — `await` chains serialize network I/O and free the loop.** The pump's body is one
+long await chain. Each `await` frees the JS thread while native does the network wait:
 
 ```ts
-// pipeline/elevation.ts:98, 114-116
-const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
-...
-if (res.status === 429 && attempt < retries) {
-  await sleep(delayMs * 2 ** (attempt + 1)); // ← parks the task; loop stays free
-  continue;
+// mobile/src/useTileGraph.ts:184-197 — the async build, each await frees the loop
+(async () => {
+  try {
+    const osm = await fetchOverpass(bbox);          // ← loop free during the fetch
+    // ...build elevation provider...
+    const g = await buildGraph(kind, bbox, osm, elev, MAX_SEG_M, ..., onPhase);  // ← free again
+    // ...store the region...
+```
+
+```
+  Build task — await points free the loop (other tasks run between)
+
+  pump task: ──fetchOverpass── [await: loop free] ──buildGraph── [await: loop free] ──store──
+                                     ▲                                ▲
+                              input/timers/render run here, not blocked
+```
+
+This is why a network build doesn't freeze the UI even though it's "one task" — it's really
+a chain of short synchronous chunks separated by yields.
+
+**Part 3 — backoff loops *space out* I/O on the same thread.** The elevation provider
+retries 429s with exponential backoff, using `await sleep()` — a `setTimeout` wrapped in a
+promise. This is async-await used to *throttle*, not just to wait:
+
+```ts
+// pipeline/elevation.ts:108-119 — retry 429 with exponential backoff, on the same thread
+for (let attempt = 0; ; attempt++) {
+  const res = await fetchImpl(url);
+  if (res.ok) { json = await res.json(); break; }
+  if (res.status === 429 && attempt < retries) {
+    await sleep(delayMs * 2 ** (attempt + 1));   // ← 800ms, 1600ms, 3200ms... loop free meanwhile
+    continue;
+  }
+  throw new Error(`Open-Meteo elevation: ${res.status}`);
 }
 ```
 
-`setTimeout` schedules a macrotask; the `await` parks this build until it fires.
-During the (exponentially growing) wait, the UI thread is fully available. Contrast
-with a `while (Date.now() < deadline) {}` spin, which would freeze the app for the
-entire backoff. The choice here is correct.
+Overpass does the same with linear backoff (`overpass.ts:42-46`, `delayMs * (attempt + 1)`).
+Both batch and space requests (`elevation.ts:121` sleeps between batches) so the free APIs
+don't throttle them. The loop is free the entire time — the `sleep` is a timer, not a spin.
+What breaks without the backoff? You hammer a throttled API and every request 429s; the
+serialized retry *is* the rate-limit compliance.
 
-**Part 3 — the hazard: A\* runs synchronously during render.** This is the one
-piece of CPU work with no yield, and it's on the hottest path:
+**Part 4 — the one synchronous hazard: A\*.** Every other task yields. `directedAstar`
+doesn't — it's a `while` loop over a priority queue that runs to completion without an
+`await` (`astar.ts:48-77`). On the JS thread, inside a `useMemo`:
+
+```
+  The blocking hazard — A* holds the thread end to end
+
+  loop: [debounce timer ready][input ready][A* memo recomputes]──────────[finally other tasks]
+                                            └─ no await inside; thread held ─┘
+        if A* is short (city graph): invisible.
+        if A* is long (huge graph):  timers + input wait → visible jank
+```
+
+Code: the search loop has no yield point —
 
 ```ts
-// mobile/src/MapScreen.tsx:151-162
-const routed = useMemo(() => {
-  ...
-  const r = directedAstar(graph, startId, endId, userMax); // ← no await anywhere inside
-  ...
-}, [graph, startId, endId, userMax]);
+// features/routing/astar.ts:48-77 — synchronous while loop, no await, holds the thread
+while (!open.isEmpty()) {
+  const current = open.pop()!;
+  if (closed.has(current)) continue;
+  if (current === goalId) { /* reconstruct + return */ }
+  closed.add(current);
+  for (const edgeId of graph.adjacency[current] ?? []) { /* relax */ }
+}
 ```
 
-And the search loop it calls (`astar.ts:48-76`) is a tight `while (!open.isEmpty())`
-with heap pushes/pops and no `await`, no `yield`, no chunking. Whatever that loop
-costs, the JS thread is blocked for the whole duration — and because it's in a
-`useMemo`, it runs as part of React's render, so the frame can't paint until A*
-returns.
-
-```
-  Execution trace — what the loop does during a route recompute
-
-  frame N:  graph/startId changes → React render begins
-            └─ useMemo runs → directedAstar()
-               └─ while(open not empty): pop, expand, push ...  ← loop BLOCKED
-               └─ ... returns path
-            └─ render continues → setState → paint
-  frame N+1: finally paints   ← if A* took >16ms, frame N was dropped (jank)
-```
-
-On the bundled 544 KB Capitol Hill graph this is fine — the haversine heuristic
-keeps `nodesExpanded` small (see the bench harness). The hazard is *scale*: merge
-a wide corridor from many tiles and the graph grows, A* expands more nodes, and
-the block lengthens with no ceiling. **Inference:** there is no measured frame
-budget in the repo, so the safe-graph-size threshold is untested — flagged in
-`08-runtime-systems-red-flags-audit.md`.
-
-**Part 4 — the merge `useMemo`s are also synchronous CPU.** `graph` and
-`displayGraph` (`useTileGraph.ts:132-162`) rebuild via `stitchGraph(mergeGraphs(...))`
-on every region change. `stitchGraph` (`tiles.ts:45-86`) iterates all nodes to
-bucket by coordinate. That too is a non-yielding block on the render thread, run
-each time a tile lands. Smaller than A* today, same category of hazard.
+This is the deliberate asymmetry: I/O is async (yields), CPU is sync (holds). It's correct
+because A\* over a city graph is fast. The boundary: if the merged graph grew past ~16ms of
+search, you'd chunk it (yield every N expansions) or move it to a worker (`02`).
 
 ### Move 3 — the principle
 
-A single-threaded event loop gives you concurrency *for free on I/O* and *nothing
-for CPU*. Async I/O is safe to pile on because every `await` is a yield. CPU-bound
-work is the opposite: it has no yield, so it owns the thread until it returns, and
-if it's on the render path it owns the next frame too. The discipline is to keep
-the loop's synchronous segments shorter than a frame — or move them off the thread.
+The event loop trades parallelism for a guarantee: **tasks run to completion without
+interleaving, so you never need a lock — but you must never block.** Async I/O honors the
+"never block" rule by delegating the wait to native; timers shape *when* tasks fire;
+backoff loops shape *how fast*. The single discipline is "yield often, hold briefly." The
+moment one task forgets to yield (A\* on a huge graph), the loop's great strength — no
+preemption — becomes its great weakness: that one task starves everything.
 
 ## Primary diagram
 
-```
-  The run-time event loop — yields vs blocks, fully labelled
+The whole scheduling picture: queues, the await seam, timers, and the lone sync hazard.
 
-  ┌─ JS thread (Hermes) · one event loop ────────────────────────┐
-  │                                                              │
-  │  MACROTASKS                MICROTASKS            RENDER       │
-  │  ┌──────────────┐          ┌──────────────┐    ┌──────────┐  │
-  │  │ setTimeout   │          │ await resume │    │ useMemo: │  │
-  │  │ (debounce,   │──────────│ (fetch, sleep│────│ A* +     │  │
-  │  │  retry,      │  yields  │  resolve)    │    │ merge    │  │
-  │  │  persist)    │   ←──────│  yields      │    │ NO YIELD │  │
-  │  └──────────────┘          └──────────────┘    └────┬─────┘  │
-  │       free during I/O ▲          free ▲              │ BLOCKS │
-  │                       └───── loop available ─────────┘ frame  │
-  └──────────────────────────────────────────────────────────────┘
-   ★ I/O is safe to pile on (yields); CPU (A*) owns the thread till done ★
+```
+  flattr event loop — queues, timers, async I/O, the sync hazard
+
+  ┌──────────────────── JS THREAD (event loop) ────────────────────┐
+  │                                                                │
+  │  microtasks (promise .then) ─drain fully─►                     │
+  │  macrotasks (one per turn):                                    │
+  │    ├ debounce 600ms → queueViewport → pump()                   │
+  │    ├ debounce 400ms → geocodeSuggest                           │
+  │    ├ retry 12s / persist 4s timers                             │
+  │    └ A* useMemo recompute ──── SYNC, HOLDS THREAD ★            │
+  │                                                                │
+  │  await points free the loop ──────────────┐                   │
+  └────────────────────────────────────────────┼──────────────────┘
+                                               ▼ native (off-thread)
+                              ┌─ network: Overpass / Open-Meteo / Nominatim ─┐
+                              │  + backoff sleeps space the requests out      │
+                              └───────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-This is the same lesson the browser taught with "don't block the main thread" and
-that Node taught with "don't do sync `crypto`/`zlib` in a request handler." The
-fix vocabulary is identical across runtimes: move CPU off-thread (Web Worker, RN
-worklet, Node `worker_threads`), or chunk it with cooperative yields
-(`setTimeout(0)` / `requestIdleCallback` / `scheduler.yield`). flattr does
-neither yet because the current graph is small — a defensible call, but one with
-no guardrail measuring when it stops being true.
+This is the **Node.js / browser event-loop model** verbatim — microtask queue (promises)
+drained before each macrotask (timer / I/O callback). The debounce pattern is the same one
+every search box uses; the backoff loop is textbook exponential-backoff-with-jitter (minus
+the jitter — flattr's is deterministic). The deeper idea, **cooperative multitasking**,
+predates JS by decades (early Mac OS, Windows 3.x) and has the same failure mode flattr's
+A\* could hit: one task that won't yield hangs the system. The modern fix — time-slicing a
+long computation by yielding periodically — is what React's concurrent mode does for
+rendering and what flattr would do for A\* if it grew. For the network-protocol view of
+these same calls (TLS, DNS, connection reuse), see `study-networking`; for the rate-limit
+strategy as backpressure, see `07`.
 
 ## Interview defense
 
-**Q: A\* is CPU-bound. Where does it run, and what's the risk?**
+**Q: "How does this app stay responsive while fetching and building graph data?"**
 
-It runs synchronously inside a `useMemo` on the React render thread —
-`MapScreen.tsx:151`. The search loop in `astar.ts:48` has no yield point, so the
-JS thread is blocked for the whole search, and because it's during render, the
-next frame can't paint until it finishes.
+Every network and disk operation is `await`-ed, which frees the single JS thread for input
+and rendering while native does the wait. Pan and typeahead bursts are debounced
+(`setTimeout`, 600ms / 400ms) so a gesture produces one build, not dozens. Backoff loops
+(`await sleep`) space out retries without spinning.
 
 ```
-  the risk in one picture
-
-  small graph:  A* < 16ms → fits in a frame → smooth
-  big corridor: A* > 16ms → blocks render → dropped frames (jank)
-                └─ no frame budget, no chunking, no worker → unbounded
+  await fetch ──[loop free: input/render run]──► resolve ──► continue
 ```
 
-Anchor: *"The network I/O is fine — every `await` yields the loop, so the spinner
-animates while streets load. It's the synchronous A* and graph-merge `useMemo`s
-that are the exposure, and there's no measurement gating graph size."*
+*Anchor:* "Async I/O frees the loop; timers shape when work fires; backoff shapes how fast."
 
-**Q: Why doesn't the Open-Meteo backoff freeze the app?**
+**Q: "What could freeze the UI?"**
 
-Because the wait is `await sleep(ms)` where `sleep` wraps `setTimeout` —
-`elevation.ts:98`. That parks the task as a macrotask and hands the loop back; it
-doesn't busy-wait. The exponential backoff can grow to seconds and the UI stays
-fully responsive the whole time.
+`directedAstar` — it's the one synchronous task on the thread, a `while` loop with no
+`await` (`astar.ts:48-77`). City-sized graphs make it invisible; a large enough graph would
+exceed a frame and jank. Fix: yield every N expansions, or move it to a worker.
+
+```
+  [A* sync, no yield]─────── thread held ───────► timers + input wait behind it
+```
+
+*Anchor:* "The blocking hazard is always the synchronous task that forgot to yield — here
+there's exactly one, and I can name it."
 
 ## See also
 
-- `02-processes-threads-and-tasks.md` — the `pump()` scheduler that rides this loop.
-- `07-backpressure-bounded-work-and-cancellation.md` — A* and `fetch` can't be cancelled.
-- `.aipe/study-performance-engineering/` — measuring the A* frame cost and budget.
-- `.aipe/study-dsa-foundations/` — the A* loop and heap that do the blocking work.
+- `02-processes-threads-and-tasks.md` — the one thread this loop runs on.
+- `07-backpressure-bounded-work-and-cancellation.md` — debounce + serialized I/O as backpressure.
+- `04-shared-state-races-and-synchronization.md` — why no-preemption means no locks.
+- `study-networking` (sibling) — the same I/O as protocol behavior (DNS, TLS, retries).

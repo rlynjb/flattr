@@ -1,43 +1,45 @@
-# 04 · Agents & Tool Use
+# 04 — Agents and tool use
 
-> **flattr is a deterministic pipeline, not an agent — control flow is
-> code-decided, never model-decided.**
+flattr has no agents. Its route flow is a deterministic, fixed-length
+chain — tap/type → geocode → nearestNode → A* → summary → render — with no
+LLM, no tool-calling loop, and no per-step reasoning. These files teach
+the agent patterns as study material and stay honest about the absence,
+while anchoring to what flattr *does* have:
 
-Every concept here is **study material**. flattr has no LLM, no agent loop, no
-tool-calling, no model. That makes it the cleanest possible *counterexample*: the
-contrast between "code decides the next step" and "a model decides the next step"
-is visible in every file, because flattr always sits on the code-decided side.
+- **A fixed chain, not an agent** — every step is a function call in a
+  known order (`MapScreen.tsx:155–159`).
+- **Tool-shaped functions** — `geocode`, `nearestNode`, `directedAstar`
+  are typed, single-purpose operations an agent *would* call as tools.
+- **All-heuristic routing** — decisions come from `haversine`, the cost
+  function, and threshold tables; the one ML attach point is `penalty`
+  (`cost.ts:16`), bound by A* admissibility.
+- **Deterministic error-shape discipline** — the real, non-agent analog of
+  error recovery: throw vs `null` vs flagged-path, with a *finite*
+  `BLOCKED` (`cost.ts:5`) separating "no flat route" from "no route."
 
-```
-THE ONE AXIS THIS SECTION TURNS ON
-┌──────────────────────────────────────────────────────────┐
-│  who decides the next step / which tool / when to stop?    │
-│                                                            │
-│   CODE  ◀───────────────────────────────────────▶  MODEL  │
-│   flattr lives here                       agents live here │
-│   (fixed pipeline + A*)              (LLM loop + tools)     │
-└──────────────────────────────────────────────────────────┘
-```
+## Files
 
-The one honest bridge: flattr's pure functions are **tool-shaped** — `geocode`
-(`pipeline/geocode.ts:9`), `routeSummary` (`features/routing/summary.ts:11`), and the
-router (`features/routing/astar.ts`) all have typed I/O and no hidden state. They'd
-make clean tools. Nothing calls them as tools. That's the seam, stated honestly —
-no agent overclaim.
+- [01-agents-vs-chains.md](01-agents-vs-chains.md) — flattr's pipeline is a
+  fixed chain, not an agent loop; an added NL-parse step would still be a
+  2-step chain.
+- [02-tool-calling.md](02-tool-calling.md) — N/A; if an agent existed,
+  `geocode`/`route` would be the tools. Their signatures are already
+  tool-shaped.
+- [03-react-pattern.md](03-react-pattern.md) — N/A; flattr has no LLM
+  reasoning loop. A*'s search loop is algorithmic, not ReAct.
+- [04-tool-routing.md](04-tool-routing.md) — flattr is 100% heuristic
+  routing; the only learnable point (`penalty`) stays a cost inside
+  deterministic search.
+- [05-agent-memory.md](05-agent-memory.md) — N/A; flattr is stateless per
+  route. The `useMemo` is input-keyed memoization, not memory.
+- [06-error-recovery.md](06-error-recovery.md) — flattr's real, disciplined
+  error shaping: distinct shapes per failure mode, finite `BLOCKED`
+  separating two user outcomes.
 
-## The six
+## Reading order
 
-| # | File | One-line |
-|---|------|----------|
-| 01 | [agents-vs-chains](01-agents-vs-chains.md) | Chain = you fix the steps; agent = model fixes them. flattr is neither — fixed pipeline + fixed A*. |
-| 02 | [tool-calling](02-tool-calling.md) | Model emits `{tool,input}`; your code runs it. flattr's pure fns are already tool-shaped — none are called as tools. |
-| 03 | [react-pattern](03-react-pattern.md) | Thought→Action→Observation. N/A — flattr's only loop is A*'s PQ expansion, proven not learned. |
-| 04 | [tool-routing](04-tool-routing.md) | Heuristic-front vs LLM-back dispatch. flattr is all-front, no LLM router. |
-| 05 | [agent-memory](05-agent-memory.md) | Short-term context + long-term retrieval. flattr is stateless; only `userMax` persists (a pref, not memory). |
-| 06 | [error-recovery](06-error-recovery.md) | Tool error→retry→max-iter stop. flattr's `BLOCKED=1e9` sentinel is the deterministic analog of graceful degradation. |
-
-## Real seams (verified)
-- **output→prompt** — `features/routing/summary.ts:11` (`routeSummary` → narration)
-- **input→prompt** — `pipeline/geocode.ts:9` (natural-language destination parsing)
-- **injection vector** — `pipeline/geocode.ts:27,52,69` (OSM `display_name` is untrusted)
-- **degradation analog** — `features/routing/cost.ts:5,18` (`BLOCKED=1e9`, spec §14.4)
+Self-contained per concept. Straight through, the honest arc is:
+agents-vs-chains (flattr is a chain) → tool-calling (the would-be tools) →
+ReAct (no reasoning loop) → tool-routing (all heuristic) → agent-memory
+(stateless) → error-recovery (the one with the richest real flattr
+content, including the finite-`BLOCKED` trick).

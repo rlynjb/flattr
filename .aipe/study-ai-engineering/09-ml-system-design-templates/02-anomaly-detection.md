@@ -1,105 +1,47 @@
-# Anomaly Detection
+# 02 — Anomaly Detection
 
-*Flag outliers against a learned or statistical baseline.*
+A reusable interview template, reframed against flattr. flattr does not ship anomaly
+detection, but its build pipeline ingests noisy external data (OSM geometry +
+elevation) — so this is the one "no" template that is honestly a *partially*: the
+input space exists, the detector does not.
 
-The second staple ML-design prompt. "Detect fraud / bad sensor readings / weird
-traffic." The shape is always the same: build a model of *normal*, then score new
-points by how far they deviate. Sometimes the model is learned (autoencoder
-reconstruction error, isolation forest); sometimes it's pure statistics (z-score,
-IQR, robust median). The interview tests whether you can define "normal" without
-labels, set a threshold, and handle the precision/recall tradeoff on rare events.
+- **The prompt:** "Design an anomaly detection system that flags unusual events in a data stream."
 
-## Standard architecture
+- **Standard architecture:** Anomaly detection is a scoring-plus-threshold pipeline over a stream — featurize events, score each against a model of "normal," and route high scores to an alert sink. The diagram below shows the stream path with the baseline model fit offline.
 
-```text
-                  ANOMALY DETECTION (generic reference shape)
-  ┌──────────┐   ┌────────────────┐   ┌──────────────┐   ┌─────────────┐
-  │ incoming │──▶│ FEATURIZE      │──▶│ SCORE vs     │──▶│ THRESHOLD   │
-  │ records  │   │ (normalize)    │   │ BASELINE     │   │ + ALERT     │
-  └──────────┘   └────────────────┘   └──────┬───────┘   └─────────────┘
-                                             │                  │
-                       baseline model ◀──────┘            quarantine /
-                       (statistical or learned)           flag / drop
-                       fit on "normal" history            ▲
-                                                          │
-                                            feedback: confirmed labels
-                                            tighten threshold over time
+```
+                  Anomaly detection — score-and-threshold over a stream
+  ┌──────────────┐  events   ┌──────────────────┐  features  ┌──────────────────┐
+  │  Source      │──────────►│  Feature extract │───────────►│  Scorer          │
+  │ (data stream)│           │  (window/aggr)   │            │  score vs normal │
+  └──────────────┘           └──────────────────┘            └────────┬─────────┘
+                                                                       │ score
+                                                  ┌────────────────────┼───────────┐
+                                                  │                    │           │
+                                            score ≤ τ            score > τ         │
+                                                  ▼                    ▼           │
+                                          ┌──────────────┐    ┌──────────────┐     │
+                                          │  Pass / store│    │  Alert sink  │     │
+                                          └──────────────┘    └──────────────┘     │
+                                                                                   │
+                          ┌────────────────────────────────────────────┐          │
+                          │ Offline: fit baseline "normal" distribution │◄─────────┘
+                          │ + choose threshold τ                        │  recent normals
+                          └────────────────────────────────────────────┘
 ```
 
-Key decisions: unsupervised (no labels, model the density) vs. supervised (rare
-labels, classify); point anomalies vs. contextual vs. collective; and where the
-detector sits — inline (block bad data) vs. offline (audit after the fact).
+  The baseline defines normal; the threshold τ trades false positives against missed anomalies. flattr builds none of this today.
 
-## Data and features (generic)
+- **Data model:** A rolling baseline of "normal" — either summary statistics (mean/variance, histogram bins) or a reference distribution snapshot — plus the threshold τ and a labeled alert log for tuning. Streaming systems keep a windowed feature buffer. flattr's analog is its static input: every `Edge {gradePct, absGradePct, lengthM, riseM, kind?}` and `Node {lat, lng, elevationM}` in `mobile/assets/graph.json`, produced once by the build pipeline. There is no stream and no baseline stored; the graph is a single batch artifact.
 
-- **Baseline corpus** — a sample of known-good data. Quality matters more than
-  size; contaminated "normal" data poisons the baseline.
-- **Features** — whatever makes the anomaly stand out. Often deltas, ratios, and
-  rolling stats rather than raw values.
-- **Scale concerns** — streaming detectors need bounded state (sketches, EWMA);
-  thresholds drift, so you re-fit on a schedule; alert fatigue is the real-world
-  failure mode, so calibrate for precision on the rare class.
+- **Key components:** Feature extractor — windows/aggregates raw events into comparable features; the choice is fixed windows over per-event scoring when anomalies are distributional (a shift across many events) rather than point outliers. Scorer — distance from baseline (z-score, isolation forest, or a distribution-distance metric like PSI/KL); the choice is an unsupervised density/distance method over a supervised classifier because labeled anomalies are rare by definition. Threshold + alerter — converts score to action; the choice is a calibrated τ with hysteresis so a single noisy event doesn't page.
 
-## Applies to this codebase
+- **Scale concerns (ordered by what hits first):** (1) False-positive rate — at any real event volume a naive τ floods the alert sink first; you tune τ before anything else. (2) Baseline drift — "normal" itself moves over time, so a fixed baseline grows stale and every event looks anomalous; needs a rolling/decaying reference. (3) Throughput and state — windowed features hold per-key state; past high cardinality the feature buffer is the memory bottleneck. (4) Concept of "anomaly" changing — what was rare becomes common, requiring threshold re-fit.
 
-**No — flattr has no anomaly detection, learned or statistical.** There is no
-detector, no baseline model, no outlier score anywhere in the pipeline or
-routing code.
+- **Eval framing:** Offline — precision/recall against a labeled anomaly set, and PR-AUC rather than ROC-AUC because anomalies are heavily imbalanced. Online — alert precision (what fraction of fired alerts were real) and time-to-detect, traded against analyst alert fatigue. The operational metric that matters most is alerts-per-day at acceptable recall.
 
-But the *nearest honest tie* is real and worth naming, because flattr's build
-pipeline ingests third-party data that absolutely can be corrupt:
+- **Common failure modes:** Alert flood — τ too tight, drowns operators; mitigate with hysteresis and rate limiting. Silent drift — baseline never updates, detector slowly goes blind or noisy; mitigate with a decaying reference window. Seasonality blindness — periodic normal swings read as anomalies; mitigate with time-bucketed baselines. Label scarcity — can't measure recall without known anomalies; mitigate with synthetic injection of known-bad events.
 
-```text
-  flattr's data path (where bad values can enter)
-  ┌──────────────┐    ┌──────────────────┐    ┌────────────────────┐
-  │ OSM / Overpass│──▶│ elevation.ts     │──▶ │ grade.ts           │
-  │ (street geom) │    │ Open-Meteo 90m   │    │ riseM / lengthM    │
-  └──────────────┘    │ DEM, no key      │    │ -> gradePct        │
-                      └──────────────────┘    └────────────────────┘
-                       coarse DEM smooths        arithmetic only —
-                       /jumps at cliffs          NO outlier check
-```
+- **Applies to this codebase: PARTIALLY.** flattr has no anomaly detector and does not monitor anything at runtime — but the *input space* for one is real and currently unguarded. Two honest framings exist. First, distribution drift: the graph's grade distribution (the `gradePct`/`absGradePct` values across all edges) is exactly the kind of quantity you would track for drift — if a rebuild from fresh OSM + elevation data shifts that distribution, routes silently change character, and nobody would notice. Second, point anomalies: individual edges can be corrupt — bad OSM geometry or noisy elevation sampling can produce an `Edge` with an implausible `gradePct` (a 60% grade on a city street) or a `riseM`/`lengthM` ratio that's physically impossible. Those are anomalous edges in flattr's input, and flagging them before they reach `graph.json` is genuinely anomaly detection on flattr's data. None of this is built — the build pipeline (`pipeline/run-build.ts`, `pipeline/grade.ts`, `pipeline/elevation.ts`) computes grades and writes the graph without any sanity gate. So: the problem fits, the system is absent.
 
-The one defense flattr has is *not* anomaly detection — it's a hard physical
-clamp. `pipeline/grade.ts:10` defines `MAX_GRADE_PCT = 40`, and line 30 clamps
-every computed grade into `[-40, +40]`. The comment is explicit: values beyond
-that are "coarse-DEM noise (a short edge straddling an elevation step)." That's a
-domain rule, applied unconditionally to every edge — it does not *detect* an
-outlier relative to a baseline, it just saturates. A genuinely anomalous edge
-(say, a tunnel/bridge node with a garbage elevation sample from Open-Meteo) that
-lands inside `[-40, 40]` sails through completely unflagged.
-
-So: the surface exists (`pipeline/grade.ts` + `pipeline/elevation.ts`), the data
-is genuinely outlier-prone, but flattr computes values arithmetically with no
-statistical or learned outlier step.
-
-## How to make it apply
-
-Concrete, against flattr's real files — and this would be *statistical*, not
-necessarily learned (the honest answer is you don't need a model here):
-
-1. **Build-time outlier check in the pipeline.** After `computeGrades`
-   (`pipeline/grade.ts:24`), compute a robust spread (median + MAD) of
-   `gradePct` over each local neighborhood of edges, and flag edges whose grade
-   is many MADs from their neighbors. A lone +35% edge between two +3% edges is
-   the signature of a bad elevation sample, not real terrain.
-2. **Cross-check elevation against neighbors.** In `pipeline/elevation.ts`,
-   after `sampleElevations`, flag any node whose elevation differs from its
-   graph neighbors by more than a plausible-slope budget given edge length. This
-   catches the corrupt-sample case the `[-40,40]` clamp silently absorbs.
-3. **Quarantine, don't drop.** Mark flagged edges/nodes in the build artifact so
-   the route summary (`features/routing/summary.ts`) can warn "this route
-   crosses low-confidence terrain" — consistent with the spec's preference for
-   honest fallbacks over silent failure.
-
-A learned detector (autoencoder over edge features) is possible but unjustified
-at flattr's scale; the statistical version is the right-sized answer and is the
-one to give in an interview. **Out of current scope** — flattr ships the clamp,
-not a detector.
-
-## See also
-
-- `pipeline/grade.ts:10,30` — the physical clamp (a rule, not a detector)
-- `pipeline/elevation.ts` — the coarse-DEM source where bad values originate
-- `features/routing/summary.ts` — where a "low-confidence terrain" flag surfaces
-- `01-recommender-system.md` — the other honest "where ML could attach" reframe
+- **How to make it apply:** Add a pre-publish validation stage to `pipeline/run-build.ts`, between graph construction and writing `graph.json`. Two concrete detectors. (a) Distributional: compute the grade histogram over all edges and a Population Stability Index (PSI) against the previously published graph's histogram; if PSI crosses a threshold (e.g. > 0.25), fail the build or warn loudly — that catches a systematic elevation-source regression. (b) Point outliers: flag any edge whose `absGradePct` exceeds a hard physical ceiling, or whose `riseM` is inconsistent with `lengthM * gradePct/100`, and emit them to a report before publishing. Both run on the data already flowing through `pipeline/grade.ts`, so the marginal cost is one pass over the edge list. This protects the one place flattr trusts external data. I've built drift-aware pipelines before; the lift here is small precisely because the data is batch and static — you get the safety without needing the streaming machinery in the standard diagram above.

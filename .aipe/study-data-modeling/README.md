@@ -1,79 +1,80 @@
-# Study — Data Modeling (flattr)
+# Study — Data Modeling · flattr
 
-> The question this guide answers: **does the data's shape match how it's
-> actually read and written — and can it stay correct?**
+The through-line: **does the data's shape match how it's actually read and
+written — and can it stay correct?**
 
-flattr has no database. Its persistent data is one file: `mobile/assets/graph.json`
-(544 KB, 1621 nodes / 1879 edges for Capitol Hill). That single artifact *is* the
-data model — a grade-annotated street graph, built once by an offline pipeline,
-shipped read-only into the app, and traversed by a hand-rolled A\*. So this audit
-is unusual: there are no migrations, no FKs, no indexes in the SQL sense. But every
-data-modeling decision is still here — it's just made in TypeScript types and a JSON
-blob instead of DDL.
-
-The canonical schema lives in `features/routing/types.ts`. Read it first.
+flattr has exactly one persistent data structure: a grade-annotated street
+graph, shipped as a static `graph.json` artifact and read whole into memory.
+There's no database, no live writes, no migration framework. That makes this
+an unusually *clean* data-modeling study — the model is small, the canonical
+schema is one TypeScript file (`features/routing/types.ts`), and every access
+pattern is visible in the code. The interesting findings aren't "this table is
+shaped wrong"; they're about **a denormalized in-memory index (`adjacency`)
+that's load-bearing for A*, a derived field stored on disk (`absGradePct`),
+a missing spatial index (`nearestNode` is an O(N) scan), an N+1-shaped
+`edgeById` linear find in the read path, and zero referential-integrity or
+schema-version guards** on an artifact that's cast blind at load.
 
 ```
-  The whole data model in one frame
+  The whole data model — one entity graph, three relations
 
-  ┌─ Graph ───────────────────────────────────────────────────────┐
+  ┌─ Graph (the artifact: graph.json) ─────────────────────────────┐
   │  city: string                                                  │
   │  bbox: [minLng, minLat, maxLng, maxLat]                        │
   │                                                                │
-  │  nodes: Record<id, Node>     ◄── keyed map (PK = id)           │
-  │     Node { id, lat, lng, elevationM }                          │
-  │                                                                │
-  │  edges: Edge[]               ◄── array (no PK index!)          │
-  │     Edge { id, fromNode ─┐                                     │
-  │            toNode ───────┼──► point into nodes (FK, unchecked) │
-  │            geometry, lengthM, riseM,                           │
-  │            gradePct (signed), absGradePct (derived), kind? }   │
-  │                                                                │
-  │  adjacency: Record<nodeId, edgeId[]>  ◄── the access index     │
-  │     denormalized: duplicates edge endpoints for O(1) expansion │
+  │   nodes: Record<id, Node>        edges: Edge[]                 │
+  │   ┌──────────────┐               ┌──────────────────────────┐ │
+  │   │ Node         │   fromNode    │ Edge                     │ │
+  │   │  id   (PK)   │◄──────────────│  id        (PK)          │ │
+  │   │  lat         │   toNode      │  fromNode  (FK→Node.id)  │ │
+  │   │  lng         │◄──────────────│  toNode    (FK→Node.id)  │ │
+  │   │  elevationM  │               │  geometry  [[lat,lng]]   │ │
+  │   └──────────────┘               │  lengthM                 │ │
+  │                                  │  riseM   (signed)        │ │
+  │   adjacency: Record<            │  gradePct (signed)       │ │
+  │     nodeId, edgeId[]  ──────────►│  absGradePct ( =|grade| )│ │← derived,
+  │   >   (denormalized index)       │  kind?                   │ │  stored
+  │                                  └──────────────────────────┘ │
   └────────────────────────────────────────────────────────────────┘
+       1621 nodes · 1879 edges · adjacency over all 1621 nodes
+       (mobile/assets/graph.json, city "seattle-mvp")
 ```
 
-## The two partition seams
+## The two partition seams (what's here vs next door)
 
-This guide is **data modeling** — the *shape* of persistent data. Two neighbors:
-
-- **vs. `study-system-design`** — "ship the graph as a static file instead of a
-  DB; build it offline; tile-and-merge for coverage" is architecture → lives there.
-  "the edges array has no id index; `absGradePct` is stored but derivable" is shape
-  → lives here.
-- **vs. `study-dsa-foundations`** — the binary heap in `pqueue.ts` and the A\*
-  traversal are in-memory data structures → there. The on-disk graph schema and its
-  adjacency index → here.
-
-Normalization is information-hiding for data — a fact stored once, editable in one
-place. The CODE analog (duplication, single source of truth) lives in
-`study-software-design`; this guide applies the same lens to the *data*.
+- **vs system-design:** "graph is a static file, not a DB; rebuild-and-reship
+  to evolve it" is the *storage-choice* call — that seam is walked here in
+  `06`. "Pan-to-load tiling, rate-limit budgeting, the corridor/viewport
+  fetch pump" is architecture → `study-system-design`. The schema *shape* and
+  whether it matches access is here; how the runtime *fetches and merges*
+  regions is there.
+- **vs DSA-foundations:** the binary heap in `pqueue.ts`, A* itself, the
+  adjacency-list *data structure* as an algorithms primitive → `study-dsa-
+  foundations`. Here we care only about adjacency as a *persisted /
+  materialized index* and whether it matches the query (`O(1)` neighbor
+  expansion in A*).
+- **vs software-design:** `absGradePct` stored alongside `gradePct` is the DB
+  analog of duplicated state — single-source-of-truth. The information-hiding
+  principle behind it lives in `study-software-design`; here we judge the
+  *denormalization call* on its read-optimization merits.
 
 ## Reading order
 
-1. `00-overview.md` — one-page orientation: the model, the verdict, worst-first.
-2. `audit.md` — the seven-lens audit. Every lens walked, `not yet exercised`
-   named honestly. Start here for the full picture.
-3. Pattern files (Pass 2 — what's actually interesting in this repo):
-   - `01-graph-as-the-schema.md` — nodes + edges + adjacency as a shipped artifact.
-   - `02-adjacency-as-denormalized-index.md` — the deliberate duplication that
-     buys O(1) A\* expansion, and `absGradePct` as a stored-derived field.
-   - `03-missing-indexes-and-scans.md` — `nearestNode` O(N), `edgeById` O(E)
-     per-edge, no spatial index, no id→edge map on the shipped graph.
-   - `04-integrity-without-a-database.md` — no referential check on
-     `fromNode`/`toNode`; no schema version; where a dangling edge crashes.
-   - `05-build-and-evolve-the-artifact.md` — the build pipeline as the migration
-     story; rebuild-and-reship; tile prefixing as runtime re-keying.
+```
+  00-overview.md                          ← orient: the model in one page
+  audit.md                                ← Pass 1: all 7 lenses, file:line
+  01-graph-as-entity-model.md             ← the schema as-built (the zoom-out)
+  02-derived-and-denormalized-fields.md   ← absGradePct + adjacency
+  03-indexes-vs-query-patterns.md         ← adjacency hit, nearestNode/edgeById miss
+  04-integrity-without-a-database.md       ← no FK/version guards; blind cast
+  05-tile-prefixing-and-id-namespacing.md  ← re-keying ids on merge
+```
 
 ## Cross-links to sibling guides
 
-- `study-system-design` — static-artifact-vs-DB, tile-and-merge coverage, the
-  offline build pipeline as architecture.
-- `study-dsa-foundations` — the binary heap (`pqueue.ts`), A\* traversal, BFS/graph
-  vocabulary you already own from reincodes (`Graph2.ts`, `PriorityQueue.ts`).
-- `study-software-design` — information hiding / single-source-of-truth, the CODE
-  analog of normalization.
-- `study-performance-engineering` — the O(N) `nearestNode` scan and O(E) `edgeById`
-  as latency findings; the elevation dedup cache.
-- `study-networking` — the Overpass / Open-Meteo build-time fetches and throttling.
+- `study-system-design` — tiling, fetch pump, rate-limit budget, storage architecture
+- `study-dsa-foundations` — binary heap, A*, adjacency list as an algorithms primitive
+- `study-software-design` — information hiding / single source of truth (the normalization analog)
+- `study-performance-engineering` — the O(N) `nearestNode` scan and O(E) `edgeById` find as latency
+- `study-runtime-systems` — whole-graph-in-memory, no streaming/paging of the artifact
+- `study-debugging-observability` — how a dangling `fromNode` surfaces (it crashes deep in A*, not at load)

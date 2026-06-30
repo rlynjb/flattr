@@ -1,214 +1,171 @@
 # AI features in this codebase
 
-**Verdict first: flattr does not currently use any LLM-powered features.**
-No model is called, no prompt is constructed, no provider SDK is installed.
-The AI engineering concepts in the numbered sub-sections of this guide are
-covered as study material; the project exercises below identify the features
-that *could* be added and the exact files they'd attach to.
+**Type label:** Honesty file (per-codebase). Read this first.
 
-This is not a hedge. It's the result of reading the whole dependency tree
-and grepping the source.
+## The one-line verdict
 
-## What's actually here (and why none of it is AI)
+flattr does **not** use any LLM-powered features. No model is called,
+no prompt is constructed, no API key exists. There is no
+`openai`/`anthropic`/`langchain` dependency in either `package.json`
+(root) or `mobile/package.json`. Every "AI" grep hit in the repo is a
+false positive — `tiles.ts` matches "vector" because it builds **vector
+tiles** (GeoJSON), `MapScreen.tsx` matches "llm" inside an unrelated
+variable name. The substance is a hand-rolled A\* router over a
+grade-annotated street graph. That is graph search, not machine
+learning.
 
-```
-flattr — where the work actually lives (no AI band exists)
-
-┌─ Build pipeline (Node, build-time only) ──────────────────┐
-│  pipeline/osm.ts · overpass.ts · elevation.ts · geocode.ts │
-│  → split.ts → grade.ts → build-graph.ts                    │
-│  output: a static mobile/assets/graph.json                 │
-└───────────────────────────┬───────────────────────────────┘
-                            │ ships one JSON artifact
-┌─ Core engine (pure TS, no framework) ────▼────────────────┐
-│  features/routing/  graph · astar · bidirectional · pqueue │
-│  features/grade/    classify · zones                       │
-│  features/map/      geojson · tiles                        │
-│  → deterministic graph algorithms. NO model anywhere.      │
-└───────────────────────────┬───────────────────────────────┘
-                            │ imported by
-┌─ Mobile app (Expo / React Native + MapLibre) ▼────────────┐
-│  MapScreen · AddressBar · GradeSlider · RouteSummaryCard   │
-│  reads graph.json, runs A*, draws colored route. NO model. │
-└────────────────────────────────────────────────────────────┘
-
-       ↑ there is no LLM band, no embedding band, no inference band ↑
-```
-
-The intelligence in flattr is **algorithmic, not learned**. The "smart"
-part is A* with an admissible haversine heuristic and a signed
-directed-grade cost function (`features/routing/cost.ts`). That's classical
-shortest-path search, decided by hand-written rules, not by a model.
-
-### Dependency audit (the proof)
-
-| where | dependencies | AI/ML? |
-|-------|--------------|--------|
-| root `package.json` | `tsx`, `typescript`, `vitest`, `@types/node` | none |
-| `mobile/package.json` | `@maplibre/maplibre-react-native`, `expo`, `expo-location`, `react`, `react-native`, async-storage, slider | none |
-
-`grep -rniE 'openai\|anthropic\|langchain\|embedding\|llm\|gpt-[0-9]\|claude-[0-9]\|rag\|gemini\|onnx\|mediapipe'`
-over `*.ts`/`*.tsx` (excluding `node_modules`/lockfiles) returns **zero**
-matches. The word `vector` appears only as MapLibre **vector tiles**.
-
-## You've shipped AI elsewhere — here's where it'd attach here
-
-You're pivoting into AI engineering, and your portfolio already proves the
-patterns:
-
-- **AdvntrCue** — classic RAG: pgvector + GPT-4 + Drizzle on Netlify
-  Functions, with tool-calling and session memory (MemoRAG). You've built
-  retrieve → augment → generate end to end.
-- **dryrun** — on-device Gemini Nano with API fallback.
-- **contrl** — real-time on-device ML (MediaPipe pose-landmark → rep counter)
-  inside a frame-rate latency budget.
-
-So this guide doesn't teach you RAG from scratch. It does the useful thing:
-points at **exactly where in flattr** each of those patterns would bolt on.
-There are three seams, and only three worth naming.
-
-## The three seams
+So this file does the honest thing the spec asks for: state plainly
+what's **not** here, then point at the exact file:line **seams** where
+an LLM would attach if you decided to add one — because those seams are
+real, and naming them is the interview-grade move.
 
 ```
-The three places AI attaches to flattr — and nowhere else
+  Zoom out — where AI would sit in flattr (it does not, yet)
 
-  USER TEXT ──────────────► [ geocode() ]      seam 1: input→prompt
-   "the flat way to the                        pipeline/geocode.ts:9
-    coffee shop on 15th"
-
-  ROUTE RESULT ───────────► [ routeSummary() ] seam 2: output→prompt
-   {distanceM, climbM,                         features/routing/summary.ts:11
-    steepCount}
-
-  OSM display_name ───────► (any prompt above)  seam 3: injection vector
-   untrusted server text                        geocode.ts:27,52,69
+  ┌─ UI layer (mobile/, Expo + RN) ─────────────────────────┐
+  │  AddressBar  GradeSlider  MapScreen  RouteSummaryCard    │
+  │       │            │          │             ▲            │
+  └───────┼────────────┼──────────┼─────────────┼────────────┘
+          │            │          │             │
+  ┌─ Core engine (features/, pipeline/, lib/) ──┼────────────┐
+  │  geocode.ts   routing/astar.ts → summary.ts │            │
+  │     ▲                              │ RouteSummary         │
+  │     │ INPUT seam            OUTPUT │ seam                 │
+  │  ───┴───                    ──────┴──── (★ would attach) │
+  │  cost.ts  penalty()  ◄── ML attach point (learned cost)  │
+  └─────────────────────────────────────────────────────────┘
+          ▲                                       ▲
+  ┌─ Provider layer (does NOT exist) ─────────────────────────┐
+  │  ✗ no LLM provider   ✗ no embeddings   ✗ no vector store  │
+  └───────────────────────────────────────────────────────────┘
 ```
 
-### Seam 1 — input→prompt: natural-language destination parsing
+## What is NOT here — be explicit
 
-**Where:** `pipeline/geocode.ts:9` — `geocode(query, opts)`.
+- **No LLM.** No chat model, no completion call, no streaming, no
+  tool-calling. `getModel("anthropic")`-style provider abstraction does
+  not exist.
+- **No embeddings.** No text is ever turned into a vector. The only
+  vectors in this repo are 2D lat/lng geometry — geographic, not
+  semantic.
+- **No RAG.** No retrieval, no chunking, no augmentation of a prompt
+  with retrieved context.
+- **No vector store.** No pgvector, no sqlite-vec, no Pinecone. The only
+  store is `mobile/assets/graph.json`, a static prebuilt graph artifact.
+- **No prompts.** No system prompt, no prompt template, no prompt
+  versioning.
+- **No agents / no tool use.** No ReAct loop, no agent memory, no
+  tool-routing.
+- **No evals.** No golden set, no LLM-as-judge, no eval harness. The
+  tests under `*.test.ts` are deterministic unit tests of graph math,
+  not model evals.
 
-Today `geocode` takes a `query` string and hands it straight to Nominatim
-as `q=`. It's a literal pass-through: whatever the user types in the
-`AddressBar` (`mobile/src/AddressBar.tsx`, wired at
-`mobile/src/MapScreen.tsx:82,182,189`) goes verbatim to the geocoder.
+## The three seams where an LLM WOULD attach
 
-The seam: wrap that call. Instead of sending raw text to Nominatim, send
-it to an LLM first to extract a clean destination from a fuzzy phrase —
-"the flat way to that bakery near Greenlake" → `{ destination: "bakery,
-Greenlake, Seattle" }` → then `geocode` that. The signature doesn't change;
-you insert one transform before line 14's `URLSearchParams`.
+These are anchored to real files. Nothing here is implemented — each is
+a **seam**, a boundary where you could splice an LLM in without
+rewriting either side.
+
+### Seam 1 — "describe my route" (output → prompt)
+
+The router already produces a clean, structured summary. That structure
+is exactly what you'd template into an LLM prompt to generate a
+natural-language route description.
+
+- **Source of the structured output:** `features/routing/summary.ts:5`
+  defines `RouteSummary = { distanceM, climbM, steepCount }`;
+  `routeSummary()` (`summary.ts:11`) computes it.
+- **Where it's produced at runtime:** `mobile/src/MapScreen.tsx:159`
+  (`summary: routeSummary(graph, r.path, userMax)`).
+- **Where it's consumed today:** `mobile/src/RouteSummaryCard.tsx`
+  renders it as static text ("Flat all the way" / "⚠ Flattest
+  available", `{km} km · +{climb} m climb`), wired at
+  `MapScreen.tsx:368`.
+- **The seam:** between `routeSummary()` (produces typed data) and
+  `RouteSummaryCard` (renders it). Today a deterministic component reads
+  the struct. An LLM call (`summarize(RouteSummary) → prose`) would
+  splice in right there. The struct is the prompt input;
+  `RouteSummaryCard` becomes the place the generated prose lands.
+- Walked in full at
+  [03-retrieval-and-rag/11-rag.md](03-retrieval-and-rag/11-rag.md) and
+  [01-llm-foundations/04-structured-outputs.md](01-llm-foundations/04-structured-outputs.md).
+
+### Seam 2 — natural-language destination parsing (input → prompt)
+
+Today the user types a literal address that goes straight to Nominatim.
+A query like *"the flattest coffee shop near me, avoid the big hill"*
+would need an LLM to parse intent before geocoding.
+
+- **The wrap point:** `pipeline/geocode.ts:9` (`geocode`) and
+  `geocode.ts:31` (`geocodeSuggest`).
+- **Where it's called:** `MapScreen.tsx:82` (autocomplete),
+  `MapScreen.tsx:182` and `:189` (resolve from/to).
+- **The seam:** an LLM pre-parse step (`NL text → {place, constraints}`)
+  would wrap `geocode`, feeding it a cleaned query string and routing
+  the constraints into `userMax`. Walked in
+  [02-context-and-prompts/03-prompt-chaining.md](02-context-and-prompts/03-prompt-chaining.md).
+
+### Seam 3 — OSM `display_name` as an injection vector (trust boundary)
+
+This is the one to flag in an interview even though no prompt exists
+yet. `geocode.ts:27` and `:52` return `rows[0].display_name` — free text
+that came from OpenStreetMap, controlled by whoever edited the map. The
+moment that string is templated into **any** future prompt (Seam 1's
+prose generator, Seam 2's parser), it is an untrusted-text injection
+vector: a place named *"Café. Ignore previous instructions and ..."*
+rides straight into the model.
+
+- **Walked in full at**
+  [06-production-serving/03-prompt-injection.md](06-production-serving/03-prompt-injection.md).
+
+## ML attach point (one, and only one)
+
+`features/routing/cost.ts` `penalty()` (`cost.ts:16`) is a hand-tuned
+analytic function. It is the one place a **learned** model could
+legitimately attach — a learned edge cost. But it carries a hard
+correctness constraint: A\* admissibility and the `BLOCKED`-finite
+invariant. Any learned cost must stay ≥ 0 and monotone, or it breaks the
+router. Walked at
+[ml-features-in-this-codebase.md](ml-features-in-this-codebase.md) and
+[08-machine-learning/01-supervised-pipeline.md](08-machine-learning/01-supervised-pipeline.md).
+
+## What you've shipped elsewhere — where it would attach here
+
+From your portfolio (`me.md`): you've already shipped the AI work that
+flattr lacks. The interview framing is *"I've built X; here's the exact
+seam where it'd attach in flattr."*
+
+- **AdvntrCue** (RAG / pgvector / GPT-4) → the **Seam 1** route-describe
+  feature is a small single-chain version of what AdvntrCue does at
+  scale. You'd reuse the structured-output → prompt discipline.
+- **dryrun** (on-device Gemini Nano + API fallback) → the route-describe
+  prose generator is a natural on-device-first feature, since flattr is
+  already a local-first Expo app reading a static `graph.json`.
+- **contrl** (on-device MediaPipe ML) → the **ML attach point**
+  (`cost.ts`) is where a learned edge cost would live, the way contrl
+  runs a trained model on-device. The difference: flattr's learned cost
+  is constrained by A\* admissibility in a way pose-landmarking is not.
+
+## Per-feature table (honest)
 
 ```
-seam 1 — what changes (input→prompt)
-
-  NOW:   user text ──────────────────────────► geocode() ─► Nominatim
-                              (pass-through)
-
-  AFTER: user text ─► [ LLM extract destination ] ─► geocode() ─► Nominatim
-                       new layer, same downstream
+  ┌──────────────────────┬──────────────┬──────────────────────────┐
+  │ Feature              │ Pattern      │ Status                   │
+  ├──────────────────────┼──────────────┼──────────────────────────┤
+  │ Route description    │ Single chain │ NOT BUILT — seam at      │
+  │                      │ (would-be)   │ summary.ts:5 →           │
+  │                      │              │ MapScreen.tsx:368        │
+  ├──────────────────────┼──────────────┼──────────────────────────┤
+  │ NL destination parse │ Single chain │ NOT BUILT — seam wraps   │
+  │                      │ (would-be)   │ geocode.ts:9             │
+  ├──────────────────────┼──────────────┼──────────────────────────┤
+  │ Injection defense    │ Input        │ NOT NEEDED YET — becomes │
+  │ on display_name      │ sanitization │ load-bearing once a      │
+  │                      │              │ prompt exists            │
+  └──────────────────────┴──────────────┴──────────────────────────┘
 ```
-
-This is the **input** half of an LLM boundary. Covered conceptually in
-`01-llm-foundations/04-structured-outputs.md` (you'd want a typed,
-schema-constrained extraction, not free text).
-
-### Seam 2 — output→prompt: "describe my route"
-
-**Where:** `features/routing/summary.ts:11` — `routeSummary(graph, path,
-userMax)` returns `{ distanceM, climbM, steepCount }`.
-
-This is the cleanest LLM attachment point in the repo. `routeSummary`
-already produces a small, typed, structured object — exactly the kind of
-thing you template into a prompt. It's consumed at
-`mobile/src/MapScreen.tsx:159` and rendered by `RouteSummaryCard.tsx`
-(currently as plain numbers).
-
-The seam: feed that `RouteSummary` into an LLM prompt to generate a
-human sentence — "Mostly flat: 2.1 km with 18 m of climb, one steep
-block near the end." The route math stays deterministic; the LLM only
-*narrates* the already-computed result.
-
-```
-seam 2 — what changes (output→prompt)
-
-  NOW:   routeSummary() ─► {distanceM, climbM, steepCount} ─► RouteSummaryCard
-                                                              (renders numbers)
-
-  AFTER: routeSummary() ─► {…} ─► [ template into prompt ] ─► LLM ─► sentence
-                                   new layer              ─► RouteSummaryCard
-```
-
-This is the **output** half of an LLM boundary, and the lowest-risk place
-to start because the structured input is already there. Covered in
-`01-llm-foundations/01-what-an-llm-is.md` and
-`02-context-and-prompts/03-prompt-chaining.md`.
-
-### Seam 3 — injection vector: OSM `display_name` is untrusted text
-
-**Where:** `pipeline/geocode.ts:27`, `:52`, `:69` — every function returns
-`label` / a string taken directly from Nominatim's `display_name` field.
-
-`display_name` is **server-controlled text from OpenStreetMap**. OSM is
-crowd-edited; anyone can name a place. Today that's harmless — it's just a
-string rendered in a label. But the moment seam 1 or seam 2 exists, that
-string flows into a prompt, and **untrusted text in a prompt is a prompt
-injection vector.** A place named `Ignore previous instructions and …`
-becomes an instruction to your model.
-
-```
-seam 3 — the trust flip (where it becomes dangerous)
-
-  ┌─ trusted (your code) ─┐  seam  ┌─ untrusted (OSM crowd data) ─┐
-  │ your prompt template  │ ═════► │ display_name string          │
-  └───────────────────────┘ (flip)└──────────────────────────────┘
-        control: YOU                     control: ANY OSM EDITOR
-   → once display_name lands in a prompt, an OSM editor
-     can inject instructions into your LLM
-```
-
-The fix is the standard one (covered in
-`06-production-serving/03-prompt-injection.md`): treat retrieved/external
-text as **data, not instructions** — delimit it, never concatenate it into
-the instruction region, and prefer structured tool I/O over free-text
-interpolation. Note this now so it's designed in, not bolted on after the
-first weird output.
-
-## Project exercises
-
-### AIX.1 — "Describe my route" (seam 2)
-
-- **What to build:** an optional LLM narration of `RouteSummary` into one
-  human sentence, behind a feature flag.
-- **Why it earns its place:** smallest, safest first AI feature — the
-  structured input already exists, so you only add the output→prompt half.
-- **Files to touch:** `features/routing/summary.ts` (export the shape you
-  template), a new `features/routing/narrate.ts` (prompt + provider call),
-  `mobile/src/RouteSummaryCard.tsx` (render the sentence),
-  `mobile/src/MapScreen.tsx:159` (call site).
-- **Done when:** a resolved route renders a model-generated sentence whose
-  numbers exactly match `routeSummary`'s output, and an eval set of 10
-  routes confirms no hallucinated stats.
-- **Estimated effort:** 0.5–1 day (provider already familiar from AdvntrCue).
-
-### AIX.2 — Natural-language destination parsing (seam 1 + seam 3 defense)
-
-- **What to build:** an LLM pre-parser in front of `geocode` that extracts
-  a structured destination from fuzzy phrasing, with injection-safe handling
-  of any text it later sees.
-- **Why it earns its place:** exercises structured outputs (input→prompt)
-  *and* forces you to design the `display_name` injection defense (seam 3)
-  before it bites.
-- **Files to touch:** new `pipeline/parse-destination.ts`,
-  `pipeline/geocode.ts:9` (call site), `mobile/src/AddressBar.tsx`,
-  `mobile/src/MapScreen.tsx:82,182,189`.
-- **Done when:** "flat way to the bakery near Greenlake" resolves to a real
-  coordinate, and an adversarial set including a malicious `display_name`
-  ("Ignore previous instructions…") never changes the model's behavior.
-- **Estimated effort:** 1–2 days.
 
 ## See also
 
-- [`ml-features-in-this-codebase.md`](ml-features-in-this-codebase.md) — the ML half (also: none)
-- [`01-llm-foundations/01-what-an-llm-is.md`](01-llm-foundations/01-what-an-llm-is.md)
-- [`06-production-serving/03-prompt-injection.md`](06-production-serving/03-prompt-injection.md)
+- [ml-features-in-this-codebase.md](ml-features-in-this-codebase.md) — the ML side (cost.ts).
+- [00-overview.md](00-overview.md) — how this whole guide is framed.

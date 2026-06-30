@@ -1,102 +1,92 @@
-# Performance Engineering — flattr (overview)
+# Performance Engineering — flattr, the one-page map
 
-The one-page map. Read this, then `audit.md`, then the pattern files in order.
+Here's the whole performance story of this repo in one frame, before any detail.
+
+```
+  flattr — where performance work actually lives
+
+  ┌─ BUILD TIME (pipeline/, Node) ─────────────────────────────┐
+  │  OSM → elevation → graph.json                              │
+  │  ★ dedup to ~90m DEM cells · batch · backoff               │  ← I/O defense
+  │     (pipeline/elevation.ts)                                 │
+  └─────────────────────────────┬──────────────────────────────┘
+                                │  ships graph.json (1621 nodes / 1879 edges)
+  ┌─ CORE ENGINE (features/, pure TS) ─▼───────────────────────┐
+  │  ★ A* heuristic pruning — MEASURED by bench/run.ts         │  ← the one
+  │     3.9–7.4x fewer expansions than Dijkstra                │    quantified win
+  │  · lazy-deletion heap (pqueue.ts)                          │
+  │  · O(N) nearest-node scan (nearest.ts)  ← latent cliff     │
+  └─────────────────────────────┬──────────────────────────────┘
+                                │  imported by
+  ┌─ MOBILE (mobile/src/, Expo + RN + MapLibre) ─▼─────────────┐
+  │  ★ A* in useMemo on JS thread (MapScreen.tsx)             │  ← render-thread
+  │  · single-flight pump, concurrency=1 (useTileGraph.ts)    │    search
+  │  · 400ms geocode / 600ms viewport debounce                │  ← the throttle
+  │  · persistent elevation cache (elevCache.ts)              │  ← rate-limit
+  └────────────────────────────────────────────────────────────┘
+```
 
 ## The verdict, first
 
-flattr is **half a performance-engineering story, and it's the harder half that's
-strong.** The optimization side — heuristic pruning, batching, caching,
-backpressure — is real and, in one case, actually *measured*. The measurement
-side — budgets, profiling, on-device timing — barely exists. There is exactly one
-instrument in the repo (`bench/run.ts`) and it measures algorithmic work in Node,
-not latency on a phone.
+flattr has **one measured performance win and a pile of well-reasoned-but-unmeasured
+defenses**. The measured win is real and good: A* heuristic pruning, instrumented
+by `bench/run.ts`, expands **3.9–7.4x fewer nodes than Dijkstra** over fixed
+interior pairs (numbers from `npm run bench` on this machine). The defenses —
+single-flight backpressure, elevation dedup + caching, debounced fetches, capped
+retries — are all the right shapes for a self-powered routing app against free
+APIs. But none of them is measured on a device. `performance.now()` lives in
+exactly one file: `bench/run.ts`.
 
-So the honest framing for an interview: *"I can prove A* expands 4–7x fewer nodes
-than Dijkstra because I instrumented it. I cannot yet prove the app hits a frame
-budget on a device, because I never measured that — and I know that's the gap."*
+So the honest framing: **the optimization that's proven (search efficiency) isn't
+the one a user feels; the one a user feels (route latency on a phone, jank while
+panning) isn't proven.** That's the headline, and the cheapest high-leverage fix
+in the whole repo.
 
-## Where performance work lives
+## Ranked findings
 
-```
-  flattr performance surface — layers and the work in each
+1. **No on-device measurement** (HIGH) — `performance.now()` only in
+   `bench/run.ts:24`. Every device-latency claim is `[inference]`. → `audit.md` R1.
+2. **A\* on the JS render thread** (MED, scales to HIGH) — `MapScreen.tsx:151-162`,
+   `useMemo`, no worker. Fine on the 1621-node base; unbounded as the merged graph
+   grows. → `01-heuristic-pruning.md`, `audit.md` R2.
+3. **O(N) nearest-node scan** (MED) — `nearest.ts:8-15`, re-run per graph rebuild.
+   Latent scaling cliff; k-d tree fix. → `03-linear-nearest-node-scan.md`.
+4. **`indexEdges()` rebuilt per search** (LOW) — `astar.ts:34`, 1879-entry Map per
+   route. → `audit.md` R4.
+5. **Zones p85 full sort** (LOW) — `zones.ts:6`, O(n log n) vs O(n) quickselect.
+   → `04-zones-percentile-sort.md`.
 
-  ┌─ UI / render (JS thread) ─────────────────────────────────┐
-  │  MapScreen.tsx                                             │
-  │   • directedAstar() in useMemo  ← search ON the JS thread  │
-  │   • heatmap/zones GeoJSON in useMemo (gated by view)       │
-  │   • 400ms autocomplete debounce                            │
-  └───────────────────────────┬───────────────────────────────┘
-                              │
-  ┌─ Coordination / backpressure ─────────────────────────────┐
-  │  useTileGraph.ts                                           │
-  │   • single-flight pump (one build at a time)              │
-  │   • 600ms region debounce · spatial work ceilings         │
-  │   • merge/stitch graph (re-alloc per tile)               │
-  └───────────────────────────┬───────────────────────────────┘
-                              │
-  ┌─ Algorithm core (measured by bench) ──────────────────────┐
-  │  features/routing/  astar.ts · pqueue.ts · nearest.ts     │
-  │   • A* heuristic pruning   • lazy-deletion heap           │
-  │   • O(N) nearest-node scan                                │
-  │  features/grade/  zones.ts (percentile via full sort)     │
-  └───────────────────────────┬───────────────────────────────┘
-                              │
-  ┌─ I/O / external (rate-limited free APIs) ─────────────────┐
-  │  elevation.ts (batch+backoff) · elevCache.ts (persist)   │
-  │  overpass.ts · geocode.ts (~1 req/s)                      │
-  └───────────────────────────────────────────────────────────┘
-```
+## not yet exercised
 
-## Ranked findings (from `audit.md` lens 8)
-
-| # | finding | evidence | file |
-|---|---------|----------|------|
-| 1 | No on-device latency measurement | `performance.now` only in bench | `bench/run.ts:24` |
-| 2 | A* runs synchronously on JS thread | search in `useMemo`, no yield | `MapScreen.tsx:151` |
-| 3 | O(N) nearest-node scan (latent cliff) | linear loop over all nodes | `nearest.ts:8` |
-| 4 | Full sort to read one percentile | `[...v].sort()` for p85 | `zones.ts:8` |
-| 5 | Whole-graph re-alloc per tile load | merge+stitch+prefix copy | `tiles.ts:89` |
-| 6 | `indexEdges` rebuilt per search | O(E) Map per call (deliberate) | `astar.ts:33` |
-
-## Measured baseline (the one real number)
-
-`npm run bench`, **[measured]**, mid-interior grid40 pair:
-
-```
-  algorithm     expanded   cost      vs dijkstra
-  dijkstra         1079    2400      1.0x  (baseline)
-  astar             276    2400      3.9x fewer expansions
-  bidirectional     336    2400      3.2x fewer
-```
-
-Across all three test pairs: A* is **3.9x–7.4x** fewer expansions than Dijkstra
-for identical optimal cost. This is the before/after that any heuristic change
-must move.
-
-## What's `not yet exercised`
-
-- **Throughput / p95 / p99 over a request population** — single-user app, no
-  server, no request population to take a percentile of.
-- **Database bottlenecks** — graph is a static 532 KB artifact; no DB, no queries.
-- **Profiling** — no flame graphs, no `--prof`, no React profiler harness.
-- **Formal budgets** — limits exist as constants, never as stated targets.
+- **Formal performance budgets** — no stated latency/fps targets; only fail-safe
+  limit constants (`MAX_CORRIDOR_SPAN_DEG`, etc.). `audit.md` lens 1.
+- **Latency distributions / p95 / p99** — single wall-ms per bench run, no
+  histogram, no load test. `audit.md` lens 3.
+- **Memory profiling** — no heap snapshot, no retention analysis. `audit.md` lens 4.
+- **Bundle / startup / frame-rate measurement** — no RN performance
+  instrumentation. `audit.md` lens 7.
 
 ## Reading order
 
-1. `audit.md` — the 8-lens walk, full grounding.
-2. `02-heuristic-pruning.md` — the measured win. A* vs Dijkstra.
-3. `03-lazy-deletion-heap.md` — the heap, and the pops/expanded decrease-key trigger.
-4. `04-linear-nearest-node.md` — the latent scaling cliff and the k-d tree fix.
-5. `05-single-flight-pump.md` — bounded concurrency / backpressure.
-6. `06-percentile-via-sort.md` — the O(n) quickselect upgrade.
-7. `07-elevation-batching-and-cache.md` — the rate-limit defense.
-8. `08-render-thread-search-and-debounce.md` — the throttle that keeps it usable, and the JS-thread risk.
+1. `audit.md` — the 8-lens walk, every finding grounded in `file:line`.
+2. `01-heuristic-pruning.md` — the measured win, with the bench numbers.
+3. `02-single-flight-pump.md` — the backpressure shape.
+4. `05-elevation-dedup-and-cache.md` — the real rate-limit defense.
+5. `06-debounced-throttled-fetch.md` — the throttle layer.
+6. `03-linear-nearest-node-scan.md` and `04-zones-percentile-sort.md` — the latent
+   CPU cliffs.
 
-## Cross-links
+## Cross-links to neighboring guides
 
-- **`study-runtime-systems`** — the JS-thread execution model, the event loop the
-  A* search blocks, bounded work and cancellation mechanics.
-- **`study-system-design`** — the tile-coverage architecture and build-time vs
-  device-time split at scale.
-- **`study-dsa-foundations`** — the heap, A*, and k-d tree as data structures in
-  their own right (you've built the heap and Dijkstra already).
+- **`study-runtime-systems`** — owns the *execution mechanism* of the JS thread,
+  the event loop, and `useMemo` timing. This guide measures the cost; runtime
+  explains why A* on the render thread blocks paint.
+- **`study-system-design`** — owns the architecture-scale tradeoff of the
+  single-flight pump and the build-time/run-time split. This guide measures the
+  bottleneck; system-design explains the boundary choice.
+- **`study-dsa-foundations`** — owns A* / heaps / k-d trees as algorithms. This
+  guide measures *which one wins on this graph*; dsa-foundations teaches the
+  structures.
+- **`study-networking`** — owns retry/backoff/timeout semantics against the
+  elevation API. This guide measures the rate-limit defense; networking explains
+  the protocol behavior.

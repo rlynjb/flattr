@@ -1,108 +1,86 @@
-# 00 — Overview: how flattr proves it works
+# 00 — Overview: the coverage map as a risk map
 
-One page. The shape of the suite, the single question it's organized around,
-and the verdict on what's strong and what's missing.
+Not the percentage. The risk map. Which critical paths have tests that would catch
+a real regression, and which don't.
 
----
+## The whole suite in one picture
 
-## Zoom out — where the tests sit
-
-The whole system is a build-time pipeline that bakes a static `graph.json`, and
-a runtime router over it. Tests bracket the parts that have a *checkable*
-answer.
+Here's flattr's test surface, drawn as the layers it covers — and the one it doesn't.
 
 ```
-  flattr — where the 130 tests land
+  flattr test coverage — by layer, by risk
 
-  ┌─ BUILD-TIME pipeline (Node, run once) ──────────────────────┐
-  │  OSM fetch → split → grade → elevation → build-graph         │
-  │  ★ tested with INJECTED fetch (no real network) ★            │ ← tested
-  └───────────────────────────────┬─────────────────────────────┘
-                                  │ emits graph.json
-  ┌─ RUNTIME engine (pure TS) ────▼─────────────────────────────┐
-  │  pqueue → dijkstra → astar → gradeAstar → directedAstar      │
-  │  → bidirectional   ★ proven by OPTIMALITY ORACLE ★           │ ← tested
-  └───────────────────────────────┬─────────────────────────────┘
-                                  │ consumed by
-  ┌─ MOBILE app (Expo / React Native) ──────────────────────────┐
-  │  MapScreen, GradeSlider, useTileGraph (on-device rerun)      │
-  │  ✗ ZERO tests ✗                                              │ ← gap
-  └─────────────────────────────────────────────────────────────┘
+  ┌─ UI layer — mobile/ (Expo / React Native) ─────────────────┐
+  │  MapScreen, AddressBar, GradeSlider, useTileGraph,         │
+  │  loadGraph, elevCache                                       │
+  │  ████ ZERO TESTS ████   ← highest-risk gap                 │
+  │  incl. the on-device rerun path in useTileGraph.ts         │
+  └────────────────────────────┬───────────────────────────────┘
+                               │ reads graph.json, calls into ↓
+  ┌─ Routing core — features/routing/ ─────────────────────────┐
+  │  astar · bidirectional · cost · pqueue · graph · nearest   │
+  │  ✓✓✓ DENSELY TESTED ✓✓✓   the crown jewel                  │
+  │  optimality oracle · property tests · finite-BLOCKED        │
+  └────────────────────────────┬───────────────────────────────┘
+                               │ consumes the artifact built by ↓
+  ┌─ Build pipeline — pipeline/ (build-time only) ─────────────┐
+  │  osm · overpass · elevation · geocode · split · grade      │
+  │  ✓✓ WELL TESTED ✓✓   injected-fetch isolation, retry matrix │
+  └────────────────────────────┬───────────────────────────────┘
+                               │ pure helpers under ↓
+  ┌─ Shared libs — lib/ · features/grade/ · features/map/ ─────┐
+  │  geo (haversine/bbox) · classify · zones · geojson · tiles │
+  │  ✓ TESTED ✓   pure functions, easy + done                  │
+  └────────────────────────────────────────────────────────────┘
+
+  ┌─ bench/ ── MEASUREMENT, not assertion (1 test, on report shape) ─┐
 ```
 
-The pure middle layer is tested to the hilt. The two ends — the live network
-on one side, the UI on the other — are where coverage thins or vanishes.
+The shape to notice: **coverage is inverted in the right direction.** The most
+complex, most correctness-critical code (the router) is the *most* tested. The
+untested layer (mobile UI) is the layer where a bug is most visible and least
+catastrophic — a wrong pixel, not a wrong route. That's the opposite of the classic
+red flag ("the hardest code is the least tested"). flattr got the priority right.
 
----
+## Verdict first: what's strong, what's the gap
 
-## The one axis: how is correctness *proven*?
+**Strongest thing in the suite:** the optimality oracle in
+`features/routing/astar.test.ts:38`. A* doesn't get asserted against a hand-typed
+expected path — it gets asserted against *Dijkstra's* answer on the same graph:
+`expect(a.path!.cost).toBeCloseTo(d.path!.cost, 6)`. Dijkstra is the simple,
+obviously-correct baseline; A* is the fast, easy-to-break optimization. The test says
+"the fast one must agree with the slow one to 6 decimals." That is a correctness
+*proof gate*, and it's the single most valuable line in the repo. Full walk in
+`01-optimality-oracle.md`.
 
-Pick one question and trace it across the suite. The answer changes by layer,
-and that contrast is the whole lesson.
+**Biggest gap, ranked worst-first:**
+
+1. **Mobile (`mobile/src/`) — zero tests.** Eight source files, none covered. The
+   one that matters: `useTileGraph.ts` stitches a route-corridor subgraph on top of the
+   bundled tiles and re-runs routing on device. That's real logic (a one-build-at-a-time
+   queue, a corridor-span guard at `MAX_CORRIDOR_SPAN_DEG`) with no test. Buildable
+   target named in `audit.md` lens 1.
+2. **No e2e / integration-through-the-app.** Every test is a unit or module test. There
+   is no test that loads the real `graph.json` and routes through it end-to-end. The
+   pipeline produces the artifact; nothing asserts the artifact the app actually ships
+   is routable.
+3. **The AI-eval seam is empty.** No LLM, no on-device model in flattr today, so lens 6
+   is honestly `not yet exercised`. Not a bug — a fact. When dryrun-style on-device AI
+   lands here, that's where the deterministic-harness-around-probabilistic-core test goes.
+
+## How the five patterns map to the layers
+
+Each Pass-2 pattern file is a technique flattr uses to *make* the green above trustworthy:
 
 ```
-  axis = "what makes the assertion trustworthy?"
-
-  pqueue       → INVARIANT + ORACLE   heap property holds after 2000 random
-                                      ops; pops match a sorted array (50 seeds)
-  astar        → ORACLE               A* cost EQUALS Dijkstra cost (the gate)
-  bidirectional→ ORACLE               matches Dijkstra / directedAstar cost
-  cost/grade   → CLOSED-FORM          assert the exact penalty formula value
-  pipeline     → FIXTURE + FAKE FETCH known input, injected response, known out
-  fixtures     → HAND-COMPUTED        diamond's S→A→G = 200, baked in by hand
+  layer            technique that defends it          pattern file
+  ─────            ─────────────────────────          ────────────
+  routing core  →  A* cost == Dijkstra cost        →  01-optimality-oracle
+  pqueue        →  heap invariant after 2000 ops   →  02-property-invariant-tests
+  pipeline      →  inject fetch, no real network    →  03-injected-fetch-isolation
+  all of routing→  hand-built graphs, known answers →  04-fixture-driven-graph-tests
+  cost/astar    →  BLOCKED is finite, not Infinity  →  05-finite-blocked-sentinel-tests
 ```
 
-Three proof strategies show up, in rough order of strength:
-
-1. **Oracle** — compute the answer a *second, independent* way and demand
-   agreement. Strongest. You don't have to know the answer; you only have to
-   trust that two methods can't both be wrong the same way. → `01`.
-2. **Invariant** — assert a property that must hold for *any* input, then throw
-   thousands of random inputs at it. → `02`.
-3. **Hand-computed expectation** — you worked out the answer yourself and pinned
-   it (`lengthM).toBe(200)`). Cheapest, most brittle, fine for tiny fixtures.
-
-The router uses #1 and #2 precisely because #3 doesn't scale to a 144-node grid
-where no human knows the optimal cost.
-
----
-
-## Verdict — strong, with two honest holes
-
-**What's strong (rank order):**
-
-- **The optimality oracle** (`features/routing/astar.test.ts:38`). A* must
-  return the *same cost* as Dijkstra on a 12×12 grid. This is the single most
-  load-bearing test in the repo — it's the only thing standing between a
-  plausible-looking wrong path and a correct one. If you change `cost.ts`, this
-  test is what catches an inadmissible heuristic.
-- **Property tests on the heap** (`features/routing/pqueue.test.ts:67`). 2000
-  random push/pop ops, invariant checked every step; plus a 50-seed sorted-order
-  oracle. The hand-rolled heap is the foundation under Dijkstra — a silent bug
-  here corrupts every route.
-- **Network isolation by injected fetch** (`pipeline/*.test.ts`). Every I/O
-  function takes a `fetch` parameter; tests pass `vi.fn()`. The suite never
-  touches the real Overpass/Open-Meteo/Nominatim APIs. 307ms, zero flake.
-- **Finite-`BLOCKED` discipline** (`features/routing/cost.test.ts:55`,
-  `astar.test.ts:82`). The repo's most subtle correctness rule — "too steep" is
-  a large *finite* number, not `Infinity` — is pinned by tests on both the cost
-  function and the router that honors it.
-
-**What's missing (rank order):**
-
-- **Mobile/UI: zero tests.** `mobile/src/` (`MapScreen.tsx`, `GradeSlider.tsx`,
-  `AddressBar.tsx`, `RouteSummaryCard.tsx`, `useTileGraph.ts`) has no test at
-  all. No component test, no hook test, no render test.
-- **The on-device rerun path is untested.** `mobile/src/useTileGraph.ts` (290
-  lines) holds the live viewport-fetch, the flat-elevation fallback, and the
-  self-heal retry loop. It re-runs the *same* pipeline functions the build uses
-  — which *are* tested — but the orchestration around them (degraded state,
-  cache, retry timing) has no coverage.
-- **No e2e.** Nothing exercises geocode → route → render end to end.
-
-The gaps are at the edges (live network behavior, UI), not in the core
-algorithm. For a project whose stated point is "the graph work is the point,"
-that's the right place to have spent the test budget — but the mobile hole is
-real and growing as `useTileGraph` accretes logic.
-
-→ Full lens-by-lens detail in `audit.md`. The techniques in `01`–`05`.
+Read `audit.md` next for the lens-by-lens walk, then drop into whichever pattern file
+matches what you want to learn to *do*, not just observe.

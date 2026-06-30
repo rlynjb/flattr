@@ -1,25 +1,30 @@
-# 02 · Context and Prompts
+# 02 — Context and prompts
 
-How a model's single finite working memory gets filled, where attention fails
-inside it, and how to split work so no one call has to hold everything. Study
-material for flattr — which runs **no LLM today**. Each file names the real seam
-where a prompt *would* attach if the "Describe my route" or NL-destination
-features were built.
+flattr runs no LLM, so it has no prompts and no context to manage. These
+files teach the concepts as study material, then anchor each to flattr's
+two real LLM seams: the **input seam** (`geocode`, `MapScreen.tsx:82/182`)
+and the **output seam** (route-describe, `MapScreen.tsx:368`). The
+recurring honest point: flattr's "context" is a typed struct
+(`RouteSummary`), not a window of documents — which is exactly why the
+window-management problems below never fire here.
 
-```
-THE ONE BOX, AND HOW WE MANAGE IT
-        ┌── 01 context window ── the finite shared budget
-prompt ─┼── 02 lost-in-middle ── attention sags in the center of that budget
-        └── 03 prompt chaining ── split work so each box stays small & checkable
-```
+## Files
 
-| # | File | Concept | flattr status |
-|---|------|---------|---------------|
-| 01 | [01-context-window.md](01-context-window.md) | Finite token budget shared by system/tools/history/retrieval/user | Not exercised — would-be input (`summary.ts:11`) is 3 numbers; window near-empty |
-| 02 | [02-lost-in-the-middle.md](02-lost-in-the-middle.md) | Models attend to start/end, miss the middle; fix via retrieve→rerank→place | Not exercised — no retrieval, no long context, no needle to lose |
-| 03 | [03-prompt-chaining.md](03-prompt-chaining.md) | One job per step; cheap model early, expensive on synthesis | Not exercised — but real design at seam 2 (`summary.ts:11` → narrate) |
+- [01-context-window.md](01-context-window.md) — the finite token
+  container. flattr's would-be prompt is tens of tokens with no history
+  and no corpus, so there's nothing to budget — its context is a struct,
+  not a window.
+- [02-lost-in-the-middle.md](02-lost-in-the-middle.md) — positional
+  attention bias in long context. N/A to flattr, but its mitigation
+  principle ("surface the few relevant items") is already how
+  `routeSummary()` shows `steepCount` instead of every edge.
+- [03-prompt-chaining.md](03-prompt-chaining.md) — multi-step LLM
+  pipelines. flattr's build pipeline is a *deterministic* chain; the one
+  place an LLM chain would attach is the NL-parse step in front of
+  `geocode()`.
 
-**The seams referenced here:**
-- output→prompt: `features/routing/summary.ts:11` → `mobile/src/MapScreen.tsx:159` → `RouteSummaryCard.tsx`
-- input→prompt: `pipeline/geocode.ts:9` (user text to Nominatim)
-- injection vector: `pipeline/geocode.ts:27,52,69` (untrusted OSM `display_name`)
+## Reading order
+
+Self-contained per concept. If reading straight through: context-window
+(why there's no budget problem) → lost-in-the-middle (the "few not many"
+instinct) → prompt-chaining (the input seam where an LLM would attach).

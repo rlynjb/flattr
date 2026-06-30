@@ -1,236 +1,156 @@
 # Database systems — red-flags audit
 
-**Industry name(s):** storage-engine risk audit / consistency-risk review ·
-**Type:** Project-specific.
+**Industry name:** storage-engine & consistency risk audit — *type label:
+Project-specific.*
 
-> Ranked by consequence. Every verdict names its evidence (`file:line`),
-> distinguishes observed behavior from inference, and states the trigger that
-> turns a today-acceptable simplification into a real bug. flattr has *no
-> database*, so most "classic" DB risks are `not yet exercised` — those are listed
-> honestly at the end, not padded into the ranking.
+Ranked by consequence. Each finding names the evidence (`file:line`), the
+verdict, and the trigger that turns a today-fine choice into a real bug.
+flattr has no database, so most "risks" are *absences* — correctly skipped
+mechanisms. Two findings are genuine gaps in the code that exists.
 
-## Zoom out, then zoom in
+## Verdict first
 
-```
-  Zoom out — where the risks live in flattr's storage map
-
-  ┌─ BUILD ──────────────────────────────────────────────────┐
-  │  pipeline → graph.json   ◄── #2 no schema version         │ ← HIGH
-  │                          ◄── #4 unenforced adjacency       │ ← MED
-  └────────────────────────────┬─────────────────────────────┘
-  ┌─ READ (in-memory) ─────────▼─────────────────────────────┐
-  │  nearestNode O(N) scan     ◄── #1 no spatial index        │ ← HIGH
-  │  mergeGraphs re-stitch     ◄── #5 uncached join           │ ← LOW
-  └────────────────────────────┬─────────────────────────────┘
-  ┌─ WRITE (elevCache) ────────▼─────────────────────────────┐
-  │  debounced setItem         ◄── #3 durability window       │ ← MED
-  └───────────────────────────────────────────────────────────┘
-```
-
-Zoom in. The two HIGH risks are both *seam* problems (`01`): the missing spatial
-index is a read-path latency cliff, and the missing schema version is a contract
-gap at the build→read boundary. Neither bites at MVP scale — both are the kind of
-thing that's invisible until exactly the moment the project succeeds.
-
-## The structure pass
-
-**Axis traced — "is this a bug *now*, or a bug *at the trigger*?"** Every finding
-is acceptable at the current scale; the audit's job is to name the trigger that
-flips each one. Ordering is by *consequence × likelihood-of-hitting-the-trigger*.
-
-## How it works — the ranked findings
-
-### #1 — `nearestNode` is an O(N) full scan (no spatial index) · HIGH
-
-**Evidence (observed):** `features/routing/nearest.ts:8` loops over every node:
-```ts
-for (const id of Object.keys(graph.nodes)) {       // scans ALL 1621 nodes
-  const d = haversine(point, { lat: n.lat, lng: n.lng });
-```
-**Consequence:** every route-endpoint tap is O(N). At 1621 nodes (current
-`graph.json`), microseconds — fine. The cost grows linearly with the graph; the
-merged graph (`useTileGraph`) makes N grow as the user pans, so it's already not
-fixed at 1621.
-
-**Trigger:** a metro-scale graph (10⁵–10⁶ nodes). Then each tap is a visible
-stall on the UI thread.
-
-**Fix:** a spatial index — k-d tree / R-tree / geohash grid built once at load,
-turning the scan into O(log N). Post-Postgres migration: PostGIS `ORDER BY geom
-<-> point LIMIT 1` on a GiST index. `→ 03` for the full walk.
+flattr's storage is correct for its workload: an immutable in-memory graph
+plus a disposable, best-effort device cache. The two real risks are both
+about *change over time*, not about today: an unindexed scan that's cheap at
+1750 nodes and a missing schema-version tag that's harmless until the
+pipeline and app diverge. Everything else (no transactions, no locks, no WAL,
+no replication) is an appropriate absence, listed here so the audit is
+honest that each lens was checked.
 
 ```
-  now: O(N) per tap (fine) ──trigger: big graph──► O(N) per tap (laggy)
-  fix: spatial index ──► O(log N) per tap
+  Risk ranking by consequence
+
+  #1 ███████████  spatial-index gap (O(N) scan)   — perf cliff on growth
+  #2 ████████     no graph schema version          — silent corruption on drift
+  #3 ████         whole-blob best-effort write      — bounded, reconstructible loss
+  #4 ██           no transactional primitive        — absent until 2nd write
+  #5 ░░           no WAL/MVCC/lock/replication       — correctly not exercised
 ```
 
-### #2 — `graph.json` has no schema version field · HIGH
+## #1 — `nearestNode` is an unindexed O(N) full scan
 
-**Evidence (observed):** top-level keys of `graph.json` are exactly
-`city, bbox, nodes, edges, adjacency` — no `version` / `schemaVersion`. The reader
-casts blind: `graph as unknown as Graph` at `mobile/src/loadGraph.ts:10`, zero
-runtime validation.
+**Evidence:** `features/routing/nearest.ts:5-18` — loops over
+`Object.keys(graph.nodes)`, haversine per node, no spatial index. Called at
+`mobile/src/MapScreen.tsx:133-134`, twice per route (start + end tap).
 
-**Consequence:** the build→read seam (`01`) has *no contract*. If `build-graph.ts`
-changes the shape (renames `adjacency`, changes `gradePct` sign convention,
-restructures `edges`), an app shipped against the old shape compiles and "loads"
-fine, then crashes deep in A* (`undefined` index) or — worse — routes *silently
-wrong* (e.g. a sign-convention flip inverts uphill/downhill, the project's entire
-point). The two programs that must agree (pipeline, app) are coupled only by a
-TypeScript type that's erased at runtime.
+**Verdict:** the one place flattr genuinely lacks an index it wants. At
+~1750 nodes it's sub-millisecond — shipping it is correct. It's a
+**latency cliff, not a bug**: cost is proportional to node count with no
+early exit, so it degrades linearly as the graph grows.
 
-**Contrast that flattr already gets right:** the elevCache *does* version its
-namespace — `STORAGE_KEY = "flattr.elevCache.v1"` (`elevCache.ts:7`). Bump to
-`.v2` and old blobs are ignored cleanly. `graph.json` lacks exactly this.
+**Trigger:** the graph expands past one neighborhood (city-scale, ~100k+
+nodes) *or* `nearestNode` starts running on every map pan instead of twice
+per route. Either makes the scan visible jank.
 
-**Trigger:** any pipeline schema change shipped out of lockstep with the app — a
-near-certainty over the project's life.
+**Fix:** build a k-d tree (or geohash buckets) once at `loadGraph` time;
+`nearestNode` becomes an O(log N) descent. Contained — only `nearestNode`
+changes; A*, adjacency, cost all stay. Maps onto the BST code already in
+Rein's reincodes repo (a k-d tree is a BST alternating split axes).
+→ deep walk in `03`, cost model in `04`.
 
-**Fix:** add `"schemaVersion": N` to `graph.json`; have `loadGraph` assert it and
-fail loud on mismatch (or run a lightweight runtime validator). `→ 01`, `→ 08`.
+## #2 — `graph.json` has no schema version
 
-```
-  pipeline (shape vN) ──no handshake──► app (expects shape vN)
-  shape drifts → silent crash OR silent wrong routing
-  fix: schemaVersion field + assert on load (fail loud)
-```
+**Evidence:** `mobile/src/loadGraph.ts:7-11` — `import graph from
+"../assets/graph.json"` then `return graph as unknown as Graph` with no
+validation. Contrast `mobile/src/elevCache.ts:7`, where the cache key
+*is* versioned: `"flattr.elevCache.v1"`.
 
-### #3 — elevCache durability window; no atomicity / weak recovery · MED
+**Verdict:** a **silent-corruption risk** the day the pipeline and the
+bundled artifact disagree. The `as unknown as Graph` cast asserts a shape
+nobody checks. If `pipeline/` adds/renames an `Edge` field
+(`features/routing/types.ts:10-20`) and the bundled `graph.json` is stale,
+the first read of the missing field returns `undefined` — no error, wrong
+routes.
 
-**Evidence (observed):** `mobile/src/elevCache.ts:39` schedules a 4-second
-debounced flush; `:53` is a single whole-blob `setItem`; `:56` re-marks `dirty`
-on failure; `:26` swallows a corrupt blob and starts empty.
+**Trigger:** any change to the `Node`/`Edge`/`Graph` shape in `pipeline/`
+shipped without regenerating + re-bundling `graph.json`. Today they ship
+together so it can't happen; the day they're decoupled (graph served
+remotely, or built on a different cadence), it can.
 
-**Consequence:** up to 4 seconds of cached elevations are lost on a crash, and a
-corrupt persisted blob is silently discarded. **Acceptable today** — the data is
-re-fetchable cache, so the cost of loss is a re-fetch (and the cost of corruption
-is a cold cache). It is *not* acceptable for any non-re-derivable data.
+**Fix:** add a `"schemaVersion"` field to `graph.json`, check it in
+`loadGraph`, throw on mismatch. One field, one comparison — exactly the
+guard the cache already has via its `.v1` key.
+→ `02` (layout angle), `07` (recovery angle).
 
-**Trigger:** storing user-authored data (saved routes, prefs, sync state) through
-the same debounced pattern. Then the 4s window and the swallow-corruption recovery
-become real data loss.
+## #3 — elev-cache write is whole-blob, best-effort, unsynchronized
 
-**Fix:** for re-derivable cache, leave it. For durable data, write synchronously on
-the critical path or move to an engine with a WAL; surface corruption instead of
-swallowing it. `→ 07`.
+**Evidence:** `mobile/src/elevCache.ts:42-57` — `persistNow` serializes the
+entire Map (`JSON.stringify(Object.fromEntries(entries))`) and overwrites the
+key; `catch` swallows the error and re-sets `dirty` to retry. No fsync
+control, no WAL, no error surfaced.
 
-### #4 — `adjacency` is a derived index with no integrity enforcement · MED
+**Verdict:** **correct for a cache, bounded loss.** Checkpoint-only (no log)
+means O(N) per flush — fine under the `MAX_ENTRIES = 50000` cap
+(`elevCache.ts:9`), a bottleneck only at far larger sizes. A crash within the
+4s debounce window (`PERSIST_DEBOUNCE_MS`, `elevCache.ts:8`) loses unflushed
+entries, which the API re-fetches. The async gap at `await setItem`
+(`elevCache.ts:51`) is benign because `mem` is append-only (`putElev` no-ops
+on existing keys, `elevCache.ts:36`).
 
-**Evidence (observed):** `adjacency` is built from `edges` at build time
-(`features/routing/graph.ts:22`). Nothing at runtime checks that `graph.json`'s
-`adjacency` is consistent with its `edges` — A* trusts it blindly
-(`astar.ts:64`).
+**Trigger:** this exact code holding data that is *not* reconstructible —
+user routes, preferences, anything without a cloud source of truth. Then
+best-effort + lossy-window becomes a data-loss bug.
 
-**Consequence:** if a build emits an `adjacency` that references a dropped edge or
-omits a present one, routing silently traverses a ghost edge or misses a real one
-— no error, just wrong paths. It's an index that can drift from the data
-(`03`'s load-bearing-skeleton lesson: the sync is the part that breaks).
+**Fix (only if the trigger fires):** move non-reconstructible state to
+`expo-sqlite` with real transactions, or write-through (no debounce) with a
+surfaced error. → durability in `07`, the async gap in `06`.
 
-**Trigger:** any pipeline bug or hand-edit that desyncs `adjacency` from `edges`.
+## #4 — no transactional / multi-write atomicity primitive
 
-**Fix:** validate on load (every `adjacency` edgeId exists in `edges`; every edge's
-endpoints appear in `adjacency`), or rebuild `adjacency` from `edges` at load
-instead of trusting the persisted copy. `→ 03`.
+**Evidence:** the only write is one `setItem` (`elevCache.ts:53`); the graph
+never writes. No `BEGIN/COMMIT`, no combined-write helper anywhere.
 
-### #5 — merged graph re-stitched on every change; per-search index rebuild · LOW
+**Verdict:** **correctly absent.** A transaction protects a group of writes
+that must agree; flattr's write group is size one. Nothing to make atomic.
 
-**Evidence (observed):** `useTileGraph.ts:132-145` recomputes the full
-`mergeGraphs → stitchGraph` whenever `[baseGraph, corridor, view]` changes (the
-`useMemo` deps), with no caching of the join result. Separately, `astar.ts:11`
-rebuilds the `byId` edge index (O(E)) on every search.
+**Trigger:** the first feature persisting two things that must stay
+consistent — saved routes + an index of them, prefs + their version. A crash
+between the two writes orphans one.
 
-**Consequence:** the join (`04`'s materialized-view-with-no-caching) and the
-per-search index build are both redundant work. **Negligible now** — three small
-inputs, ~1879 edges. The seed of an N+1-shaped cost if tiles multiply or routing
-is called in a tight loop.
+**Fix:** `expo-sqlite` `BEGIN/COMMIT`, or keep the cache's trick of writing
+everything in one key so the group stays size one. → `05`.
 
-**Trigger:** many merged tiles, or high-frequency routing (live re-route on
-movement).
+## #5 — no WAL, MVCC, locks, or replication
 
-**Fix:** memoize the stitch incrementally; hoist `indexEdges` to load time (build
-`byId` once with the graph). `→ 04`.
+**Evidence:** none present anywhere in `mobile/src` or `features/`.
 
-### Move 3 — the principle
+**Verdict:** **correctly not exercised**, each for a concrete reason:
 
-Every finding here is the same shape: a simplification that's *correct at the
-current scale* and becomes a bug *at a named trigger*. That's the honest way to
-audit a small codebase — not "this is wrong" but "this is right until X, and X is
-likely/unlikely." The two HIGH items (spatial index, schema version) are the ones
-whose triggers are near-certain over the project's life; the rest are gated on
-features flattr hasn't built. An audit that can't name the trigger is just
-opinion.
+| Mechanism | Why correctly absent | Trigger to add |
+|---|---|---|
+| WAL | writes are reconstructible; checkpoint-only suffices | a write you can't recreate (`07`) |
+| MVCC | single thread, no concurrent readers-of-writes | a worklet/process reads while main writes (`06`) |
+| Locks | event loop serializes; graph immutable | true parallelism on shared state (`06`) |
+| Replication | one device, one copy; data immutable | a 2nd copy anywhere (`08`) |
+| Isolation levels | one serial writer; no anomalies possible | concurrent transactions (`05`) |
 
-## Primary diagram
+These aren't gaps. A single-device, read-mostly app carrying WAL or MVCC
+machinery would be *over-engineering* — the audit lists them to prove each
+lens was walked, not to flag a missing feature.
 
-```
-  the ranked board — finding × evidence × trigger
-
-  rank  finding                     evidence              trigger
-  ────  ──────────────────────────  ────────────────────  ────────────────────
-  #1 H  nearestNode O(N) scan       nearest.ts:8          big graph → laggy taps
-  #2 H  no schema version           graph.json keys;      pipeline shape drift →
-        on graph.json               loadGraph.ts:10        silent crash/wrong route
-  #3 M  durability window +         elevCache.ts:39,53,   durable user data →
-        swallow-corruption          26                     real data loss
-  #4 M  adjacency unenforced        graph.ts:22;          desynced index →
-        vs edges                    astar.ts:64            silent wrong paths
-  #5 L  uncached merge / per-       useTileGraph.ts:132;  many tiles / hot loop →
-        search index rebuild        astar.ts:11            redundant work
-```
-
-## not yet exercised — honestly, not ranked
-
-These are real database risks that simply don't apply to flattr's current shape.
-Listing them so the audit is complete, not to inflate it:
-
-- **Transaction anomalies** (dirty/non-repeatable/phantom/write-skew) — no
-  multi-writer shared durable state. Trigger: multi-device sync. `→ 05`
-- **Lock contention / deadlock** — one app-level lock, no cycle possible. Trigger:
-  a real lock manager over shared rows. `→ 06`
-- **Replication lag / stale reads / failover** — single device, single artifact
-  (the static bundle-staleness analog is in `08`, not a runtime risk). Trigger:
-  live backend with replicas. `→ 08`
-- **Query-planner regressions** — no planner; the plan is hand-written A*. `→ 04`
-- **N+1** — the routing N+1 is designed out by the adjacency index; only the mild
-  per-search rebuild (#5) remains. `→ 04`
-
-## Interview defense
-
-**Q: "What are the top two storage risks in flattr?"**
-
-> One: `nearestNode` is an O(N) scan with no spatial index (`nearest.ts:8`) —
-> fine at 1621 nodes, a per-tap latency cliff at metro scale; fix is a k-d tree or
-> PostGIS GiST. Two: `graph.json` has no schema version and the app casts it blind
-> (`loadGraph.ts:10`), so a pipeline shape change shipped out of lockstep crashes
-> silently or — worse for a grade router — flips a sign convention and routes
-> wrong with no error. The elevCache already versions its key (`.v1`); the graph
-> should too.
+## The honest summary
 
 ```
-  #1 unindexed nearest → latency cliff at scale
-  #2 unversioned artifact → silent wrong routing on drift
+  what to actually do, in order
+
+  NOW:    nothing is broken. Ship as-is.
+  SOON:   add graph "schemaVersion" (#2) — 1 field, prevents silent
+          corruption the day pipeline/app decouple. Cheap insurance.
+  ON GROWTH: k-d tree for nearestNode (#1) when the graph leaves the
+          neighborhood. Contained change.
+  ON NEW STATE: transactions + real durability (#3/#4) only when flattr
+          persists data the API can't hand back.
 ```
 
-Anchor: *both top risks are seam problems invisible until the project succeeds —
-a read-path cliff and a contract-less build→read boundary.*
-
-**Q: "Why isn't the missing transaction support on your risk list?"**
-
-> Because there's nothing to make atomic — the graph is read-only and the only
-> writer does single-op whole-blob writes. Putting "no transactions" on the risk
-> list would be padding. It becomes a real risk the day flattr adds multi-device
-> sync to a shared store, and I'd flag it *then*. An audit that can't name the
-> trigger for a finding shouldn't list the finding.
-
-Anchor: *a risk without a trigger is opinion; flattr's absent DB mechanisms are
-correct simplifications until a named feature flips them on.*
+The through-line: every mechanism flattr skips, it skips because its data is
+either *immutable* (graph, elevation facts) or *reconstructible* (the cache
+from the API). Those two properties delete the need for transactions, locks,
+WAL, and replication. The day flattr persists *mutable, irreplaceable* state
+is the day this audit's "correctly absent" rows start becoming work.
 
 ## See also
 
-- `00-overview.md` — the same ranking with the storage map
-- `03-btree-hash-and-secondary-indexes.md` — #1 the spatial-index gap in depth
-- `01-database-systems-map.md` — #2 the build→read seam contract gap
-- `07-wal-durability-and-recovery.md` — #3 the durability window
-- `04-query-planning-and-execution.md` — #4/#5 the index and merge costs
-- `../study-performance-engineering/` — measuring #1 and #5
-- `../study-system-design/` — the migration that activates the deferred risks
+- `00-overview.md` — the same findings in the ranked overview.
+- `03` (spatial index) · `07` (schema version + durability) · `05`/`06`
+  (transactions/concurrency) — the deep walks behind each finding.

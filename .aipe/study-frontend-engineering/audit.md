@@ -1,194 +1,235 @@
-# Frontend audit — flattr `mobile/`
+# Frontend Engineering Audit — flattr `mobile/`
 
-Pass 1 of the two-pass shape. Eight frontend lenses walked against `mobile/src/`. Each section names
-what the codebase actually does with `file:line` grounding, or marks `not yet exercised`. Significant
-findings cross-link to a Pass 2 pattern file.
+Pass 1 of the two-pass shape. Eight lenses, each grounded in `file:line` or marked
+`not yet exercised`. Significant findings cross-link to a Pass-2 pattern file.
 
-The surface is small: one screen, six presentational components, one stateful hook, three tiny
-data/cache modules. The depth is concentrated in the hook and the render-time derivations.
+Stack as built: Expo `~56.0.12`, React Native `0.85.3`, React `19.2.3`,
+`@maplibre/maplibre-react-native@^11.3.4`, `expo-location@~56.0.18`,
+`@react-native-async-storage/async-storage@2.2.0`. TypeScript `~6.0.3`.
+Entry: `index.ts` → `App.tsx` → `src/MapScreen.tsx`.
 
 ---
 
 ## 1. rendering-and-reactivity
 
-**Mode: single-screen native app, no SSR/SSG/RSC.** Expo SDK ~56, React Native 0.85, React 19
-(`mobile/package.json:5-12`). Entry is `index.ts` → `App.tsx` → `<MapScreen />` under a
-`SafeAreaView` (`mobile/App.tsx:7-14`). There is no web rendering path in use — `expo start --web`
-exists as a script (`package.json`) but the app targets native (`android/` is prebuilt, MapLibre is a
-native module).
+**Mode: native-rendered, declarative, recompute-on-demand. Not SPA/SSR/SSG —
+those categories are web-only.** There is no DOM. React reconciles a tree of
+React Native + MapLibre host components; the actual map raster and vector
+features are drawn by the native MapLibre renderer (`@maplibre/maplibre-react-native`).
 
-**Reconciliation: React's standard virtual-DOM diffing on the JS side; the map is a native view.**
-The MapLibre `<Map>` is a native component; React reconciles the *declarative children*
-(`GeoJSONSource`/`Layer`/`Marker`) and the overlay tree, but the map raster and gestures are owned by
-the native layer (`MapScreen.tsx:281-312`).
+The reconciliation seam: React diffs the *props* you pass `<GeoJSONSource
+data={…}>` (`MapScreen.tsx:287, 292, 297`); when `data` changes identity, the
+bridge ships the new FeatureCollection to native and MapLibre redraws. React's
+virtual-DOM diff decides *what data crosses the bridge*, never *how pixels land*.
 
-**When work happens: render-time, and a lot of it.** The heavy derivations run during render inside
-`useMemo`:
-- the route (A\*) at `MapScreen.tsx:151-162`,
-- the heatmap GeoJSON at `:121-124`,
-- the zone cells at `:125-128`,
-- the derived node ids at `:133-134`.
+**When work happens:** all derived render data is computed in `useMemo` during
+render, on the JS thread:
+- `routed` (the route) — `MapScreen.tsx:151–162` → `directedAstar` runs here.
+  This is A\* on the render path. **→ see `01-render-thread-astar.md`.**
+- `heatmap` / `zoneCells` / `zonesFC` — `MapScreen.tsx:121–129`, gated on
+  `view === "edges"` / `"zones"` so they're only built when shown (on-demand).
+- `startId` / `endId` — `MapScreen.tsx:133–134`, `nearestNode` per render.
 
-This is the defining reactivity fact of the app: a `userMax` change re-runs A\* and re-builds the
-heatmap synchronously in the render pass. React 19 is present but no concurrent features (`useTransition`,
-`useDeferredValue`, Suspense) are used — the work is plain synchronous `useMemo`. → see
-**`01-render-time-astar.md`**.
+**Scheduling:** plain synchronous React 19. No `useTransition`, no
+`useDeferredValue`, no Suspense, no concurrent-feature opt-in. Every state change
+re-renders `MapScreen` synchronously and re-runs whichever memos have stale deps.
+The JS-thread event loop and frame budget belong to `study-runtime-systems` and
+`study-performance-engineering` respectively — this lens names the *coupling*;
+those guides own the *numbers*.
 
-Cross-link: the JS single-thread scheduling that makes render-time A\* a UI-blocking concern belongs to
-`study-runtime-systems`.
+---
 
 ## 2. state-architecture
 
-**One owner: `MapScreen`.** All app state is `useState` in `MapScreen` (`MapScreen.tsx:37,56-68`):
-view mode, `userMax`, `startPt`/`endPt`, `userLoc`, route busy/error, the two text fields, the active
-field, suggestions. Children are pure — they receive value + callback props and own no app state.
+**Shape: lifted local state in one component + imperative refs in one hook. No
+global store, no context, no reducer.**
 
-**Source-of-truth: coordinates, ids derived.** `startPt`/`endPt` are `{lat,lng}` (`:59-60`); `startId`/
-`endId` are `useMemo`-derived via `nearestNode` against the *current* graph (`:133-134`). This is the
-single most consequential state decision in the app. → see **`02-coords-not-ids-endpoints.md`**.
+Source-of-truth `useState` in `MapScreen` (`:37, :56–68`): `view`, `userMax`,
+`startPt`, `endPt`, `userLoc`, `routeBusy`, `routeError`, `fromText`, `toText`,
+`activeField`, `suggestions`, `suggestField`. Eleven pieces, all flat.
 
-**Server state vs client state:** the tile-fetched graph is server-derived state, owned by
-`useTileGraph` as two regions (`view`, `corridor`) plus refs (`useTileGraph.ts:107-122`). It's merged
-with the bundled base graph at render via `useMemo` (`:132-162`). There is no query library — this hook
-*is* the server-state cache.
+**The one deliberate state-design call:** endpoints are stored as **coordinates**
+(`startPt`/`endPt`, `:59–60`), and the node id is **derived** (`startId`/`endId`,
+`:133–134`) via `useMemo(nearestNode(graph, pt))`. Source-of-truth is the
+geographic point; the graph node is a projection that re-snaps as tiles load.
+**→ see `04-coords-as-endpoint-state.md`.**
 
-**No URL state, no form library, no global store.** `not yet exercised` for URL/router state (single
-screen). Form state is two controlled strings in `MapScreen`, no Formik/RHF.
+**Derived state, never stored:** `routed` (`:151`), `heatmap`/`zones` (`:121`),
+`showCard`/`searching` (`:274, :277`). The pattern is consistent — compute from
+source-of-truth in a memo rather than mirror it into more state.
 
-Cross-link: system-level state ownership (base/viewport/corridor merge as an architecture) belongs to
-`study-system-design`.
+**Imperative state lives in refs**, in `useTileGraph`: `viewRef`, `corridorRef`,
+`busyRef`, `pendingViewRef`, `pendingCorridorRef`, `timerRef`, `retryRef`,
+`retryCountRef`, `gradesOnRef`, `lastBoundsRef` (`useTileGraph.ts:111–122`). These
+back a single-flight job machine that must *not* trigger re-renders on every
+mutation — refs are the right tool. The committed results (`view`, `corridor`)
+are mirrored into `useState` (`:107–108`) so the derived `graph`/`displayGraph`
+memos recompute. **→ see `02-single-flight-pump.md`.**
+
+**Form state:** controlled inputs (`AddressBar.tsx:70–79, 88–98`) lifted to
+`MapScreen` (`fromText`/`toText`). No form library; `canRoute` is derived inline
+(`AddressBar.tsx:60`). **URL state: not yet exercised** (no router).
+
+---
 
 ## 3. component-architecture
 
-**Container/presentational split, cleanly.** `MapScreen` is the container (all state + handlers);
-`AddressBar`, `GradeSlider`, `Legend`, `RouteSummaryCard` are presentational, each a single exported
-function component taking a typed props object (`AddressBar.tsx:29-59`, `GradeSlider.tsx:13-19`,
-`Legend.tsx:11`, `RouteSummaryCard.tsx:6-16`).
+**Shape: one fat orchestrator + five thin presentational children.**
 
-**Composition: plain props, one local sub-component.** No render props, no compound components, no
-headless pattern, no context. The one nested component is `Suggestions` inside `AddressBar`
-(`AddressBar.tsx:9-27`) — a private presentational helper, not exported. Abstraction is minimal and
-earns its place: each component maps to one visible panel.
+`MapScreen` (443 lines) owns all state, all handlers, all data wiring. The
+children are presentational, controlled entirely by props:
+- `AddressBar` (`AddressBar.tsx`) — 13 props, fully controlled inputs +
+  suggestions dropdown. Contains one private sub-component `Suggestions` (`:9–27`).
+- `GradeSlider` (`GradeSlider.tsx`) — `userMax` + `onChange`. Preset chips.
+- `Legend` (`Legend.tsx`) — `userMax` only; derives bands from it.
+- `RouteSummaryCard` (`RouteSummaryCard.tsx`) — `found`/`summary`/`userMax`/`note`.
+- `marker` (`MapScreen.tsx:265–272`) — a render helper, not a component.
 
-**Boundaries are drawn by screen region**, not by domain — `Legend`, `GradeSlider`,
-`RouteSummaryCard` are each an absolutely-positioned overlay (`Legend.tsx:33`, `GradeSlider.tsx:42`,
-`RouteSummaryCard.tsx:49`). The stateful logic is pulled out into the `useTileGraph` hook, which is the
-one deep module on the frontend side. `not yet exercised`: compound-component APIs, slots, render props.
+Composition is **plain props (container/presentational)** — no children/slots,
+no render props, no headless pattern, no compound components. That's the right
+call at this size: five children, one screen, no reuse pressure yet. The
+discipline is clean: every child is a pure function of props with local
+`StyleSheet`. Module/interface depth belongs to `study-software-design`.
 
-Cross-link: module/interface depth analysis of `useTileGraph` belongs to `study-software-design`.
+The smell to name: `MapScreen` is doing a lot — view toggle, geocoding,
+autocomplete debounce, location, tap-to-route, swap, the route memo, and all map
+layers. It's not *wrong* at one screen, but it's the file that would split first
+if a second screen appeared (extract `useRouting`, `useGeocodeSuggest`).
+
+---
 
 ## 4. data-fetching-and-cache
 
-**Hand-rolled, no query library.** All fetching goes through the shared `pipeline/` engine called from
-two places: `useTileGraph` (Overpass + Open-Meteo for the graph) and `MapScreen` handlers (Nominatim
-for geocode/suggest/reverse).
+**Shape: hand-rolled. No react-query/SWR/route-loaders.** Server-state crosses
+into client-state through `useTileGraph`, which is a bespoke fetch+cache machine.
 
-**The fetch state machine is `useTileGraph`'s `pump`** (`useTileGraph.ts:166-227`): single-flight
-(`busyRef`), corridor-prioritized over viewport, debounced (`DEBOUNCE_MS = 600`, `:64`), with a capped
-self-heal retry for elevation-degraded regions (`MAX_RETRIES = 6`, `:65`; `RETRY_MS = 12000`, `:71`). →
-see **`03-single-flight-tile-pump.md`**.
+- **Fetch wrapper:** none generic; `pipeline/*` functions (`fetchOverpass`,
+  `openMeteoProvider`, `geocode`/`reverseGeocode`/`geocodeSuggest`) are called
+  directly.
+- **Single-flight:** one build at a time via `busyRef` + a `pump()` drain loop
+  (`useTileGraph.ts:166–227`), corridor prioritized over viewport.
+  **→ `02-single-flight-pump.md`.**
+- **Cache invalidation:** coverage-based, not time-based. `covers()`
+  (`:82–86`) treats a region as a cache hit only if it fully contains the bbox
+  *and* isn't degraded; degraded regions always miss so they refetch real grades.
+- **Two-tier elevation cache:** in-memory `Map` + AsyncStorage write-behind,
+  keyed by ~90m DEM cell (`elevCache.ts`, `useTileGraph.ts:36–62`). DEM values
+  never change, so cache entries are valid forever. **→ `06-persistent-write-behind-cache.md`.**
+- **Error / degraded handling:** `bestEffortElevation` (`:20–31`) swallows a
+  throttled elevation API and builds with flat (0 m) elevation so streets still
+  render and routing still connects — then flags the region `degraded` for a
+  silent self-heal retry. **→ `05-debounce-as-throttle-with-self-heal.md`.**
+- **Optimistic updates: not yet exercised** (no mutations to a server).
+- **Geocode autocomplete:** debounced 400 ms (`MapScreen.tsx:73–89`), bounded to
+  a ~30 km viewbox so "starbucks" returns local hits (`:51–54`).
 
-**Cache: two layers.** (1) An in-memory + AsyncStorage elevation cache keyed by ~90m DEM cell, debounced
-writes, 50k-entry cap, survives restarts (`elevCache.ts:7-57`). (2) The region-coverage check `covers()`
-(`useTileGraph.ts:82-86`) is a coarse "do we already have this bbox?" cache that short-circuits refetch.
+Wire semantics (rate limits, retry/backoff on the socket) belong to
+`study-networking`; this lens owns the *client cache contract*.
 
-**Invalidation:** DEM samples never change, so the elevation cache is valid forever (`elevCache.ts:2-4`).
-The region cache invalidates by *degraded* flag — a flat-fallback region is treated as a miss so it
-refetches (`covers()` returns false when `r.degraded`, `:83`).
-
-**Error/retry:** elevation failure degrades to flat 0m rather than failing the build
-(`bestEffortElevation`, `useTileGraph.ts:20-31`); Overpass failure keeps the last region and waits for
-the next pan (`:219-220`). No optimistic mutations — this is read-only data.
-
-Cross-link: HTTP/wire semantics and rate-limit behavior belong to `study-networking`; cache-as-system-
-architecture belongs to `study-system-design`.
+---
 
 ## 5. routing-and-navigation
 
-**`not yet exercised` — single screen, no navigation library.** There is no React Navigation, no
-expo-router, no stack/tab. The entire app is `MapScreen`. "Routing" in flattr means *street routing*
-(A\*), not screen routing. No code-splitting at a route boundary (nothing to split), no deep-linking,
-no scroll restoration, no guards/redirects.
+**not yet exercised.** Single screen. `App.tsx` renders `MapScreen` directly; no
+React Navigation, no Expo Router, no route config, no deep links, no code-split
+boundary, no navigation lifecycle. The only "navigation" is *map camera*
+movement (`cameraRef.current?.easeTo`, e.g. `MapScreen.tsx:100, 197, 262`), which
+is map state, not app routing.
 
-The closest navigation-adjacent behavior is *camera* movement — `cameraRef.current?.easeTo(...)` for
-recenter/route/locate (`MapScreen.tsx:100,115,197,231,262`) — but that's map camera, not app routing.
+If a second screen ever lands (saved routes, settings), this is where Expo Router
+or React Navigation enters and `MapScreen` sheds its god-component weight.
+
+---
 
 ## 6. styling-and-design-system
 
-**`StyleSheet.create` inline per component; no design-token system.** Each component defines its own
-`StyleSheet` (`MapScreen.tsx:387`, `AddressBar.tsx:122`, etc.). Colors are inline hex literals
-repeated across files (`#1565c0` the brand blue appears in nearly every component).
+**Shape: per-component `StyleSheet.create` with inline hex literals. No design
+system.**
 
-**The one shared "token" set is the grade palette** in the engine: `COLORS` /`bandColor` in
-`features/grade/classify.ts:18-27` (green/yellow/red/grey). This is consumed by both the React `Legend`
-(`Legend.tsx:23`) and the map-layer GeoJSON (`features/map/geojson.ts:31`), so the legend never drifts
-from what's painted — that's the closest thing to a design token in the repo.
+Every component ends in a local `StyleSheet.create` block
+(`MapScreen.tsx:387`, `AddressBar.tsx:122`, etc.). Layout is absolute-position
+overlays stacked over a full-bleed `<Map>`, hand-tuned with magic-number top
+offsets (`toggle top:160`, `Legend top:160`, `GradeSlider top:268`,
+`RouteSummaryCard bottom:150`) — a fragile vertical stack tuned by eye, not a
+layout system.
 
-**Theming: `not yet exercised`.** `userInterfaceStyle: "light"` is hard-set (`app.json`), no dark mode,
-no theme context. **Responsive: `not yet exercised`** — `orientation: "portrait"` locked, overlays use
-fixed pixel offsets (`top: 160`, `top: 268` — `Legend.tsx:35`, `GradeSlider.tsx:44`) that are manually
-stacked, a known fragility (see lens 8). **Animation:** only MapLibre camera eases; no React-side
-animation system (no Reanimated, no `Animated`).
+- **Design tokens: not yet exercised.** The brand blue `#1565c0` is a literal
+  repeated across `MapScreen`, `AddressBar`, `GradeSlider`, `Legend`, and
+  `RouteSummaryCard` — five files, no shared token. Change the brand color =
+  five-file grep-and-replace. The *band* colors are centralized (`bandColor` in
+  `features/grade/classify.ts`, consumed by `Legend.tsx:23` and the map layers),
+  so the data-driven palette composes — but the chrome palette does not.
+- **Theming / dark mode: not yet exercised.** `App.tsx:8` hard-codes
+  `barStyle="dark-content"`; no `useColorScheme`, no theme context.
+- **Responsive strategy: not yet exercised** as a system. `flex:1` + absolute
+  overlays adapt to screen size loosely; no breakpoints/container queries.
+- **Animation:** only MapLibre camera eases (`easeTo` duration props). No
+  Reanimated, no `Animated`, no layout animation.
+
+---
 
 ## 7. browser-platform-and-build
 
 **Platform APIs actually touched:**
-- **expo-location** — foreground permission + `getCurrentPositionAsync` (`MapScreen.tsx:95-97`),
-  declared in `app.json` plugins with a usage string.
-- **MapLibre native** (`@maplibre/maplibre-react-native` ^11.3.4) — native map view, declarative
-  sources/layers, `CameraRef` imperative handle (`MapScreen.tsx:4,70,100`).
-- **AsyncStorage** (`@react-native-async-storage/async-storage` 2.2.0) — the persistent elevation cache
-  (`elevCache.ts:5,21,53`).
-- **`StatusBar.currentHeight`** — Android status-bar inset for overlay offset (`MapScreen.tsx:24`).
-- **`Keyboard.dismiss()`** — after map-tap / suggestion select (`MapScreen.tsx:246,261`).
+- **`expo-location`** — `requestForegroundPermissionsAsync` +
+  `getCurrentPositionAsync` (`MapScreen.tsx:95–97`). Locate-on-launch (`:108–110`)
+  and a locate button (`:114–117`). Permission-denied falls back to the bundled
+  bbox center — graceful, no crash.
+- **MapLibre native** — `<Map>/<Camera>/<GeoJSONSource>/<Layer>/<Marker>`
+  (`MapScreen.tsx:281–312`). **→ `03-declarative-data-driven-map-layers.md`.**
+- **AsyncStorage** — persistent elevation cache (`elevCache.ts`). The only
+  storage API. **→ `06-persistent-write-behind-cache.md`.**
+- **`Keyboard`** — `Keyboard.dismiss()` on map-tap / suggestion-select
+  (`MapScreen.tsx:246, 261`).
+- **`StatusBar.currentHeight`** — overlay top inset (`MapScreen.tsx:24`).
+- **`fetch`** — passed into `openMeteoProvider(fetch, …)` (`useTileGraph.ts:191`).
 
-`@react-native-community/slider` is a dependency (`package.json:7`) but **not imported** anywhere in
-`src/` — `GradeSlider` uses preset `Pressable` chips, not a slider. Dead dependency.
+**Build:** Expo managed (`expo start` / `expo run:android` / `expo run:ios`,
+`package.json`). Metro bundler (Expo default — not Vite/Webpack/Turbopack). Deploy
+artifact is a native app binary, not a JS bundle on a CDN. `graph.json` is
+bundled as an asset and imported directly (`loadGraph.ts:7`). No code splitting
+(single screen), no tree-shaking concern surfaced, no service worker (native).
+Bundle-size *measurement* belongs to `study-performance-engineering`.
 
-**Build: Expo / Metro.** Standard Expo bundling. The notable customization is `metro.config.js`: a
-custom `resolveRequest` that aliases `features`/`lib`/`pipeline` to `mobile/.engine/*` (the shared
-engine synced in by `scripts/sync-engine.mjs`) because Metro won't resolve imports escaping the project
-root. `tsconfig.json` points the same aliases at the real `../features/*` source for typechecking. The
-graph is bundled as a static `assets/graph.json` import (`loadGraph.ts:7`). No code-splitting, no
-tree-shaking config, no service worker.
+**Dead dependency:** `@react-native-community/slider@5.2.0` is declared in
+`package.json` but imported nowhere — `GradeSlider.tsx` uses preset `Pressable`
+chips, not a `<Slider>`. Remove it.
 
-Cross-link: bundle-size *measurement* belongs to `study-performance-engineering`.
+---
 
 ## 8. frontend-red-flags-audit
 
 Ranked by user-visible consequence.
 
-**1. Render-time A\* blocks the JS thread (highest leverage).** `directedAstar` runs in a `useMemo`
-during render (`MapScreen.tsx:151-162`). On a large merged corridor graph, every `userMax` change (and
-every tile that lands, changing `graph`) re-runs the full search synchronously on the single JS thread.
-Inferred consequence: dragging across grade presets *would* drop frames on a big graph, because there's
-no `useTransition`/worker offload. Not yet observed at a number — that's `study-performance-engineering`'s
-job — but the coupling is structural. → `01-render-time-astar.md`.
+1. **A\* on the JS render thread (`MapScreen.tsx:151–162`).** `directedAstar`
+   runs synchronously inside a `useMemo` during render. Today the graph is small
+   (Capitol Hill + on-demand tiles) and the deps are tight, so it's fast. But
+   every recompute blocks the JS thread, and the route memo re-runs whenever
+   `graph`, `startId`, `endId`, or `userMax` changes — including *every corridor
+   tile load* and *every preset tap*. As coverage grows, a slow search janks the
+   whole UI (the map gestures live on the native thread and stay smooth, but JS-
+   driven overlays freeze). **Move:** if it ever janks, push A\* off-thread (a
+   worklet / `InteractionManager` / a worker) and feed the result back as state.
+   **→ `01-render-thread-astar.md`.** Quantify with `study-performance-engineering`.
 
-**2. Heatmap rebuild on every `userMax` change touches every edge.** `graphToGeoJSON(displayGraph,
-bandsForUserMax(userMax))` re-maps all edges into GeoJSON whenever `userMax` changes
-(`MapScreen.tsx:121-124`, `geojson.ts:20-34`). On a dense viewport this is O(edges) per slider tap, also
-render-time. Same single-thread cost as #1.
+2. **`#1565c0` brand color duplicated across five files (lens 6).** No token. A
+   rebrand is a grep-and-replace with no compiler help. Low user-facing risk,
+   high maintenance tax. **Move:** one `colors.ts` token module.
 
-**3. Manually stacked fixed-offset overlays.** Panel positions are hardcoded pixel tops that must be
-kept consistent by hand: address bar at `top:8`, toggle at `top:160`, legend at `top:160`, slider at
-`top:268`, summary at `bottom:150`, locate at `bottom:90` (`AddressBar.tsx:124`, `MapScreen.tsx:430`,
-`Legend.tsx:35`, `GradeSlider.tsx:44`, `RouteSummaryCard.tsx:49`, `MapScreen.tsx:418`). Add a panel or
-change one height and the others overlap. The `searching` flag hiding panels (`MapScreen.tsx:277,
-316-381`) is a workaround for the dropdown colliding with this stack.
+3. **Magic-number absolute overlay offsets (lens 6).** `top:160`, `top:268`,
+   `bottom:150` hand-tuned. A taller status bar, a font-scale accessibility
+   setting, or a third panel shifts the stack and panels overlap. **Move:** a
+   flex/inset layout or computed offsets instead of literals.
 
-**4. Status-bar inset is Android-only.** `STATUS_BAR_INSET = StatusBar.currentHeight ?? 24`
-(`MapScreen.tsx:24`) — `currentHeight` is `undefined` on iOS, so it falls back to a magic `24`. On a
-notched iPhone the overlay offset is a guess, not a safe-area inset. (`App.tsx` does wrap in
-`SafeAreaView`, which mitigates this for the root.)
+4. **`MapScreen` is a 443-line god component (lens 3).** Owns all state, all
+   network wiring, all handlers. Not a bug, but the first thing that blocks a
+   second screen or a test seam. **Move:** extract `useRouting` and
+   `useGeocodeSuggest` hooks.
 
-**5. `userMax` is not used in the `zoneCells` memo deps but `zonesFC` recomputes anyway.** `zoneCells`
-deps are `[displayGraph, view]` (`MapScreen.tsx:125-128`) — correct, cells don't depend on `userMax`.
-`zonesFC` re-colors on `userMax` (`:129`). This is actually correct, listed only to confirm it's *not* a
-stale-closure bug.
+5. **No error boundary.** `if (!graph)` renders a static "Failed to load graph"
+   (`MapScreen.tsx:164–170`), but a throw inside `directedAstar` or a layer
+   render has no boundary to catch it — it unmounts to a red screen / native
+   crash. **Move:** wrap `MapScreen` in an error boundary.
 
-**6. Dead `slider` dependency** ships in the bundle unused (`package.json:7`). Minor; size only.
-
-**No critical correctness red flags** — state is single-owner and derived, so there's little room for
-the classic "state stored where it can't be invalidated" bug. The risks here are all performance-
-coupling and layout-fragility, both inferred from structure rather than observed at runtime.
+6. **Dead `@react-native-community/slider` dependency (lens 7).** Ships unused
+   native code in the binary. **Move:** delete from `package.json`.

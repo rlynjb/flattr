@@ -1,92 +1,178 @@
-# LLM-as-Judge Bias
-### industry: *automated grading* — reference material (rung 4 hazards)
+# LLM-as-judge bias — when the scorer is itself a model
 
-## Zoom out
+**Industry name(s):** LLM-as-judge / model-graded evals / judge bias.
+**Type:** Industry standard (study material). **Not present in flattr.**
+
+## Zoom out — flattr's judge is `===`, which has no bias
+
+flattr scores its outputs with exact equality, so there's no judge to be
+biased — `1200 === 1200` doesn't have a favorite. This file is study
+material for a method flattr **does not use today** and would only adopt
+if a route-describe feature shipped and the prose-eval case count grew
+past what a human can rubric-score by hand. At that point you'd hand
+scoring to a model, and inherit a new failure mode: the *judge itself*
+has biases that corrupt the eval. Knowing them is the price of using one.
 
 ```
-LLM-AS-JUDGE — a model grades another model's output
-┌──────────────────────────────────────────────────────────────┐
-│  output A ─┐                                                    │
-│  output B ─┼──▶  JUDGE MODEL + rubric  ──▶  score / winner      │
-│  rubric  ──┘                                                    │
-└──────────────────────────────────────────────────────────────┘
-        powerful when there's NO computable answer —
-        but the judge is itself a fallible, biased model
+  Zoom out — where a judge would attach (it doesn't today)
+
+  ┌─ Engine (deterministic) ────────────────────────────────┐
+  │  RouteSummary numbers — scored by === (no judge, no bias)│
+  └────────────────────────────┬─────────────────────────────┘
+                  ★ no LLM output → no judge needed
+  ┌─ (future) describe prose ──▼─────────────────────────────┐
+  │  "Mostly flat, one steep block"                         │
+  │      │ scored by a MODEL judge → inherits judge bias     │
+  └──────────────────────────────────────────────────────────┘
 ```
 
-You reach for an LLM judge only on rung 4: open-ended output where no regex or
-embedding distance captures "good." It scales human judgment, but it imports the
-judge's biases into your scoreboard — so you have to *eval the eval*.
+## Structure pass
+
+- **Layers:** engine (exact-match, no judge) → (future) prose (model
+  judge).
+- **Axis — judge objectivity:** `===` is perfectly objective. A model
+  judge is a *probabilistic, biased* scorer. Moving from numbers to prose
+  trades objectivity for the ability to score open-ended text at all.
+- **Seam:** the judge would sit on the *output* of a future
+  `describe.ts`, reading the prose plus the `RouteSummary` it was built
+  from. The `RouteSummary` (from `summary.ts:5`) is the *ground truth*
+  the judge checks against — which is the one thing that keeps the judge
+  honest: it can verify the numbers even if it's biased about style.
 
 ## How it works
 
-**Move 1 — the pattern: the judge is a subject with tells.**
+### Move 1 — the mental model
+
+An LLM-as-judge is a model you prompt with "here's an output and some
+criteria, score it." It scales rubric scoring but carries known biases:
+**position bias** (favors whichever candidate is shown first),
+**verbosity bias** (longer answers read as better), **self-preference**
+(a model rates its own family's outputs higher), and **leniency drift**
+(scores creep up over a run). None of these exist in `===`; all of them
+appear the moment the scorer is a model.
 
 ```
-KNOWN JUDGE BIASES
-┌───────────────────────────────────────────────────────────┐
-│ POSITION      prefers whichever option is shown first       │
-│ VERBOSITY     longer answer reads as "more thorough"        │
-│ SELF-PREFER   favors text in its own model's style          │
-│ FORMAT        markdown/bullets score above equal plain prose │
-└───────────────────────────────────────────────────────────┘
+  Pattern — biases a model judge adds that === never had
+
+  position     A-then-B scores ≠ B-then-A → randomize order
+  verbosity    longer ⇒ "better" → cap length, score per-criterion
+  self-pref    judge favors own family → use a different model
+  leniency     scores drift up → re-anchor with known-bad samples
 ```
 
-Mental model: an LLM judge is not a ruler, it's a *very fast, slightly drunk
-grader*. Useful at scale, but it has systematic tilts you must correct for, not
-trust away.
+### Move 2 — the walkthrough
 
-**Move 2 — countermeasures, step by step.**
+**What flattr would judge.** A route-describe output for
+`{distanceM:900, climbM:40, steepCount:3}` — a sentence. The judge's job
+is to score it against the rubric from
+[02-eval-methods.md](02-eval-methods.md).
 
-```
-DEBIASING MOVES
-  position   → run both orders, average (swap A/B, score twice)
-  verbosity  → rubric caps length; penalize padding explicitly
-  self-prefer→ use a different model family as judge
-  drift      → calibrate judge against a small HUMAN-labeled set
-```
+**Why flattr's case is unusually judge-resistant.** The `RouteSummary`
+the prose is built from is *deterministic ground truth*:
 
-The last one is the keystone: you validate the judge against a human-graded sample
-*before* you trust its verdicts. An uncalibrated judge is an opinion with a
-confidence interval you never measured.
-
-**Move 3 — principle.** Use an LLM judge *only when there is no oracle*. If the
-correct answer is computable, an objective check beats any judge — it has zero bias
-and zero cost. The judge is a last resort for genuinely subjective output, not a
-default.
-
-## In this codebase
-
-**Not yet exercised** — and flattr is the perfect illustration of *when you do not
-need a judge at all*. flattr's quality questions all have **computable oracles**.
-
-```
-flattr has an OBJECTIVE ORACLE → no judge needed
-┌──────────────────────────────────────────────────────────────┐
-│  bench/run.ts:53    cost = result.path.cost                    │
-│  fixtures.ts:46     "Known: shortest S→G = S,A,G (200)"        │
-│                                                                │
-│  "Is this route good?"  →  is its cost == the optimum?         │
-│                            ▲ computable. real answer. no vibes.│
-└──────────────────────────────────────────────────────────────┘
+```ts
+// summary.ts:5 — three numbers the judge can check arithmetically
+export type RouteSummary = { distanceM: number; climbM: number; steepCount: number };
 ```
 
-The bench harness (`bench/run.ts`) compares dijkstra / astar / bidirectional and
-reports `cost` per algorithm. Because route cost is a *ground truth you can
-compute*, the "judge" is just `===` — A* must return the same optimal cost Dijkstra
-does, exactly. There is nothing subjective to grade, so an LLM judge would be pure
-downside: slower, costlier, and biased about a question that has a real answer.
+So the highest-stakes check — "did the prose state the climb and steep
+count correctly?" — is a *number match*, not a style judgment. You hand
+that to a structural assertion (no judge), and reserve the model judge
+for genuinely subjective criteria (tone, clarity). That shrinks the
+judge's surface, and with it the blast radius of judge bias.
 
-**The contrast that matters.** Deterministic problems with oracles (flattr) sit at
-the opposite pole from LLM judging. You'd only reach for a judge if flattr produced
-something *without* an oracle — e.g. a narration at `summary.ts:11` whose "is this
-sentence clear and natural?" has no computable answer. Even then, the lesson holds:
-judge *only* the genuinely subjective slice (tone, clarity), and keep the factual
-slice (climb = 5 m, distance = 200 m) on rung 1, where the oracle still rules. Most
-of an LLM feature's correctness should stay objectively checkable; the judge covers
-the irreducible remainder.
+**How you'd defend against the biases.** Randomize candidate order
+(kills position bias), score each rubric criterion separately rather than
+asking for one overall number (blunts verbosity bias), use a different
+model family than the one that wrote the prose (kills self-preference),
+and seed the judge run with a few known-bad outputs to detect leniency
+drift. None of this is needed today because flattr has no judge.
+
+### Move 3 — the principle
+
+A model judge is a measurement instrument with a systematic error.
+Minimize what you ask it to judge: anything that reduces to a number
+(flattr's `climbM`, `steepCount`) should be checked by `===`, not the
+judge, so the judge only rules on the irreducibly subjective. The less
+the judge decides, the less its bias can corrupt the eval.
+
+## Primary diagram
+
+```
+  Shrinking the judge's surface with flattr's ground truth
+
+  ┌─ describe prose ────────────────────────────────────────┐
+  │  "Mostly flat, three steep blocks, 40m climb"           │
+  └───────────┬───────────────────────────┬─────────────────┘
+   numeric claims │                        │ subjective claims
+   (climb=40,steep=3)│                     │ (tone, clarity)
+  ┌─ check by === ▼──────────┐   ┌─ judge by MODEL ▼────────┐
+  │ vs RouteSummary (truth)  │   │ biased; randomize order, │
+  │ NO judge, NO bias        │   │ per-criterion, diff model│
+  └──────────────────────────┘   └──────────────────────────┘
+```
+
+## Elaborate
+
+The deepest defense against judge bias is to need the judge less, and
+flattr's architecture hands you that for free: its AI feature's facts are
+all engine-computed numbers. Contrast a pure-summarization task where
+*everything* is subjective — there, the judge decides everything and its
+bias dominates. flattr's route-describe would be the *easy* case for
+model-graded eval precisely because the ground truth (`RouteSummary`)
+sits right next to the prose. Lean on that.
+
+## Project exercises
+
+### B5-EVAL.5 — split numeric checks from the judge
+
+- **Exercise ID:** B5-EVAL.5
+- **What to build:** a two-stage describe-eval: stage 1 asserts (with
+  `===`) that the prose's numbers match the source `RouteSummary`; stage
+  2 hands only tone/clarity to a model judge.
+- **Why it earns its place:** it keeps the high-stakes facts out of the
+  biased judge's reach, shrinking bias blast radius.
+- **Files to touch:** new `features/routing/describe.eval.ts`, reuse
+  `RouteSummary` from `summary.ts:5`.
+- **Done when:** a prose output with a wrong `climbM` fails in stage 1,
+  never reaching the judge.
+- **Estimated effort:** 2–3 hrs (depends on a describe feature existing).
+
+### B5-EVAL.6 — position-bias smoke test
+
+- **Exercise ID:** B5-EVAL.6
+- **What to build:** an offline harness that scores the same two describe
+  candidates in both orders and flags when the winner flips.
+- **Why it earns its place:** it makes position bias *visible* before you
+  trust the judge's rankings.
+- **Files to touch:** new `features/routing/describe.judge.test.ts`.
+- **Done when:** a flip between orderings fails the test.
+- **Estimated effort:** 2 hrs.
+
+## Interview defense
+
+**Q: would you trust an LLM to grade flattr's route descriptions?**
+Answer: only for the subjective part, and never for the numbers. The
+prose is built from `RouteSummary` (`summary.ts:5`), which is
+deterministic ground truth — so "did it state the climb and steep count
+correctly?" is an `===` check, no judge. I'd reserve the model judge for
+tone and clarity, then defend against its biases: randomize candidate
+order (position bias), score per-criterion (verbosity bias), use a
+different model family (self-preference). Load-bearing point: a model
+judge is a biased instrument, so minimize what it's allowed to decide —
+flattr's architecture makes that easy because the facts are numbers.
+
+```
+  numbers → === (no bias)   |   tone → model judge (defend biases)
+```
+
+Anchor: *"flattr has no judge today because `===` needs none; if one
+ever ships, the `RouteSummary` ground truth keeps it honest about the
+facts."*
 
 ## See also
-- `02-eval-methods.md` — where rung 4 sits and why you climb to it
-- `04-llm-observability.md` — logging judge calls (cost/latency) if one existed
-- `bench/run.ts` — the objective oracle (`cost`) that makes a judge unnecessary here
+
+- [02-eval-methods.md](02-eval-methods.md) — where the judge sits on the strictness gradient.
+- [01-eval-set-types.md](01-eval-set-types.md) — the rubric set the judge would score.
+- [04-llm-observability.md](04-llm-observability.md) — logging the judge's calls.
+- [../06-production-serving/03-prompt-injection.md](../06-production-serving/03-prompt-injection.md) — a hostile label can attack the judge's prompt too.

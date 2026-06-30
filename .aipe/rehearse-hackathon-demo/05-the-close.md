@@ -1,170 +1,197 @@
-# Chapter 5 — The Close + The Ask   (8:45–9:30, 45 seconds)
+# Chapter 5 — The Close + The Ask   (8:45–9:30, 0:45)
 
 ## Opening hook
 
-Forty-five seconds, and the only job is to end on a beat instead of trailing
-off into "yeah, so, that's it." The room remembers the last thing you say
-almost as much as the money shot — so the close is one line of vision, one
-clear ask, and one sentence engineered to be repeated to the person sitting
-next to them. Then you stop talking. You finish at 9:30 with thirty seconds of
-buffer, not at 10:00 on the buzzer.
+You've shown it, explained it, proved it's real. Now you land the plane. The close
+is forty-five seconds with three jobs: name where it goes next (clearly framed as
+*future*, never demoed as if it exists), make a specific ask of the room, and
+deliver the last line they repeat to each other on the way out. The failure mode
+this chapter trains against is the trail-off — "yeah, so, that's basically it,
+thanks" — which throws away the one moment the room is primed to remember you.
 
-The trap here is demoing the future. Everything you mention as "next" is
-clearly framed as future — never shown as if it exists, never blurred with
-what the demo just proved. flattr does what you showed; the vision is where it
-goes, and you keep that line sharp.
+End on a beat, not a fade. You finish at 9:30 with thirty seconds of buffer in
+hand — finishing early is a strength, not a gap to fill.
 
 ## The time-budget bar
 
+Forty-five seconds. Vision, ask, last line. Then stop talking.
+
 ```
   ┌──────────────────────────────────────────────────────────┐
-  │ ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░▓▓▓░░░░░░░░░░░░░ │
-  │ 8:45 ───────────────────────────── 9:30 ─────────────10:00 │
-  │   THE CLOSE — you own 8:45 to 9:30 (45 sec)               │
-  │   vision → ask → last line → STOP. Finish at 9:30.        │
+  │ ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░▓▓▓░░░░░░░░░░░░░░░ │
+  │ 1:00 ──────────────────────────── 8:45 ─ 9:30 ─────── 10:00│
+  │        THE CLOSE — you own 8:45 to 9:30 (45 sec)          │
   └──────────────────────────────────────────────────────────┘
 ```
 
-Forty-five seconds, then silence. Land it and stop.
+## The chapter-opening diagram — the closing arc
 
-## The chapter-opening diagram — the close, in three beats
-
-The shape of a close that lands: narrow from the demo to one vision line, to
-one ask, to one repeatable last line. Each beat shorter than the last.
-
-```
-  THE CLOSE — narrow to the last line
-
-  ┌─ what you proved (the demo, behind you) ─────────────────┐
-  │  flattr routes for flat, not fast — live, on-device       │
-  └────────────────────────────┬─────────────────────────────┘
-                               │
-  ┌─ BEAT 1 · VISION (1 line) ▼──────────────────────────────┐
-  │  "the routing layer for everyone fast-routing forgot"     │
-  │   — clearly FUTURE: more cities, profiles, turn-by-turn    │
-  └────────────────────────────┬─────────────────────────────┘
-                               │
-  ┌─ BEAT 2 · THE ASK (1 line) ▼─────────────────────────────┐
-  │  what you want from THIS room: a vote / feedback / a chat  │
-  └────────────────────────────┬─────────────────────────────┘
-                               │
-  ┌─ BEAT 3 · LAST LINE (1 line) ▼───────────────────────────┐
-  │  the sentence they repeat to each other. then SILENCE.    │
-  └────────────────────────────────────────────────────────────┘
-```
-
-Three beats, each tighter, ending on the one line you want echoing in the room
-after you sit down.
-
-## The body — the three beats
-
-### Beat 1 — the vision (8:45–9:05): where it goes, framed as future
-
-One line. The bigger thing flattr is the first step toward — and everything in
-it is explicitly *next*, never implied as built.
+The close has a fixed shape: from what's built (the spine you just demoed), to
+what's next (named as vision, not shown), to the ask, to the last line. Each beat
+is shorter than the last; you accelerate into the final sentence.
 
 ```
-┃ "Today flattr does one city and three profiles —
-┃  kick-scooter, walking, anything. Next is the rest of the
-┃  map, real accessibility profiles, and turn-by-turn — the
-┃  routing layer that everyone optimizing for 'fastest' forgot."
+  THE CLOSING ARC — built → next → ask → last line
+
+  ┌─ WHAT'S BUILT (1 sentence) ──────────────────────────────┐
+  │  "Today it routes you the flattest way between two        │
+  │   addresses, colored by grade, with one honest knob."     │
+  └───────────────────────────┬──────────────────────────────┘
+                              ▼
+  ┌─ WHAT'S NEXT (vision — clearly FUTURE) ──────────────────┐
+  │  bigger DEM resolution · saved profiles per vehicle ·     │
+  │  turn-by-turn — framed as "where it goes," never demoed   │
+  └───────────────────────────┬──────────────────────────────┘
+                              ▼
+  ┌─ THE ASK (specific) ─────────────────────────────────────┐
+  │  "If you bike, scooter, or walk a hilly city — try it     │
+  │   and tell me where it'd route you wrong."                │
+  └───────────────────────────┬──────────────────────────────┘
+                              ▼
+  ┌─ THE LAST LINE (the one they repeat) ────────────────────┐
+  │  "Optimized for flat, not fast."                          │
+  └──────────────────────────────────────────────────────────┘
 ```
 
-Note the structure: "today it does X" (true, you just showed it) "next is Y"
-(clearly future). You never blur the two. The judge knows exactly what's real.
+That bottom box is the sentence you want bouncing around the room after you sit
+down. Everything before it accelerates toward it.
 
-### Beat 2 — the ask (9:05–9:20): what you want from this room
+## The body — the beats in order
 
-Be specific. A vague "thanks for watching" wastes the one moment the room is
-primed to act. Pick the ask that fits your hackathon — a vote, a specific
-piece of feedback, or a conversation.
+### Beat 1 — what's built, in one line (8:45–8:55)
 
-```
-┃ "If you've ever dreaded a hill on foot or on wheels, I'd
-┃  love your vote — and I want to know which city you'd want
-┃  flattr in first. Come find me after."
-```
-
-The "which city" question is a small trick that works: it makes the judge
-picture *using* it, which is the headspace you want them voting from.
-
-### Beat 3 — the last line (9:20–9:30): the one they repeat
-
-The sentence engineered to travel. Short, concrete, ties back to the money
-shot. Say it, then stop — let it hang.
+One sentence that re-states the spine. Not a recap of every feature — the single
+true thing the demo proved.
 
 ```
-┃ "Every other map asks how fast. flattr asks how flat.
-┃  Thanks."
+  SHOW (on screen)               SAY (out loud)
+  ─────────────────────────      ──────────────────────────────────
+  the routed map still up        "So that's flattr: type two
+  (green route + card)            addresses, get the flattest way
+                                  there, colored by grade, with one
+                                  knob for how much hill you'll take."
 ```
 
-Then silence. Don't add "so, um, that's our demo." Don't fill the gap. The
-last line is the period. Sit down on it.
+### Beat 2 — what's next, framed as future (8:55–9:10)
 
-### Strong vs weak — the close move
-
-```
-  WEAK close                       STRONG close
-  ──────────────────────────      ──────────────────────────
-  "Yeah so that's flattr, um,      "Every other map asks how
-   thanks, any questions? we ran    fast. flattr asks how flat."
-   out of time on some stuff but    → one clean repeatable line
-   yeah..."                         → then STOP
-  → trails off, no last line       → ends on a beat
-  → over the buzzer at 10:15       → done at 9:30, buffer left
-
-  Demo the roadmap as if it        "Today: one city. Next: the
-  exists ("you can also...")        rest of the map." → future
-  → blurs real vs vision            clearly labeled as future
-```
-
-The weak close gives the room nothing to hold and runs over the clock. The
-strong close hands them one sentence and gets off stage with time to spare.
-
-## The IF-IT-BREAKS box
+Name the vision. Be explicit that it's not built — "where I'd take it next" — so
+you never demo vaporware. Keep it to the two or three things that obviously
+extend the spine.
 
 ```
-╔══════════════════════════════════════════════════════════════╗
-║ IF IT BREAKS — you blank / the buzzer is about to go          ║
-║ No live demo here, but if you're out of time mid-close, skip   ║
-║ straight to the last line. It's the only beat that must land:  ║
-║ "Every other map asks how fast. flattr asks how flat. Thanks." ║
-║ Then stop. A clean one-line ending beats a rushed three-beat   ║
-║ one. Never run past the buzzer — judges stop listening at 10.  ║
-╚══════════════════════════════════════════════════════════════╝
+  SHOW (on screen)               SAY (out loud)
+  ─────────────────────────      ──────────────────────────────────
+  (same map, or a simple         "Where it goes next: sharper
+   'what's next' slide)           elevation data, saved profiles per
+                                  vehicle — your scooter and your
+                                  legs want different max grades — and
+                                  turn-by-turn. None of that's built
+                                  yet; that's the roadmap."
 ```
 
-## The "tighten it" treatment
+### Beat 3 — the ask (9:10–9:20)
 
-**Cut:** beat 1 (the vision). Go straight from the demo to the ask to the last
-line. The vision is the most expendable beat — the ask and the last line are
-what convert.
-**Floor:** the last line. Even if the whole rest of the close evaporates, you
-say "Every other map asks how fast. flattr asks how flat" and you sit down.
-That sentence is the close.
+A specific, answerable ask. Not "please vote for us" — a concrete invitation tied
+to who in the room would actually use it.
+
+```
+  SHOW (on screen)               SAY (out loud)
+  ─────────────────────────      ──────────────────────────────────
+  (you, to the room)             "My ask: if you bike or scooter or
+                                  walk a hilly city, try it and tell
+                                  me where it'd route you wrong — that
+                                  feedback is what I want most."
+```
+
+### Beat 4 — the last line (9:20–9:30)
+
+The line they repeat. Short, sticky, and it *is* the product thesis. Say it,
+pause, stop. Do not add "thanks, any questions" as the last words — say the line
+last.
+
+```
+  SHOW (on screen)               SAY (out loud)
+  ─────────────────────────      ──────────────────────────────────
+  hold on the green route        "flattr. Optimized for flat, not
+                                  fast."   ( pause. stop. )
+```
+
+```
+  ┃ "flattr. Optimized for flat, not fast."
+```
+
+```
+  ┃ "If you bike or walk a hilly city — try it, and tell me
+  ┃  where it'd route you wrong."
+```
+
+## Strong vs weak — landing vs trailing off
+
+The contrast that decides whether they remember you.
+
+```
+  WEAK — the trail-off                STRONG — the landed beat
+  ─────────────────────────────       ──────────────────────────────────
+  "Yeah, so that's basically it.      "Where it goes next: sharper
+   There's a bunch more I didn't       elevation, saved profiles, turn-
+   get to, the code's on GitHub,       by-turn — that's the roadmap. If
+   um, thanks I guess, any             you bike a hilly city, try it and
+   questions?"                         tell me where it'd route you
+                                       wrong. flattr — optimized for
+  → energy leaks out; the last          flat, not fast." ( stop )
+    words are "any questions"
+                                       → ends on the thesis; the room
+                                         repeats the line
+```
+
+The weak close isn't missing information — it's missing a *beat*. It fades. The
+strong close accelerates into a single sticky line and stops on it.
+
+## IF IT BREAKS
+
+The close is spoken over a held screen. The only risk is the screen dropping
+mid-close — which doesn't matter, because the close is words, not action.
+
+```
+  ╔══════════════════════════════════════════════════════════════╗
+  ║ IF IT BREAKS                                                 ║
+  ║ The screen drops during the close → don't react to it. The   ║
+  ║ close is pure speech: deliver the vision, the ask, and the   ║
+  ║ last line to the room directly. End on "optimized for flat,  ║
+  ║ not fast" regardless of what's on screen.                    ║
+  ╚══════════════════════════════════════════════════════════════╝
+```
+
+## The "tighten it" cut
+
+Cut Beat 2 (what's next) — the vision is the most expendable beat. Go built-line →
+ask → last line in twenty seconds. **Floor: you must deliver the last line.**
+Never cut "optimized for flat, not fast" — that single sentence is the close's
+entire job; everything else is runway to it.
 
 ## The one-page run sheet
 
 ```
-  ┌─ CH 05 · THE CLOSE · 8:45–9:30 ──────────────────────────┐
+  ┌─ RUN SHEET — CH 5 THE CLOSE ── 8:45–9:30 (45 sec) ────────┐
   │                                                           │
-  │  BEAT 1 (8:45) VISION — labeled as future:                │
-  │   ┃ "Today: one city, three profiles. Next: the rest of   │
-  │      the map + turn-by-turn — the layer fastest forgot."  │
+  │  BEATS, accelerating:                                     │
+  │   1. built:  "flattest way, colored by grade, one knob"   │
+  │   2. next:   sharper elevation · saved profiles · turn-   │
+  │              by-turn  (SAY 'not built yet — roadmap')      │
+  │   3. ask:    "if you bike/walk a hilly city, try it and   │
+  │              tell me where it'd route you wrong"           │
+  │   4. last:   "flattr. Optimized for flat, not fast."      │
+  │              ( pause. stop. )                              │
   │                                                           │
-  │  BEAT 2 (9:05) THE ASK — specific:                        │
-  │   ┃ "Vote for it — and tell me which city you'd want      │
-  │      first. Find me after."                               │
+  │  NAIL THIS LINE (say it LAST, then stop):                 │
+  │   ┃ "flattr. Optimized for flat, not fast."               │
   │                                                           │
-  │  BEAT 3 (9:20) ★ LAST LINE — then SILENCE:                │
-  │   ┃ "Every other map asks how fast. flattr asks how flat. │
-  │      Thanks."                                             │
+  │  DON'T demo what's next as if it exists. Frame as future. │
+  │  DON'T end on "any questions." End on the thesis.          │
   │                                                           │
-  │  RULE: finish at 9:30. Never past the buzzer.             │
+  │  IF IT BREAKS: close is pure speech — deliver to the room.│
   │                                                           │
-  │  IF SHORT: skip to the last line. It's the floor.         │
-  │  TIGHTEN: cut beat 1 (vision). Keep ask + last line.      │
-  └───────────────────────────────────────────────────────────┘
+  │  TIGHTEN: cut Beat 2 (what's next).                       │
+  │   FLOOR: deliver the last line.                           │
+  └────────────────────────────────────────────────────────────┘
 ```
-
-Chapter 06 is prep for after the clock — the questions judges always ask.

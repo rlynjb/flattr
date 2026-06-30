@@ -1,72 +1,121 @@
-# 02 — Design an LLM Tech-Support Chatbot
+# Tech Support Chatbot
 
-**RAG over a support corpus + tool-calling + guardrails. The canonical LLM interview question — and it has essentially zero attach point in flattr.**
+An interview-reframe template. The same flattr code, viewed through the lens of a
+support-chatbot system-design prompt. Answered honestly — and the honest answer is
+that flattr is not this.
 
-This is a generic system-design template. The classic ask: build a support assistant that answers user questions by retrieving from your docs (RAG), can take actions on the user's behalf (tool-calling), and won't go off the rails (guardrails). It's worth knowing cold because it bundles three subsystems every LLM product eventually grows. But be blunt up front: **flattr has no chat surface, no support corpus, and no model.** This file teaches the template and then says honestly where the single thin analog lives.
+## The prompt
 
-## The standard architecture
+"Design a tech support chatbot that answers questions, escalates, and learns from
+corrections."
+
+## Standard architecture
+
+The canonical answer is RAG plus a control loop: classify the incoming question,
+retrieve grounding docs, generate a grounded answer, gate it on a confidence threshold,
+escalate to a human when the gate fails, and feed the human's correction back into the
+knowledge base.
 
 ```
-LLM support chatbot (generic)
-┌──────────┐   ┌──────────────┐   ┌─────────────────────┐   ┌──────────┐
-│ user turn│──▶│ retrieve      │──▶│ LLM (system prompt + │──▶│ guardrail │──▶ reply
-│ "reset   │   │ from docs     │   │ retrieved context +  │   │ filter    │
-│  my pw"  │   │ (RAG)         │   │ tool definitions)    │   └──────────┘
-└──────────┘   └──────────────┘   └─────────────────────┘
-                     ▲                    │   ▲
-              support corpus         tool-call │ tool result
-              (vector store)              ▼   │
-                                  ┌──────────────────┐
-                                  │ tools: lookup     │
-                                  │ order, reset pw,  │
-                                  │ escalate to human │
-                                  └──────────────────┘
+              TECH SUPPORT CHATBOT — RAG + escalation control loop
+  ┌──────────┐   ┌────────────┐   ┌──────────────┐   ┌──────────────┐
+  │ user msg │──►│ classify / │──►│  retrieve    │──►│  generate    │
+  └──────────┘   │ intent     │   │ (KB / RAG)   │   │ (grounded)   │
+                 └────────────┘   └──────────────┘   └──────┬───────┘
+                                                            │
+                                          confident? ───────┤
+                                          ┌──── yes ────────┘
+                                          ▼                 │ no
+                                   ┌────────────┐           ▼
+                                   │  answer    │     ┌────────────┐
+                                   └────────────┘     │  escalate  │
+                                          ▲           │  to human  │
+                                          │           └─────┬──────┘
+                                   ┌──────────────┐         │ correction
+                                   │ KB / feedback│◄────────┘
+                                   │   store      │
+                                   └──────────────┘
 ```
 
-Three subsystems:
-- **RAG** grounds answers in your real docs so the model doesn't hallucinate policy.
-- **Tool-calling** lets it *do* things (look up an account, file a ticket) instead of just talking.
-- **Guardrails** sit on both input (prompt-injection, abuse) and output (PII leakage, off-topic, hallucinated promises) — plus a human-escalation path.
+The defining edges are the escalation gate and the correction-write-back: the system
+knows when it doesn't know, and it improves from human fixes.
 
-## Data model + scale concerns (brief)
+## Data model
 
-- **Corpus**: support articles chunked and embedded; re-indexed when docs change.
-- **Conversation state**: turn history, possibly summarized to fit the context window.
-- **Tool registry**: typed function schemas the model can call; each needs auth + a permission boundary.
-- **Guardrail tier**: cheap classifiers before the expensive model; output validation after.
-- **Scale**: cache common answers, batch embeddings, rate-limit per user, and track deflection rate (tickets the bot resolved without a human) as the north-star metric.
+- **Conversation state**: turn history, current intent, resolution status, per session.
+- **Knowledge base**: support docs / past resolved tickets, chunked and embedded for RAG.
+- **Escalation queue**: unresolved threads handed to humans, with context.
+- **Correction log**: human-edited answers, written back as new KB entries / fine-tune data.
+
+## Key components
+
+- **Intent classifier** — routes question type, decides early escalation. Choice:
+  cheap classifier over a full LLM call when intent is a small fixed set, for latency.
+- **Retriever (RAG)** — grounds the answer in real docs to suppress hallucination.
+  Choice: retrieval over fine-tuning, because the KB changes faster than you can retrain.
+- **Generator** — composes the grounded answer with citations. Choice: low temperature,
+  because support answers want consistency, not creativity.
+- **Escalation gate** — confidence threshold that prefers a human handoff over a wrong
+  answer. Choice: tune toward recall of "I'm unsure" — a missed escalation costs trust.
+
+## Scale concerns
+
+Ordered by what hits first.
+
+- **At low volume**: KB freshness dominates — stale docs produce confidently wrong
+  answers long before throughput matters.
+- **At ~thousands of conversations/day**: escalation queue management and human
+  reviewer throughput become the bottleneck, not model inference.
+- **At high volume**: per-conversation context windows and retrieval cost dominate
+  spend; you cache common Q&A and compress history.
+
+## Eval framing
+
+- **Offline**: answer accuracy / groundedness against a labeled QA set; hallucination
+  rate; escalation precision and recall.
+- **Online**: deflection rate (resolved without human), CSAT, escalation rate, repeat-
+  contact rate. Deflection and CSAT trade off — over-deflecting tanks satisfaction.
+
+## Common failure modes
+
+- **Hallucinated answers** — confident, ungrounded, wrong. Mitigation: strict RAG
+  grounding, cite-or-abstain, answer only from retrieved context.
+- **Under-escalation** — bot insists on answering what it can't. Mitigation: calibrate
+  the confidence gate toward escalation; treat a missed handoff as a defect.
+- **Stale KB** — docs lag reality. Mitigation: correction write-back plus freshness SLAs.
+- **Prompt injection via user text** — user input steers the model. Mitigation: treat
+  the message as untrusted data, never as instructions; structured tool boundaries.
 
 ## Applies to this codebase
 
-**Not at all.** This is the most honest verdict in the whole section.
-
-- **No chat.** There is no conversational surface anywhere in flattr. The only text-input UI is `mobile/src/AddressBar.tsx` — two address fields and a Route button. No turns, no history, no dialogue.
-- **No support corpus.** flattr's data is `data/graph.json` (a routing graph) and OSM/elevation pipeline inputs. There is nothing resembling support articles to retrieve over. (See `03-retrieval-and-rag/README.md`: "flattr has a graph, not a corpus.")
-- **No model, no tools, no guardrails.** Nothing in the repo calls an LLM. There is no tool registry, no system prompt, no output filter. The cost function in `features/routing/cost.ts` and A* in `features/routing/astar.ts` are deterministic algorithms, not agents.
-- **The single honest thread** — and it's thin: the one place a flattr feature touches *natural language a model could speak* is `features/routing/summary.ts:11` (`routeSummary` → distance / climb / steep-count). A hypothetical *"describe my route"* or *"why did it avoid that hill?"* assistant would start by feeding that summary into a prompt. That is the **embryo of a chatbot's grounding context** — but it is grounding for a *route-explanation* feature, not a *support* feature. There's still no support-doc corpus, no tools, and no dialogue. It's a different product.
-
-Verdict: **out of scope.** flattr is a routing engine. A support chatbot shares none of its subsystems.
+**No.** flattr is a grade-aware routing tool, not a question-answering or support
+system. There is no conversation, no user question, no knowledge base, no escalation,
+and nothing that learns from corrections. The architecture above has no anchor in the
+codebase: there is no intent classifier (`features/routing/classify.ts` is a static
+grade-threshold table, not an NL classifier), no retriever in the RAG sense
+(`nearest.ts` retrieves graph nodes by distance, not documents by relevance), and no
+generator. The single generative-adjacent surface in the entire app is the route
+description seam — `RouteSummary` is produced at `MapScreen.tsx:159` from
+`features/routing/summary.ts:5` and rendered by `RouteSummaryCard` at
+`MapScreen.tsx:368`. That is an OUTPUT-to-PROMPT seam where a model *could* one day turn
+`{distanceM, climbM, steepCount}` into a sentence, but it is description, not dialogue:
+no question comes in, no escalation goes out, nothing is corrected. Forcing flattr into
+the support-chatbot mold would be inventing a product flattr is not.
 
 ## How to make it apply
 
-The honest move is to *not* build a support chatbot — flattr has nothing to support. The only adjacent thing worth naming is the route-explanation assistant, and even that is a different product than this template:
+This is a stretch, and worth naming as one in the interview. The only plausible bridge
+is an "ask about your route" thought-experiment: a tiny Q&A surface over the
+`RouteSummary` already produced at `MapScreen.tsx:159` — "how much climbing?", "any
+steep sections?" — answered from `{distanceM, climbM, steepCount}` plus the
+`path.steepEdges` flags. That reuses the route-describe OUTPUT seam (`summary.ts`) as
+grounding context, which is the closest flattr has to a knowledge base.
 
-```
-Route-explanation assistant (the nearest flattr-shaped thing — NOT a support bot)
-features/routing/summary.ts:11  ──▶  prompt("Describe this route: …")  ──▶  LLM  ──▶  text
-        (distance, climbM,            (grounding = your own route                "Mostly flat,
-         steepCount)                   facts, not a doc corpus)                   one short climb…")
-```
-
-- **Seam to start from:** `features/routing/summary.ts:11`. Build a `describeRoute(summary, path)` that serializes route facts into a prompt; call a model; render the prose in `mobile/src/RouteSummaryCard.tsx`. That's grounding-by-your-own-data, closer to *report generation* than to RAG.
-- **What's still missing for the actual template:** there is no corpus to retrieve (kills the RAG leg), no actions to take (kills the tool-calling leg), and the only guardrail that matters is the existing injection concern — OSM `display_name` is untrusted (`pipeline/geocode.ts:27,52,69`) and would need escaping before it ever entered a prompt.
-
-So: the *seam* exists, the *product* doesn't. Building a support chatbot here would mean inventing a support domain flattr doesn't have. Don't — but know that `summary.ts:11` is where natural-language generation would first touch this codebase.
-
-## See also
-
-- `02-context-and-prompts/` — system prompts and context construction (the LLM leg of this template)
-- `04-agents-and-tool-use/` — tool-calling in isolation (also N/A in flattr)
-- `03-retrieval-and-rag/11-rag.md` — the RAG leg; note flattr has a graph, not a corpus
-- `01-search-ranking.md` — the other template here; geocode is a real search UI, this is not
-- Real seams: output→prompt `features/routing/summary.ts:11`; input→prompt `pipeline/geocode.ts:9`; injection vector `pipeline/geocode.ts:27,52,69`
+But it stops well short of the template. There is no KB to retrieve from beyond a single
+struct, no need to escalate (the answer is three numbers), and no correction loop —
+flattr has no backend to write corrections to. The honest version: the route-describe
+seam is the one generative attachment point, and even fully built it produces a captioner,
+not a support chatbot. I've shipped genuinely conversational on-device assistants
+elsewhere (dryrun, Gemini Nano), so I know the shape; here I'd say plainly that flattr's
+problem doesn't ask for it, and a good staff engineer declines to bolt a chatbot onto a
+routing app to satisfy a template.

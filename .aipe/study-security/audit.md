@@ -1,280 +1,267 @@
-# audit.md — the 8-lens security audit (Pass 1)
+# Security Audit — flattr (Pass 1)
 
-Every lens, walked against the real repo. Where flattr does something, it's
-named with `file:line`. Where it doesn't, the lens is marked **not yet
-exercised** with the *trigger* — the change that makes the lens start to matter.
-No invented vulnerabilities; no softened real ones.
+The 8-lens walk. Each lens gets a verdict against real `file:line` evidence, or
+`not yet exercised` with the trigger that would activate it. Significant
+findings cross-link to the Pass 2 pattern files. No exploit code — weakness,
+broken trust assumption, fix.
 
-The through-line, held constant across all 8: *what can an attacker reach, and
-what happens when they do?* In flattr there is no auth and no other user, so
-"attacker" mostly means **a hostile or corrupt third-party response, a drifted
-artifact, or a malicious address string** — not a logged-in adversary.
+The through-line: *every input is hostile until proven otherwise; every boundary
+either enforces a trust decision or leaks one.*
 
 ---
 
-## 1. trust-boundaries-and-attack-surface
+## 1. Trust boundaries and attack surface
 
-**What the repo does.** Three boundaries where data crosses from untrusted into
-trusted code. This is the audit's zoom-out; each gets a Pass-2 file.
+**Verdict: three live boundaries, all on the data plane. No control-plane
+boundary (auth) exists.** This is the zoom-out for the whole audit.
 
 ```
-  The three crossings
+  Where untrusted input crosses into trusted flattr code
 
-  ① external data   Overpass (OSM ways) + Open-Meteo (elevation)
-                    → pipeline/overpass.ts, pipeline/elevation.ts
-                    enters at BUILD time (run-build.ts) AND
-                    RUNTIME (useTileGraph.ts on-device tile fetch)
-                    → see 01-external-data-trust-boundary.md
-
-  ② artifact load   mobile/assets/graph.json → loadGraph.ts:10
-                    cast `as unknown as Graph`, no runtime check
-                    → see 02-unvalidated-artifact-load.md
-
-  ③ user → 3rd party  typed text + exact GPS → Nominatim (geocode.ts)
-                    display_name back into the UI (AddressBar.tsx:23)
-                    → see 03-user-input-to-third-party-url.md
+  source                     enters at                       trusted after
+  ─────────────────────────  ──────────────────────────────  ─────────────
+  Overpass OSM JSON          pipeline/overpass.ts:41          parseOsm
+  Open-Meteo elevation JSON  pipeline/elevation.ts:111        sampleElevations
+  graph.json (artifact)      mobile/src/loadGraph.ts:10       ALL routing
+  Nominatim reply            pipeline/geocode.ts:25,52,68      MapScreen state
+  typed address / GPS        mobile/AddressBar.tsx → geocode  outbound URL
+  AsyncStorage elev cache    mobile/src/elevCache.ts:23       tile grades
 ```
 
-**The trust assumption.** Every boundary assumes the other side returns
-well-formed, well-typed, sane data. None *enforces* it. The one exception that
-proves the rule: the `±40%` grade clamp at `grade.ts:30` is the only place in
-the whole pipeline that says "this external value might be garbage, bound it."
+Each boundary, the trust assumption, whether it holds:
 
-**The red flag this lens looks for** — "input treated as trusted because it
-comes from our own frontend" — **does fire, mildly.** GPS coords and typed text
-*are* from your own UI, so trusting them is fine. But the OSM/Open-Meteo
-responses are *not* yours, and the pipeline trusts them almost as much. That's
-boundary ①.
+- **Overpass response** (`overpass.ts:41`) — cast `(await res.json()) as
+  OverpassResponse` with no schema check. `parseOsm` (`osm.ts:5`) defensively
+  skips ways with `<2` resolved coords (`osm.ts:23`) and unknown highway kinds
+  (`osm.ts:20`), so it's *partially* hardened — but lat/lng values themselves are
+  trusted raw. → deep walk in `01-external-data-trust-boundary.md`.
+- **Open-Meteo response** (`elevation.ts:111`) — cast `as { elevation: number[]
+  }`; the array length is assumed to match the request and elements assumed
+  numeric. A short or non-numeric array silently corrupts grades. → `01-`.
+- **`graph.json`** (`loadGraph.ts:10`) — `graph as unknown as Graph`. The
+  single most load-bearing trust assumption in the repo, and the least
+  enforced. → `02-unvalidated-artifact-load.md`.
+- **Nominatim reply** (`geocode.ts:27,52,69`) — `display_name` is
+  attacker-influenceable OSM text (anyone can edit OSM). It flows into UI state
+  and is rendered. Inert today (React escapes), live the day it reaches an LLM
+  or HTML sink. → `03-user-input-to-third-party-url.md`.
 
-→ Deep walk: `01`, `02`, `03`.
-
----
-
-## 2. authentication-and-authorization
-
-**Not yet exercised.** There is no login, no session, no token, no user
-account, no per-resource check anywhere in the repo. `grep` for `auth`,
-`session`, `token`, `login` returns only `@react-native-async-storage` (a
-local KV cache for elevation, `mobile/src/elevCache.ts`) — not identity.
-
-This is **correct for what flattr is**: a single-user, read-only,
-local-compute app. There's nothing to authenticate to and nothing to authorize.
-
-**Trigger — when this lens starts to matter:**
-- The moment flattr adds *saved routes per user*, *a shared backend*, or *any
-  account*. Then the classic gap appears: authn present, authz assumed. The
-  buildable target is per-resource ownership checks (`route.userId === session.userId`)
-  on every read and write, not just a logged-in gate.
-- A weaker trigger: if the on-device elevation cache (`elevCache.ts`) ever
-  syncs to a shared store, "who can read whose cached coords" becomes an authz
-  question.
+**Red flag check — "trusted because it comes from our own frontend":** present
+in spirit at `loadGraph.ts:10` — `graph.json` is trusted because *we built it*.
+But "we built it" is not "it's well-formed at runtime": the build can drift, the
+file can be swapped in a tampered bundle, a partial write can truncate it.
 
 ---
 
-## 3. input-validation-and-injection
+## 2. Authentication and authorization
 
-**What the repo does — and the surfaces that don't exist.**
+**Verdict: not yet exercised.** No users, no sessions, no protected resources.
+`grep` for auth/session/token/login/cookie across `features/`, `pipeline/`,
+`mobile/src/` returns nothing. The only "permission" in the codebase is an OS
+one: `Location.requestForegroundPermissionsAsync()` (`MapScreen.tsx:95`) — that's
+device-consent for GPS, not application authn/authz.
 
-- **SQL injection: N/A.** No database, no query layer anywhere. Nothing to
-  inject into.
-- **Command injection: N/A.** No `child_process`, no shell-out. The build
-  script writes a file with `node:fs` (`run-build.ts`) but never executes
-  external input.
-- **Path traversal: N/A in app, low in build.** `run-build.ts` writes a
-  hard-coded path `data/graph.json`; no user-controlled path component.
-- **SSRF: borderline, contained.** The app *does* construct third-party URLs
-  from data (`geocode.ts` builds Nominatim URLs from typed text;
-  `elevation.ts:106` builds Open-Meteo URLs from coords). But the endpoints are
-  **hard-coded constants** (`ENDPOINT`, `DEFAULT_ENDPOINT`,
-  `https://api.open-meteo.com/...`), and only the *query string* is
-  user-influenced, properly encoded via `URLSearchParams` / `encodeURIComponent`
-  (`overpass.ts:30`, `elevation.ts:72`). An attacker can't redirect the fetch to
-  an internal host. → see `03` for the residual privacy concern.
-- **XSS: deferred, not live.** The one place attacker-influenced text renders is
-  the Nominatim `display_name` shown at `AddressBar.tsx:23-24` inside a React
-  `<Text>`. React escapes by default, so it's inert today. It becomes live the
-  instant that string is fed to a `dangerouslySetInnerHTML`, a WebView, or
-  (the real future risk) **an LLM prompt**. → see `03`.
-- **Prompt injection: not yet exercised** — no LLM in the repo. But the seam is
-  pre-loaded: `display_name` is attacker-influenceable text that, the day a
-  "describe this route" LLM feature lands, becomes a prompt-injection vector.
-  Flagged in `03` and the AI-engineering cross-link.
-
-**The one real validation in the codebase:** `grade.ts:30` clamps `gradePct` to
-`±MAX_GRADE_PCT (40)`. It's framed as DEM-noise cleanup, but it *is* an
-input-validation control — it bounds an externally-derived value so a garbage
-elevation delta can't produce a 9000% grade that breaks downstream math. → `01`.
-
-**Red flag — "string-built query or prompt with user input":** fires weakly.
-The query strings *are* string-built but correctly encoded. No prompt exists
-yet. Watch the prompt seam.
+- **Trust assumption:** there is no actor to authenticate; every user of the
+  app has identical, total access to identical, public data.
+- **TRIGGER that activates this lens:** the moment flattr grows a backend with
+  saved routes, accounts, or any per-user state. Then "who are you" (sessions,
+  token expiry) and "what can you do" (per-route authz) both become real, and
+  the classic gap — *authn present, authz assumed* — becomes a live risk.
+- **Buildable target:** if/when accounts land, every saved-route read/write
+  needs an ownership check at the data-access layer, not just a logged-in check.
 
 ---
 
-## 4. secrets-and-configuration
+## 3. Input validation and injection
 
-**What the repo does — and why "nothing to manage" is the honest answer.**
-
-- The three live data sources are **keyless free APIs**: Overpass
-  (`overpass-api.de`), Open-Meteo (`api.open-meteo.com`), Nominatim
-  (`nominatim.openstreetmap.org`). No key, no token, nothing to leak.
-- The **only** secret the codebase references is `GOOGLE_ELEVATION_KEY`, read
-  from `process.env` at `pipeline/run-build.ts:23` and passed to
-  `googleProvider(key)` (`elevation.ts:65`). This is **build-time only** — it
-  never enters the mobile bundle. The runtime path (`useTileGraph.ts:191`)
-  hard-wires `openMeteoProvider` (keyless), so even if you set the Google key,
-  the *app* never carries it.
-- The build output (`data/graph.json`) is **git-ignored** (`.gitignore`), so a
-  graph derived with a paid key doesn't drag the key — or anything sensitive —
-  into history. (Side note: the *bundled* `mobile/assets/graph.json` is checked
-  in, but it's public street geometry, not a secret.)
-
-**No secret in source, no secret in the client bundle, no secret in logs.**
-This is the right posture for the project; don't add a vault for keys that don't
-exist.
-
-**Trigger:** the moment a *paid* or *rate-limited-by-key* API is called from the
-*device* (e.g. moving Google elevation to runtime, or adding an LLM API). Then
-the key must live behind a thin proxy you control — never in the app bundle,
-where any user can extract it. The buildable target: a keyless edge function
-that holds the secret and the device calls *that*.
-
----
-
-## 5. data-exposure-and-privacy
-
-**What the repo does.** The exposure here is **location privacy**, not data
-over-fetching (there's no API of your own to over-fetch from).
-
-- **Exact GPS leaves the device.** `MapScreen.tsx:97` reads the precise
-  position (`Location.getCurrentPositionAsync`) and `handleUseCurrentLocation`
-  (`:220`) stores it as the route start. On routing, `geocode()` /
-  `reverseGeocode()` send coordinates and typed addresses to Nominatim
-  (`geocode.ts:63`). So **a third party (OSM) sees where the user is and where
-  they're going**, tied to the device's IP, on every query. → `03`.
-- **No PII in logs.** The build logs node/edge counts (`run-build.ts`), not user
-  data. The app has no server logs at all.
-- **Error messages are terse and non-leaky.** `geocode.ts:24` throws
-  `Geocode failed: ${status}` (a status code, no internals); the UI collapses
-  failures to `"Lookup failed — try again"` (`MapScreen.tsx:203`). No stack
-  traces or internal paths reach the user.
-
-**Red flag — "response returns more than the caller is entitled to":** does not
-fire (no API of your own). The honest privacy finding is the GPS-to-third-party
-leak, which is inherent to using a hosted geocoder. The mitigation is the
-`searchViewbox` bias (`MapScreen.tsx:51`) which *narrows* what's sent, plus the
-keyless nature meaning OSM can't tie queries to an account.
-
-**Trigger:** any analytics SDK, crash reporter, or your-own backend. Each
-becomes a new place coords or addresses could be logged. The buildable target:
-coarsen coords before they leave the device (round to ~100m) unless precision is
-required.
-
----
-
-## 6. dependencies-and-supply-chain
-
-**What the repo does.**
-
-- **Lockfiles present, both projects.** `package-lock.json` (root) and
-  `mobile/package-lock.json` pin the full tree. No unpinned floating installs.
-- **Root deps are dev-only and tiny:** `tsx`, `typescript`, `vitest`,
-  `@types/node` (`package.json`). The engine has **zero runtime production
-  dependencies** — it's pure TypeScript over the standard library. That's a
-  near-minimal supply-chain surface.
-- **Mobile deps are the real surface:** Expo `~56`, React Native `0.85`,
-  React `19.2`, `@maplibre/maplibre-react-native`, `expo-location`,
-  `async-storage`, `community/slider` (`mobile/package.json`). These are
-  large, transitive-heavy native modules — the bulk of the attack surface lives
-  in *their* trees, not flattr's code.
-- **No `postinstall` scripts in the repo's own package.json files.** (Transitive
-  packages may have their own; that's the unmanaged part.)
-
-**Red flag — "no lockfile, or known CVEs unpatched":** the lockfile red flag
-does **not** fire. The CVE posture is **not audited here** — running
-`npm audit` in both trees is the buildable next step; this audit confirms the
-*hygiene* (lockfiles, pinned versions, no first-party runtime deps) but does not
-claim the transitive tree is CVE-free.
-
-**Trigger:** every `npm install` of a new mobile dependency widens this. The
-standing target: `npm audit` in CI for both `package-lock.json` files, and treat
-a new transitive `postinstall` as a review event.
-
----
-
-## 7. llm-and-agent-security
-
-**Not yet exercised.** There is no LLM, no agent, no tool-calling, no model
-output anywhere in the repo. `grep` for `openai`, `anthropic`, `claude`,
-`prompt`, `llm`, `agent`, `tool` returns nothing in source.
-
-This is honest: flattr is a deterministic router. There is no prompt to inject
-into, no tool whose scope could exceed its task, no model output flowing into a
-sink.
-
-**But the seam is pre-loaded — flag it now.** The project context positions
-flattr in an AI-pivot portfolio, and `docs/flattr-spec.md` hints at future
-narration. The day a "describe my route / explain the grade" LLM feature lands,
-two existing facts become security-relevant *immediately*:
-
-1. **`display_name` is attacker-influenceable text** (lens 3, file `03`). Anyone
-   can edit an OSM place name. If that string is concatenated into a prompt
-   ("Routing the user to {display_name}…"), it's a textbook prompt-injection
-   vector. The control is to **frame untrusted text as data, never as
-   instructions**, and never let model output flow back into a sink (URL, fs,
-   eval) without a gate.
-2. **Tool scope.** If an agent ever drives the router (calls `geocode`,
-   `directedAstar`, `fetchOverpass`), give it the *narrowest* tool set the task
-   needs. An agent that only needs to read a route should not also hold the
-   elevation-fetch or file-write tools.
-
-**Trigger:** the first `@anthropic-ai/sdk` / `openai` import. At that point this
-lens flips from `not exercised` to the most important lens in the audit, and
-`03` becomes the load-bearing pattern file.
-
----
-
-## 8. security-red-flags-audit (capstone checklist)
-
-Consolidated, marked against this repo. `FIRES` = present risk;
-`DEFERRED` = inert today, live under a named future change; `N/A` = no surface.
+**Verdict: no SQL/command/path/XSS sink exists; the real injection surface is
+data-shape, not code-injection.** Ranked worst-first.
 
 ```
-  flag                                  status     location / note
-  ────────────────────────────────────  ─────────  ───────────────────────────
-  Untrusted input treated as trusted    FIRES      grade.ts:30 only guard;
-   (external OSM/elevation)               (med)      else trusted. → 01
-  Artifact loaded without validation    FIRES      loadGraph.ts:10 `as Graph`.
-   (highest availability risk)            (HIGH)     → 02
-  Exact GPS sent to 3rd party           FIRES      MapScreen.tsx:97 → geocode.ts
-   (location privacy)                     (low)      → 03
-  String-built query w/ user input      DEFERRED   encoded today (URLSearchParams
-                                                     / encodeURIComponent). OK.
-  Attacker text rendered in UI (XSS)    DEFERRED   AddressBar.tsx:23; React
-                                                     escapes. Live if → WebView.
-  Attacker text → LLM prompt            DEFERRED   no LLM yet. → 03, lens 7.
-  Secret in source / bundle / logs      N/A        only build-time env key;
-                                                     data/ gitignored.
-  SQL injection                         N/A        no database.
-  Command injection                     N/A        no shell-out.
-  SSRF (redirect fetch to internal)     N/A        endpoints hard-coded consts.
-  CSRF                                  N/A        no cookies, no server.
-  Missing authn / authz                 N/A        no users, no resources.
-  Session fixation / weak session       N/A        no sessions.
-  No lockfile                           N/A        both lockfiles present.
-  Known-CVE deps                        UNKNOWN    run `npm audit` (both trees).
+  Injection surface, ranked
+
+  worst  ► artifact shape (graph.json) → crashes A*        → 02-
+         ► external data shape (OSM/elev) → garbage routes → 01-
+         ► display_name → UI (inert: React escapes)        → 03-
+  none     SQL / shell / fs-path / eval / innerHTML
 ```
 
-**The one-line fixes, ranked:**
+- **No SQL injection.** No database, no query string assembled anywhere. `grep`
+  for `SELECT`/`query(`/`exec(` across the repo: nothing.
+- **No command/path injection.** The only `node:fs` use is
+  `run-build.ts:47` writing `data/graph.json` to a *hardcoded* path — no user
+  input reaches a filesystem path or a shell.
+- **No classic XSS.** No `dangerouslySetInnerHTML`, no `innerHTML`, no `eval` in
+  `mobile/src/`. `display_name` renders inside a React `<Text>`
+  (`AddressBar.tsx:23-25`), which escapes by default. → `03-`.
+- **The real injection-shaped risks are deserialization-of-untrusted-shape:**
+  - `loadGraph.ts:10` — no runtime validation of the parsed graph. → `02-`.
+  - `elevation.ts:111` — `json.elevation` length/type assumed. → `01-`.
+  - `elevCache.ts:23` — `JSON.parse` of AsyncStorage wrapped in try/catch; a
+    poisoned value is type-cast `as Record<string, number>` but a non-numeric
+    value would propagate as a bogus elevation. Local-only (the device's own
+    storage), so severity is low, but it's the same unchecked-deserialization
+    pattern.
 
-1. **`02` (HIGH):** validate `graph.json` at load with a runtime schema (Zod or
-   a hand-rolled guard) so corruption fails *at the boundary* with a clear
-   message, not deep in A*.
-2. **`01` (MED):** add bounds checks alongside the grade clamp — finite
-   coordinates, non-empty geometry, monotonic node references — before the
-   artifact is built/trusted.
-3. **`03` (LOW now, becomes HIGH with LLM):** keep treating `display_name` as
-   data; the instant an LLM feature lands, frame it as untrusted input and
-   never let it become instructions.
+**Red flag check — "string-built query or prompt with user input":** no SQL
+prompt today. The *URL* built from user input (`geocode.ts:14`,
+`URLSearchParams`) is correctly encoded — `URLSearchParams` escapes the query, so
+there's no URL-injection here. → covered as a privacy (not injection) finding in
+`03-`.
 
-The pattern files below walk the three that fire.
+---
+
+## 4. Secrets and configuration
+
+**Verdict: clean. No secret in source, history, or client bundle.** flattr's
+free-API design means there's almost nothing to leak.
+
+- **Keyless by default.** Overpass, Open-Meteo, Nominatim, and the OpenFreeMap
+  tile style (`MapScreen.tsx:21`) all require no key.
+- **The one optional key is build-time only.** `GOOGLE_ELEVATION_KEY` is read
+  from `process.env` at `run-build.ts:23` and passed to `googleProvider`
+  (`elevation.ts:65`). It runs inside `npm run build:graph` on the developer's
+  machine; it is **never** imported into `mobile/` and never bundled into the
+  app. Confirmed: the only `process.env` read in the whole repo is that one
+  line.
+- **`data/` is gitignored** (`.gitignore:4`) — the build output (and anything a
+  developer drops there) never enters git history.
+- **No `.env` / secret files tracked.** `git ls-files | grep -iE
+  '\.env|secret|key'` returns nothing.
+
+**Red flag check — secret in source / bundle / logs:** none fires. The
+build-time key never crosses into the client half. One note, not a finding:
+`run-build.ts:25` logs `"Elevation: Google Elevation API (paid)."` — it logs
+*that* a key is used, never the key value. Correct.
+
+---
+
+## 5. Data exposure and privacy
+
+**Verdict: the real exposure is outbound, not inbound — exact GPS + typed text
+leave the device to a third party.** This is the one privacy finding worth
+ranking up.
+
+- **Exact coordinates sent to Nominatim.** `reverseGeocode(lat, lng)`
+  (`geocode.ts:58`, called from `MapScreen.tsx:247`) sends full-precision GPS to
+  `nominatim.openstreetmap.org`. Forward geocoding (`geocode.ts:21`) sends the
+  user's typed address/place text. Every routing query is a data point handed to
+  a third party. → deep walk in `03-`.
+- **Coarsening exists for display but not for the request.** `MapScreen.tsx:248`
+  truncates the *fallback* label to 5 decimals — but the *request* at
+  `geocode.ts:63` sends `String(lat)` / `String(lng)` at full precision. The
+  coarsening is cosmetic, not privacy-preserving.
+- **No PII in logs/errors.** Error paths set generic UI strings ("From not
+  found", `MapScreen.tsx:184`; "Lookup failed — try again",
+  `MapScreen.tsx:203`) — no coordinates or query text leak into error messages.
+- **No over-fetching surface** — there's no API returning more than a caller is
+  entitled to, because there's no API and no per-caller entitlement.
+
+**Red flag check — response returns more than caller is entitled to:** N/A (no
+server). The privacy finding is the *outbound* direction: full-precision
+location to a third party with no coarsening. Buildable mitigation: round
+coordinates to ~3 decimals (~110 m) before the reverse-geocode request, or
+proxy through your own endpoint if/when one exists.
+
+---
+
+## 6. Dependencies and supply chain
+
+**Verdict: lean and locked. Two lockfiles present, tiny dependency surface, no
+postinstall risk in the repo's own manifests.**
+
+```
+  Dependency posture
+
+  manifest             runtime deps   lockfile        notable
+  ───────────────────  ─────────────  ──────────────  ─────────────────────
+  package.json (root)  0 (dev only)   package-lock ✓  tsx, vitest, typescript
+  mobile/package.json  7              package-lock ✓  expo 56, RN 0.85,
+                                                       react 19, maplibre-rn 11
+```
+
+- **Root engine has zero runtime dependencies** — only `tsx`, `typescript`,
+  `vitest`, `@types/node` as devDeps (`package.json:11-16`). The router, heap,
+  and geo math are all hand-rolled (per project constraints). A hand-rolled
+  binary heap (`pqueue.ts`) is more code to own but zero transitive supply-chain
+  surface — a deliberate, defensible trade for this project.
+- **Mobile has 7 runtime deps** (`mobile/package.json:5-14`), all
+  platform/framework (Expo, React Native, MapLibre, AsyncStorage, slider,
+  expo-location). No utility-library sprawl, no obviously abandoned packages.
+- **Both halves have a `package-lock.json`** — installs are reproducible; no
+  floating-version drift.
+- **No postinstall scripts in flattr's own manifests.** (Transitive
+  postinstalls inside `node_modules` are unaudited here — that's an `npm audit`
+  job, out of scope for a code-level read.)
+
+**Red flag check — no lockfile / known CVEs unpatched:** lockfiles present, so
+the first half doesn't fire. The CVE half can't be settled by reading source —
+**run `npm audit` in both `/` and `/mobile`** to close this lens. Version note:
+`react-native 0.85` + `expo ~56` + `react 19` are recent; staying current is the
+right posture and `mobile/AGENTS.md` already enforces reading versioned docs
+before touching mobile code.
+
+---
+
+## 7. LLM and agent security
+
+**Verdict: not yet exercised — no model in the loop today. But there's a primed
+prompt-injection vector waiting for one.**
+
+- **No LLM/agent code in flattr.** No model client, no tool definitions, no
+  prompt assembly anywhere in `features/`, `pipeline/`, or `mobile/src/`.
+- **The dormant vector:** `display_name` from Nominatim (`geocode.ts:27`) is
+  attacker-editable OSM text. Today it's rendered React-escaped and inert. The
+  *day* an LLM feature consumes it — "summarize this route," "describe the
+  destination" — that text becomes untrusted model input, and a crafted OSM
+  place name becomes a prompt-injection payload reaching the model without a
+  gate. → this is exactly the seam `03-` walks.
+- **TRIGGER:** any LLM consuming geocoder text, route summaries, or graph data.
+- **Buildable target when it lands:** treat `display_name` (and any
+  retrieved/third-party text) as untrusted model input — delimit it, never let
+  it carry instructions, and gate any model *output* before it reaches a sink
+  (don't execute model-emitted code/queries).
+
+**Red flag check — agent tool-set exceeds task / model output into a sink:**
+N/A today; named here so it's not forgotten the day it becomes real.
+
+---
+
+## 8. Security red-flags audit (capstone)
+
+Consolidated checklist, marked against this repo. `fires` = real finding here;
+`N/A` = no surface; location + one-line fix where it fires.
+
+```
+  flag                                   verdict   location / note
+  ─────────────────────────────────────  ────────  ──────────────────────────────
+  Input trusted "because it's ours"      FIRES     loadGraph.ts:10 — validate
+                                                     artifact at load (→ 02-)
+  Untrusted shape deserialized unchecked FIRES     elevation.ts:111, elevCache.ts:23
+                                                     — check length/type (→ 01-)
+  Out-of-range numeric input unclamped   FIRES     osm.ts:8 lat/lng, grade clamp at
+                                                     grade.ts:30 only (→ 01-)
+  Full-precision PII to third party      FIRES     geocode.ts:63 — coarsen coords
+                                                     before request (→ 03-)
+  3rd-party text into a future sink      FIRES     geocode.ts:27 — gate before LLM
+                                          (dormant) /HTML (→ 03-, 07-)
+  Boundary failure swallowed silently    FIRES     MapScreen.tsx:202,
+                                          (minor)   useTileGraph.ts:219 — log it
+  Secret in source / bundle / log        N/A       keyless; key is build-only
+                                                     (run-build.ts:23)
+  SQL / command / path injection         N/A       no DB, no shell, hardcoded fs path
+  XSS (innerHTML/eval/dangerouslySet…)   N/A       React escapes; none present
+  Missing authn / authz / CSRF           N/A       no users, server, or cookies
+  No lockfile                            N/A       both package-lock.json present
+  Known-CVE deps                         UNKNOWN   run `npm audit` in / and /mobile
+```
+
+**The one-paragraph capstone takeaway:** flattr's security story is dominated by
+*availability and integrity of data*, not *confidentiality or access control* —
+because there's no access to control. Fix the artifact validation
+(`loadGraph.ts:10`) and the external-data shape checks (`elevation.ts:111`,
+`osm.ts`) and you've closed the two findings that can actually bite a user
+today. Everything else is either dormant (LLM, `03-`'s prompt-injection half) or
+genuinely absent with a named trigger (auth, SQL, CSRF). The honesty *is* the
+audit: a thin attack surface, precisely mapped, beats a thick one vaguely
+gestured at.

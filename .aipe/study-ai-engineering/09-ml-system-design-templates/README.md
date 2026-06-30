@@ -1,51 +1,42 @@
 # 09 — ML System-Design Templates
 
-Generic ML-system-design *interview reframes*, grounded honestly against flattr.
+Interview-reframe templates for the classic "design an ML system" prompts,
+answered honestly about flattr's *current* state.
 
-**Read this first.** flattr has **no ML model, no training, no inference
-runtime.** It is a deterministic, grade-aware routing engine: a hand-rolled A*
-(`features/routing/astar.ts`) over a grade-annotated street graph, minimizing a
-hand-coded cost (`features/routing/cost.ts`), plus an Expo/RN map app. Nothing in
-the repo learns from data.
+## What these are
 
-So why an ML-system-design section? Because these prompts are the standard
-interview genre, and the valuable skill is being able to (a) draw the canonical
-architecture and (b) say *honestly* whether the codebase in front of you
-resembles it — and if not, name the nearest real attach point instead of
-hand-waving. Each file below keeps the generic architecture/data/scale material
-brief and spends its weight on two honest bullets: **"Applies to this codebase"**
-and **"How to make it apply,"** answered about flattr's real files only.
+flattr has **no trained model and no ML**. It is a hand-rolled A* router over a
+grade-annotated street graph (TypeScript, Expo/React Native, local-first). These
+templates exist anyway because the prompts show up in interviews regardless of
+what you built — and the skill being tested is reframing a canonical system-design
+question against your real artifact without overclaiming.
 
-## The three templates
+This follows **Approach-2: every template appears even when the honest answer is
+"no."** A confident, specific "no — here's why, and here's the nearest real
+analog" is a stronger interview answer than a forced "yes." Each template carries
+nine labelled bullets and an `Applies to this codebase` verdict that does not
+inflate flattr's capabilities.
 
-| # | Template | Does flattr resemble it? | Nearest real attach point |
-|---|----------|--------------------------|---------------------------|
-| [01](01-recommender-system.md) | Recommender system | **Partly (the honest one).** flattr computes *optimal* routes deterministically — it doesn't recommend by learned preference. | `features/routing/cost.ts:16` — a learned edge-cost would replace `penalty()`, constrained `>=0` / monotone / BLOCKED-finite, behind the `CostFn` seam (`types.ts:40`). |
-| [02](02-anomaly-detection.md) | Anomaly detection | **No.** No detector, no baseline. flattr's only defense is a hard clamp, not outlier detection. | `pipeline/grade.ts` + `pipeline/elevation.ts` — compute grades arithmetically with no outlier check; a statistical check could catch corrupt OSM/Open-Meteo data. Out of scope. |
-| [03](03-object-detection-cv.md) | Object detection / CV (on-device) | **None.** No camera, no pixels, no CV surface. | The only on-device shape is A* (algorithm, not inference). Transferable lesson is contrl's on-device-budget discipline, applicable only if flattr added on-device elevation infill. Out of scope. |
+## The templates
 
-## The one real story
+- [01 — Recommender System](01-recommender-system.md) — Applies: **NO.** flattr has no catalog, users, interaction log, or ranker. The nearest analog is the learned edge cost (`features/routing/cost.ts`), which ranks edges *inside* A* — optimization, not recommendation. How-to-make-apply frames suggesting a `userMax` preset as a tiny single-user rules recommender, and is honest that it's a stretch.
 
-If you take one thing from this section: the **recommender reframe (01)** is the
-only template with a genuine, clean attach point. flattr's optimizer consumes any
-`CostFn = (edge, fromNodeId, userMax) => number` (`features/routing/types.ts:40`),
-and the hand-tuned `penalty()` in `cost.ts` is exactly where a learned
-route-preference model would live — turning a deterministic optimizer into a
-personalized one without touching A* itself. The constraints (`>=0`, monotone in
-grade, BLOCKED finite per spec §14.4) are dictated by A* correctness, which is
-*why* it's a good interview answer: it shows you can add ML to a system without
-breaking its guarantees. The blocker is a rider-choice dataset that doesn't exist
-yet.
+- [02 — Anomaly Detection](02-anomaly-detection.md) — Applies: **PARTIALLY.** Not built, but the problem genuinely fits flattr's input space: drift on the graph's grade distribution, or flagging corrupt edges (bad OSM/elevation) before publishing. How-to-make-apply adds PSI on the grade distribution plus outlier-edge gating to `pipeline/run-build.ts`.
 
-## What is NOT ML here (kill the false positive)
+- [03 — Object Detection (On-Device CV)](03-object-detection-cv.md) — Applies: **NO.** flattr has no camera, video, or pixels — nothing to detect. Contrasts **contrl**, which does real on-device pose detection via MediaPipe. The honest move is to name the mismatch and redirect to contrl rather than torture flattr into a fit.
 
-`features/grade/classify.ts` looks classifier-shaped but is **not** an ML
-classifier — it's a threshold table (`classifyAbs` at lines 11-16,
-`classifyDirected` at 33-38) mapping grade % to a color band against fixed or
-userMax-derived cutoffs. No model, no training, no inference. Don't claim it.
+## The one real ML anchor
 
-## See also
+flattr's single ML attach point is the learned edge cost in
+`features/routing/cost.ts` — `penalty(g, max, k1, k2)` (cost.ts:16), the per-edge
+multiplier that `gradeCostDirected` (cost.ts:32) feeds to A*. It must stay ≥0 and
+monotone to preserve A* admissibility against the haversine heuristic, and an
+over-max grade maps to a finite `BLOCKED = 1e9` (cost.ts:5) so "flattest-but-steep
+route exists" stays distinct from "no route / disconnected."
 
-- `../ml-features-in-this-codebase.md` — inventory of (non-)ML surfaces
-- `../07-system-design-templates/` — the non-ML system-design genre
-- `../08-machine-learning/` — ML fundamentals
+For the supervised-learning framing of that anchor — turning those hand-tuned
+`k1`/`k2` constants into learned weights — see
+[../08-machine-learning/01-supervised-pipeline.md](../08-machine-learning/01-supervised-pipeline.md).
+
+Note: `features/grade/classify.ts` is a **threshold table** (if/else over
+`DEFAULT_BANDS`), not a classifier — don't call it ML.

@@ -1,282 +1,267 @@
-# Build-Time Graph Artifact
+# Build-time graph artifact
 
-**Industry names:** static site generation / ahead-of-time compilation /
-prebuilt data artifact. **Type:** Industry standard (the SSG pattern, applied
-to a graph instead of HTML).
+**Industry names:** static site generation (SSG) / build-time precomputation /
+"bake the data" / asset-as-database. **Type:** Industry standard.
 
 ---
 
 ## Zoom out, then zoom in
 
-You've shipped a Next.js app (AdvntrCue) where the request hits a serverless
-function that queries Postgres at *request time*. flattr does the opposite:
-it does all the expensive work *once, offline*, bakes the result into a file,
-and ships the file. The runtime never computes the graph — it reads it.
+flattr has no database and no API server. The thing every other app would put in
+Postgres — the routable street graph — flattr computes once on your laptop and
+ships as a JSON file inside the app bundle. The runtime never builds the base
+graph; it reads it.
 
 ```
-  Zoom out — where the artifact lives
+  Zoom out — where the artifact sits in the system
 
-  ┌─ BUILD TIME (Node / tsx, your laptop) ───────────────────┐
-  │  Overpass + elevation + grade math                       │
-  │            │                                             │
-  │            ▼                                             │
-  │     ★ data/graph.json ★   ← THIS CONCEPT (the artifact)  │ ← we are here
-  └────────────┬─────────────────────────────────────────────┘
-               │ hand-copied into the app bundle
-               ▼
-  ┌─ RUNTIME (Expo RN, device) ──────────────────────────────┐
-  │  loadGraph.ts  →  import graph.json  →  route over it     │
-  │  (no fetch, no DB, no compute of the graph)              │
-  └──────────────────────────────────────────────────────────┘
+  ┌─ BUILD TIME (your machine, npm run build:graph) ───────────┐
+  │  overpass → osm → split → elevation → grade → build-graph   │
+  │                                          │                  │
+  │                              run-build.ts │ JSON.stringify   │
+  └──────────────────────────────────────────┼─────────────────┘
+                                              ▼
+                      ★ data/graph.json ★  ← THE ARTIFACT (we are here)
+                              │  copied into the bundle
+  ════════════════ ARTIFACT BOUNDARY (static file) ═════════════
+                              ▼
+  ┌─ RUNTIME (the phone) ──────────────────────────────────────┐
+  │  loadGraph.ts → baseGraph → directedAstar → map            │
+  └────────────────────────────────────────────────────────────┘
 ```
 
-Zoom in: the concept is **moving expensive, rarely-changing work out of the
-request path and into a build step**, leaving a static artifact the runtime
-just reads. The question it answers: *why does flattr need no backend?* Because
-the only thing a backend would do here — turn streets + elevation into a routable
-graph — already happened at build time.
+The pattern: you know how a static-site generator runs your React at build time
+and ships plain HTML, so the browser does zero rendering work? Same shape. flattr
+runs the expensive graph-building pipeline at build time and ships plain JSON, so
+the phone does zero graph-building work for the base area. The question it answers:
+*where does the cost of turning the world into a routable graph live — at request
+time, or once, ahead of time?*
 
-## Structure pass
+---
 
-**Layers.** Two: the *build layer* (`pipeline/`) that produces the artifact,
-and the *runtime layer* (`mobile/`) that consumes it. The artifact
-(`graph.json`) is the seam between them.
+## The structure pass
 
-**Axis — `lifecycle` (when does the work happen?).** Hold that one question
-across the layers:
+**Layers** (one axis traced down each): build pipeline → artifact → runtime reader.
+
+**Axis = lifecycle (when does the work happen?).** Hold that one question constant:
 
 ```
-  One question: "when is the graph computed?" — traced across layers
+  One question down the layers: "when does the graph get built?"
 
-  ┌──────────────────────────────────────────┐
-  │ build layer: pipeline/run-build.ts        │  → BUILD TIME (once, offline)
-  └──────────────────────────────────────────┘
-        │  artifact crosses the seam (a file)
-        ▼
-  ┌──────────────────────────────────────────┐
-  │ runtime layer: mobile/src/loadGraph.ts    │  → NEVER (just reads it)
-  └──────────────────────────────────────────┘
+  ┌───────────────────────────────────┐
+  │ build pipeline (pipeline/*)        │  → BUILD TIME (once, offline)
+  └───────────────────────────────────┘
+      ┌─────────────────────────────────┐
+      │ artifact (graph.json)           │  → never; it's frozen
+      └─────────────────────────────────┘
+          ┌─────────────────────────────┐
+          │ runtime reader (loadGraph)  │  → RUNTIME, but only a JSON.parse
+          └─────────────────────────────┘
 
-  the answer flips at the file boundary — that flip IS the architecture
+  the answer flips at the artifact: above it = compute; below it = read
 ```
 
-**Seam.** `data/graph.json` → `mobile/assets/graph.json`. The axis flips hard
-across it: on the build side the graph is *computed* (network calls, math); on
-the runtime side it is *given* (a synchronous import). That's a load-bearing
-seam — everything about flattr's "no backend" claim sits on it.
+**Seam = the artifact.** This is the load-bearing boundary. Trace the *cost* axis
+across it: above, building one graph means an Overpass fetch + thousands of
+elevation samples + grade math (seconds, network-bound). Below, getting the graph
+means `JSON.parse` of a bundled file (milliseconds, no network). The axis flips
+hard — that's what makes the file a real architectural seam and not just an output.
+
+The other thing the seam carries: a **trust** flip. Above it, the build holds an
+API key (`GOOGLE_ELEVATION_KEY`) and hits rate-limited services. Below it, the app
+ships no keys and makes no calls to serve the base area.
+
+---
 
 ## How it works
 
-### Move 1 — the mental model
+#### Move 1 — the mental model
 
-You already know this shape from frontend: it's static site generation. Next.js
-`getStaticProps` runs at build time, hits your data source, and freezes the
-result into HTML the CDN serves with zero per-request compute. flattr does the
-same thing, except the frozen artifact is a *routable graph* instead of a page.
-
-The strategy in one sentence: **compute once at build time, serialize, ship the
-serialized blob, read it at runtime.**
+The shape is "precompute and freeze." A pipeline of pure stages takes a bbox and
+produces a `Graph` object; the last stage serializes it to disk; the app imports
+that file. Nothing in the runtime path can rebuild the base graph — that capability
+lives entirely on the build side of the seam.
 
 ```
-  The pattern — compute-once, read-many
+  Pattern — fan-in pipeline to a frozen artifact
 
-   BUILD TIME (runs once)              RUNTIME (runs every session)
-   ───────────────────────            ────────────────────────────
-   fetch ──► transform ──► serialize  read ──► use
-     │          │             │         │       │
-   Overpass   split+grade   JSON      import   route
-     │          │             │         │       │
-     └── slow, network-bound ─┘         └─ instant, local ─┘
-            (minutes)                       (microseconds)
+  bbox ─► [overpass] ─► [osm] ─► [split] ─► [elevation] ─► [grade] ─► [build-graph]
+                                                                          │
+                                                                   Graph object
+                                                                          │
+                                                              JSON.stringify (freeze)
+                                                                          ▼
+                                                                  data/graph.json
+                                                                  (read-only forever
+                                                                   until next build)
 ```
 
-The expensive arrow (fetch + transform) runs in the build column. The runtime
-column only ever does `import` + `route`. That asymmetry is the entire payoff.
+#### Move 2 — the walkthrough
 
-### Move 2 — the walkthrough
-
-**The build entrypoint produces exactly one file.** `pipeline/run-build.ts`
-fetches, builds, and writes. Watch the last three lines — the whole pipeline
-collapses into a single `JSON.stringify`:
+**The build is a linear orchestration of pure stages.** You've chained `.map()` /
+`.filter()` transforms where each step's output feeds the next — same idea, but each
+"step" is a module. `buildGraph` is the orchestrator and it reads like a pipeline:
 
 ```ts
-// pipeline/run-build.ts:40-52 (main)
-const osm = await fetchOverpass(BBOX);                              // 43: network
-const graph = await buildGraph("seattle-mvp", BBOX, osm, provider, // 46: transform
-                               maxSegM, sampleOpts);
-mkdirSync("data", { recursive: true });                            // 47
-writeGraph(graph, "data/graph.json");                              // 48: serialize → ONE file
+// pipeline/build-graph.ts:12 — each line is one stage; output feeds the next
+const ways = parseOsm(osm);                                   // raw OSM → ways
+const { nodes, edges } = splitWays(ways, maxSegM);            // densify ≤12m segments
+const nodesWithElev = await sampleElevations(nodes, elevation, sampleOpts); // + DEM
+const gradedEdges = computeGrades(nodesWithElev, edges);      // + signed grade %
+return { city, bbox, nodes: nodesWithElev,
+         edges: gradedEdges, adjacency: buildAdjacency(gradedEdges) };
+```
 
-// pipeline/run-build.ts:11-13 (writeGraph)
+The boundary condition that makes this whole pattern possible is one line of
+*absence*: `pipeline/build-graph.ts:2` — *"No node:fs here so this module bundles
+for the app."* `buildGraph` does I/O-free pure assembly. The filesystem write lives
+one layer up, in `run-build.ts`, which the app never imports. That separation is
+exactly what lets the *same* `buildGraph` run on-device later
+(→ `02-on-device-pipeline-rerun.md`).
+
+**The freeze is one `writeFileSync` of `JSON.stringify`.** No schema migration, no
+serialization library:
+
+```ts
+// pipeline/run-build.ts:11
 function writeGraph(graph: Graph, path: string): void {
-  writeFileSync(path, JSON.stringify(graph));   // the artifact is just JSON
+  writeFileSync(path, JSON.stringify(graph));   // the entire persistence layer
 }
 ```
 
-The artifact is plain JSON — no binary format, no index files. Everything the
-runtime needs (`nodes`, `edges`, `adjacency`, `bbox`) is in
-`pipeline/build-graph.ts:29`'s return object, stringified.
+The honest cost: this is **not atomic** — a crash mid-write corrupts `graph.json`.
+That's accepted because the file is regenerable from `npm run build:graph`; the
+durability bar is deliberately low (audit lens 5). A temp-file-then-rename would
+close it for free, and that's the one cheap hardening worth adding.
 
-```
-  Layers-and-hops — the artifact crossing from build to runtime
-
-  ┌─ Build (Node) ─────────┐  hop 1: JSON.stringify(graph)   ┌─ Filesystem ─┐
-  │  buildGraph() returns  │ ──────────────────────────────► │ data/graph.  │
-  │  {nodes,edges,adj,bbox}│                                  │ json         │
-  └────────────────────────┘                                 └──────┬───────┘
-                                          hop 2: manual copy        │
-                                          (npm run build:graph,     ▼
-                                           then cp into assets)  ┌─ App bundle ─┐
-                                                                 │ mobile/      │
-                                                                 │ assets/      │
-                                                                 │ graph.json   │
-                                                                 └──────┬───────┘
-  ┌─ Runtime (RN) ─────────┐  hop 3: import (synchronous)            │
-  │  loadGraph() returns   │ ◄───────────────────────────────────────┘
-  │  the Graph             │
-  └────────────────────────┘
-```
-
-**The runtime side is a synchronous import — no async, no I/O.** This is the
-tell that there's no backend:
+**The read is a typed cast of a bundled import.** Crossing the artifact boundary on
+the runtime side is trivial:
 
 ```ts
-// mobile/src/loadGraph.ts:7-11
-import graph from "../assets/graph.json";   // 7: bundled at compile time
+// mobile/src/loadGraph.ts:7
+import graph from "../assets/graph.json";        // Metro bundles it into the app
 export function loadGraph(): Graph {
-  return graph as unknown as Graph;          // 9-11: just a cast, no fetch
+  return graph as unknown as Graph;              // no parse cost beyond Metro's
 }
 ```
 
-No `fetch`, no `await`, no loading state. The graph is present the instant the
-module loads, because Metro bundled the JSON into the app binary.
+The hop across the seam, drawn:
 
-**The same engine runs in both layers — that's why this scales to on-device.**
-The build pipeline imports `buildAdjacency` from `features/routing/graph`
-(`build-graph.ts:4,29`). That same `features/` code ships to the device. The
-copy step makes it bundleable:
+```
+  Layers-and-hops — crossing the artifact boundary
 
-```js
-// mobile/scripts/sync-engine.mjs:15-19
-for (const dir of ["features", "lib", "pipeline"]) {
-  cpSync(path.join(repoRoot, dir), path.join(dest, dir), {
-    recursive: true,
-    filter: (src) => !src.endsWith(".test.ts"),   // 18: skip tests
-  });
-}
+  ┌─ Build machine ─────────┐  hop 1: JSON.stringify(graph)   ┌─ Disk ─────────┐
+  │  run-build.ts           │ ──────────────────────────────► │ data/graph.json│
+  └─────────────────────────┘                                 └───────┬────────┘
+                                                  hop 2: copy into     │
+                                                  mobile/assets/       ▼
+  ┌─ Phone (bundle) ────────┐  hop 3: import + cast            ┌─ Bundle ───────┐
+  │  loadGraph.ts → Graph   │ ◄────────────────────────────── │ graph.json     │
+  └─────────────────────────┘                                 └────────────────┘
+
+  hop 1 = seconds, network-bound  |  hop 3 = milliseconds, no network
 ```
 
-Because `pipeline/` itself is copied in, the device can re-run the build for
-new areas — which is the next pattern (`02-on-device-pipeline-rerun.md`). The
-artifact is the base case; the on-device re-run is the same machine pointed at a
-different bbox.
+**What the artifact costs you, named.** It's 544 KB on disk (`mobile/assets/graph.json`)
+for a single Capitol Hill slice. `config.ts:4` keeps the bbox small *on purpose* —
+"so the bundled graph.json stays phone-friendly." That's the tradeoff stated
+plainly: a frozen artifact means bundle size scales with covered area, and the base
+coverage is intentionally tiny because the on-device rerun (`02-`) backfills the rest.
 
-#### Move 2 variant — what breaks if you remove it
+#### Move 3 — the principle
 
-The irreducible kernel is three parts:
+Precompute anything that's expensive to derive and cheap to store, **as long as it
+doesn't change between builds.** The street graph qualifies: streets and 90m DEM
+elevation are effectively static, so paying the cost once at build time and freezing
+the result removes an entire server, an entire query layer, and an entire
+availability dependency from the runtime. The discipline that makes it work is
+keeping the producer pure (no `fs`, no globals) so the *same* code can run on either
+side of the freeze.
 
-1. **The build step** (`run-build.ts:40-52`). Remove it and there's no graph —
-   the runtime would have to compute it, which means shipping a backend or
-   doing the full Overpass+elevation+grade work on first launch every time.
-2. **The serialization** (`run-build.ts:11-13`). Remove the `JSON.stringify`
-   and there's nothing to ship — the computed graph dies with the build
-   process.
-3. **The synchronous load** (`loadGraph.ts:7`). Remove the static import and
-   the runtime is back to async fetch + loading states + a server to fetch
-   *from*.
-
-Optional hardening layered on top: the `sync-engine.mjs` copy (an artifact of
-Metro's watch scope, not the pattern), and the on-device re-run (an *extension*
-of the base artifact, not part of it).
-
-### Move 3 — the principle
-
-The principle is **push work to the cheapest lifecycle stage that can do it.**
-Graph construction is expensive and rarely changes, so it belongs at build time,
-not request time. The moment you accept that, the backend evaporates: there's
-nothing left for a server to do. This is the same instinct behind SSG, behind
-compiled-vs-interpreted, behind precomputed indexes — do the work once, where
-it's cheap, and let the hot path just read.
+---
 
 ## Primary diagram
 
 ```
-  Build-time graph artifact — the full picture
+  Build-time graph artifact — the whole pattern
 
-  ┌─ BUILD LIFECYCLE (once, npm run build:graph) ─────────────────────────┐
-  │                                                                       │
-  │  Overpass ─► osm ─► split ─► elevation ─► grade ─► buildAdjacency     │
-  │  (network)         (≤12m)   (3 providers) (signed)                    │
-  │                                  │                                    │
-  │                                  ▼                                    │
-  │                   buildGraph() → {nodes,edges,adjacency,bbox}         │
-  │                                  │                                    │
-  │                       JSON.stringify (run-build.ts:12)                │
-  │                                  ▼                                    │
-  │                          ★ data/graph.json ★                         │
-  └──────────────────────────────────┬────────────────────────────────── ┘
-                                      │  hand-copied → mobile/assets/
-  ════════════════════════ THE SEAM (a static file) ═══════════════════════
-                                      │
-  ┌─ RUNTIME LIFECYCLE (every session) ──────────────────────────────────┐
-  │   loadGraph() ── import graph.json ──► Graph ──► directedAstar(...)    │
-  │   (synchronous, no fetch, no DB, no backend)                          │
-  └────────────────────────────────────────────────────────────────────── ┘
+  ┌─ BUILD (Node) ──────────────────────────────────────────────┐
+  │  config.BBOX                                                 │
+  │      ▼                                                       │
+  │  fetchOverpass → parseOsm → splitWays → sampleElevations     │
+  │      → computeGrades → buildAdjacency ──► Graph (pure, no fs) │
+  │                                              │               │
+  │                                  run-build.ts│ writeFileSync  │
+  └──────────────────────────────────────────────┼──────────────┘
+                                                  ▼
+                          data/graph.json  (544 KB, frozen)
+                                                  │ copy → mobile/assets/
+   ═══════════════════ ARTIFACT BOUNDARY ═════════╪═══════════════════════
+                                                  ▼
+  ┌─ RUNTIME (phone) ──────────────────────────────────────────┐
+  │  import graph.json → loadGraph(): Graph → baseGraph         │
+  │      (no network, no DB, no build — just a typed read)      │
+  └────────────────────────────────────────────────────────────┘
 ```
+
+---
 
 ## Elaborate
 
-This is static site generation generalized past HTML. The web learned it the
-hard way: rendering every page per request doesn't scale, so Jamstack/SSG moved
-rendering to build time and served static files from a CDN. flattr applies the
-identical reasoning to graph data — the "render" is graph construction, the
-"CDN file" is `graph.json`.
+This is the same idea as a static-site generator (Next.js `getStaticProps`,
+Jekyll, Hugo): move work from request time to build time when the inputs are known
+ahead of time. It's also the "data as an asset" pattern — shipping a SQLite file or
+a prebuilt index inside an app instead of querying a server.
 
-The interesting twist is that flattr doesn't *only* prebuild. Because the build
-pipeline is just TypeScript that also runs on-device, it can fall back to
-build-at-runtime for areas the artifact doesn't cover. That's a hybrid the web
-SSG world also reached eventually — Incremental Static Regeneration is "prebuilt
-by default, build-on-demand at the edges." flattr's `useTileGraph` is ISR for a
-street graph. Read `02-on-device-pipeline-rerun.md` next.
+flattr's variant is unusual in that the *producer of the artifact is also importable
+by the consumer* (`build-graph.ts` has no `fs`), which sets up the next pattern: the
+runtime can re-run the build for areas the artifact doesn't cover. Most SSG setups
+can't do that — the build toolchain doesn't ship to the client. Here it does, on
+purpose. Read `02-on-device-pipeline-rerun.md` next; it's the direct consequence of
+keeping `buildGraph` pure.
 
-What to read next: `03-tile-merge-stitch.md` for how on-demand pieces glue onto
-the base artifact, and neighboring **study-data-modeling** for the `Node`/`Edge`
-schema that the artifact serializes.
+Adjacent guides: the on-disk serialization/durability mechanics →
+`study-database-systems`; the `Graph`/`Node`/`Edge` schema →
+`study-data-modeling`.
+
+---
 
 ## Interview defense
 
-**Q: Why no backend? Isn't that a limitation?**
-It's a consequence of the data being read-mostly and computable ahead of time.
-The only work a backend would do — turn OSM + elevation into a routable graph —
-happens at build time and ships as `data/graph.json` (`run-build.ts:48`). The
-runtime imports it synchronously (`loadGraph.ts:7`) and routes locally. No
-per-request compute means no server to run it on.
+**Q: Why no database? Isn't a file a step backward?**
+A street graph is read-only at runtime and rebuilt offline. A database buys you
+mutation, queries, and concurrency — flattr needs none of those for the base graph.
+A file buys zero cold-start network, zero server, zero query layer. For
+*immutable-between-builds, read-only* data, the file is the correct choice, not a
+compromise.
 
 ```
-  request-time compute        vs        build-time compute (flattr)
-  ──────────────────────                ───────────────────────────
-  client → server → DB → compute        client → import file → route
-  (every request pays)                  (compute paid once, at build)
+  the decision, drawn
+
+  data is immutable between builds? ──yes──► freeze it (file)
+                                  └──no───► need a datastore
 ```
-Anchor: *the backend evaporates because the graph is precomputed.*
+Anchor: *"No live backend / DB. Graph is a prebuilt static artifact."*
 
-**Q: What's the cost of the static-artifact approach?**
-Staleness and manual invalidation. There's no freshness check —
-`graph.json` is rebuilt and copied by hand (`loadGraph.ts:2-5` comment). The
-base coverage drifts from OSM until someone re-runs `npm run build:graph`.
-That's acceptable for an MVP slice and the right call to avoid running
-infrastructure; at coverage scale you'd automate the rebuild.
+**Q: What's the load-bearing line in this whole pattern?**
+`pipeline/build-graph.ts:2` — the *absence* of `node:fs`. Keeping the producer
+pure is what lets the same builder run on the phone later. Drop that and you'd have
+two diverging graph builders. Naming the thing that *isn't* there is the signal you
+understood why it's structured this way.
+Anchor: pure producer = reusable across the artifact seam.
 
-**Q: The load-bearing part people forget?**
-The serialization step. Computing the graph is the obvious part; the part that
-makes it an *artifact* is `JSON.stringify` to a single file
-(`run-build.ts:12`). Without it the computed graph dies with the build process
-and you're back to needing a server.
+**Q: First thing that breaks at 10× area?**
+Bundle size and cold-start parse — the artifact grows with coverage. The code
+already anticipates this (`config.ts:4` keeps the bbox small); the escape hatch is
+the on-device rerun, so you ship a small base and backfill.
+Anchor: artifact size scales with area; coverage is intentionally tiny.
+
+---
 
 ## See also
 
-- `00-overview.md` — the whole system in one frame
-- `02-on-device-pipeline-rerun.md` — the same pipeline, run on the device
-- `03-tile-merge-stitch.md` — how new pieces attach to the base artifact
-- `audit.md` §1 (system-map), §5 (storage choice)
-- neighboring: **study-data-modeling** (the serialized `Node`/`Edge` schema)
+- `02-on-device-pipeline-rerun.md` — the same pipeline running on the phone.
+- `03-tile-merge-stitch.md` — how runtime regions glue onto the base artifact.
+- `05-elevation-provider-fallback.md` — the elevation stage's failure model.
+- `audit.md` lenses 1, 5, 7 — boundaries, storage choice, scale.
+</content>

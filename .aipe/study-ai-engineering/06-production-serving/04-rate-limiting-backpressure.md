@@ -1,82 +1,204 @@
-# Rate Limiting & Backpressure
+# Rate limiting & backpressure — the geocode/elevation calls
 
-*Industry name: rate limiting / backpressure / load shedding — serving flow control.*
+**Industry name(s):** rate limiting / throttling / backpressure.
+**Type:** Industry standard. **Has a REAL home in flattr** — the Nominatim and Open-Meteo HTTP calls.
 
-## Zoom out
+## Zoom out — flattr already pages itself to a 1 req/sec external limit
+
+This isn't a hypothetical for flattr. Its *only* external calls —
+Nominatim geocoding and Open-Meteo elevation — are rate-limited services,
+and flattr already shapes its request rate around them. `MapScreen.tsx`
+deliberately issues the From/To geocodes *sequentially* with the comment
+"Nominatim allows ~1 req/sec," debounces autocomplete, and the elevation
+API *429s on quota*. So rate limiting and backpressure have a real,
+non-LLM home in this repo today. The LLM version (token-per-minute
+limits, queueing describe calls) would attach at a future describe call —
+but the pattern is already exercised against real HTTP dependencies.
 
 ```
-  Two directions of flow control
-  ┌───────────────────────────────────────────────────────────┐
-  │  INBOUND (rate limiting)     │  OUTBOUND (backpressure)      │
-  │  cap how fast clients hit YOU │  cap how fast YOU hit a dep   │
-  │                              │                              │
-  │  clients ──►[limiter]──► app  │  app ──►[limiter]──► provider │
-  │  reject/queue excess         │  slow/queue to stay under cap │
-  └───────────────────────────────────────────────────────────┘
+  Zoom out — where flattr meets rate limits TODAY
+
+  ┌─ UI (mobile/) ──────────────────────────────────────────┐
+  │  typing → debounced suggest · From/To → sequential geocode│
+  └────────────────────────────┬─────────────────────────────┘
+              REAL rate limits ▼
+  ┌─ External services ─────────────────────────────────────┐
+  │  Nominatim  ~1 req/sec policy                           │
+  │  Open-Meteo elevation  429 on quota                    │
+  └────────────────────────────┬─────────────────────────────┘
+              ★ same pattern would shape a future describe call
 ```
 
-Every serving system has a maximum sustainable rate. Rate limiting protects *you* from clients; backpressure protects a *downstream dependency* from you. For LLM apps both matter: providers enforce RPM/TPM limits (you must not exceed them — outbound), and you cap your own users so one client can't drain your quota (inbound). Same mechanism, opposite ends of the pipe.
+## Structure pass
+
+- **Layers:** UI (request source) → engine (`geocode`) → external service
+  (rate-limited).
+- **Axis — request pressure vs service capacity:** the UI can *generate*
+  far more requests than the service will *accept* (a fast typist, two
+  endpoints at once). Rate limiting throttles the source; backpressure is
+  the source *slowing down* because the sink is full.
+- **Seam:** `MapScreen.tsx:189` is the throttle seam — the From geocode
+  and the To geocode are `await`-ed in sequence, on purpose, so two calls
+  never hit Nominatim in the same second. The rate-shaping lives in the
+  *caller*, not in `geocode()` itself.
 
 ## How it works
 
-### Move 1 — the pattern: a budget over time
+### Move 1 — the mental model
+
+Rate limiting caps *how often* you call a dependency; backpressure is the
+feedback that makes a fast producer wait for a slow consumer. Three tools
+do most of the work: **debounce** (drop bursts — only fire after input
+settles), **serialize** (one call at a time, so N calls take N×latency
+not N-at-once), and **token bucket / spacing** (enforce a minimum gap
+between calls). flattr uses the first two today against real limits.
 
 ```
-  token bucket:   [● ● ● ● ●]  refills at R per sec, cap N
-                   │
-   request ────────┤ token available? ─► proceed (take one)
-                   └ empty?            ─► wait / queue / reject
+  Pattern — three throttles, by where pressure builds
+
+  debounce    typing bursts → fire once after settle (suggest)
+  serialize   N parallel → N sequential (From then To geocode)
+  spacing     enforce ≥ Δt between calls (token bucket / 1 req/sec)
+        │
+  flattr today: debounce (suggest) + serialize (geocode pair)
 ```
 
-Mental model: a rate limit is a budget that refills on a clock. The only design choices are *what to do when the budget is empty*: **block** (wait — backpressure), **queue** (defer), or **shed** (reject/429 — protect yourself). LLM serving uses all three: block on provider limits, queue background jobs, shed abusive users.
+### Move 2 — the walkthrough
 
-### Move 2 — step by step (outbound, the common LLM case)
+**Serialize — the From/To geocode pair.** `MapScreen.tsx` resolves two
+addresses but never fires them together:
 
+```ts
+// MapScreen.tsx:182 — From, awaited first
+const a = await geocode(from, { viewbox });
+...
+// MapScreen.tsx:189 — To, awaited AFTER → "Nominatim allows ~1 req/sec"
+const b = await geocode(to, { viewbox });
 ```
-  1. provider says: 60 requests / minute
-  2. you set a limiter at ≤ 1 req/sec (with headroom)
-  3. before each call: acquire a slot (block if none free)
-  4. on 429 anyway: back off and retry (→ 05)
-  5. for bulk work: SEQUENTIAL or small-concurrency, not a burst
+
+`Promise.all([geocode(from), geocode(to)])` would be faster but would
+fire two requests in the same instant — exactly what the ~1 req/sec
+policy forbids. The sequential `await` *is* the rate limiter.
+
+**Debounce — autocomplete suggestions.** Typing generates a request per
+keystroke unless you damp it. flattr does:
+
+```ts
+// MapScreen.tsx:80 — fire only after input settles (400ms)
+suggestTimer.current = setTimeout(async () => {
+  const results = await geocodeSuggest(text, { viewbox: searchViewbox, ... });
+  ...
+}, 400);
 ```
 
-The simplest correct limiter is *just do one thing at a time* — sequential calls with a delay. It throws away throughput, but for a polite client against a 1-req/sec API it's exactly right and impossible to get wrong.
+plus a 3-char minimum (`MapScreen.tsx:75`) — so a fast typist generates
+*one* geocode, not ten. That's backpressure against the same Nominatim
+limit.
+
+**The elevation 429 — backpressure from the sink.** Open-Meteo returns
+429 when the build pipeline exceeds quota. The response there is
+*caching* (`elevCache.ts` — already-fetched cells never re-hit the API)
+plus retry/backoff (next file). Caching is backpressure relief: the more
+you cache, the less pressure reaches the rate-limited sink.
+
+**Where an LLM rate limit would attach.** A future describe call against
+a cloud model has a tokens-per-minute limit. The *same* three tools
+apply: debounce describe regeneration, serialize concurrent describes,
+and space calls under the TPM budget — layered onto the existing
+request-shaping in `MapScreen.tsx`.
 
 ### Move 3 — the principle
 
-**Match your emission rate to the slowest thing downstream, and decide explicitly what happens to the overflow.** A pipeline that emits faster than its consumer absorbs will fail — the only question is whether it fails loudly (429s) or you shape the flow on purpose.
+Shape the request rate at the *source*, to the *slowest* dependency's
+limit. flattr does this today: it serializes the geocode pair and
+debounces suggestions because Nominatim only tolerates ~1 req/sec, and it
+caches elevation because Open-Meteo 429s. The LLM version is the same
+discipline against a token budget. Backpressure is just letting the slow
+sink set the producer's pace.
 
-## In this codebase
-
-**NOT YET EXERCISED for LLM** — no model, no provider RPM to respect. But flattr already does outbound rate limiting *correctly* against two real external APIs, using the two simplest valid strategies. The pattern transfers one-to-one to LLM serving.
+## Primary diagram
 
 ```
-  flattr's outbound flow control (real, today)
-  ┌──────────────────────────────────────────────────────────────┐
-  │  ① Nominatim (~1 req/sec policy)                                │
-  │     strategy: SEQUENTIAL calls, never parallel                 │
-  │     mobile/src/MapScreen.tsx:189                               │
-  │       const b = await geocode(to, { viewbox });                │
-  │       // "sequential: Nominatim allows ~1 req/sec"            │
-  │     From is awaited (:182) BEFORE To (:189) — by construction  │
-  │     the app never bursts two geocode calls at once.            │
-  │                                                                │
-  │  ② Open-Meteo Elevation (free-tier, 429-prone)                 │
-  │     strategy: BATCH + THROTTLE                                 │
-  │     pipeline/elevation.ts                                      │
-  │       OPEN_METEO_BATCH = 100   ← ≤100 points per request       │
-  │       delayMs = 300            ← sleep between batches         │
-  │       (and 429 backoff — see 05)                              │
-  └──────────────────────────────────────────────────────────────┘
+  flattr's request shaping (real, today)
+
+  ┌─ typing ──────┐  debounce 400ms + 3-char min (MapScreen.tsx:75/80)
+  │               ▼
+  │   geocodeSuggest ──────────► Nominatim (~1 req/sec)
+  │
+  ┌─ Route press ─┐  serialize (MapScreen.tsx:182 → :189)
+  │   geocode(from) ──await──► geocode(to) ──► Nominatim
+  │
+  ┌─ build ───────┐  cache-first (elevCache.ts) → fewer calls
+  │   elevation ──────────────► Open-Meteo (429 on quota)
+  └─────────────────────────────────────────────────────────
+  (future) describe ──► space under TPM budget ──► cloud model
 ```
 
-- **The Nominatim case is the cleanest possible rate limiter:** concurrency of one. `MapScreen.tsx:182` awaits the *From* geocode fully before `:189` issues the *To* geocode. There's no token bucket because there doesn't need to be — serializing the two awaits *is* the limiter, and the comment names the policy it's respecting. This is exactly how you'd serialize calls to an LLM provider with a tight RPM limit.
-- **The Open-Meteo case is the bulk-job version:** chunk the work (`OPEN_METEO_BATCH = 100`), sleep between chunks (`delayMs`, `sleep(delayMs)` at line 121), and stay under the quota by construction. Swap "100 elevation points" for "100 documents to summarize" and this is LLM batch processing with backpressure.
+## Elaborate
 
-**The shape you'd reuse for an LLM:** if narration shipped at `features/routing/summary.ts:11`, you'd put the *same* sequential-await or batch-with-delay discipline in front of the model call to respect its RPM/TPM limits. flattr already writes this correctly — just for map APIs instead of a model. **Not exercised for LLM.**
+The cleanest backpressure relief flattr has isn't a throttle at all —
+it's the cache. `elevCache.ts` removes pressure from the elevation API by
+never asking twice for the same cell, which does more for the 429 problem
+than any retry. The general lesson: the best way to survive a rate limit
+is to *not make the call*. For a future describe feature, the
+describe-cache (see [01-llm-caching.md](01-llm-caching.md)) is the first
+line of rate-limit defense, before any spacing logic. Throttle what you
+can't cache; cache everything you can.
+
+## Project exercises
+
+### B6-RATE.1 — explicit spacing for the geocode pair
+
+- **Exercise ID:** B6-RATE.1
+- **What to build:** a small `rateLimit(minGapMs)` helper that enforces a
+  ≥1000 ms gap between Nominatim calls, replacing the implicit
+  sequential-`await` with an explicit token-bucket spacing.
+- **Why it earns its place:** it turns the load-bearing comment at
+  `MapScreen.tsx:189` into enforced behavior that survives refactors.
+- **Files to touch:** new `pipeline/rateLimit.ts`, call sites
+  `MapScreen.tsx:182`/`:189`/`:82`.
+- **Done when:** two geocodes fired back-to-back are spaced ≥1 s, proven
+  by a test with a fake clock.
+- **Estimated effort:** 2–3 hrs.
+
+### B6-RATE.2 — bounded concurrency for elevation fetches
+
+- **Exercise ID:** B6-RATE.2
+- **What to build:** a concurrency-capped queue for elevation requests
+  (e.g. ≤4 in flight) feeding `elevCache`, so a corridor load can't burst
+  the Open-Meteo quota.
+- **Why it earns its place:** it adds backpressure at the real 429 source
+  the cache alone can't cover (cold cells).
+- **Files to touch:** the elevation fetch path (`pipeline/elevation.ts`),
+  reuse `elevCache.ts` get/put.
+- **Done when:** a cold corridor load never exceeds the cap in flight and
+  429 rate drops under load.
+- **Estimated effort:** 3–4 hrs.
+
+## Interview defense
+
+**Q: does flattr handle rate limits?** Answer: yes, against real
+services. Its only external calls are Nominatim and Open-Meteo, both
+rate-limited. The From/To geocodes are `await`-ed *sequentially*
+(`MapScreen.tsx:189`, commented "Nominatim allows ~1 req/sec") so two
+requests never hit the same second; autocomplete is debounced 400 ms with
+a 3-char floor (`MapScreen.tsx:75`/`:80`); and elevation 429s are
+absorbed by `elevCache` so already-fetched cells never re-call. That's
+serialize + debounce + cache — the same three tools an LLM TPM limit
+would need, which would attach at a future describe call. Load-bearing
+point: shape the request rate at the source to the slowest dependency,
+and the strongest throttle is the call you cache away.
+
+```
+  serialize + debounce + cache → fit the ~1 req/sec sink
+```
+
+Anchor: *"flattr's rate limiting isn't hypothetical — the sequential
+geocode at `MapScreen.tsx:189` exists because Nominatim demands it."*
 
 ## See also
 
-- `05-retry-circuit-breaker.md` — what to do when you hit the limit anyway (429)
-- `02-llm-cost-optimization.md` — rate limiting and cost both target the same metered dependency
-- `mobile/src/MapScreen.tsx:182,189` and `pipeline/elevation.ts:96–121` — the two live limiters
+- [05-retry-circuit-breaker.md](05-retry-circuit-breaker.md) — what to do when the throttled call still fails.
+- [01-llm-caching.md](01-llm-caching.md) — the cache is the best backpressure relief.
+- [02-llm-cost-optimization.md](02-llm-cost-optimization.md) — quota is flattr's real cost; rate limiting protects it.
+- [../05-evals-and-observability/04-llm-observability.md](../05-evals-and-observability/04-llm-observability.md) — track throttle waits and 429s as span attributes.

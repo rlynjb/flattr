@@ -1,294 +1,305 @@
-# Parametric search over cost functions
+# 01 — Parametric search over cost functions
 
-> **Strategy pattern / dependency injection / higher-order function**
-> — Industry standard. The deep module is APOSD-specific framing.
+**Industry names:** strategy pattern / dependency injection / policy-as-parameter.
+**Type label:** Industry standard.
+
+One `search()` is Dijkstra, A*, grade-A*, and directed-A* — the
+difference is two function arguments, never a branch inside the loop.
+
+---
 
 ## Zoom out, then zoom in
 
-You've got four algorithms to ship: Dijkstra, A\*, grade-aware A\*, and
-directional grade A\*. The naive repo has four search functions, each ~60
-lines, each re-implementing the frontier, the closed set, and the path
-reconstruction. flattr has *one*. The four "algorithms" are just different
-arguments handed to it.
-
-Here's where that one function sits.
+Where this sits: it's the floor of the routing core. Everything that
+routes — the bench harness, the mobile route button, every test — calls
+through this one function.
 
 ```
-  Zoom out — where search() lives
+  Zoom out — where parametric search lives
 
-  ┌─ UI layer (mobile) ─────────────────────────────────┐
-  │  MapScreen.tsx  →  directedAstar(graph, a, b, max)   │
-  └───────────────────────────┬──────────────────────────┘
-                              │  (graph, start, goal, userMax)
-  ┌─ Core: features/routing ──▼──────────────────────────┐
-  │  ★ search(graph, start, goal, max, costFn, heur) ★    │ ← we are here
-  │       uses: pqueue.ts · graph.ts · cost.ts           │
-  └───────────────────────────┬──────────────────────────┘
-                              │  costFn(edge, from, max) → number
-  ┌─ cost.ts ─────────────────▼──────────────────────────┐
-  │  distanceCost · gradeCostAbs · gradeCostDirected      │
-  └───────────────────────────────────────────────────────┘
+  ┌─ MOBILE / BENCH (callers) ───────────────────────────────────┐
+  │  MapScreen route tap        bench/run.ts        *.test.ts     │
+  └───────────────────────────────┬──────────────────────────────┘
+                                  │ dijkstra() / astar() /
+                                  │ gradeAstar() / directedAstar()
+  ┌─ ROUTING CORE (features/routing) ────────────────────────────┐
+  │  ┌──────────────────────────────────────────────────────┐    │
+  │  │  ★ search(graph, start, goal, userMax,                │    │
+  │  │           costFn, heuristicFn)  ★  ← we are here       │    │
+  │  └───────┬───────────────────────────┬───────────────────┘    │
+  │          │ costFn                     │ heuristicFn            │
+  │   ┌──────▼─────┐               ┌──────▼─────┐                  │
+  │   │ cost.ts    │               │ haversine /│                  │
+  │   │ (penalty)  │               │ zero       │                  │
+  │   └────────────┘               └────────────┘                  │
+  └───────────────────────────────────────────────────────────────┘
 ```
 
-Zoom in: this is the **deepest module in the repo** — big behavior (four
-optimal-pathfinding algorithms) behind a small interface (one function
-signature). The trick is that the *algorithm* (Dijkstra vs A\* vs grade A\*)
-isn't four implementations — it's two parameters: a cost function and a
-heuristic. Change the arguments, change the algorithm. That's the strategy
-pattern, and it's why `astar.ts` is 163 lines instead of 500.
+Zoom in: the pattern is **the strategy pattern, applied to a graph
+search.** You've done this every time you passed a comparator to
+`Array.prototype.sort` — `sort` is the algorithm, your `(a,b) => …` is
+the policy. Here `search` is the algorithm and `(costFn, heuristicFn)`
+is the policy. The whole "Dijkstra → A* → grade → directional"
+progression the bench measures is *one body* with four argument pairs.
+
+---
 
 ## Structure pass
 
-**Layers.** Three nested levels, all in `astar.ts`:
-- *Generic*: `search()` — the frontier loop, agnostic to what it minimizes.
-- *Configured*: the stage wrappers `dijkstra`/`astar`/`gradeAstar`/
-  `directedAstar` — each binds one `(costFn, heuristic)` pair.
-- *Domain*: the cost functions themselves live in `cost.ts` (pattern `02`).
+**Layers.** Two: the generic search engine (outer) and the concrete
+cost/heuristic policies (inner). The stage wrappers
+(`dijkstra`/`astar`/`gradeAstar`/`directedAstar`) are the named bindings
+between them.
 
-**Axis — "who decides what counts as cheap?"** Trace it down:
+**Axis held constant — "who knows the domain (grade)?"** Trace it down:
 
 ```
-  axis = "who decides edge cost?"
+  One question down the layers: "who knows about grade?"
 
-  ┌─ search() loop ────────────┐  doesn't decide — CALLS costFn
-  └──────────┬──────────────────┘
-             │  seam: CostFn type (types.ts:40)
-  ┌─ stage wrapper ───────────┐  decides WHICH costFn to bind
-  └──────────┬──────────────────┘
-             │
-  ┌─ cost.ts ─────────────────┐  decides the actual number
-  └─────────────────────────────┘
+  ┌──────────────────────────────────────┐
+  │ search()           astar.ts:22        │  → knows NOTHING about grade
+  └──────────────────────────────────────┘
+      ┌──────────────────────────────────┐
+      │ costFn (a parameter)             │  → the seam: grade enters HERE
+      └──────────────────────────────────┘
+          ┌──────────────────────────────┐
+          │ gradeCostDirected  cost.ts:32│  → knows EVERYTHING about grade
+          └──────────────────────────────┘
 
-  control of "what is cheap" flips at the CostFn seam
+  the answer flips at the costFn boundary — that's the load-bearing seam
 ```
 
-**Seam.** The load-bearing boundary is the `CostFn` type (`types.ts:40`):
-`(edge, fromNodeId, userMax) => number`. Above it, the search loop knows
-only "smaller is better." Below it, the whole grade domain. Control flips:
-the loop *calls*, the cost fn *decides*. That's a real contract, and it's why
-you can study the search loop without ever reading `cost.ts`.
+**Seam.** `search() │ costFn`. The axis "who knows about grade" flips
+from *nothing* to *everything* exactly there. That's why it's load-bearing:
+you can swap the grade model, add a new cost (traffic, surface, shade)
+or remove grade entirely, and the search loop never changes. → the
+penalty side of this seam is `02-penalty-as-the-domain-seam.md`.
+
+Hand off to mechanics.
+
+---
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You already know this shape from React: a `<List>` component that takes a
-`renderItem` prop. The list owns the iteration, the keys, the virtualization
-— all the hard generic machinery — and delegates "what does one row look
-like?" to a function you pass in. `search()` is the same move: it owns the
-frontier, the closed set, the relaxation, the reconstruction — and delegates
-"what does one edge cost?" to a function you pass in.
+The shape: a search loop with two **holes** punched in it where a
+decision must be made — "what does this edge cost?" and "how far might
+the goal still be?" — and those holes are filled by arguments, not by
+`if` branches. Same shape as `sort(arr, comparator)`: the loop is fixed,
+the policy is injected.
 
 ```
-  the pattern — one engine, swappable cost
+  Pattern — the loop with two injected holes
 
-           ┌──────────────────────────────┐
-  costFn ─►│         search()             │
-  heur   ─►│  frontier · closed · relax   │─► Path
-           │  reconstruct · summarize     │
-           └──────────────────────────────┘
-                       ▲
-        same engine, four behaviors:
-          (distanceCost, zero)        = Dijkstra
-          (distanceCost, haversine)   = A*
-          (gradeCostAbs, haversine)   = grade A*
-          (gradeCostDirected, haversine) = directional A*
+         ┌───────────────────────────────────────┐
+         │  pop cheapest frontier node            │
+         │  for each neighbor edge:               │
+         │     g' = g + ┌───────────┐ ← HOLE 1    │
+         │              │  costFn   │   (policy)   │
+         │              └───────────┘              │
+         │     priority = g' + ┌────────────┐      │
+         │                     │ heuristicFn│ ←HOLE 2
+         │                     └────────────┘      │
+         │     push neighbor at priority           │
+         └───────────────────────────────────────┘
+              the loop is fixed; the holes are arguments
 ```
 
-In one sentence: **the algorithm is data — a pair of functions — not code.**
+### Move 2 — the walkthrough
 
-### Move 2 — the step-by-step walkthrough
-
-#### The generic engine never names a domain concept
-
-This is the load-bearing part. Open `search()` and search it for the word
-"grade." It isn't there. The loop talks about `g` (cost-so-far), `tentative`,
-`closed`, `open` — pure pathfinding vocabulary.
+**The signature is the whole design.** `search` takes the two policies
+as its last two parameters. This is the line that makes four algorithms
+into one.
 
 ```ts
-// astar.ts:64-74 — the relaxation step, annotated
-for (const edgeId of graph.adjacency[current] ?? []) {   // expand neighbors
-  const edge = byId.get(edgeId)!;                         // O(1) via index
-  const next = otherEnd(edge, current);                   // graph.ts — endpoint
-  if (closed.has(next)) continue;                         // skip finalized
-  const tentative = g.get(current)! + costFn(edge, current, userMax);
-  //                                  └── the ONLY domain touchpoint ──┘
-  if (tentative < (g.get(next) ?? Infinity)) {            // better path?
-    g.set(next, tentative);
-    came.set(next, { edge, prev: current });
-    open.push(next, tentative + heuristicFn(graph.nodes[next], goal));
-  }
-}
+// features/routing/astar.ts:22-29
+export function search(
+  graph: Graph, startId: string, goalId: string,
+  userMax: number,
+  costFn: CostFn,            // ← HOLE 1: what does an edge cost?
+  heuristicFn: HeuristicFn   // ← HOLE 2: estimate to goal
+): SearchResult {
 ```
 
-The whole grade domain enters through one expression: `costFn(edge, current,
-userMax)`. Everything else is Dijkstra's relaxation. **What breaks if you
-remove the indirection?** You'd inline grade math here, and now every
-algorithm variant has to re-implement it — change amplification across four
-functions instead of one.
+`CostFn` and `HeuristicFn` are the contracts (`types.ts:40,43`). Anything
+matching those types plugs in. That's the seam, expressed as a type.
 
-#### The stage wrappers are partial application, not duplication
+**Hole 1 fires in the relaxation step.** `astar.ts:68` — the loop adds
+`costFn(edge, current, userMax)` and never asks *what kind* of cost it
+is:
 
 ```ts
-// astar.ts:136-163 — four "algorithms", each one line of real logic
-export function dijkstra(g, start, goal) {
-  return search(g, start, goal, Infinity, distanceCost, zeroHeuristic);
-}
-export function directedAstar(g, start, goal, userMax) {
-  return search(g, start, goal, userMax, gradeCostDirected, haversineHeuristic);
-}
+// features/routing/astar.ts:68
+const tentative = g.get(current)! + costFn(edge, current, userMax);
 ```
 
-Each wrapper binds a `(costFn, heuristic)` pair and names the result. The
-name *is* the abstraction: "directional A\*" is precisely "search with the
-directed-grade cost and the haversine heuristic." A reader who sees
-`directedAstar` in `MapScreen.tsx` knows exactly what runs without reading
-`search()`. **What breaks if you remove the wrappers?** Nothing structural —
-but every call site would have to pass four functions correctly, and "which
-heuristic pairs with which cost?" would leak up to the UI. The wrappers pull
-that decision down (APOSD: pull complexity downward — see `audit.md` Lens 5).
+Bridge from what you know: this is the `g + edgeWeight` line of any
+Dijkstra you've written — except `edgeWeight` is `costFn(...)`, so the
+*meaning* of "weight" is supplied from outside. For `distanceCost` it's
+meters; for `gradeCostDirected` it's meters-inflated-by-uphill. The loop
+can't tell.
 
-#### Heuristic is the second injected strategy — and it must stay honest
+**Hole 2 fires in the push.** `astar.ts:72`:
 
-The heuristic is the other parameter. `zeroHeuristic` (`astar.ts:8`) turns
-A\* into Dijkstra (no guidance). `haversineHeuristic` (`astar.ts:9`)
-estimates straight-line distance to the goal.
-
-```
-  layers-and-hops — what each injected function sees
-
-  ┌─ search() ─────────────────────────────────────────────┐
-  │  per edge:  cost  = costFn(edge, from, userMax)         │
-  │  per node:  bound = heuristicFn(node, goal)             │
-  │  priority = cost-so-far + bound                         │
-  └───────┬───────────────────────────┬────────────────────┘
-          │ hop: edge + from + max     │ hop: node + goal
-          ▼                            ▼
-   ┌─ cost.ts ──────┐          ┌─ lib/geo.ts ────┐
-   │ returns ≥ 0    │          │ haversine ≤ true │
-   └────────────────┘          │ remaining dist   │
-                               └──────────────────┘
+```ts
+// features/routing/astar.ts:72
+open.push(next, tentative + heuristicFn(graph.nodes[next], goal));
 ```
 
-The contract on the heuristic is **admissibility**: it must never
-*overestimate* remaining cost, or A\* can return a non-optimal path. Haversine
-is a straight-line lower bound on graph distance — admissible by geometry.
-The matching contract on the cost function is that the penalty is `≥ 0`
-(`cost.ts` `penalty` returns 0 for downhill), so adding grade penalty only
-*increases* cost and never breaks the haversine lower bound. **What breaks if
-the heuristic overestimates?** A\* prunes a node it shouldn't and returns a
-suboptimal route — silently. That's why `project context` lists "heuristic
-must stay admissible" as a must-not-change constraint.
+For `zeroHeuristic` (`astar.ts:8`) this is just `tentative` — pure
+Dijkstra, no guidance. For `haversineHeuristic` (`astar.ts:9`) it adds a
+straight-line lower bound — A*'s informed push. **The boundary condition:**
+the heuristic must be *admissible* (never overestimate) or A* returns a
+wrong path. flattr keeps it admissible by construction — haversine is a
+true lower bound on road distance, and the grade penalty is ≥ 0 so it
+only ever *adds* cost (audit constraint, spec §14). Break admissibility
+and this exact line silently returns suboptimal routes.
 
-#### One reconstruction, shared by both search shapes
+**The four bindings — the named vocabulary.** `astar.ts:136-163` binds
+the holes:
 
-`summarizePath` (`astar.ts:110-131`) is itself injected with `costFn` — it
-re-sums the exact traversed edges and flags `steepEdges`. Crucially, both
-`search()` *and* `bidirectional()` call it (`bidirectional.ts:6`), so the
-"turn a node list into a Path" logic exists once. **What breaks if removed?**
-The two search algorithms would each grow their own summarizer and could
-drift — one counting climb differently than the other.
+```ts
+// features/routing/astar.ts:136-163  (condensed)
+dijkstra      = search(g, s, t, Infinity, distanceCost,       zeroHeuristic)
+astar         = search(g, s, t, Infinity, distanceCost,       haversineHeuristic)
+gradeAstar    = search(g, s, t, userMax,  gradeCostAbs,       haversineHeuristic)
+directedAstar = search(g, s, t, userMax,  gradeCostDirected,  haversineHeuristic)
+```
+
+Read down the cost column: distance → distance → abs-grade →
+directed-grade. Read the heuristic column: zero → haversine → haversine →
+haversine. The *entire algorithm progression* is a table of argument
+choices. The bench harness walks exactly these four to show each
+addition's effect on `nodesExpanded`.
+
+**Why this isn't a pass-through layer.** Each wrapper adds the one fact
+that names the algorithm (the audit lens 4 makes this call). `dijkstra`
+*is* the binding `(distanceCost, zeroHeuristic)` — that's information, not
+forwarding.
 
 ### Move 3 — the principle
 
-When variants of a thing differ only in a *decision*, make the decision a
-parameter and write the thing once. The depth of a module is functionality
-hidden per unit of interface; injecting the cost function lets `search()`
-hide four algorithms behind one signature. The general lesson: **the
-algorithm is often data.** Resist writing the fifth near-copy — find the
-parameter that already separates the four.
+When several "different" things share a skeleton and differ only in a
+decision, make the decision a parameter and the skeleton a single
+function. You stop maintaining four search loops and start maintaining
+one loop plus four tiny policies — and each policy is independently
+testable without standing up a graph. The signal that you've found the
+right seam: adding the *next* variant (a shade-aware cost, a traffic
+cost) is a new 3-line function, not an edit to `search`.
+
+---
 
 ## Primary diagram
 
-The whole pattern in one frame: one engine, two injected strategies, four
-named configurations, one shared summarizer.
+The whole pattern in one frame: one engine, two typed holes, four
+bindings, many callers.
 
 ```
-  parametric search — the complete picture
+  Parametric search — full recap
 
-  ┌─ UI ───────────────────────────────────────────────────────┐
-  │  MapScreen → directedAstar(graph, start, goal, userMax)     │
-  └───────────────────────────┬─────────────────────────────────┘
-                              │ binds (gradeCostDirected, haversine)
-  ┌─ Core: astar.ts ──────────▼─────────────────────────────────┐
-  │  ┌─ stage wrappers ─────────────────────────────────────┐   │
-  │  │ dijkstra · astar · gradeAstar · directedAstar        │   │
-  │  └───────────────────┬───────────────────────────────────┘   │
-  │  ┌─ search() ────────▼───────────────────────────────────┐   │
-  │  │  PQueue frontier → pop → closed check → relax via      │   │
-  │  │  costFn → push → goal? → reconstruct → summarizePath   │   │
-  │  └────────┬───────────────────────────┬──────────────────┘   │
-  └───────────┼───────────────────────────┼─────────────────────┘
-        costFn│                      heur  │
-   ┌─ cost.ts ▼──────┐          ┌─ lib/geo.ts ▼──┐
-   │ ≥ 0 penalty     │          │ admissible LB  │
-   └─────────────────┘          └────────────────┘
+  callers:  dijkstra()  astar()  gradeAstar()  directedAstar()  (astar.ts:136)
+                  │         │          │              │
+                  └────┬────┴─────┬────┴──────┬───────┘
+                       ▼          ▼           ▼
+                 (distanceCost,  (gradeCostAbs, (gradeCostDirected,
+                  zeroHeuristic)  haversine)     haversine)
+                       │          │           │
+                       ▼          ▼           ▼
+            ┌─────────────────────────────────────────────┐
+            │  search(graph,start,goal,userMax,            │ astar.ts:22
+            │         costFn ◄HOLE1, heuristicFn ◄HOLE2)   │
+            │  ┌───────────────────────────────────────┐  │
+            │  │ pop → relax via costFn → push via      │  │
+            │  │ tentative+heuristicFn → repeat         │  │
+            │  └───────────────────────────────────────┘  │
+            │            returns SearchResult{path,metrics}│
+            └─────────────────────────────────────────────┘
+                       CostFn / HeuristicFn = types.ts:40,43
 ```
+
+---
 
 ## Elaborate
 
-This is the strategy pattern (GoF) and, equivalently, plain dependency
-injection via higher-order functions. The deep-module framing is APOSD: the
-value isn't the pattern name, it's that one small interface hides a lot of
-behavior, so callers reason about routing without reasoning about the loop.
+This is the strategy pattern (GoF) meeting dependency injection, and it's
+the same instinct behind `Array.sort(cmp)`, React's render props, and a
+SQL planner that takes a cost model. The graph-search version has a long
+pedigree: a textbook A* *is* Dijkstra with a heuristic added, so unifying
+them under one parameterized loop isn't a flattr invention — it's
+recognizing that the "four algorithms" were always one algorithm with a
+knob. What flattr does well is resist the temptation to special-case:
+there's no `if (useGrade)` anywhere in `search`. Read `cost.ts` next
+(`02`) for the policy side of the seam; read `study-dsa-foundations` for
+the A*/Dijkstra algorithms themselves.
 
-It connects directly to pattern `02` (the cost function as the domain seam —
-*what* gets injected) and pattern `04` (the `PQueue` the engine uses — itself
-a deep module that knows nothing of grades). The benchmark harness (`bench/`)
-exploits this exact seam: it runs the same `search()` across all four
-configurations to chart the algorithm progression, which only works *because*
-the configurations are arguments.
+---
 
-To go deeper on deep modules and information hiding, read the matching
-chapters in `read-aposd`. For the algorithm correctness (admissibility,
-optimality), see `study-dsa-foundations/`.
+## Project exercises
+
+### EX-01-A — Add a fifth cost without touching `search`
+
+- **What to build:** a `surfaceCost` `CostFn` that inflates unpaved
+  edges, plus a `surfaceAstar` wrapper.
+- **Why it earns its place:** proves the seam holds — if you can add a
+  variant with zero edits to `astar.ts:22-78`, the design is real.
+- **Files to touch:** `features/routing/cost.ts` (new fn),
+  `features/routing/astar.ts` (new wrapper only).
+- **Done when:** a test routes with it and `search` is byte-unchanged.
+- **Estimated effort:** 30 min.
+
+### EX-01-B — Prove the heuristic admissibility boundary
+
+- **What to build:** a test that injects a *deliberately inadmissible*
+  heuristic (haversine × 5) and asserts the returned path is no longer
+  optimal vs Dijkstra on the same graph.
+- **Why it earns its place:** makes the load-bearing boundary condition
+  visible — the seam allows a wrong policy, so you learn what the
+  contract protects.
+- **Files to touch:** `features/routing/astar.test.ts`.
+- **Done when:** the test demonstrates the suboptimal path and a comment
+  names why.
+- **Estimated effort:** 45 min.
+
+---
 
 ## Interview defense
 
-**Q: "Why one `search()` with parameters instead of four readable, explicit
-functions? Isn't a dedicated `gradeAstar` clearer than threading a cost
-function?"**
+**Q: Why one `search()` instead of separate `dijkstra` and `astar`
+functions? Isn't that over-engineering?**
 
-The clearest version is *both*, and that's what the code does: there's one
-generic `search()` *and* four named wrappers (`astar.ts:136-163`). Callers
-get the readable name `directedAstar`; the engine gets written once. If I
-split into four full implementations, the frontier loop, closed set, and path
-reconstruction would be copy-pasted four times — and a bug fix in
-reconstruction (like the parallel-edge fix at `astar.ts:80-84`) would have to
-land in four places or silently fix only one. The parameter *is* the
-difference between the algorithms; making it a parameter makes the difference
-explicit instead of buried in four near-identical bodies.
+The load-bearing answer: Dijkstra and A* *are the same algorithm* —
+A* is Dijkstra with an admissible heuristic added to the priority. Once
+you see that, two copies is the over-engineering: two loops to keep in
+sync, two places a stale-skip bug can hide. One parameterized loop with
+`(costFn, heuristicFn)` holes is the smaller surface.
 
 ```
-  four copies            vs        one engine + four configs
-  ┌────────────┐                   ┌────────────┐
-  │ dijkstra   │ ← bug             │  search()  │ ← fix once
-  │ astar      │ ← bug fixed       └─────┬──────┘
-  │ gradeAstar │ ← bug not fixed         │ 4 configs
-  │ directed   │ ← bug not fixed    ┌────┴────┐
-  └────────────┘                   wrappers (1 line each)
+  one loop, four bindings  vs  four loops
+
+  search(…, costFn, heuristicFn)        dijkstraLoop(){…}
+     ├ (distance, zero)    = dijkstra   astarLoop(){…}      ← 4 copies
+     ├ (distance, hav)     = astar      gradeLoop(){…}        of the same
+     ├ (gradeAbs, hav)     = gradeAstar dirLoop(){…}          stale-skip
+     └ (gradeDir, hav)     = directed   ↑ every fix ×4
 ```
 
-*Anchor: the algorithm is data — a `(costFn, heuristic)` pair — so write the
-engine once and name the configurations.*
+**Q: What stops a bad cost function from breaking the search?**
+The `CostFn` type contract plus one invariant: cost ≥ 0 (penalty never
+negative, `cost.ts:16` returns 0 for downhill). And `pqueue.ts:24`
+throws on NaN priority, so a cost that returns NaN fails loud at push,
+not silently in heap order.
 
-**Q: "What's the load-bearing invariant that makes this safe?"**
+**Anchor:** "Dijkstra and A* are the same loop; the difference is two
+arguments — `search(…, costFn, heuristicFn)` in `astar.ts:22`."
 
-Admissibility of the heuristic *and* non-negativity of the cost penalty. The
-heuristic must be a lower bound on remaining cost (haversine is, by
-geometry), and the grade penalty must be `≥ 0` (`cost.ts` returns 0 for
-downhill). Break either and A\* can return a suboptimal path with no error.
-That's the part people forget — they remember "A\* needs a heuristic" but not
-"and it must never overestimate, and the cost it guides over must stay
-monotone."
-
-*Anchor: A\* is only correct while the heuristic never overestimates and the
-penalty never goes negative.*
+---
 
 ## See also
 
-- `02-penalty-as-the-domain-seam.md` — *what* gets injected as the cost.
-- `04-lazy-deletion-priority-queue.md` — the frontier the engine pops from.
-- `05-blocked-as-large-finite.md` — how the cost fn handles "too steep."
-- `audit.md` Lens 2 (deepest module), Lens 5 (pull complexity down).
-- `study-dsa-foundations/` — A\* optimality and admissibility proofs.
+- `02-penalty-as-the-domain-seam.md` — the cost side of the seam.
+- `03-directed-traversal-over-undirected-storage.md` — how `directedGrade`
+  feeds the directed cost.
+- `04-lazy-deletion-priority-queue.md` — the heap the loop pops from.
+- `05-blocked-as-large-finite.md` — what an over-grade edge costs.
+- `audit.md` lens 2 (deepest module), lens 4 (not a pass-through).

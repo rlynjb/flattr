@@ -1,224 +1,278 @@
-# Problem Brief — flattr
+# The Problem Brief
 
-> The 10-point core, in order. Each point is tagged **EVIDENCE** (provable from
-> this repo) or **INFERENCE** (plausible, unproven — converted to a discovery
-> question in `05`). Read the tag before you read the claim.
+The 10-point brief, in order. This is the document you'd put in front of
+a staff engineer or a hiring panel and defend line by line. Every claim
+is tagged **EVIDENCE** (a `file:line` you can open) or **INFERENCE**
+(plausible, but about humans, and not in the repo). Don't let the two
+blur.
+
+---
 
 ## Where the problem sits
 
-Before the ten points, put the problem on the map. flattr lives entirely on the
-client; there is no demand-sensing layer anywhere in the stack, which is exactly
-why the right column of `00`'s diagram is empty.
+Before the points, put the problem on the map. flattr is a routing
+problem that lives between three free data providers and one phone.
 
 ```
-  flattr — the whole system, with the missing layer marked
+  Zoom out — where the problem lives
 
-  ┌─ User / Demand layer ───────────────────────────────────┐
-  │   ✗ NO USERS  ✗ NO ANALYTICS  ✗ NO INTERVIEWS           │ ← the gap
-  │     (docs/flattr-spec.md §3 user table = hypothesis)     │   this book is about
-  └───────────────────────────────┬─────────────────────────┘
-                                  │  (no signal flows up)
-  ┌─ Client layer (Expo / RN) ────▼─────────────────────────┐
-  │   MapScreen.tsx · GradeSlider · RouteSummaryCard         │  ← SHIPS, works
-  └───────────────────────────────┬─────────────────────────┘
-                                  │  reads static artifact
-  ┌─ Engine layer (TS, hand-rolled) ▼───────────────────────┐
-  │   ★ astar.ts · cost.ts · pqueue.ts · graph.ts ★         │  ← PROVEN correct
-  └───────────────────────────────┬─────────────────────────┘
-                                  │  consumes
-  ┌─ Build pipeline (offline) ────▼─────────────────────────┐
-  │   osm.ts · elevation.ts · grade.ts → graph.json (544KB) │  ← PROVEN runs
-  └─────────────────────────────────────────────────────────┘
+  ┌─ User layer ──────────────────────────────────────────┐
+  │  someone on foot / kick scooter / wheels who can't     │
+  │  comfortably climb a hill   ←★ THE PROBLEM LIVES HERE ★ │
+  └─────────────────────────┬──────────────────────────────┘
+                            │  "route me somewhere flat"
+  ┌─ App layer (mobile/) ───▼──────────────────────────────┐
+  │  Expo app: address bar → directedAstar() → colored     │
+  │  path + climb number     (offline, no network in route)│
+  └─────────────────────────┬──────────────────────────────┘
+                            │  reads bundled graph.json
+  ┌─ Build layer (pipeline/) ─▼────────────────────────────┐
+  │  OSM/Overpass streets + Open-Meteo elevation →          │
+  │  grade-annotated graph (BUILD-TIME ONLY)               │
+  └────────────────────────────────────────────────────────┘
 ```
 
-Everything below the top band is real and tested. The top band is empty. Hold
-that picture.
+The technical machinery (bottom two bands) is built and tested. The
+top band — the human with the pain — is asserted, not measured. Keep
+that asymmetry in view through all ten points.
 
 ---
 
 ## 1. User or operational problem — who experiences what pain
 
-**INFERENCE.** The asserted pain (`docs/flattr-spec.md` §1, §3): people who
-travel under their own power — kick-scooter commuters, pedestrians avoiding
-hills, wheelchair / stroller / rolling-luggage users — get routed by Google Maps
-on shortest/fastest, which "hides per-block grade inside a smoothed elevation
-curve." The claimed unmet need: *"a route that avoids what they can't comfortably
-climb, and a map that shows where the flat is at a glance."*
+**The claimed pain (INFERENCE, from `docs/flattr-spec.md` §1):** Google
+Maps minimizes distance/time and buries per-block grade inside a
+smoothed elevation curve. Tools that *do* expose grade (AccessMap) use
+fixed pedestrian thresholds not tuned to how the specific rider travels.
+So a kick-scooter commuter and a hill-avoiding walker share one unmet
+need: a route that avoids what *they personally* can't comfortably
+climb, plus a map showing where the flat is at a glance.
 
-What's real about this: the *mechanism* of the pain is concrete and correct.
-Google Maps does optimize distance/time and does not expose per-segment grade.
-That is verifiable. What is **not** verified: that any real person feels this
-strongly enough to change tools. The §3 user table is the author's hypothesis,
-not a research finding. There is no interview, no survey, no support ticket, no
-forum quote anywhere in the repo.
-
-> Coach note: in a review, say it like this — "The pain is *plausible and
-> specific*, but I have not validated it. What I've validated is that it's
-> *technically addressable*." Then point at the engine.
-
-## 2. Evidence and current cost — what the repo proves
-
-**EVIDENCE.** This is the strong column. The repo proves the problem is solvable
-with free data and a hand-rolled engine:
+**Who (INFERENCE, spec §3):** three personas —
 
 ```
-  Proof chain — each link is a file you can open
+  Three asserted personas — none validated by a real user
 
-  free data  ──►  grade graph  ──►  correct router  ──►  honest answer
-  ─────────       ───────────       ─────────────       ─────────────
-  pipeline/       split.ts          astar.ts            cost.ts:6
-  osm.ts          grade.ts          + admissible h      BLOCKED = 1e9
-  elevation.ts    → graph.json      (haversine)         (finite, not Inf)
-  geocode.ts      544 KB, real      = A* == Dijkstra    → "flat vs.
-                  (mobile/assets)     optimality gate     disconnected"
+  ┌──────────────────────┬───────────────────────────────────┐
+  │ kick-scooter / push  │ wants blocks they can kick without │
+  │ commuter             │ dismounting on the steep ones      │
+  ├──────────────────────┼───────────────────────────────────┤
+  │ hill-avoiding        │ older adults, fatigue, heat — flat │
+  │ pedestrian           │ over fast                          │
+  ├──────────────────────┼───────────────────────────────────┤
+  │ wheelchair / stroller│ hard grade ceiling, non-negotiable │
+  │ / rolling luggage    │                                    │
+  └──────────────────────┴───────────────────────────────────┘
 ```
 
-The load-bearing proofs, with line anchors:
+**The honest line you say out loud:** "These are personas I wrote, not
+people I interviewed. The repo proves I can *route* for them. It does
+not prove they exist in numbers or would switch tools." That sentence is
+the spine of the whole brief.
 
-- **Optimality gate** — `features/routing/astar.test.ts:38` asserts A* returns
-  the *same* path cost as Dijkstra (`toBeCloseTo`, 6 digits); `:47,:51` assert
-  A* expands `toBeLessThanOrEqual` Dijkstra's node count. Dijkstra is the oracle;
-  A* is checked against it. This is real correctness rigor.
-- **Search efficiency is measured, not asserted** — `bench/run.ts` runs Dijkstra
-  → A* → bidirectional over fixed interior pairs and records `nodesExpanded`,
-  `pushes`, `pops`, `ms`, `cost` per algorithm; `bench/report.ts` formats the
-  table. The "fewer nodes for the same answer" claim is producible on demand.
-- **The domain cost model is direction-aware** — `cost.ts` `penalty()` is free
-  downhill (`g <= 0 → 0`), linear in the moderate band, quadratic in the steep
-  band, `BLOCKED` over `userMax`. Signed by travel direction via
-  `directedGrade`.
-- **Honest fallback is a graph property, not a UI patch** — `BLOCKED = 1e9`
-  (finite) at `cost.ts:6` means an only-steep path is still returned and flagged;
-  `null` is reserved for a genuinely disconnected graph. Two distinct real
-  states. See `.aipe/study-system-design/04-honest-fallback-routing.md`.
-- **It ships** — `mobile/src/MapScreen.tsx` and friends render the graph on an
-  Expo app; `graph.json` is a real 544 KB artifact, not a fixture.
+## 2. Evidence and current cost — repo vs inference
 
-**Current cost of the problem: unmeasured.** There is no number for how many
-people are mis-routed, how much extra climb they suffer, or what a flat route
-saves them. Zero. That blank is the single most important fact in this brief.
+This is the point that matters most. Split it cleanly.
 
-## 3. Why now — what changed or what cost compounds
+```
+  The split — what's grounded vs what's asserted
 
-**EVIDENCE (for the technical "why now") + INFERENCE (for the demand "why now").**
+  EVIDENCE (file:line)              INFERENCE (about humans)
+  ──────────────────────            ────────────────────────
+  router works        ✓             pain is real           ?
+  oracle: A*==Dijkstra ✓            pain is widespread      ?
+  bench numbers       ✓             users would switch      ?
+  honest fallback     ✓             presets beat AccessMap  ?
+  shipped on a city   ✓             grade is trusted        ?
+       │                                    │
+       ▼                                    ▼
+  "I can build it"                  "they want it built"
+  PROVEN                            UNPROVEN — the gap
+```
 
-What genuinely changed and makes *building* this feasible now:
+**EVIDENCE — the technical premise is solid:**
 
-- Free, queryable street data (OSM via Overpass) and free elevation
-  (Open-Meteo) both exist and the pipeline consumes them — `pipeline/overpass.ts`,
-  `pipeline/elevation.ts`. You don't need a DEM license or a paid elevation API.
-- On-device compute is enough to run A* over a bbox graph client-side; the Expo
-  app does exactly this with a 544 KB artifact.
+- The grade-aware router runs and is correct. `features/routing/astar.ts:22-78`
+  is one parametric `search()`; `directedAstar` (lines 155-162) wires the
+  signed-grade cost to the admissible haversine heuristic.
+- The directional penalty is real and tested:
+  `features/routing/cost.ts:16-22` — flat/downhill is free, moderate
+  uphill is linear (`k1=0.4`), steep uphill is quadratic (`k2=1.0`), over
+  `userMax` is `BLOCKED`.
+- **The oracle is your single strongest piece of evidence.**
+  `features/routing/astar.test.ts:38-44` asserts A* returns the *same*
+  optimal cost as Dijkstra to 6 decimals; lines 47-52 assert A* expands
+  ≤ Dijkstra. That's a correctness proof, not a vibe.
+  → walk the mechanics in `../study-testing/01-optimality-oracle.md`.
+- The bench produces hard numbers (`bench/run.ts`): on a grid30 interior
+  pair, Dijkstra expands **203** nodes, A* expands **32** — ~6.3× fewer.
+  On grid40 mid-interior, **1079 → 276**, ~3.9×.
+  → see `../study-performance-engineering/01-heuristic-pruning.md`.
 
-What has **not** changed in a way the repo can prove: any urgency on the demand
-side. There is no "grade-aware routing is suddenly in demand" signal. The honest
-"why now" is *"the tooling cost to attempt it dropped to zero"* — which is a
-reason it's cheap to *try*, not a reason anyone is *waiting*.
+**The current cost of the problem (INFERENCE):** the spec asserts a
+walker takes a hillier route than they'd choose because no tool exposes
+*their* threshold. There is no measured cost — no time lost, no trips
+abandoned, no user complaint in the repo. State it as the hypothesis it
+is.
+
+## 3. Why now — what changed or compounds
+
+**EVIDENCE that the build is newly cheap:** the three data inputs are
+free and keyless today —
+
+```
+  Why the build is feasible now — free-tier stack
+
+  ┌─ OSM via Overpass ─┐  ┌─ Open-Meteo DEM ─┐  ┌─ Nominatim ─┐
+  │ street network     │  │ 90m elevation    │  │ geocoding   │
+  │ pipeline/          │  │ pipeline/        │  │ pipeline/   │
+  │ overpass.ts:4-48   │  │ elevation.ts:85+ │  │ geocode.ts  │
+  │ free, retried      │  │ free, no key     │  │ free, ~1rps │
+  └────────────────────┘  └──────────────────┘  └─────────────┘
+```
+
+A grade-annotated street graph used to need paid elevation data and a
+routing license. The free tier makes a single developer able to build
+the whole thing — and the repo proves it (`data/graph.json` exists).
+
+**The honest counterweight:** "why now" for the *technology* is real and
+provable. "Why now" for the *demand* is not in the repo. Don't claim a
+market timing you can't show.
 
 ## 4. Beneficiaries and exclusions
 
-**INFERENCE (beneficiaries) / EVIDENCE (exclusions, via spec §13).**
+```
+  In scope vs out — who this is and isn't for
 
-Asserted beneficiaries (`docs/flattr-spec.md` §3) — all unproven as real users:
+  BENEFITS (asserted)            EXCLUDED (by design — see ch. 02)
+  ──────────────────             ─────────────────────────────────
+  self-powered travelers in      • drivers (it's not a car router)
+  one bundled neighborhood:      • transit / multi-modal trips
+   - on foot                     • anyone outside the bundled bbox
+   - kick scooter                  (Capitol Hill, ~0.35 km²)
+   - mobility aids / wheels       • users needing turn-by-turn nav
+                                  • users needing accounts / history
+```
+
+**EVIDENCE for the in-scope boundary:** the shipped graph covers exactly
+one bbox — `[-122.3284, 47.6181, -122.3214, 47.6241]`, a Capitol Hill
+slice (`pipeline/config.ts`), 1621 nodes / 1879 edges. Everyone outside
+that box is excluded *today* by the artifact itself, not by a roadmap
+promise.
+
+## 5. Constraints
+
+Four hard constraints, all visible in the repo. They bound every option
+in chapter 03.
 
 ```
-  one knob (userMax), three asserted user shapes
-
-  userMax ~5%   ──►  kick scooter / push commuter   (INFERENCE)
-  userMax ~8%   ──►  pedestrian avoiding hills       (INFERENCE)
-  userMax ~5%   ──►  wheelchair / stroller / luggage (INFERENCE, "hard ceiling")
+  ┌─ free-tier data ──────────► no paid budget; Open-Meteo │
+  │                             429s under heavy testing    │
+  ├─ hand-rolled engine ──────► no Valhalla/OSRM/GraphHopper│
+  │   (spec §14)                the graph + router IS the    │
+  │                             point — portfolio repo       │
+  ├─ offline client ──────────► graph is a bundled static    │
+  │   (loadGraph.ts:1-11)       asset; no net in route path  │
+  └─ single developer ────────► no team, no PM, no users     │
 ```
 
-Note the slider story shifted in the actual build: git history shows commit
-`b24797c` *"drop the max-grade slider, keep the preset buttons only."* So the
-shipped knob is now **presets**, not a free slider — the "one number, everyone
-sets their own red" framing from spec §2 is partly walked back in code. Name that
-if asked; it's a small honesty point about the spec drifting from the build.
+These aren't excuses. They're the frame. A reviewer who hears "I
+hand-rolled the router *on purpose* because the algorithm is the
+artifact" reads a deliberate constraint, not a gap.
 
-Intentional exclusions (spec §13, this is EVIDENCE of deliberate scoping):
-turn-by-turn voice nav, live traffic, transit integration, crowdsourced hazards,
-accounts/sync, the LLM destination parser. All explicitly out of v1.
+## 6. Options — including DO NOTHING
 
-## 5. Constraints — technical, product, time
+Full treatment with opportunity cost is in
+`03-options-and-opportunity-cost.md`. The headline: **`do nothing` is a
+real, ranked option** — the engine is already built and tested, so
+walking away loses very little and avoids pouring more single-developer
+time into an unvalidated demand. Any option that *adds* scope must beat
+that bar.
 
-**EVIDENCE.** All four are fixed and visible in the repo:
+## 7. Smallest useful scope — the validating slice
 
-- **Free-tier data** — OSM + Open-Meteo only; Open-Meteo 429s under heavy
-  testing (project context, external-data caveat). Accuracy is gated by free
-  elevation resolution — spec §11.A calls grade accuracy "the make-or-break,"
-  and coarse elevation produces "a map that lies about the steep blocks, i.e.
-  worse than nothing" (§12).
-- **Hand-rolled engine** — no third-party router (spec §14, locked). This is a
-  *learning/portfolio* constraint, not a user constraint — important distinction.
-- **Offline client** — static `graph.json`, no live backend. Limits coverage to
-  prebuilt bboxes.
-- **Single developer** — solo. Every feature competes with discovery for the
-  same hours.
-
-## 6. Options — including `do nothing`
-
-Full treatment in `03-options-and-opportunity-cost.md`. The headline: because the
-engine already works and demand is unproven, **`do nothing more on features`** is
-a genuinely strong option, and the real fork is *discovery vs. more engine*.
-
-## 7. Smallest useful scope — the narrowest validating slice
-
-**The validating slice already mostly exists; the missing piece is putting it in
-front of a human and watching.** Concretely:
+The narrowest thing that tests the premise is **already built**, which
+is the cheapest possible position to be in.
 
 ```
-  smallest slice that tests the PREMISE (not the engine)
+  The smallest validating slice — and it ships today
 
-  ┌─ ONE bundled neighborhood ──────────────────────────────┐
-  │  prebuilt graph.json for a single hilly bbox             │  ← exists
-  │  (e.g. downtown + Capitol Hill, spec §10 Phase 0)        │
+  ┌────────────────────────────────────────────────────────┐
+  │  ONE bundled neighborhood (Capitol Hill, ~0.35 km²)     │
+  │  + set two endpoints (address bar)                      │
+  │  + a grade-routed, color-coded path                     │
+  │  + the climb number on a summary card                   │
   │                                                          │
-  │  set endpoints  →  grade-routed path, colored by         │
-  │  (A → B)            directedGrade  +  ONE climb number    │  ← exists
-  │                     (RouteSummaryCard: distance, climbM,  │
-  │                      steepCount — summary.ts)             │
-  └──────────────────────────────────────────────────────────┘
-        the NEW work is not code. it's: show this to 5 real
-        self-powered travelers and measure if the flat route
-        beats the Google Maps route in their judgment.
+  │  = enough to put in front of one real walker and ask:   │
+  │    "is this the route you'd actually take?"             │
+  └────────────────────────────────────────────────────────┘
 ```
 
-The engine, the colored path, and the climb number (`routeSummary` →
-`distanceM`, `climbM`, `steepCount`) are all built. The validating *act* — does a
-real walker/scooter-rider prefer flattr's route over the default one — has never
-been done. That act is the slice. Full cut in `02`.
+**EVIDENCE it exists:** `mobile/src/MapScreen.tsx:150-162` calls
+`directedAstar(graph, startId, endId, userMax)` client-side;
+`mobile/src/RouteSummaryCard.tsx:26-27` renders distance + rounded climb;
+the colored path and legend key off `userMax`. The validating
+experiment is not a thing to build — it's a thing to *run*. Detailed in
+chapter 02.
 
 ## 8. Non-goals and cuts
 
-**EVIDENCE (spec §13) + this book's recommended cuts.** Explicit non-goals:
-city-wide coverage, turn-by-turn, accounts, multi-modal/transit. Detailed in
-`02-scope-cuts-and-non-goals.md`.
+Explicit, in `02-scope-cuts-and-non-goals.md`. Headline non-goals:
+**city-wide coverage, turn-by-turn navigation, user accounts, and
+multi-modal/transit routing.** Each is a deliberate cut, not a missing
+feature.
 
-## 9. Success metrics — observable outcomes + feedback loop
+## 9. Success metrics — available-now vs needs-users
 
-Split into **available-now** (engine correctness, bench numbers, route
-plausibility — all measurable today) vs. **needs-users** (adoption, switching,
-trust — measurable only with the discovery slice). Full treatment in
-`04-success-metrics-and-feedback-loop.md`.
+Full treatment in `04-success-metrics-and-feedback-loop.md`. The split
+is the whole point:
+
+```
+  Two metric classes — don't confuse them
+
+  AVAILABLE NOW (repo)           NEEDS USERS (can't fake)
+  ────────────────────           ─────────────────────────
+  oracle: A*==Dijkstra ✓         adoption / installs
+  bench expansions ✓             switching from Google Maps
+  route plausibility (eyeball)   trust in the grade colors
+                                 retention / repeat use
+```
+
+You can prove the left column today. The right column requires the one
+experiment in chapter 02. Never report a left-column metric as if it
+answered a right-column question.
 
 ## 10. Risks and objections
 
-The review-room questions and the answers that hold are in
-`05-skeptical-reviewer-questions.md`. The sharpest one: *"You built a solution
-looking for a problem — defend the demand."* The answer is not to fake demand;
-it's to own the EVIDENCE/INFERENCE split and name the discovery slice.
+The skeptical review room is `05-skeptical-reviewer-questions.md`. The
+sharpest objections, previewed: *AccessMap already does hill-avoidance*;
+*90m DEM smooths the short steep pitches that matter most*; *you dropped
+your own central slider (b24797c) before any user asked*; *one
+0.35 km² neighborhood proves nothing about generality.* Each has an
+answer that holds — go read them.
 
 ---
 
-## The brief in one line
+## The brief in one frame
 
-You can prove flattr **works**. You cannot prove anyone **wants** it. The
-correct investment is the cheapest experiment that converts the §3 user table
-from hypothesis into evidence — not another algorithm.
+```
+  flattr problem brief — the whole thing, one picture
 
-## See also
+  ┌─ PROVEN (EVIDENCE) ────────────────────────────────────┐
+  │  technically solvable: grade-aware A*, oracle-correct,  │
+  │  bench-measured, honest fallback, shipped on one city   │
+  │  → astar.ts, cost.ts, *.test.ts, bench/, graph.json     │
+  └────────────────────────┬───────────────────────────────┘
+                           │  but
+  ┌─ UNPROVEN (INFERENCE) ─▼───────────────────────────────┐
+  │  worth solving: demand, switching, trust, generality    │
+  │  → zero users, zero telemetry, zero research in repo    │
+  └────────────────────────┬───────────────────────────────┘
+                           │  so
+  ┌─ THE MOVE ─────────────▼───────────────────────────────┐
+  │  run the already-built slice on ONE real walker before  │
+  │  investing another hour. do-nothing is a live option.   │
+  └────────────────────────────────────────────────────────┘
+```
 
-- `00-overview.md` — the EVIDENCE/INFERENCE split this brief is built on.
-- `03-options-and-opportunity-cost.md` — why discovery beats more engine.
-- `.aipe/study-dsa-foundations/05-graphs-and-traversals.md` — the A*/Dijkstra
-  foundation behind the optimality gate.
+Next: `02-scope-cuts-and-non-goals.md`.

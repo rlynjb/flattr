@@ -1,256 +1,271 @@
-# RFC 01 — Build-time graph artifact, no database
+# 01 — Build-time graph artifact, no database
 
-**Decision:** the routing graph is a prebuilt static `graph.json` that the app loads
-once and only reads. There is no backend service and no spatial database — the build
-pipeline turns OSM + elevation into a frozen artifact, and runtime traversal never writes
-anything.
+> **Decision:** the routing graph is a single static JSON artifact built offline by
+> the pipeline and bundled into the app; the app only ever *reads* it. No routing
+> server, no spatial database, no query layer. Adjacency is the index, and the
+> whole graph is in memory before the first route.
 
-> Coach: lead with the verdict. "We ship a baked graph file, not a routing server." Say
-> it first; the reviewer's first question — "where's the database?" — is answered before
-> they ask. The suspense version ("so we considered a few options…") invites them to
-> design it for you.
+---
 
-═════════════════════════════════════════════════
-2. CONTEXT / PROBLEM
-═════════════════════════════════════════════════
+## Context / problem
 
-flattr routes over a *grade-annotated street graph* for one neighborhood (Capitol Hill,
-Seattle — `mobile/src/loadGraph.ts:2`). The data it routes over is:
+flattr routes over a grade-annotated street graph: nodes are street intersections
+with elevation, edges carry a signed grade. The access pattern is the thing to
+notice before you pick storage. Routing is **whole-graph traversal** — A* pops a
+node, reads its incident edges, relaxes neighbors, repeats. It never asks "give me
+all edges in this bbox" or "edges where grade < 4%." It asks, thousands of times
+per route, "what edges touch *this* node?"
 
-- **Bounded.** One bbox, thousands of nodes/edges — not a continent.
-- **Static.** A street's length, geometry, and grade don't change between requests. The
-  DEM elevation behind the grade *never* changes (`mobile/src/elevCache.ts:3` — "DEM
-  samples never change, so cached values are valid forever").
-- **Read in one shape.** Every query is the same: load the whole graph, run a
-  whole-graph traversal from start to goal. There is no "fetch one street," no partial
-  query, no per-user write.
+That's a pointer-chase, not a query. And the data behind it doesn't change at
+request time — a street's grade is a fact about the world, fixed once you've
+sampled elevation. The schema is small and known:
+`Node {id, lat, lng, elevationM}`, `Edge {id, fromNode, toNode, geometry, lengthM,
+riseM, gradePct, absGradePct, kind?}`, plus `adjacency: nodeId -> edgeIds`
+(`features/routing/types.ts:1`).
 
-The spec proposed Next.js on Netlify (`docs/flattr-spec.md` §8), but the constraint that
-actually shaped the data layer is `docs/flattr-spec.md` §14: the graph work is the *point*
-of the project, hand-rolled, no Valhalla/OSRM/GraphHopper. A routing engine or a spatial
-DB would have *hidden* the graph behind someone else's index — exactly the thing this
-project exists to build by hand.
+So the question forced on the design: where does the graph live, and what reads it?
+The spec (`docs/flattr-spec.md` §8) originally proposed a Next.js web app on
+Netlify. The repo answered differently — and the answer is "nowhere live; it's a
+file."
 
-═════════════════════════════════════════════════
-3. GOALS & NON-GOALS
-═════════════════════════════════════════════════
+---
+
+## Goals & non-goals
 
 **Goals**
-- Runtime has zero infrastructure: no server to deploy, no DB to provision, no connection
-  to fail. The app opens `graph.json` and routes.
-- Traversal reads adjacency in O(1) per neighbor lookup — adjacency *is* the index.
-- The expensive work (OSM fetch, elevation sampling, grade computation) happens once at
-  build time, not per request.
+- Routing reads the graph with zero network and zero query latency — adjacency is
+  an O(1) lookup, not a `SELECT`.
+- The graph is reproducible from source: `npm run build:graph` regenerates it from
+  OSM + elevation (`pipeline/run-build.ts`).
+- The engine bundles for both Node (bench/tests) and the device (Expo app) — no
+  `node:fs`, no server runtime assumed (`pipeline/build-graph.ts:2`).
 
 **Non-goals**
-- *Not* a live, continuously-updated map. The data is frozen at build time, on purpose.
-- *Not* multi-city at runtime. One bundled graph; a second city is a second build.
-- *Not* a query API. There is no "give me edges in this box" endpoint — the only
-  operation is "load the whole graph."
+- Live data freshness. A new sidewalk in OSM does not appear until the next build.
+- Spatial queries beyond adjacency (radius search, bbox filter as a DB operation).
+  Nearest-node is done in-process (`features/routing/nearest.ts`), not by an index.
+- Per-user or per-request graph mutation. The artifact is read-only and shared.
 
-> Coach: the non-goals are where you win the scope fight. When someone says "but what
-> about live traffic / construction closures / a second city," you point at the non-goal:
-> "out of scope by design — v1 is one frozen neighborhood." A non-goal stated up front is
-> a closed door; a non-goal you forgot is an open argument.
+---
 
-═════════════════════════════════════════════════
-4. THE DECISION
-═════════════════════════════════════════════════
+## The decision
 
-Split the system at build time. The pipeline produces an artifact; the app consumes it.
-The seam between them is a JSON file on disk — nothing crosses it at runtime.
+Build the graph offline, freeze it to `graph.json`, bundle it, and have the app
+`import` it as a typed `Graph`. Routing runs against the in-memory object;
+`adjacency` *is* the index.
 
 ```
-  flattr data layer — build time produces, runtime only reads
+  Build-time vs runtime — the seam is the file
 
-  ┌─ BUILD TIME (pipeline/, Node + tsx) ─────────────────────────┐
-  │                                                              │
-  │  Overpass ──► parseOsm ──► splitWays ──► sampleElevations    │
-  │  (OSM)        osm.ts       split.ts      elevation.ts        │
-  │                                              │               │
-  │                                              ▼               │
-  │                                        computeGrades         │
-  │                                        grade.ts              │
-  │                                              │               │
-  │                                              ▼               │
-  │                                   buildAdjacency + assemble   │
-  │                                   build-graph.ts:29           │
-  │                                              │               │
-  └──────────────────────────────────────────────┼──────────────┘
-                                                  │  writes
-                                                  ▼
-                                  ┌────────────────────────────┐
-                                  │  graph.json  (the artifact) │ ← the seam:
-                                  │  nodes · edges · adjacency  │   a frozen file
-                                  └────────────────────────────┘
-                                                  │  bundled into the app,
-                                                  │  loaded ONCE
-  ┌─ RUNTIME (mobile/, Expo RN) ─────────────────▼──────────────┐
-  │                                                              │
-  │  loadGraph() ──► search(graph, …) ──► Path                   │
-  │  loadGraph.ts:9   astar.ts:22         (read-only traversal)  │
-  │                                                              │
-  │  NO write. NO server hop. NO DB query.                       │
-  └──────────────────────────────────────────────────────────────┘
+  ┌─ BUILD TIME (pipeline/, offline) ─────────────────────────────┐
+  │  Overpass (OSM)  ──►  parse  ──►  split ways  ──►  sample      │
+  │                                                   elevation    │
+  │                                                      │         │
+  │                                                      ▼         │
+  │                                   compute grades  ──► buildAdjacency
+  │                                                      │         │
+  │                                                      ▼         │
+  │                                            ┌──────────────┐    │
+  │                                            │  graph.json  │    │  ← frozen artifact
+  │                                            └──────┬───────┘    │
+  └───────────────────────────────────────────────────┼──────────┘
+                          bundled into the app │  (read-only)
+  ┌─ RUNTIME (mobile/, on device) ──────────────▼─────────────────┐
+  │  loadGraph()  ──►  Graph in memory                            │
+  │                      │                                         │
+  │                      ▼  search() pops node, reads...           │
+  │              adjacency[nodeId]  ──►  [edgeId, edgeId, ...]      │  ← the index
+  │                      │  O(1), no query, no network             │
+  │                      ▼                                         │
+  │              relax neighbors, repeat                          │
+  └───────────────────────────────────────────────────────────────┘
 ```
 
-The artifact's shape is the routing data model itself (`features/routing/types.ts:22`):
+The two halves never share a process. The contract between them is a file with a
+fixed shape. That's the whole architecture.
+
+**The build is a fixed pipeline** — `buildGraph` runs the stages in order and
+returns a `Graph`, deliberately with no filesystem dependency so the same function
+runs offline to make `graph.json` *and* on-device to build viewport tiles
+(`pipeline/build-graph.ts:12`):
 
 ```ts
-  type Graph = {
-    city: string;
-    bbox: [number, number, number, number];
-    nodes: Record<string, Node>;       // id -> {lat,lng,elevationM} — O(1) lookup
-    edges: Edge[];                      // the full edge list
-    adjacency: Record<string, string[]>;// nodeId -> incident edgeIds — THE INDEX
-  };
+// pipeline/build-graph.ts:12 — the build, framework-free, fs-free
+const ways = parseOsm(osm);                          // OSM → ways
+const { nodes, edges } = splitWays(ways, maxSegM);   // long ways → short edges
+const nodesWithElev = await sampleElevations(...);   // attach elevationM
+const gradedEdges = computeGrades(nodesWithElev, edges);
+return { city, bbox, nodes, edges: gradedEdges,
+         adjacency: buildAdjacency(gradedEdges) };    // ← adjacency baked in
 ```
 
-`adjacency` is the load-bearing field. It's the *only* index the router needs, and it's
-precomputed at build time by `buildAdjacency` (`features/routing/graph.ts:22`):
+**Loading is one import.** No connection pool, no migration, no ORM
+(`mobile/src/loadGraph.ts:9`):
 
 ```ts
-  // features/routing/graph.ts:22 — runs once at build, baked into graph.json
-  export function buildAdjacency(edges: Edge[]): Record<string, string[]> {
-    const adj: Record<string, string[]> = {};
-    for (const e of edges) {
-      (adj[e.fromNode] ??= []).push(e.id);   // each edge listed under BOTH endpoints
-      (adj[e.toNode] ??= []).push(e.id);     // so neighbor lookup is a map read
-    }
-    return adj;
-  }
+// mobile/src/loadGraph.ts — graph.json is the REAL build artifact
+import graph from "../assets/graph.json";
+export function loadGraph(): Graph {
+  return graph as unknown as Graph;
+}
 ```
 
-At runtime the router reads it directly — `graph.adjacency[current]` is the expansion
-step (`features/routing/astar.ts:64`). No query planner, no B-tree, no `WHERE` clause.
-The data structure a spatial DB would build *for* you is sitting in the JSON, already
-built.
+**Adjacency is the index** (`features/routing/graph.ts:22`). This is the part a
+reviewer should feel in their gut: the structure that would be a `CREATE INDEX` in
+a database is just a `Record<string, string[]>` built once at the end of the
+pipeline.
 
-> Coach: the sentence that gets the yes is "adjacency is the index." A reviewer who hears
-> "no database" worries you'll do linear scans. You don't — the precomputed adjacency map
-> gives you the same O(1) neighbor lookup a DB index would, with none of the DB. Say that
-> and the worry evaporates.
-
-═════════════════════════════════════════════════
-5. ALTERNATIVES CONSIDERED
-═════════════════════════════════════════════════
-
-```
-  Three ways to hold a routing graph — what each costs
-
-  ┌─ A. routing engine (OSRM / Valhalla) ───────────────────────┐
-  │  upload OSM → engine builds contraction hierarchies →        │
-  │  query a /route HTTP endpoint                                │
-  │  WHY IT LOST: hides the graph behind someone else's index —  │
-  │  the exact work §14 says is the point. And it's a server to  │
-  │  run. No directional grade cost without forking it.          │
-  └──────────────────────────────────────────────────────────────┘
-  ┌─ B. spatial DB (PostGIS / pgRouting) ───────────────────────┐
-  │  load edges into Postgres, query with SQL + pgRouting        │
-  │  WHY IT LOST: a DB indexes for partial queries (find edges   │
-  │  in a box, nearest road). flattr never does a partial query  │
-  │  — it loads the WHOLE graph and traverses. Paying for an     │
-  │  index nobody reads. Plus a DB to provision and a network    │
-  │  hop on every route.                                         │
-  └──────────────────────────────────────────────────────────────┘
-  ┌─ C. build-time JSON artifact (CHOSEN) ──────────────────────┐
-  │  pipeline bakes graph.json; app bundles + reads it           │
-  │  WHY IT WON: matches the access pattern (read-only whole-    │
-  │  graph). Zero runtime infra. Adjacency IS the index. The     │
-  │  hand-rolled graph stays visible — the project's whole point.│
-  └──────────────────────────────────────────────────────────────┘
+```ts
+// features/routing/graph.ts:22 — buildAdjacency: nodeId -> incident edgeIds
+for (const e of edges) {
+  (adj[e.fromNode] ??= []).push(e.id);   // every edge registers under both
+  (adj[e.toNode] ??= []).push(e.id);     // of its endpoints
+}
 ```
 
-The deciding factor is the **access pattern**. A database earns its keep when you query
-*subsets* — give me rows where X, nearest neighbor to Y. flattr has exactly one query
-shape: load everything, traverse. When you always read the whole dataset, an index over
-it is dead weight, and a server in front of it is a hop you don't need.
+And the router consumes it as a hash lookup inside the hot loop — no query crosses
+a boundary (`features/routing/astar.ts:64`):
 
-> Coach: don't argue "databases are slow" — they're not, and a reviewer who's run PostGIS
-> will eat you alive. Argue access pattern. "A DB indexes for partial queries; we never
-> do a partial query." That's a fact about *flattr*, not a claim about databases. It
-> can't be countered because it's true of this system specifically.
-
-═════════════════════════════════════════════════
-6. TRADEOFFS ACCEPTED
-═════════════════════════════════════════════════
-
-We chose the baked artifact, accepting:
-
-- **Frozen data.** The graph reflects the world as of the last `npm run build:graph`. A
-  new street, a closed road, a re-paved hill — none of it shows up until you rebuild and
-  reship. For a grade map of a stable residential neighborhood, that's fine: hills don't
-  move. For live traffic it would be wrong — which is why live traffic is a non-goal.
-- **No schema version on the artifact.** `graph.json` carries `city` and `bbox` but no
-  format version. If the `Graph` type changes shape, an old bundled file and new code
-  drift silently. Today they can't drift — the artifact and the reader ship in the same
-  build — but the moment a graph is fetched at runtime instead of bundled, this becomes a
-  real hazard. (See Open questions.)
-- **Whole-graph in memory.** The app holds the entire graph at once. Fine at neighborhood
-  scale; it would not survive a city-sized graph without tiling — which is exactly why
-  the on-device viewport/corridor tiling exists (`mobile/src/useTileGraph.ts`).
-
-> Coach: name the frozen-data cost in the same breath as the benefit — "we trade
-> freshness for zero infra, and for a grade map that's the right trade because hills are
-> stable." Stated together, it's a deliberate engineering call. Stated apart — benefit in
-> the pitch, cost dragged out under questioning — it looks like you got caught.
-
-═════════════════════════════════════════════════
-7. RISKS & MITIGATIONS
-═════════════════════════════════════════════════
-
-```
-  Risk                          Mitigation
-  ────                          ──────────
-  stale graph (world changed)   rebuild + reship; acceptable for a grade
-                                map of stable terrain
-  graph too big for one bundle  on-device tiling fetches viewport/corridor
-                                on demand (useTileGraph.ts) — base graph
-                                stays small, the rest streams in
-  artifact/reader schema drift  today impossible (same build); add a
-                                version field BEFORE any runtime fetch
-  build pipeline breaks         pipeline is pure modules with co-located
-                                *.test.ts; build is reproducible from OSM
+```ts
+// features/routing/astar.ts:64 — the read pattern that justifies the choice
+for (const edgeId of graph.adjacency[current] ?? []) {   // O(1) neighbor fetch
+  const edge = byId.get(edgeId)!;                        // O(1) edge resolve
+  ...
+}
 ```
 
-═════════════════════════════════════════════════
-8. ROLLOUT / MIGRATION
-═════════════════════════════════════════════════
+---
 
-This is the current shipped state, so "rollout" is really "how does data move":
+## Alternatives considered
 
-- **Producing a graph:** `npm run build:graph` (`pipeline/run-build.ts`) → writes
-  `data/graph.json` → copy to `mobile/assets/graph.json` → it bundles into the app
-  (`mobile/src/loadGraph.ts:2-3`).
-- **What changes for callers:** nothing at runtime. The router (`astar.ts`) takes a
-  `Graph` object and doesn't care where it came from — bundled file, on-device tile build,
-  or test fixture. That indifference is what lets tiling (`useTileGraph.ts`) merge live
-  builds into the base graph without touching the router.
-- **Offline fallback:** `graph.sample.json` is a synthetic graph for offline dev
-  (`mobile/src/loadGraph.ts:4-5`), not bundled unless imported.
+**1. Routing server + spatial database (PostGIS / pgRouting).** The textbook
+answer: edges in a table, a GiST index on geometry, `pgr_dijkstra` for the route.
+Lost because the access pattern doesn't want a query engine. Routing is one
+connected traversal of a known small region, not ad-hoc spatial filtering. A DB
+buys you bbox queries and live writes flattr doesn't need, and charges you a
+network hop *per route request* plus an always-on server. For a read-only,
+whole-graph traversal, the index you actually want is adjacency — and you can bake
+that into a file.
 
-═════════════════════════════════════════════════
-9. OPEN QUESTIONS
-═════════════════════════════════════════════════
+**2. Tile server, fetch-on-demand (vector tiles + per-tile routing).** Fetch graph
+tiles as the user pans, route across stitched tiles. Lost as the *base* layer
+because it puts a network round-trip in the cold path of the first route and
+couples routing to connectivity. (Note: flattr *does* use exactly this on top of
+the base artifact for coverage beyond the bundled region — viewport and corridor
+builds in `mobile/src/useTileGraph.ts`. The decision here is that the *base* is a
+frozen artifact, with tiles as an additive layer, not the foundation.)
 
-- **When does the artifact need a schema version?** The moment a graph is fetched at
-  runtime rather than bundled in the same build, artifact and reader can drift. Adding a
-  `version` field to `Graph` is cheap now and impossible to retrofit cleanly later. Worth
-  doing before the next storage change.
-- **What's the rebuild trigger?** There's no automated "the neighborhood changed, rebuild"
-  signal. Today it's manual. At what staleness does that stop being acceptable?
-- **Does multi-city change the answer?** One bundled graph is fine. Ten cities the user
-  might pick between starts to argue for fetching graphs on demand — which reopens
-  versioning and pulls a thin "graph CDN" into scope.
+**3. SQLite on device (the local-first store from buffr/dryrun).** A real option
+given the portfolio — buffr uses SQLite as the canonical store. Lost because there
+are no writes and no relational queries to justify a query engine on device. The
+graph is immutable reference data; an `import` of JSON is strictly less machinery
+than a database for read-only data that ships with the app.
 
-> Coach: open questions are a *strength* in a design doc, not a confession. Listing the
-> schema-version hazard before anyone asks signals you see two moves ahead. The reviewer
-> who was about to ask "what about versioning?" instead thinks "they've already thought
-> about this." That's the staff signal.
+```
+  Alternatives, scored on the access pattern
 
-─────────────────────────────────────────────────
-**See also**
-- `study-system-design/01-build-time-graph-artifact.md` — the comprehension walkthrough
-- `study-system-design/03-tile-merge-stitch.md` — how tiling extends the base artifact
-- RFC 02 — the router that consumes this artifact
-- `docs/flattr-spec.md` §4 (data model), §8 (stack), §14 (hand-rolled mandate)
+                       live writes  spatial query  network/route  always-on
+  ────────────────────  ──────────  ─────────────  ────────────   ─────────
+  PostGIS + pgRouting     yes ✓        yes ✓          yes ✗          yes ✗
+  tile server             yes ✓        per-tile       yes ✗          yes ✗
+  SQLite on device        yes ✓        SQL ✓          no ✓           no ✓
+  ★ static graph.json     no  ✗        no   ✗         no ✓           no ✓
+  ────────────────────  ──────────  ─────────────  ────────────   ─────────
+  flattr needs:           NO           NO             NO             NO
+```
+
+The column flattr needs is "no" four times. The artifact is the only option that
+charges nothing for capabilities the app doesn't use.
+
+---
+
+## Tradeoffs accepted
+
+We chose a frozen artifact, accepting:
+
+- **The data is stale by construction.** OSM edits and elevation corrections don't
+  land until someone reruns `build:graph` and re-bundles. For a grade map of a
+  city, the world changes slower than the release cycle — acceptable.
+- **No schema version on the artifact.** `graph.json` carries `{city, bbox, nodes,
+  edges, adjacency}` with no version field. If the `Edge` shape changes, an old
+  bundled `graph.json` silently mismatches the new code. Today the build and the
+  reader ship together in one app, so they can't skew — but the moment the artifact
+  is delivered separately from the binary, this is the bug. (Open question below.)
+- **Whole graph in memory.** The app holds every node and edge at once. Fine at
+  neighborhood scale (Capitol Hill); not a continent.
+
+None of these are regrets. They're the price of deleting an entire backend, and at
+this scale the backend is the thing not worth its weight.
+
+---
+
+## Risks & mitigations
+
+```
+  Risk                              Mitigation                          where
+  ────────────────────────────────  ──────────────────────────────────  ──────────────
+  graph.json drifts from Edge type  build + reader ship in one bundle;  loadGraph.ts,
+    (no version field)                typed cast at load                  types.ts
+  bundled region too small for the  on-device viewport/corridor tile    useTileGraph.ts
+    user's actual location            builds extend coverage at runtime
+  in-memory graph too big to load   neighborhood scale only; tiles are  useTileGraph.ts
+                                       per-region, not global
+  stale grades after OSM changes    rebuild + re-bundle on release;     run-build.ts
+                                       reproducible from source
+```
+
+The sharpest one is the version field. The mitigation today is "they can't skew
+because they ship together" — which is true until it isn't. Name it; don't pretend
+it's solved.
+
+---
+
+## Rollout / migration
+
+There's nothing to roll out — this is the architecture as built, not a change in
+flight. The migration story is forward-looking: **if** the graph ever needs to be
+delivered out-of-band (downloaded, not bundled), the migration is to add a
+`version` (or `schemaVersion`) field to the `Graph` type and gate `loadGraph()` on
+it. Callers don't change; the load path gains a compatibility check. That's the
+one seam where today's "ship together" assumption would have to become an explicit
+contract.
+
+For data already in flight: there is none. The artifact is regenerated wholesale by
+`build:graph`; there's no incremental migration because there's no mutable store.
+
+---
+
+## Open questions
+
+- **Should `graph.json` carry a schema version now, before it's needed?** Cheap to
+  add, prevents a silent-mismatch class of bug the day the artifact decouples from
+  the binary. Leaning yes, but it's currently unbuilt.
+- **Where's the line where in-memory stops working?** No measured node/edge ceiling
+  exists yet. The tile system papers over it for coverage, but there's no number on
+  "graph too big to load."
+- **Nearest-node is a linear scan** (`features/routing/nearest.ts`), not a spatial
+  index. Fine at current scale; an open question whether it needs a grid/k-d tree
+  if the bundled region grows.
+
+---
+
+## Coach notes
+
+- **Lead with the access pattern, not the absence of a database.** "We don't have a
+  backend" sounds like a gap. "The access pattern is read-only whole-graph
+  traversal, so adjacency is the index and the index is a file" sounds like a
+  decision. Same fact, opposite read.
+- A reviewer's reflex is "no database? how do you query?" Beat it to the punch:
+  *there are no queries* — there's one traversal, and it wants pointers, not SQL.
+- If they push on staleness, don't get defensive. "Grades change slower than
+  releases; rebuild is one command and reproducible from source" closes it.
+- The honest weakness to volunteer is the missing version field. Naming the bug
+  *they'd* find reads as someone who's thought past the happy path.
+
+## See also
+
+- `02-parametric-directional-router.md` — what reads this artifact
+- `03-honest-degradation-elevation.md` — how the artifact gets built when the
+  elevation API is down
+- `.aipe/study-system-design/` — build-time vs runtime as a system boundary
+- `.aipe/study-dsa-foundations/` — adjacency list as a graph representation

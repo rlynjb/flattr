@@ -1,356 +1,308 @@
-# Chapter 8 — The AI question
+# Chapter 8 — The AI Question
 
-In 2026 every senior interviewer knows you used AI to build this. Claude Code
-wrote a lot of flattr's code. That is not a secret to protect — it's the default,
-and pretending otherwise is the fastest way to fail this chapter. The question
-under "did you use AI?" is never really about whether you used it. It's about
-whether you understand what you shipped well enough to own it. This chapter
-teaches the calibrated-honest answer: matter-of-fact about the AI's role,
-matter-of-fact about yours, grounded in real understanding of the code.
+In 2026, this question is coming, and the interviewer already knows the
+answer is yes. "Did you use AI to build this?" "Can you explain this section
+line by line?" "What did the AI get wrong?" The senior interviewers asking
+these aren't trying to catch you using AI — everyone uses AI. They're testing
+whether you understand what you shipped well enough to *own* it. The candidate
+who used heavy AI assistance and can defend every load-bearing decision beats
+the candidate who wrote every line by hand but can't explain why.
 
-The framework that runs through this whole chapter is **three modes of
-decision-making.** Some decisions you made deliberately. Some the AI suggested
-and you evaluated and accepted. Some the AI defaulted to and you didn't deeply
-evaluate. Naming which mode each decision was — *especially* admitting the third
-mode where it's true — is the single strongest signal you can send. The
-candidate who claims every decision was mode one is lying and the interviewer
-knows it.
+You built flattr with Claude Code — significant AI assistance, by your own
+account. This chapter teaches the calibrated-honest answer: matter-of-fact
+about the AI's role, matter-of-fact about yours, and grounded in the fact that
+you can defend the architecture, the algorithm, and the debugging. The worst
+answer is defensive or evasive. The best is grounded.
 
 ---
 
-## The chapter-opening diagram — what AI did, what I did
+## The "what AI did, what I did" split
 
-The honest split. Not a 50/50 marketing slide — a real map of where your
-understanding is load-bearing and where the AI did mechanical work.
+This is the chapter's spine: a clean division of the work, so you can speak to
+both halves without flinching. The point isn't to minimize the AI — it's to
+show you own the decisions regardless of who typed them.
 
 ```
-  flattr — what AI did vs what I own
+  flattr — who did what
 
-  ┌─ AI (Claude Code) DID ────────┬─ I OWN ──────────────────────┐
-  │ wrote most of the actual code  │ the ARCHITECTURE: build-time │
-  │ (typing out astar.ts, the      │ vs runtime split, no backend,│
-  │ React Native components, tests)│ static graph decision        │
-  │                                │                              │
-  │ boilerplate: GeoJSON shaping,  │ the ALGORITHM: directional   │
-  │ MapLibre wiring, Expo config   │ cost model, admissible        │
-  │                                │ heuristic, finite BLOCKED,    │
-  │ suggested library choices,     │ the Dijkstra→A*→grade→        │
-  │ idiomatic TS patterns          │ directed progression          │
-  │                                │                              │
-  │ helped DEBUG: surfaced the     │ the DEBUGGING JUDGMENT: knew  │
-  │ disconnected-components lead    │ to separate algorithm from   │
-  │                                │ data, ran the reachability    │
-  │                                │ probe, recognized the classic│
-  │                                │ mesh-construction bug         │
-  └────────────────────────────────┴──────────────────────────────┘
+  ┌─ AI HELPED HEAVILY WITH ────────┬─ I OWN ────────────────────────┐
+  │ • TypeScript syntax, boilerplate │ • THE ARCHITECTURE: build-time │
+  │ • Expo / RN / MapLibre wiring    │   vs runtime split, no backend │
+  │ • test scaffolding               │ • THE ALGORITHM: one parametric│
+  │ • refactors, type plumbing       │   search(), directional cost,  │
+  │                                  │   admissible heuristic         │
+  │                                  │ • THE DEBUGGING: disconnected-  │
+  │                                  │   components bug, reachability  │
+  │                                  │   probe, corridor pre-load fix  │
+  │                                  │ • THE DESIGN CALLS: BLOCKED      │
+  │                                  │   finite, directional cost,     │
+  │                                  │   degrade-honestly              │
+  └──────────────────────────────────┴────────────────────────────────┘
 
-  THE TEST: I can explain any line. AI typed it; I directed it.
-  Where I CAN'T explain a line, I say so (never bluff code).
-
-  ┌─ THREE MODES of every decision ──────────────────────────────┐
-  │  1. DELIBERATE          my call    (directional cost, no DB)  │
-  │  2. EVALUATED+ACCEPTED  AI suggested, I weighed it             │
-  │                         (Open-Meteo, lazy-deletion heap)      │
-  │  3. DEFAULTED-TO        AI's default, I didn't deeply vet     │
-  │                         (own this honestly — riskiest, most   │
-  │                          senior-positive when owned)          │
-  └──────────────────────────────────────────────────────────────┘
+  THREE MODES OF EACH DECISION — be ready to label which
+  ┌────────────────────────────────────────────────────────────────┐
+  │ DELIBERATE             I decided. (directional cost, no backend) │
+  │ EVALUATED & ACCEPTED   AI suggested, I weighed it, kept it.      │
+  │ DEFAULTED-TO           AI's default, I didn't deeply evaluate.   │
+  │                        ← riskiest to own, strongest when owned.  │
+  └────────────────────────────────────────────────────────────────┘
 ```
 
-The right column and the three-modes box are what you defend. The left column
-you state plainly and move on.
+The left column doesn't weaken you — owning that AI wrote the boilerplate is
+honest and normal. The right column is where you live. And the three modes are
+the tool that makes the whole chapter work: when you can label *which* mode a
+decision came from, you sound like someone who watched their own decisions
+get made, not someone who accepted a pile of code on faith.
 
 ---
 
-## "Did you use AI to build this?"
+## The headline — "did you use AI to build this?"
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│ THEY ASK                                                          │
-│   "Did you use AI to build this?"                               │
-│                                                                   │
-│ WHAT THEY'RE TESTING                                              │
-│   NOT whether you used it — they assume you did. They're          │
-│   testing whether you'll be defensive or honest, and whether     │
-│   "I used AI" means "I understand it" or "I copy-pasted and       │
-│   hoped." Your tone in the first five seconds answers half of    │
-│   it.                                                             │
-└─────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────┐
+│ THEY ASK                                                 │
+│   "Did you use AI to build this?"                        │
+│                                                          │
+│ WHAT THEY'RE REALLY ASKING                               │
+│   NOT "did you cheat." They assume you used AI. They're  │
+│   testing: are you defensive about it (insecure), evasive│
+│   about it (dishonest), or matter-of-fact about it       │
+│   (mature)? And crucially — do you understand what you   │
+│   shipped, or did you ship something you can't explain?  │
+└─────────────────────────────────────────────────────────┘
 ```
 
-> "Yes, heavily — I built it with Claude Code. The way I'd frame it: the AI did
-> most of the *typing*, and I did the *directing*. The architecture is mine — the
-> build-time-versus-runtime split, the decision to have no backend, the static
-> graph. The algorithm is mine — the directional cost model, keeping the
-> heuristic admissible, the finite BLOCKED value, building it as a measured
-> progression. Claude wrote a lot of the actual lines, especially the boilerplate
-> — GeoJSON shaping, MapLibre wiring, the test scaffolding.
+The strong answer, in your voice — matter-of-fact, then pivot to ownership:
+
+> "Yes, heavily — I built it with Claude Code. It wrote a lot of the
+> TypeScript, the Expo and MapLibre wiring, the test scaffolding. That's how I
+> work now. What I own are the decisions that matter: the architecture is
+> mine — the build-time-versus-runtime split and the call to have no backend
+> were my design. The algorithm is mine — the directional grade cost, the
+> single parametric `search()` that does Dijkstra through directional A*, the
+> choice to keep the heuristic admissible. And the debugging is mine — when
+> routing returned 'no route' on a connected-looking map, I formed the
+> hypothesis, ran the reachability probe, and traced it to disconnected
+> components. The AI didn't hand me that; I did the diagnosis.
 >
-> The test I hold myself to is: I can explain any line in the routing engine, and
-> *why* it's there, not just what it does. Where the AI made a choice I didn't
-> deeply evaluate, I'll tell you that too — I'd rather be precise about what I
-> directed versus what I accepted than pretend I hand-wrote every character."
+> So the honest framing is: AI accelerated the typing, I own the thinking.
+> And I can prove that — ask me about any load-bearing decision and I'll tell
+> you why it's there and what it costs."
+
+That last line is an *invitation*. You're not bracing against the line-by-line
+follow-up — you're requesting it. That's the move that turns the AI question
+from a threat into your strongest moment.
 
 ```
-┃ "The AI did the typing. I did the directing. I can
-┃  explain any line in the engine — and where I can't,
-┃  I'll say so."
+┌─────────────────────────┬─────────────────────────┐
+│ WEAK ANSWER             │ STRONG ANSWER           │
+├─────────────────────────┼─────────────────────────┤
+│ "I mean, I used it for   │ "Yes, heavily — Claude  │
+│ some boilerplate but I    │ Code wrote a lot of the │
+│ wrote the important       │ TS and wiring. I own    │
+│ parts myself, the AI      │ the architecture, the   │
+│ just helped a little."    │ algorithm, and the      │
+│                          │ debugging — ask me about │
+│ (defensive, minimizing)   │ any decision and I'll    │
+│                          │ tell you why it's there  │
+│                          │ and what it costs. AI    │
+│                          │ accelerated the typing;  │
+│                          │ I own the thinking."     │
+├─────────────────────────┼─────────────────────────┤
+│ Why it's weak:          │ Why it works:           │
+│ Defensive and minimizing.│ Matter-of-fact about    │
+│ "Just helped a little"    │ the AI, specific about  │
+│ reads as insecure — the  │ what YOU own, and ends  │
+│ interviewer hears        │ by INVITING the         │
+│ someone uncomfortable     │ line-by-line probe.     │
+│ with how they work. It    │ Confidence, not         │
+│ also invites suspicion    │ defense.                │
+│ you CAN'T explain it.     │                         │
+└─────────────────────────┴─────────────────────────┘
 ```
 
-That's the whole posture in two sentences. Notice it's neither defensive
-("well, I wrote the important parts myself") nor evasive ("I mean, everyone uses
-AI"). It's matter-of-fact and it sets up the deeper questions.
-
----
-
-## "Can you explain this section line by line?"
-
-This is the real test. They'll pick a function and ask you to walk it. This is
-where bluffing dies and understanding shows.
+The weak answer's tell is the word "just." Minimizing the AI's role signals
+you're uncomfortable with it — and in 2026 that discomfort itself reads as a
+junior trait. The strong answer is *more* honest about the AI's role and
+*more* confident about yours. Both at once.
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│ THEY ASK                                                          │
-│   "Can you walk me through this function line by line?"          │
-│   (pointing at search() in astar.ts)                            │
-│                                                                   │
-│ WHAT THEY'RE TESTING                                              │
-│   The actual probe behind the whole chapter. Did you understand  │
-│   what the AI wrote, or did you accept code you can't read?      │
-│   They'll pick a load-bearing function on purpose.              │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-The good news: `search()` is exactly the function you understand best. Walk it
-with confidence.
-
-> "Sure. `search` (astar.ts:22) is the one engine the whole project runs on. It
-> takes the graph, start and goal, the user's max grade, and — the key part — a
-> `costFn` and a `heuristicFn`. Those two arguments are what make it Dijkstra, or
-> A*, or grade-aware, or directional.
->
-> It sets up an open priority queue, a `g` map of best-known cost to each node, a
-> `came` map for path reconstruction, and a `closed` set. It pushes the start with
-> priority equal to the heuristic. Then the main loop: pop the lowest-f node. If
-> it's already closed, skip it — that's lazy deletion, I push duplicates and skip
-> stale pops instead of doing a decrease-key. If it's the goal, reconstruct and
-> return. Otherwise close it, and for each incident edge, compute the tentative
-> cost through the current node using `costFn` — *this* is where directional cost
-> enters, because `costFn` gets the `fromNodeId` and can apply a signed penalty —
-> and if that beats the best known cost to the neighbor, relax it and push it with
-> `tentative + heuristic`.
->
-> The lazy-deletion choice was deliberate — it's the simplest correct heap, and
-> the spec says upgrade to decrease-key only if profiling demands it (§14.3). At
-> my graph size it never did."
-
-That walkthrough proves the point: you don't just know that the AI wrote it, you
-know *why each piece is shaped the way it is* — the lazy deletion, the `costFn`
-seam, the relaxation condition. That's ownership.
-
-Deeper line-by-line on `search()`, lazy deletion, and the relaxation invariant →
-`.aipe/study-dsa-foundations/`.
-
----
-
-## "What did the AI get wrong?" — the three modes in action
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│ THEY ASK                                                          │
-│   "What did the AI get wrong, or what did you have to push       │
-│    back on?"                                                     │
-│                                                                   │
-│ WHAT THEY'RE TESTING                                              │
-│   Were you a passenger or a driver? Can you name a moment you    │
-│   overrode the AI — which proves you were actually evaluating    │
-│   its output, not just accepting it? And can you admit a place   │
-│   you DIDN'T evaluate (mode three) honestly?                     │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-This is where the three modes earn their place. Walk all three.
-
-> "Three honest categories.
->
-> Deliberate, where I drove: the finite BLOCKED value. The instinct — and I think
-> the default an AI would reach for — is to make an impassable edge cost Infinity.
-> I specifically wanted it large-but-finite (1e9, cost.ts:5) so that a steep-only
-> route still gets returned and flagged, distinct from a genuinely disconnected
-> 'no route.' That distinction was my call and I'd push back on Infinity every
-> time.
->
-> Evaluated and accepted: the lazy-deletion priority queue, and Open-Meteo for
-> elevation. The AI suggested both. I evaluated lazy deletion against decrease-key
-> and accepted it because it's simpler and correct and profiling didn't justify
-> the complexity. I evaluated Open-Meteo against Google's paid API and accepted
-> the free one *because* I could put it behind a provider interface and swap later.
-> Those were AI suggestions I actively weighed.
->
-> Defaulted-to, where I'll be honest I didn't go deep: some of the Expo and
-> MapLibre configuration, and the exact GeoJSON property shaping for the map
-> layers. The AI produced idiomatic versions, they worked, and I didn't
-> independently verify every Expo 56 API choice against the docs — I leaned on the
-> AI and the fact that it rendered. If you drilled into why a specific MapLibre
-> layer style is structured the way it is, I'd be reconstructing it, not recalling
-> a decision I made."
-
-```
-        ▸ Three modes: what I drove, what I weighed, what
-          I defaulted to. Owning the third mode honestly
-          is the strongest signal in this chapter.
-```
-
-Naming the defaulted-to mode (Expo/MapLibre config) is the move most candidates
-are too scared to make — and it's exactly the one that reads as senior, because
-it proves the other two modes are real distinctions, not a story.
-
----
-
-## Weak vs strong — the AI question
-
-```
-┌──────────────────────────────┬──────────────────────────────┐
-│ WEAK ANSWER                   │ STRONG ANSWER                 │
-├──────────────────────────────┼──────────────────────────────┤
-│ "I mean, I used some AI for   │ "Yes, heavily — Claude Code.  │
-│ autocomplete but I really     │ The AI typed most of the code;│
-│ wrote it myself. The AI just  │ I directed the architecture   │
-│ helped with small stuff."     │ and the algorithm. I can      │
-│  — OR —                       │ explain any line in the       │
-│ "Yeah AI wrote most of it,    │ engine. Three modes: I drove  │
-│ honestly I'm not sure how     │ the finite BLOCKED, I weighed │
-│ some of it works but it       │ and accepted the lazy heap and│
-│ passes the tests."            │ Open-Meteo, and I defaulted to│
-│                               │ the Expo/MapLibre config —    │
-│                               │ which I'd reconstruct, not    │
-│                               │ recall."                      │
-├──────────────────────────────┼──────────────────────────────┤
-│ Why both are weak:            │ Why it works:                  │
-│ The first is defensive and    │ Matter-of-fact about the AI,   │
-│ obviously false — minimizing  │ specific about ownership,      │
-│ AI use in 2026 reads as       │ proves understanding (can      │
-│ insecurity. The second is the │ explain any line), and the     │
-│ opposite failure: accepting   │ three-modes honesty — including │
-│ code you can't explain. Both  │ the defaulted-to admission —   │
-│ fail the real test:           │ shows you were driving, not    │
-│ understanding.                │ riding.                        │
-└──────────────────────────────┴──────────────────────────────┘
+┃ "AI accelerated the typing. I own the thinking. And I can
+┃  prove it — ask me about any decision."
 ```
 
 ---
 
-## Where the AI conversation goes next
+## The drill-down — "explain this section line by line"
 
 ```
-  You gave the three-modes answer.
-        │
-        ├─► IF THEY DRILL INTO A "DEFAULTED-TO" AREA
-        │     (e.g. "why is this MapLibre layer shaped this way?")
-        │     "That's one I flagged as defaulted-to — I'd be
-        │      reconstructing it live rather than recalling a
-        │      decision. Let me reason through it..." then
-        │      actually reason. Never bluff a recall you don't
-        │      have. See the box below.
-        │
-        ├─► IF THEY ASK "so what did YOU actually contribute?"
-        │     "The judgment. The AI can write an A*; it can't
-        │      decide that cost should be directional, or that
-        │      BLOCKED must be finite, or that the snap is the
-        │      first bottleneck not the search. Those are the
-        │      decisions, and they're mine."
-        │
-        └─► IF THEY ASK "what has working with AI taught you?"
-              "To be sharper about what I'm actually deciding
-               versus accepting. When the AI types fast, the
-               risk is accepting choices you didn't make. The
-               discipline is knowing, for every load-bearing
-               line, which mode it came from."
+┌─────────────────────────────────────────────────────────┐
+│ THEY ASK                                                 │
+│   "Pick a non-trivial function and explain it to me      │
+│    line by line."                                        │
+│                                                          │
+│ WHAT THEY'RE REALLY ASKING                               │
+│   This is the verification. They want to know the AI     │
+│   didn't ship you something you can't read. The test     │
+│   isn't whether you memorized lines — it's whether you   │
+│   understand the MECHANISM well enough to walk it.       │
+└─────────────────────────────────────────────────────────┘
+```
+
+Pick `gradeCostDirected` — it's short, it's the heart of the project, and you
+understand it cold:
+
+> "Take the directional cost — `gradeCostDirected` in cost.ts:32. It returns
+> `edge.lengthM * (1 + penalty(directedGrade(edge, fromNodeId), userMax))`.
+> Walk it inside out: `directedGrade` (graph.ts:17) gives the signed grade in
+> the direction you're actually traveling — positive `gradePct` if you're
+> going from the edge's `fromNode`, negated if you're going the other way.
+> That sign flip is the entire directional behavior. Then `penalty`
+> (cost.ts:16) takes that signed grade: if it's at or below zero — flat or
+> downhill — it returns 0, so downhill is literally free. Moderate uphill is a
+> linear penalty, steep uphill is quadratic, and over your `userMax` it
+> returns `BLOCKED`, which is `1e9`. Finally I multiply the penalty into the
+> edge length, so a steep edge costs more than a flat edge of the same
+> distance. That `1 +` matters — it means a flat edge still costs its real
+> length, so the router doesn't collapse to 'minimize penalty, ignore
+> distance.' I can walk any of these — the cost function is the part I
+> understand best because it's the part that makes flattr flattr."
+
+You walked it inside-out with file:line refs and named the *why* behind each
+piece (the sign flip, the `1 +`). That's understanding, not memorization, and
+it's verifiable on the spot.
+
+---
+
+## The sharpest version — "what did the AI get wrong?"
+
+```
+┌─────────────────────────────────────────────────────────┐
+│ THEY ASK                                                 │
+│   "What did the AI get wrong, and how did you catch it?" │
+│                                                          │
+│ WHAT THEY'RE REALLY ASKING                               │
+│   Do you REVIEW what the AI produces, or accept it on    │
+│   faith? The candidate who can name a specific thing the │
+│   AI got wrong and how they caught it proves they're the │
+│   engineer in the loop, not a passenger.                 │
+└─────────────────────────────────────────────────────────┘
+```
+
+This is where the three modes earn their keep. The strongest material here is
+a `defaulted-to` decision you later caught and corrected, or an AI suggestion
+you evaluated and *rejected*:
+
+> "The most useful thing is the stuff I had to push back on. The AI's instinct
+> on the 'no flat route' case was to treat over-limit edges as impassable —
+> effectively infinite cost. That would've been wrong for the product: it
+> would collapse 'too steep' into 'no route' and leave the user with a dead
+> end instead of a flagged steep path. I made `BLOCKED` a large *finite*
+> number — `1e9`, cost.ts:5 — precisely so an only-steep path is still
+> returned and flagged. That distinction is mine, and it's the kind of thing
+> the AI won't get right because it's a product decision, not a code pattern.
+> More generally, the algorithm correctness — admissibility, the directional
+> sign convention, the disconnected-components diagnosis — is where I'm the
+> reviewer. The AI is fast at syntax and weak at 'is this the right behavior
+> for *this* product,' so that's exactly the line I watch."
+
+The `BLOCKED`-finite example is perfect because it's a real design decision
+where the obvious (AI-default) move was subtly wrong, and you can articulate
+*why* a product decision is the kind of thing AI gets wrong. That's the mature
+read on the tool.
+
+```
+┃ "The AI is fast at syntax and weak at 'is this the right
+┃  behavior for THIS product.' That line is exactly where I
+┃  stay the reviewer."
 ```
 
 ---
 
-## The "I don't know" box — when they drill a defaulted-to area
+## When the AI question pushes past your depth
 
-This is the one place in the whole book where "I don't know" is *most* likely and
-*most* survivable — because you pre-labeled it as defaulted-to.
+Even here, there's an honest-gap version — when they ask about a part where
+you genuinely *did* lean on the AI's default without deep evaluation.
 
 ```
 ╔═══════════════════════════════════════════════════════════════╗
-║ WHEN YOU DON'T KNOW                                            ║
+║ WHEN YOU DON'T KNOW (the defaulted-to honesty)               ║
 ║                                                               ║
-║   They drill exactly into a "defaulted-to" area you flagged:  ║
-║   "You said you didn't evaluate the Expo config deeply. OK —  ║
-║   why does loadGraph cast through `unknown`? Why that         ║
-║   pattern?"                                                    ║
+║   They probe a part you didn't deeply evaluate: "Why did you  ║
+║   structure the bidirectional search's potential function     ║
+║   exactly this way? Did you derive it or accept it?"          ║
 ║                                                               ║
-║   You genuinely may not have a designed reason — it's an AI   ║
-║   default you accepted. Owning that beats inventing one.      ║
+║   This is the riskiest mode — defaulted-to — and the          ║
+║   bidirectional proof is exactly where you're least confident ║
+║   (Chapter 6). The honest answer is the strong one.           ║
 ║                                                               ║
-║   Say:                                                         ║
-║   "Honest answer: that `as unknown as Graph` cast            ║
-║    (loadGraph.ts:10) is a TypeScript pattern for asserting    ║
-║    a type the compiler can't infer from a JSON import — and   ║
-║    it's exactly the spot I called out as a validation gap in  ║
-║    Chapter — in the failure story. It's an AI default I       ║
-║    accepted without making it a real boundary. I wouldn't     ║
-║    defend it as a good decision; I'd defend it as a known     ║
-║    gap I'd fix with a validation pass. I'm not going to       ║
-║    invent a principled reason for it, because there isn't     ║
-║    one — it was the path of least resistance and I'd change   ║
-║    it."                                                        ║
+║   Say:                                                        ║
+║   "I'll be straight: the balanced-potential formulation is a  ║
+║    place where I worked it out with the AI and verified it    ║
+║    empirically rather than deriving it cold myself. I          ║
+║    understand the mechanism — forward and reverse potentials  ║
+║    that stay consistent, the stopping rule when the frontiers ║
+║    meet — and I trust it because it returns the same paths as  ║
+║    my single-direction A* across the tests. But the formal    ║
+║    consistency proof is something I'd want to derive carefully ║
+║    before I claimed I owned it from first principles. So       ║
+║    that one is 'evaluated and accepted on evidence,' not       ║
+║    'derived from scratch,' and I'd rather tell you that than   ║
+║    pretend I proved it on a whiteboard."                      ║
 ║                                                               ║
-║   What this signals: you connected the drilled line to a gap  ║
-║   you ALREADY identified (consistency across the interview),  ║
-║   refused to manufacture a justification, and named the fix.  ║
-║   That's maximum credibility — you'd rather own a gap than    ║
-║   fake a reason.                                              ║
-║                                                               ║
-║   Do NOT say:                                                  ║
-║   "Oh, I chose that cast deliberately because it's the most   ║
-║    type-safe way to..." — inventing a principled reason for   ║
-║   an AI default is the one move that can sink an otherwise    ║
-║   strong loop. They can smell a retrofitted justification.    ║
+║   What this signals: you can label the EXACT mode a decision  ║
+║   came from (defaulted-to / accepted-on-evidence), you don't  ║
+║   inflate your ownership, and you back the gap with empirical ║
+║   evidence. Owning a defaulted-to decision honestly is the    ║
+║   single most senior-positive move in the whole AI            ║
+║   conversation — most candidates can't admit one exists.      ║
 ╚═══════════════════════════════════════════════════════════════╝
 ```
 
-```
-┃ "I'm not going to invent a principled reason for it,
-┃  because there isn't one. I'd rather own the gap than
-┃  fake the rationale."
-```
+For the algorithm internals you'd want to derive cold — A* admissibility,
+bidirectional consistency, heap mechanics — point yourself at
+**`.aipe/study-dsa-foundations/`**.
 
 ---
 
-## What you'd change about how you used AI
+## What you'd change
 
-If I ran this project again, I'd be more deliberate about turning mode-three
-decisions into mode-two decisions *during* the build instead of discovering them
-in interview prep. Every time the AI produced something load-bearing — the
-`loadGraph` cast, the Expo config — I'd pause and decide whether to evaluate it or
-consciously accept the default, and write that down. The engine I drove hard and
-understand cold. The shell I let the AI default on, and that's exactly where my
-"defaulted-to" admissions cluster. Closing that gap during the build, not after,
-is the discipline AI-assisted work actually demands.
+In how you *talk about* the AI, the thing to tighten is to label the mode
+proactively. Don't wait to be asked "did you evaluate this or accept it" —
+volunteer "this one I decided, this one the AI suggested and I kept after
+weighing it, this one I defaulted to and verified by tests." Naming the mode
+before you're asked is the difference between sounding like you watched your
+decisions get made and sounding like you're reconstructing them under
+pressure. The three modes aren't a defense — they're how you prove you were
+the engineer in the loop the whole time.
 
 ---
 
-## One-page summary — Chapter 8
+## One-page summary — read this the night before
 
-**Core claim:** The AI question tests understanding, not usage. Be matter-of-fact
-about the AI's role, prove you can explain the code, and name the three modes of
-decision-making honestly — including defaulted-to.
+**Core claim:** The AI question isn't "did you cheat" — it's "do you
+understand what you shipped." Be matter-of-fact about the AI, specific about
+what you own, and invite the line-by-line probe.
 
-**The answers:**
-- **"Did you use AI?"** → "Yes, heavily, Claude Code. AI typed; I directed. I can explain any line in the engine."
-- **"Explain this line by line"** → walk `search()` (astar.ts:22): the `(costFn, heuristicFn)` seam, lazy deletion, relaxation. You own this function cold.
-- **"What did AI get wrong / push back on?"** → three modes: drove finite BLOCKED; weighed+accepted lazy heap + Open-Meteo; defaulted-to Expo/MapLibre config.
+**Questions covered:**
+- *"Did you use AI?"* → Yes, heavily, Claude Code. AI accelerated the typing;
+  I own the architecture, algorithm, and debugging. Ask me anything.
+- *"Explain it line by line"* → `gradeCostDirected` (cost.ts:32) inside-out:
+  signed `directedGrade` (graph.ts:17), `penalty` 0-for-downhill (cost.ts:16),
+  the `1 +` that keeps distance in the cost.
+- *"What did AI get wrong?"* → the `BLOCKED`-finite call (cost.ts:5) — AI's
+  default treated steep as impassable; I made it finite so steep stays a
+  flagged path. Product decisions are where AI is weak and I stay reviewer.
+- *"Did you derive the bidirectional potential?"* → no — evaluated and
+  accepted on empirical evidence, not derived cold. Said plainly.
 
-**The three modes:** deliberate · evaluated-and-accepted · defaulted-to. Owning mode three is the strongest signal.
+**The three modes:** deliberate (I decided) · evaluated-and-accepted (AI
+suggested, I weighed it) · defaulted-to (AI's default, verified not derived).
+Label the mode before being asked.
 
 **Pull quotes:**
-- ┃ "The AI did the typing. I did the directing. I can explain any line — and where I can't, I'll say so."
-- ▸ Three modes: what I drove, what I weighed, what I defaulted to.
-- ┃ "I'm not going to invent a principled reason for it. I'd rather own the gap than fake the rationale."
+- "AI accelerated the typing. I own the thinking."
+- "The AI is fast at syntax and weak at 'is this right for THIS product.'"
 
-**What you'd change:** Turn mode-three decisions into mode-two *during* the build — pause on every load-bearing AI default and consciously evaluate or accept it, in writing. Never bluff code; own the gap instead.
+**What you'd change:** Label the decision mode proactively — don't wait to be
+asked whether you decided, accepted, or defaulted.

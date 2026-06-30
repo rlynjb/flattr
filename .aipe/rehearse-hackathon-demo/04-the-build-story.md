@@ -1,210 +1,221 @@
-# Chapter 4 — The Build Story   (8:00–8:45, 45 seconds)
+# Chapter 4 — The Build Story   (8:00–8:45, 0:45)
 
 ## Opening hook
 
-Forty-five seconds to prove this is a real build, not a mockup, and the way
-you do that is with one specific war story — the bug that almost killed it and
-the fix that saved it. Judges have seen a hundred pitch decks dressed up as
-demos. The thing that separates you is a *concrete* obstacle, named precisely,
-with the real fix. You're not listing features here. You're telling the one
-story that only someone who actually built this could tell.
+Forty-five seconds to prove this is a real build, not a mockup — and the way you
+do that is by telling the story of the one hard bug you actually cracked. Not a
+feature list. A war story. Judges have seen a hundred demos that look real and
+fall apart on the second question; the thing that separates yours is that you can
+name a genuine obstacle, how you diagnosed it, and how you fixed it. You have one
+perfect story for this, and it's true: the "no route" bug.
 
-The story is the "no route" bug — when two valid addresses returned nothing,
-and why. Tell it tight, land the fix, then own one rough edge with your chin
-up. Owning a limitation reads as confidence; hiding it reads as a pitch.
+The discipline here is brevity. Forty-five seconds is one obstacle, one diagnosis,
+one fix — told fast, owned cleanly, including the rough edges. Don't reach for a
+second story; you don't have time, and the first one is strong enough.
 
 ## The time-budget bar
 
+Three-quarters of a minute. One story: problem, probe, fix.
+
 ```
   ┌──────────────────────────────────────────────────────────┐
-  │ ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░▓▓▓░░░░░░░░░░░░░░░░ │
-  │ 8:00 ─────────────────────── 8:45 ───────────────────10:00 │
-  │   THE BUILD STORY — you own 8:00 to 8:45 (45 sec)         │
-  │   ONE debugging win + ONE owned rough edge. Fast.         │
+  │ ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░▓▓▓░░░░░░░░░░░░░░░░░░ │
+  │ 1:00 ─────────────────────── 8:00 ─ 8:45 ──────────── 10:00│
+  │        BUILD STORY — you own 8:00 to 8:45 (45 sec)        │
   └──────────────────────────────────────────────────────────┘
 ```
 
-Forty-five seconds. One story, told clean. No feature list.
+## The chapter-opening diagram — the 'no route' bug and the fix
 
-## The chapter-opening diagram — the "no route" debugging win
-
-This is the bug and the fix in one picture. Two valid addresses, no route
-returned — because they landed in two *disconnected* graph components, and the
-fix was to load the corridor between them so they sit in one connected graph.
+This is the bug, the diagnosis, and the fix in one frame. The story has a perfect
+shape: a symptom that made no sense (both addresses exist, but "no route"), a
+probe that found the real cause (the two endpoints sat in two disconnected
+graphs), and a fix that's genuinely clever (load the whole corridor between them
+in one build and stitch it together).
 
 ```
-  THE "NO ROUTE" BUG → THE FIX
+  THE 'NO ROUTE' BUG → THE CORRIDOR-STITCH FIX
 
-  ─── BEFORE: the reachability probe says "unreachable" ───
-
-   start ●         (gap: no edges loaded here)         ● end
-     │                                                   │
-   ┌─┴── component A ──┐                   ┌── component B ┴─┐
-   │ loaded tile       │   ✗ NO PATH       │ loaded tile     │
-   │ around start      │   between them     │ around end      │
-   └───────────────────┘                   └─────────────────┘
-        A* explores A, drains its frontier, never reaches B
-        → returns null → card: "No route between those points"
-        (but the streets obviously connect in real life!)
-
-  ─── AFTER: load the corridor → one connected component ───
-
-   start ●━━━━━━━━━━━━ corridor tiles loaded ━━━━━━━━━━━● end
-     │                                                   │
-   ┌─┴───────────────── one merged + stitched graph ─────┴─┐
-   │  ensureBbox([min..max] + 1 tile margin) → fetch the    │
-   │  WHOLE span → mergeGraphs → stitchGraph (snap          │
-   │  coincident boundary nodes so seams actually connect)  │
-   └────────────────────────────────────────────────────────┘
-        A* now crosses the seam → real route → it bends
-        around the hill. (MapScreen.tsx:139 endpoint effect)
+  SYMPTOM
+  ┌──────────────────────────────────────────────────────────┐
+  │  start exists ✓   end exists ✓   …yet "No route." ✗       │
+  │  made no sense — both points were right there on the map  │
+  └──────────────────────────────────────────────────────────┘
+                            │  reachability probe on-device
+                            ▼
+  DIAGNOSIS  (the probe printed:  s=true  e=true  eReach=false)
+  ┌──────────────────────────────────────────────────────────┐
+  │   only tiles near the viewport had loaded:                │
+  │                                                           │
+  │     ┌─ component 1 ─┐        ┌─ component 2 ─┐            │
+  │     │  ● start      │  GAP   │       end ●   │            │
+  │     │   (loaded)    │  no    │   (loaded)    │            │
+  │     └───────────────┘ streets└───────────────┘            │
+  │                                                           │
+  │   two DISCONNECTED graph components → A* can't cross      │
+  └──────────────────────────────────────────────────────────┘
+                            │  ensureBbox() in useTileGraph.ts
+                            ▼
+  FIX
+  ┌──────────────────────────────────────────────────────────┐
+  │   when both endpoints are set, fetch the WHOLE corridor   │
+  │   between them in ONE Overpass + elevation build, then    │
+  │   stitchGraph() welds coincident boundary nodes →         │
+  │                                                           │
+  │     ●━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━●                 │
+  │       start and end now in ONE connected component        │
+  └──────────────────────────────────────────────────────────┘
 ```
 
-The bug looked like a routing failure but it was a *graph connectivity*
-failure — and telling that difference is the whole story.
+The shape of that story — weird symptom, a probe that found the real cause, a fix
+that's faster than the naive approach — is exactly what makes a build sound real.
 
 ## The body — the beats in order
 
-### Beat 1 — what shipped (one sentence, 8:00–8:10)
+### Beat 1 — the symptom + the probe (8:00–8:25)
 
-Don't list features. One sentence that says "this is a working system."
-
-```
-┃ "Everything you just saw is real — a hand-rolled A* router
-┃  over a street graph I build on-device from live OpenStreetMap
-┃  and elevation data. No Google Maps API doing the work."
-```
-
-The "hand-rolled, no routing API" point matters — it tells judges the graph
-work is *yours*, which is exactly what they probe for in Q&A.
-
-### Beat 2 — the debugging win (8:10–8:35)
-
-The story. Tell it like it happened, because it did.
+Tell it like it happened. Both addresses resolved, both points were on the map,
+and it still said "no route." That's the hook. Then the diagnosis: you didn't
+guess, you ran a reachability probe on the device that told you the start and end
+were in two disconnected pieces of the graph.
 
 ```
-  SHOW (on screen / slide)      SAY (out loud)
-  ──────────────────────        ─────────────────────────────
-  the BEFORE half of the        "Early on, two perfectly valid
-  diagram (two components)       addresses would just return 'no
-                                 route' — even though the streets
-                                 obviously connect."
-  ──────────────────────        ─────────────────────────────
-  point at the gap              "Turned out the start and end were
-                                 landing in two disconnected pieces
-                                 of the graph — I'd only loaded
-                                 tiles around each endpoint, not
-                                 the gap between them."
-  ──────────────────────        ─────────────────────────────
-  the AFTER half               "The fix: when you set both points,
-                                 load the whole corridor between
-                                 them, merge it, and stitch the
-                                 seams so the nodes actually join.
-                                 Now A* crosses it."
+  SHOW (on screen)               SAY (out loud)
+  ─────────────────────────      ──────────────────────────────────
+  (talking head, or the bug      "The hard one: I'd type two real
+   diagram on a slide)            addresses and get 'No route' — even
+                                  though both points were right there.
+                                  I ran a reachability probe and it
+                                  said: start exists, end exists, but
+                                  the end is unreachable."
+```
+
+### Beat 2 — the fix (8:25–8:45)
+
+The cause and the fix, fast. Only the tiles near the screen had loaded, so the
+two endpoints sat in separate graph components. The fix: when both endpoints are
+set, load the whole bounding corridor between them in one build and stitch it into
+one connected graph.
+
+```
+  SHOW (on screen)               SAY (out loud)
+  ─────────────────────────      ──────────────────────────────────
+  point at the two-components     "Only the streets near the screen
+  → one-component panels          had loaded, so the two ends were in
+                                  separate islands. The fix: load the
+                                  whole corridor between them in one
+                                  shot and stitch it into one graph.
+                                  No route became every route."
 ```
 
 ```
-┃ "It looked like a routing bug. It was a graph-connectivity
-┃  bug — two components that never touched. Once I loaded and
-┃  stitched the corridor, the route just appeared."
+  ┃ "Two real addresses, and still 'no route.' Turned out the
+  ┃  start and the end were in two disconnected islands of the
+  ┃  map — so I load the whole corridor between them and stitch
+  ┃  it into one graph."
 ```
 
-The detail that makes this credible: I kept `BLOCKED` as a large *finite*
-number, not `Infinity`, so the router never confuses "this path is too steep"
-with "there's no path." A `null` route means genuinely disconnected — like the
-bug — and "flattest available" with flagged steep blocks means it exists but
-climbs. Two different graph states, surfaced honestly. That distinction is why
-I could even *see* this was a connectivity bug and not a cost bug.
+## Own the rough edges — say these before a judge finds them
 
-### Beat 3 — own the rough edges (8:35–8:45)
-
-Name a real limitation, flat, no apology. This is the move that reads as
-confidence.
+A hackathon build is rough, and you own that with the confidence of someone who
+shipped under a clock. Two honest edges, named matter-of-factly. This is strength,
+not weakness — it tells the room you know exactly where the build stands.
 
 ```
-┃ "Two honest edges: my elevation data is coarse — about a
-┃  90-meter grid — so grades are approximate, and I label them
-┃  that way. And when the free elevation API rate-limits me,
-┃  I fall back to flat and retry rather than crash. I'd rather
-┃  the map stay up and tell you it's approximate than lie."
+  THE ROUGH EDGES — own them, don't hide them
+
+  ┌─ coarse elevation ───────────────────────────────────────┐
+  │  Grades come from a free ~90 m elevation grid. That's why │
+  │  the card says "grades approximate" — real enough to bend │
+  │  the route, not survey-grade. I'd rather show that than    │
+  │  fake precision.                                          │
+  └──────────────────────────────────────────────────────────┘
+
+  ┌─ flat fallback when the API throttles ───────────────────┐
+  │  The free Open-Meteo elevation API rate-limits. When it   │
+  │  429s, I build with flat (0 m) elevation so the streets    │
+  │  still render and routing still connects — then quietly    │
+  │  self-heal the grades once the API recovers. Connectivity  │
+  │  over fidelity, on purpose.                                │
+  └──────────────────────────────────────────────────────────┘
 ```
 
-That's it. You named the coarse 90 m DEM and the flat-fallback-on-throttle,
-you framed both as deliberate ("I'd rather X than Y"), and you moved on. No
-"unfortunately," no "we ran out of time." Shipped under a clock, owns the
-tradeoffs.
+You don't have to say both on stage — pick the one that fits the moment, or save
+them for Q&A. The point of having them written is that nothing a judge asks
+catches you flat-footed.
 
-### Strong vs weak — the build-story move
+## Strong vs weak — story vs feature list
 
-```
-  WEAK build story                 STRONG build story
-  ──────────────────────────      ──────────────────────────
-  "We built a router, a heatmap,   ONE bug: "two addresses
-   a slider, autocomplete, a tile   returned no route — they were
-   system, an elevation cache,       in disconnected components.
-   a fallback system, swap..."        Loaded the corridor, fixed."
-  → feature checklist, no proof    → a story only the builder
-    it was hard or real              could tell → proves it's real
-
-  Hide the rough edges, hope no    "Grades are coarse — 90 m grid
-  one asks                          — and I label them approximate
-                                     on purpose."
-  → defensive when asked           → owns it → reads as confident
-```
-
-The weak column is a résumé. The strong column is a story. A story that names
-a real bug and a real fix is the single strongest proof in the whole talk that
-this is a build, not a deck.
-
-## The IF-IT-BREAKS box
+The contrast that makes forty-five seconds count.
 
 ```
-╔══════════════════════════════════════════════════════════════╗
-║ IF IT BREAKS — you're out of time / lose the thread           ║
-║ This chapter has no live demo, so nothing crashes — but it's   ║
-║ the first thing to compress if the demo ran long. Collapse to  ║
-║ one line: "Hardest part was a 'no route' bug — two addresses   ║
-║ in disconnected graph pieces; I load and stitch the corridor   ║
-║ between them now." Then jump to the close. The story survives   ║
-║ as a single sentence.                                          ║
-╚══════════════════════════════════════════════════════════════╝
+  WEAK — the feature list             STRONG — the war story
+  ─────────────────────────────       ──────────────────────────────────
+  "I built address autocomplete,      "I'd type two real addresses and
+   a grade heatmap, a zones            get 'No route' — both points right
+   overlay, the swap button, the       there on the map. A probe showed
+   max-grade presets, current-         the start and end were in two
+   location, an elevation cache…"       disconnected islands of graph. So
+                                       I load the whole corridor between
+  → a list; nothing proves it           them and stitch it into one. That's
+    was HARD; sounds like a tour         the bug I'm proudest of cracking."
+
+                                       → one real obstacle, real diagnosis,
+                                         real fix — sounds like an engineer
 ```
 
-## The "tighten it" treatment
+The feature list is true but flat — it proves breadth, not depth. The war story
+proves you hit a real wall and got through it. Depth is what judges remember.
 
-**Cut:** beat 3 (the rough edges) — fold it into Q&A instead, where "what are
-the limitations?" is asked anyway.
-**Floor:** beat 2, the debugging win, in at least one sentence. If you cut the
-whole story you've cut the proof that it's real — and a working build's only
-edge over a pitch deck is proof. Keep the bug.
+## IF IT BREAKS
+
+This chapter is spoken — no live app. If a slide is up and dies, the story stands
+on its own as speech.
+
+```
+  ╔══════════════════════════════════════════════════════════════╗
+  ║ IF IT BREAKS                                                 ║
+  ║ The bug-diagram slide won't show → tell the story with your  ║
+  ║ hands: "two real addresses, still 'no route' — they were in  ║
+  ║ two disconnected islands; I load the corridor between them   ║
+  ║ and stitch it." The story needs no visual to land.           ║
+  ╚══════════════════════════════════════════════════════════════╝
+```
+
+## The "tighten it" cut
+
+Cut Beat 1's setup and lead straight with the punchline: "two real addresses,
+still 'no route' — they were in disconnected islands, so I load and stitch the
+whole corridor." **Floor: you must land one genuine technical obstacle and its
+fix.** If you're catastrophically over, cut this whole chapter and fold the one
+line into the close — but losing the war story costs you the "this is real"
+signal, so cut elsewhere first.
 
 ## The one-page run sheet
 
 ```
-  ┌─ CH 04 · BUILD STORY · 8:00–8:45 ────────────────────────┐
+  ┌─ RUN SHEET — CH 4 BUILD STORY ── 8:00–8:45 (45 sec) ──────┐
   │                                                           │
-  │  BEAT 1 (8:00) what shipped, ONE line:                    │
-  │   ┃ "real hand-rolled A* over a graph I build on-device   │
-  │      from live OSM + elevation. No routing API."          │
+  │  ONE STORY: the 'no route' bug.                           │
+  │   • symptom: two real addresses → still "No route"        │
+  │   • probe:   reachability check → s✓ e✓ eReach✗           │
+  │   • cause:   start + end in two DISCONNECTED components    │
+  │   • fix:     load whole corridor in one build → stitch     │
   │                                                           │
-  │  BEAT 2 (8:10) ★ THE BUG:                                 │
-  │   ┃ "two valid addresses → 'no route' → they were in      │
-  │      DISCONNECTED graph components. Fix: load + stitch     │
-  │      the corridor between them. A* now crosses it."        │
-  │   • BLOCKED is large-FINITE, not ∞ → 'too steep' ≠         │
-  │     'no path'. That's how I saw it was connectivity.       │
+  │  NAIL THIS LINE:                                          │
+  │   ┃ "The start and end were in two disconnected islands — │
+  │   ┃  so I load the whole corridor between them and stitch │
+  │   ┃  it into one graph."                                  │
   │                                                           │
-  │  BEAT 3 (8:35) own it, no apology:                        │
-  │   ┃ "grades are coarse — 90 m grid, labeled approximate.  │
-  │      API throttles → flat fallback + retry, not a crash."  │
+  │  ROUGH EDGES (own one if asked):                          │
+  │   • coarse ~90 m elevation → "grades approximate"         │
+  │   • flat fallback when Open-Meteo 429s, self-heals after  │
   │                                                           │
-  │  IF SHORT ON TIME: collapse to beat 2 one-liner → close.  │
-  │  TIGHTEN: cut beat 3 (it's a Q&A anyway).                 │
-  │    FLOOR: keep the bug. It's the proof.                   │
+  │  files: useTileGraph.ts (ensureBbox) · tiles.ts (stitch)  │
   │                                                           │
-  │  DEEPER: defense book → 04-honest-fallback-routing.md,    │
-  │          study → 03-tile-merge-stitch.md                  │
-  └───────────────────────────────────────────────────────────┘
+  │  IF IT BREAKS: tell the story as speech, no visual needed.│
+  │                                                           │
+  │  TIGHTEN: lead with the punchline.                        │
+  │   FLOOR: land ONE real obstacle + its fix.                │
+  └────────────────────────────────────────────────────────────┘
 ```
-
-Go to chapter 05 — land the last line.

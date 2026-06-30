@@ -1,60 +1,55 @@
 # Template — agentic coding / build system
 
-Generic interview template (nine-bullet shape). flattr *has* a build system
-(`pipeline/`), but it's a deterministic chain, not an agentic one — so this
-template applies only as a contrast.
+Doesn't fit flattr's runtime domain (it routes, it doesn't write code). But
+the reader's portfolio has the nearest real anchor — **aipe** (per `me.md`),
+the meta-tool generating this very guide: a describe → diagnose → act
+layering driven by markdown specs. aipe is agent-*adjacent* and stops short
+of an autonomous coding loop, which is itself the lesson.
 
 - **The prompt:** "Design an agent that completes a coding task across a
   repo — read, plan, edit, verify."
 
-- **Standard architecture:** plan-and-execute (plan the changes, then execute
-  per file) + verifier-critic (run tests / review the diff, loop on failure)
-  + guardrails (scope the writable files, cap iterations).
+- **Standard architecture:** plan-and-execute (plan the changes, then
+  execute per file) + verifier-critic (run tests / review the diff, loop on
+  failure) + guardrails (scope the writable files, cap iterations).
 
 ```
-  retrieve repo context → PLAN → execute (edit) → VERIFY (tests)
-                            ▲                          │
-                            └──── re-plan on failure ──┘  (cap rounds)
+  repo context → PLAN changes → EXECUTE per file → VERIFY (tests/review)
+                     ▲                                   │ fail
+                     └─────────── re-plan trigger ◄───────┘
+                                  (cap iterations)
 ```
 
-- **Data model:** repo context (file tree, relevant files retrieved), the
+- **Data model:** repo context (file tree, retrieved relevant files), the
   plan, the diff, test results, an iteration counter.
 
 - **Key components:** retrieval over the codebase (which files matter),
   planning, execution (edits), verification (tests/review), the re-plan
-  trigger on verification failure. Decision: plan-and-execute vs pure ReAct
-  for the edit loop.
+  trigger. Decision: plan-and-execute vs pure ReAct for the edit loop.
 
 - **Scale concerns:** large repos blow the context budget (retrieval routing
   over the codebase), long tasks blow the iteration cap, cost per task.
 
 - **Eval framing:** task success (tests pass), trajectory efficiency (edits
-  and re-plans to completion), regression rate (did it break something else).
+  + re-plans to completion), regression rate (did it break something else).
 
 - **Common failure modes:** editing files outside scope, plan assumptions
-  breaking mid-execution (re-plan), verifier sharing the producer's blind
+  breaking mid-execution (re-plan), the verifier sharing the producer's blind
   spots, context loss across long tasks.
 
-- **Applies to this codebase:** **No, as an agent — but flattr has the
-  deterministic skeleton of one.** flattr's build pipeline
-  (`pipeline/run-build.ts`) is a *plan-and-execute chain with no model*: the
-  "plan" is the fixed engineer-written stage order (osm → split → elevation →
-  grade → build-graph), the "execute" is each pure transform, and the
-  "verify" is the test suite (Vitest) plus the A* admissibility invariants.
-  Same plan→execute→verify *shape*, zero model — which is exactly the
-  chains-vs-agents point: a plan-execute structure doesn't require an agent.
+- **Applies to this codebase:** **no.** flattr is a routing engine; it
+  generates no code and edits no files. The closest real instance in the
+  reader's portfolio is **aipe** — markdown-as-source-of-truth, slash
+  commands as the interface, a describe → diagnose → act layering. But aipe
+  ships *no autonomous loop and no multi-agent system*: a slash command is a
+  single guided LLM pass over a spec, not a self-directed plan→execute→verify
+  agent. It's agent-adjacent and deliberately stops there — the same way
+  flattr's router is a control loop that stops short of an agent.
 
-- **How to make it apply:** flattr isn't a coding-agent target — the artifact
-  it builds is `graph.json`, not code. The honest framing for an interview is
-  the contrast: "my build pipeline is plan-execute-verify *without* a model,
-  which is the deterministic baseline you should reach for before an agentic
-  build system. You'd only add a model if the build steps became
-  data-dependent in a way the engineer can't sequence in advance" — and
-  flattr's never do (the stage order is fixed regardless of input). That "I
-  used a chain because the steps were known" answer is stronger than reaching
-  for an agentic builder.
-
-## See also
-- `../01-reasoning-patterns/01-chains-vs-agents.md` — the pipeline as a chain
-- `../03-multi-agent-orchestration/01-when-not-to-go-multi-agent.md`
-- `01-multi-agent-research-assistant.md` · `02-agentic-support-system.md`
+- **How to make it apply:** for flattr specifically, this template doesn't
+  apply — don't retrofit it. The transferable lesson, if asked, is the
+  escalation discipline flattr *does* model: `bench/`-driven
+  measure-then-escalate (Dijkstra→A*→bidirectional) is exactly the
+  plan→verify→re-plan loop's instinct (verify against a metric, escalate on a
+  named failure), just applied deterministically to search rather than to
+  code edits.

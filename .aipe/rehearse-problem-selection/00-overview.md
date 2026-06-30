@@ -1,110 +1,203 @@
 # Problem Selection — flattr (overview)
 
-> Coach posture. Base persona: `teacher.md` (staff engineer), voice shifted to
-> coach for `me.md` (Rein). Diagrams primary, second person, no hedging, no
-> marketing. This book justifies **why** flattr deserves investment *before* any
-> solution design — and it is brutally honest about what the repo can and cannot
-> prove.
+Coach voice. Same staff engineer from `teacher.md`, shifted to coach
+posture (per `rehearse-interview-defense.md`): more direct, "do say this,
+don't say that," focused on what survives a review room — not what's
+merely true. Calibrated to you (`me.md`): diagrams first, pattern over
+vendor, concept → mechanism → your code.
 
-## The one thing to internalize before you defend this
+This book is the human layer *before* solution design. It answers one
+question and refuses to skip it: **does this problem deserve the
+investment you've already poured into it?** You built the engine. This
+book makes you defend the choice to build *anything*.
 
-You built a router. You did **not** validate a problem. Those are two different
-claims, and a sharp reviewer will separate them in the first thirty seconds.
-This book makes you the one who separates them first.
+---
 
-Here is the whole brief in one frame. Read the two columns as two different
-kinds of truth — one you can point at a file for, one you cannot.
+## The one thing to internalize first
 
-```
-  flattr — what the repo proves vs. what it only asserts
-
-  ┌─ EVIDENCE (point at a file) ────────────┐   ┌─ INFERENCE (plausible, unproven) ──┐
-  │ • A* == Dijkstra optimality gate        │   │ • that kick-scooter commuters      │
-  │     astar.test.ts:38,47,51              │   │     exist in measurable numbers    │
-  │ • node-expansion drops (bench harness)  │   │ • that they'd switch from Google   │
-  │     bench/run.ts → report.ts            │   │     Maps to a flat-first router     │
-  │ • signed directional grade cost         │   │ • that "show me the flat" is a      │
-  │     cost.ts penalty()                    │   │     felt pain, not a nice-to-have   │
-  │ • honest fallback (BLOCKED finite)      │   │ • that grade ceiling is a hard,     │
-  │     cost.ts:6, astar fallback           │   │     non-negotiable need for anyone  │
-  │ • free data pipeline runs               │   │ • the AccessMap differentiator      │
-  │     pipeline/*.ts, graph.json 544 KB    │   │     ("personalized userMax") matters│
-  │ • ships on device (Expo app)            │   │                                     │
-  │     mobile/src/MapScreen.tsx            │   │                                     │
-  └─────────────────────────────────────────┘   └────────────────────────────────────┘
-        ↑ the problem is SOLVABLE                       ↑ the problem is WORTH solving
-          (proven, technically)                           (NOT proven — discovery needed)
-```
-
-The repo lands the left column hard. The right column is empty of evidence —
-there are no users, no logs, no interviews, no waitlist, no analytics, nothing.
-`docs/flattr-spec.md` §3 prints a three-row user table; that table is a
-**hypothesis written by the author**, not a finding. Treat it as inference.
-
-## The honesty framing this book uses
-
-One sentence, and it runs through every file:
-
-> **flattr proves the problem is technically solvable. It contains zero evidence
-> the problem is worth solving. The correct next investment is discovery, not
-> features.**
-
-That is not a weakness to hide. Stated first, it reads as senior judgment —
-exactly the framing `docs/flattr-spec.md` §15.1 already reaches for about
-*scale* ("name the gap before a reviewer does"). This book applies the same move
-to *demand*.
-
-## Reading order
+There are two different claims, and flattr proves exactly one of them.
 
 ```
-  00-overview.md                    ← you are here: the EVIDENCE/INFERENCE split
-        │
-        ▼
-  01-problem-brief.md               who hurts · what the repo proves · why now ·
-        │                           beneficiaries · constraints (the 10-point core)
-        ▼
-  02-scope-cuts-and-non-goals.md    the smallest validating slice + what NOT to build
-        │
-        ▼
-  03-options-and-opportunity-cost.md  including `do nothing` as a real option
-        │
-        ▼
-  04-success-metrics-and-feedback-loop.md  metrics available-now vs. needs-users
-        │
-        ▼
-  05-skeptical-reviewer-questions.md  the review-room questions and answers that hold
+  Two claims — flattr proves the left, not the right
+
+  ┌─ CLAIM A: "this is technically solvable" ─────────────┐
+  │  hand-rolled directional A* over free OSM +           │
+  │  Open-Meteo data; A*==Dijkstra oracle; bench          │
+  │  node-expansion numbers; BLOCKED-finite honest        │
+  │  fallback; shipped Expo app on a real neighborhood    │
+  │                                                        │
+  │  STATUS: ★ PROVEN by the repo ★                        │
+  └────────────────────────────────────────────────────────┘
+
+  ┌─ CLAIM B: "people want this enough to switch" ────────┐
+  │  demand, adoption, trust, willingness to leave         │
+  │  Google Maps / AccessMap for a flatter route           │
+  │                                                        │
+  │  STATUS: ☐ UNPROVEN — zero users, zero telemetry,      │
+  │          zero research anywhere in the repo            │
+  └────────────────────────────────────────────────────────┘
+
+  A skeptical reviewer attacks B. Your repo answers A.
+  The whole book is about not confusing the two.
 ```
 
-## Constraints baked into every recommendation
+Grep the repo for `analytics|telemetry|sentry|mixpanel|amplitude|
+posthog|survey|user.?research|adoption`. It returns nothing. No
+analytics SDK in `mobile/package.json`, no telemetry plugin in
+`mobile/app.json`, no deployed web app, no app-store build. The three
+user personas in `docs/flattr-spec.md` §3 (kick-scooter commuter,
+hill-avoiding pedestrian, wheelchair/stroller user) are *spec personas*,
+not interviewed humans.
 
-These are fixed by the repo and `me.md`; they bound every option in this book.
+That is not a weakness to hide. It's the most honest and most
+defensible thing about this brief. **You separate what you can prove
+from what you're inferring, and you name the cheapest experiment that
+would close the gap.** That posture is what a staff reviewer is looking
+for — not a fabricated TAM slide.
 
-- **Free-tier data only** — OSM (Overpass) + Open-Meteo elevation. `pipeline/`
-  proves it works; Open-Meteo 429s under load (project context, external-data
-  caveat).
-- **Hand-rolled engine mandate** — no Valhalla / OSRM / GraphHopper. Locked in
-  `docs/flattr-spec.md` §14. The graph work *is* the project.
-- **Offline client** — graph is a static artifact (`mobile/assets/graph.json`),
-  the app only reads it. No live backend, no DB.
-- **Single developer** — Rein, solo. Every scope decision is a time decision.
+---
 
-## What this book is NOT
+## What the repo actually proves (EVIDENCE)
 
-It does not invent a market, a user count, a conversion rate, or an org
-constraint. Where demand is asserted, it is labelled INFERENCE and converted
-into a **discovery question** (see `05`). If the only honest answer is "we don't
-know yet," this book says so and tells you what to go measure.
+Every item here is grounded in a file you can open. This is your
+ammunition.
 
-## Cross-links to the study guides
+```
+  Evidence ledger — provable from the repo today
 
-The 16 study guides under `.aipe/study-*/` prove the *solvability* column. This
-book points at them rather than restating:
+  ┌────────────────────────────┬──────────────────────────────────┐
+  │ claim                      │ where it lives                   │
+  ├────────────────────────────┼──────────────────────────────────┤
+  │ grade-aware A* router      │ features/routing/astar.ts:22-78  │
+  │ directional uphill penalty │ features/routing/cost.ts:16-22   │
+  │ one knob (userMax)         │ astar.ts:26, cost.ts:28,32       │
+  │ A*==Dijkstra oracle        │ astar.test.ts:38-44              │
+  │ A* expands ≤ Dijkstra      │ astar.test.ts:47-52              │
+  │ bench node-expansion nums  │ bench/run.ts + report.ts         │
+  │ BLOCKED finite, not Inf    │ cost.ts:5 (1e9)                  │
+  │ steep ≠ disconnected       │ astar.test.ts:82-96              │
+  │ free build-time data       │ pipeline/overpass.ts, elevation  │
+  │ offline routing hot path   │ mobile/src/loadGraph.ts:1-11     │
+  │ shipped neighborhood       │ data/graph.json (Capitol Hill,   │
+  │                            │ ~0.35 km², 1621 nodes/1879 edges)│
+  └────────────────────────────┴──────────────────────────────────┘
+```
 
-- `.aipe/study-dsa-foundations/05-graphs-and-traversals.md` — the A* / Dijkstra
-  foundation the optimality gate rests on.
-- `.aipe/study-system-design/04-honest-fallback-routing.md` — the
-  BLOCKED-finite "flat vs. disconnected" distinction.
-- `.aipe/study-performance-engineering/02-heuristic-pruning.md` — the
-  node-expansion win the bench harness measures.
-- `.aipe/study-data-modeling/01-graph-as-the-schema.md` — why the graph artifact
-  is the whole data model.
+## What the repo does NOT prove (INFERENCE)
+
+```
+  Inference ledger — plausible, NOT in the repo
+
+  ┌────────────────────────────────────────────────────────┐
+  │ • that anyone wants flatter-over-faster routing         │
+  │ • that the three personas exist in real numbers         │
+  │ • that users would switch from Google Maps / AccessMap  │
+  │ • that one preset tap beats AccessMap's fixed thresholds│
+  │ • that 90m-DEM grade is accurate enough to be trusted   │
+  │ • any market size, adoption rate, or retention number   │
+  └────────────────────────────────────────────────────────┘
+```
+
+The honest framing throughout this book: **EVIDENCE is anything with a
+`file:line`. INFERENCE is everything about humans.** When you speak to
+a reviewer, you tag each sentence as one or the other. Never launder an
+inference into a fact.
+
+---
+
+## One signal the repo gives you for free
+
+You don't have user research — but you do have a *design decision* that
+behaves like a tiny piece of feedback. Commit `b24797c` ("drop the
+max-grade slider, keep the preset buttons only") replaced the
+continuous 2–15% slider with three fixed presets (kick scooter 5% /
+walking 8% / any 15%). The commit message says "Per request."
+
+```
+  b24797c — a partial walk-back of "everyone sets their own grade"
+
+  BEFORE (44ca84e)            AFTER (b24797c)
+  ┌────────────────┐          ┌────────────────┐
+  │ continuous     │          │  🛴 5%          │
+  │ slider 2–15%   │   ──►    │  🚶 8%          │
+  │ 14 settings    │          │  🏔️ 15%         │
+  │ "your number"  │          │  3 presets      │
+  └────────────────┘          └────────────────┘
+
+  the core thesis was "one slider, everyone sets where red begins"
+  (spec §2). dropping it to 3 buttons narrows that thesis. note it —
+  it's the closest thing to a product signal the repo contains.
+```
+
+Treat this as a flag, not proof. It's an unforced narrowing of the
+central wedge before a single user touched it. A reviewer who knows the
+spec will ask about it. Chapter 05 hands you the answer.
+
+---
+
+## How to read this book
+
+```
+  Reading order — orient, then defend
+
+  00-overview.md ─────────► you are here (the map)
+        │
+        ▼
+  01-problem-brief.md ────► the 10-point brief: pain, evidence,
+        │                   why-now, who, constraints
+        ▼
+  02-scope-cuts-and-non-goals.md ─► smallest validating slice +
+        │                           explicit non-goals
+        ▼
+  03-options-and-opportunity-cost.md ─► incl. DO NOTHING as a
+        │                               real option
+        ▼
+  04-success-metrics-and-feedback-loop.md ─► available-now vs
+        │                                     needs-users
+        ▼
+  05-skeptical-reviewer-questions.md ─► the review room, answered
+```
+
+## Constraints that frame every decision
+
+These are real and visible in the repo. They bound every option in
+chapter 03.
+
+```
+  ┌─ free-tier data ──────────────────────────────────────┐
+  │  OSM/Overpass + Open-Meteo elevation + Nominatim.      │
+  │  No paid map/elevation budget. 429s when quota burns.  │
+  └────────────────────────────────────────────────────────┘
+  ┌─ hand-rolled engine mandate ──────────────────────────┐
+  │  no Valhalla/OSRM/GraphHopper. The graph + router IS   │
+  │  the project (spec §14). This is a portfolio repo.     │
+  └────────────────────────────────────────────────────────┘
+  ┌─ offline client ──────────────────────────────────────┐
+  │  graph bundled as a static asset; no network in the    │
+  │  routing hot path (loadGraph.ts:1-11).                 │
+  └────────────────────────────────────────────────────────┘
+  ┌─ single developer ────────────────────────────────────┐
+  │  you. No team, no PM, no design partner, no user base. │
+  └────────────────────────────────────────────────────────┘
+```
+
+## Cross-links into the study guides
+
+This book is the *why*. The study guides are the *how*. When a reviewer
+pushes on mechanism, you walk them into these:
+
+- **`../study-dsa-foundations/05-graphs-and-traversals.md`** — the A*
+  and Dijkstra mechanics the brief keeps invoking.
+- **`../study-system-design/04-honest-fallback-routing.md`** — the
+  BLOCKED-finite "steep ≠ disconnected" distinction that makes the
+  smallest-slice demo honest.
+- **`../study-system-design/06-parametric-search-engine.md`** — the one
+  engine, four cost/heuristic pairs, that `userMax` keys off.
+- **`../study-performance-engineering/01-heuristic-pruning.md`** — where
+  the bench node-expansion numbers come from.
+- **`../study-testing/01-optimality-oracle.md`** — the A*==Dijkstra
+  oracle that is your strongest correctness evidence.
+- **`../study-data-modeling/01-graph-as-entity-model.md`** — the shipped
+  graph artifact the whole problem stands on.
+
+Now go to `01-problem-brief.md`.

@@ -1,161 +1,205 @@
-# 06 — WebSockets, SSE, Streaming, and Realtime
+# WebSockets, SSE, streaming, and realtime
 
-**Long-lived connections, server push, streaming bodies** · *Industry standard* · **NOT YET EXERCISED**
+**Industry name(s):** long-lived connections · server-sent events · streaming responses. **Type:** Industry standard.
 
-## Zoom out, then zoom in
+## Status: not yet exercised
 
-flattr has no realtime networking. Not a WebSocket, not Server-Sent Events, not long-polling, not a streamed response body. Every network interaction is a discrete request that opens, completes, and closes. This file is honest about that — and useful precisely because it draws the line where realtime *would* enter and what it would replace.
-
-```
-  Zoom out — the realtime band, empty in flattr
-
-  ┌─ UI ──────────────────────────────────────────────┐
-  │  MapScreen — pan, type, route                       │
-  └────────────────────────┬───────────────────────────┘
-                           │ request/response only
-  ┌─ ★ Realtime band ★ ───────────────────────────────┐
-  │           (NOT YET EXERCISED)                       │ ← we are here
-  │  no WebSocket · no SSE · no streaming · no push     │
-  └────────────────────────┬───────────────────────────┘
-                           │
-  ┌─ Providers ─────────────▼──────────────────────────┐
-  │  Overpass · Open-Meteo · Nominatim (all one-shot)   │
-  └────────────────────────────────────────────────────┘
-```
-
-Zoom in: the question this concept answers is *"does any part of flattr need a connection that stays open and pushes data over time?"* The answer today is no, and the reason is structural — flattr's data (a street graph, an elevation grid, an address lookup) is *static*. Nothing about it changes second-to-second, so there's nothing to push.
-
-## Structure pass
-
-**Layers.** There's nothing to layer — the realtime band is empty. The useful structural move is to identify *where* a realtime requirement would attach if the product grew.
-
-**Axis = guarantees (request/response vs continuous stream).** Across all of flattr, the answer never changes: every call is one-shot request/response. There's no seam where it flips to streaming, because no module streams. That flat answer *is* the finding.
+flattr has **no** WebSocket, **no** SSE, **no** streamed/chunked response, and **no**
+long-lived connection anywhere. Every call in the repo is a discrete request/response that
+opens, transfers a complete JSON body, and closes. This chapter is honest about that — and
+teaches the realtime patterns *by contrast with what flattr does instead*, then shows
+exactly where each would slot in if flattr ever needed it.
 
 ```
-  axis traced: request/response or continuous?
+  Zoom out — flattr's connections are all short-lived request/response
 
-  ┌─ Overpass ─┐  ┌─ Open-Meteo ─┐  ┌─ Nominatim ─┐
-  │ one-shot   │  │ one-shot     │  │ one-shot    │
-  └────────────┘  └──────────────┘  └─────────────┘
-   no seam flips to streaming anywhere → realtime not exercised
+  ┌─ flattr ───────────────────────────────────────────────────┐
+  │  fetch ─► open ─► transfer WHOLE body ─► close              │
+  │  (Overpass · Open-Meteo · Nominatim — all this shape)       │
+  │                                                             │
+  │  ✗ no socket held open   ✗ no event stream                 │
+  │  ✗ no res.body reader    ✗ no reconnect logic              │
+  └─────────────────────────────────────────────────────────────┘
+
+  ★ THIS CONCEPT would live in a long-lived band that does not exist ★
 ```
 
-**Seam.** The only relevant seam is hypothetical: the boundary between "static baked data" (what flattr is) and "live updating data" (what would demand realtime). flattr sits entirely on the static side.
+## Why it's absent — and why that's correct
 
-## How it works
+flattr's data is **static and pull-shaped**. The graph is a prebuilt artifact; elevation
+and street data are immutable for a given area; geocoding is a one-shot lookup. Nothing in
+the domain *pushes* — there's no live position feed, no other user, no server-initiated
+update. Realtime transports exist to solve "the server has new data and the client
+shouldn't have to ask." flattr's server-side is three read-only third-party APIs that
+**only** answer when asked. There is nothing to push, so there is no push transport. That's
+a domain fact, not a missing feature.
+
+## The structure pass — the axis that decides realtime
+
+**Axis: who initiates the next message — client or server?**
+
+```
+  Axis: "who pushes the next byte?"
+
+  ┌─ request/response (flattr today) ─┐  CLIENT initiates every exchange
+  │  client asks → server answers      │  → poll/debounce/retry to refresh
+  └────────────────────────────────────┘
+  ┌─ realtime (not in flattr) ────────┐  SERVER may initiate anytime
+  │  socket/stream stays open          │  → reconnect logic, backpressure
+  └────────────────────────────────────┘
+  the seam is "who can speak unprompted" — flattr is all client-initiated
+```
+
+flattr lives entirely on the left. The moment any feature needs the *right* side — a
+server speaking unprompted — is the moment a realtime transport earns its place.
+
+## How it works — the patterns, and where they'd attach
 
 ### Move 1 — the mental model
 
-You know the difference between a `fetch` (ask once, get an answer, done) and a WebSocket (open a pipe, both sides talk whenever they want, until someone closes it). flattr is 100% the former. The mental model for *this* file is the negative space: what would a realtime feature look like, and why doesn't flattr's data need one?
+You know the difference between refreshing a page (request/response) and a live feed that
+updates itself (push). flattr only does the first. The three realtime patterns are three
+ways to get the second:
 
 ```
-  Pattern — request/response (what flattr is) vs realtime (what it isn't)
+  The three push transports, by shape
 
-  flattr (now):
-    client ──ask──► server
-    client ◄answer─ server      one exchange, connection closes
-
-  realtime (not exercised):
-    client ══open══► server
-    client ◄push═══ server      server pushes whenever it has data
-    client ◄push═══ server      connection stays open
-    client ══close═► server     until torn down (needs reconnect/heartbeat)
+  WebSocket   client ◄════════════► server   full-duplex, both speak
+  SSE         client ◄──────────────  server   one-way server→client stream
+  HTTP stream client ──► server ──drip──► client   chunked body, read as it arrives
 ```
 
-### Move 2 — what's confirmed absent, and where it would attach
+### Move 2 — where each would slot into flattr
 
-**Confirmed absent.** A repo-wide search for `WebSocket`, `EventSource`, `SSE`, streaming body readers (`res.body.getReader`), and `ws`/`socket.io`/`eventsource` dependencies returns nothing across `pipeline/`, `mobile/src/`, `lib/`, and `features/`. Both `package.json` files carry no realtime library. Every response is consumed whole via `await res.json()` (`overpass.ts:41`, `elevation.ts:111`, `geocode.ts:25`) — the body is fully buffered, never read as a stream.
-
-```
-  Layers-and-hops — how flattr reads a body (whole, not streamed)
-
-  ┌─ provider ──┐ hop: full JSON body
-  │ sends bytes │ ──────────────────────────┐
-  └─────────────┘                           ▼
-  ┌─ platform fetch ────────────────────────────┐
-  │ buffers the entire body                      │
-  └──────────────────────┬───────────────────────┘
-            hop: await res.json()
-                         ▼
-  ┌─ flattr ────────────────────────────────────┐
-  │ gets the parsed object all at once           │
-  │ (no getReader, no incremental chunks)         │
-  └──────────────────────────────────────────────┘
-```
-
-**Where realtime would attach if the product grew.** Three plausible features, none built:
+flattr's closest *current* mechanism to "realtime" is its **self-heal retry loop** — and
+naming what it does instead of streaming is the lesson. When elevation comes back flat
+(throttled), flattr re-queues the region on a timer to upgrade it later:
 
 ```
-  feature (hypothetical)        would need        replaces
-  ───────────────────────────   ───────────────   ─────────────────────
-  live GPS turn-by-turn         streamed position  the one-shot Location
-  re-route                      updates (local)    call (MapScreen:97)
-  ───────────────────────────   ───────────────   ─────────────────────
-  live traffic/closure overlay  SSE or WebSocket   nothing (new data
-                                from a backend      source entirely)
-  ───────────────────────────   ───────────────   ─────────────────────
-  collaborative route share     WebSocket          nothing (new feature)
+  mobile/src/useTileGraph.ts:209-218 — polling-style self-heal, NOT a stream
+  ┌──────────────────────────────────────────────────────────────┐
+  │ if (degraded && retryCountRef.current < MAX_RETRIES) {        │
+  │   retryCountRef.current += 1;                                 │
+  │   retryRef.current = setTimeout(() => {                       │
+  │     if (viewRef.current?.degraded) pendingViewRef.current=…   │ ◄ re-POLL the area
+  │     pump();                                                   │   on a 12s timer
+  │   }, RETRY_MS);   // RETRY_MS = 12000 (useTileGraph.ts:71)    │
+  │ }                                                             │
+  └──────────────────────────────────────────────────────────────┘
 ```
 
-Note the first one is the closest: turn-by-turn navigation does involve a continuous *local* GPS stream — but that's the device's location API, not a network transport. Even a full nav feature wouldn't necessarily add a network WebSocket; it would re-run A* locally as the GPS position moves. So flattr could ship live navigation and *still* not need a realtime network transport. That's the surprising part worth saying out loud.
+This is **timer-driven polling**, the request/response answer to "I want fresher data
+later." A realtime transport would replace the timer with a held-open connection. Here's
+where each pattern would attach if flattr grew that need:
 
-**No reconnect/heartbeat logic, because there's nothing to reconnect.** Realtime transports need reconnect-with-backoff, heartbeats/pings, and resume-from-offset logic — flattr has none, correctly, because it holds no long-lived connection. Its "reconnect" equivalent is the self-heal retry in `useTileGraph.ts:209-218`, which re-issues a *fresh one-shot build*, not a reconnect to a dropped stream.
-
-### Move 2.5 — current vs future
+**WebSocket — if flattr added live turn-by-turn navigation.** A walking route where the
+server pushes "you're off-route, recompute" needs full-duplex: client streams GPS up,
+server pushes corrections down. That's the one feature that would justify a WebSocket. It
+doesn't exist; routing is computed *on device* from the static graph (`features/routing/`),
+so nothing needs pushing.
 
 ```
-  Phase A (now)                  Phase B (if realtime arrives)
-  ───────────────────────────    ────────────────────────────────
-  all request/response           a long-lived connection appears
-  body buffered whole            body or events read incrementally
-  no reconnect logic             reconnect + backoff + heartbeat
-  self-heal = re-fetch one-shot  resume = reattach to the stream
-  needs: nothing                 needs: a backend that pushes +
-                                 ws/SSE client + connection lifecycle
+  Layers-and-hops — hypothetical nav WebSocket (NOT built)
+
+  ┌─ RN app ──┐  ════ GPS stream up ════►  ┌─ nav server ─┐
+  │           │  ◄═══ reroute push down ═══ │ (would not   │
+  │           │      (full-duplex, held)     │  exist — on- │
+  └───────────┘                              │  device now) │
+                                             └──────────────┘
 ```
 
-The takeaway is *what doesn't have to change*: the graph build, the router, the cache, and all three current API calls stay exactly as they are. Realtime would be a new band added beside them, not a rewrite of the existing one.
+**SSE — if a first-party backend streamed build progress.** flattr's build already has
+*phases* (`buildGraph` reports steps via `onPhase`, `useTileGraph.ts:196`), but they're
+local function callbacks, not server events. If graph-building moved to a backend, SSE
+would stream those phase updates one-way to the client. Today the phases never cross the
+wire.
+
+**HTTP streaming (chunked body) — if a response were huge and incremental.** flattr reads
+every body whole with `await res.json()` (`overpass.ts:41`, `elevation.ts:111`). For a
+massive Overpass response you *could* stream-parse `res.body` to start building before the
+last byte arrives. flattr doesn't, because viewport/corridor bboxes are capped small
+(`MAX_LOAD_SPAN_DEG`, `MAX_CORRIDOR_SPAN_DEG` in `useTileGraph.ts:67,69`) — bodies are
+small enough to buffer. The size cap is *why* streaming isn't needed.
+
+```
+  Comparison — flattr today vs the streaming version it doesn't need
+
+  TODAY (useTileGraph.ts:186):              STREAMING (not built):
+  await fetchOverpass(bbox)                 const reader = res.body.getReader()
+  await res.json()  ← whole body            while(chunk) parseIncrementally(chunk)
+       │                                          │
+  bbox capped small ⇒ body small ⇒          would matter only if bodies
+  buffering is fine, streaming unneeded     grew past the bbox caps
+```
+
+**Reconnect logic — not exercised because there's no connection to lose.** WebSocket/SSE
+need reconnect-with-backoff because a held-open socket drops. flattr's retries
+(`overpass.ts:42`, `07`) reconnect a *fresh request*, not a *dropped stream* — different
+problem. There is no `onclose`/`onerror` reconnect handler anywhere, correctly, because
+nothing stays open.
 
 ### Move 3 — the principle
 
-Realtime is a transport you reach for when data *changes while you're watching it* and the server knows before the client does. flattr's data is static (a baked graph, a DEM that never changes, address lookups that are stable), so request/response is not a limitation — it's the correct match. Adding a WebSocket to static data would be infrastructure with nothing to carry. Recognizing when you *don't* need realtime is as much a skill as knowing how to wire it.
+Realtime transports are the answer to one question: *can the server speak unprompted?* If
+the answer is no — as it is for every API flattr touches — then polling, debouncing, and
+timer-driven self-heal are not a poor substitute, they're the *correct* tool, and a
+WebSocket would be over-engineering. The principle: **don't reach for a held-open
+connection until the data actually pushes.** flattr's self-heal timer is the honest,
+right-sized version of "refresh later."
 
 ## Primary diagram
 
-The complete picture — the realtime band empty, with its hypothetical attachment points marked.
-
 ```
-  flattr realtime — empty band, future attachment points
+  flattr realtime posture — everything client-initiated, push absent
 
-  ┌─ what exists (request/response) ───────────────────────────┐
-  │  fetch → await res.json() (whole body) → done → close       │
-  │  Overpass · Open-Meteo · Nominatim  ·  local GPS one-shot   │
-  └─────────────────────────────────────────────────────────────┘
-
-  ┌─ what's NOT YET EXERCISED ─────────────────────────────────┐
-  │  WebSocket · SSE · long-poll · streamed body · server push  │
-  │  reconnect · heartbeat · resume-from-offset                 │
+  ┌─ flattr (today) ───────────────────────────────────────────┐
+  │  request/response only:                                     │
+  │    pan/route  → fetch → whole body → close                  │
+  │    self-heal  → setTimeout(12s) → re-fetch  (polling)       │
   │                                                             │
-  │  would attach at: live nav (likely still local, no ws) ·    │
-  │  live traffic overlay (SSE/ws + backend) · route sharing    │
+  │  ✗ WebSocket   would need: live nav (on-device today)       │
+  │  ✗ SSE         would need: backend build-progress stream    │
+  │  ✗ HTTP stream would need: bodies past the bbox size caps   │
+  │  ✗ reconnect   would need: a held-open connection to drop   │
   └─────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-The streaming case most relevant to the AI-engineering pivot is LLM token streaming (SSE) — the pattern in AdvntrCue's streaming response. That's the realtime transport you'll actually use next, and it's worth contrasting: an LLM stream is request/response that happens to deliver its *one* answer incrementally (token by token via SSE), which is different from a WebSocket's bidirectional push. flattr exercises neither, but the partition is the thing to carry forward — "stream one response" (SSE, LLM tokens) vs "push many messages" (WebSocket, live collaboration). When you build the AI features, you'll add the first; flattr's static-data shape is why it needs neither.
+WebSockets and SSE came out of the "I'm tired of polling" era — chat, live dashboards,
+collaborative editing, all cases where the server genuinely has unprompted updates. The
+skill is recognizing when you *don't* have that case: flattr's data is immutable per area
+and computed on-device, so there's no push to receive. The cleanest signal of engineering
+judgment here is that flattr reached for a 12-second self-heal *timer* instead of a socket
+— matching the transport to the actual data shape. Read `07` next: it's the full treatment
+of the request/response hardening (retry, backoff, the concurrency pump) that flattr uses
+*instead of* realtime transports.
 
 ## Interview defense
 
-**Q: Does flattr use any realtime transport, and if not, why not?**
-None — no WebSocket, SSE, long-poll, or streamed body; every response is buffered whole via `await res.json()`. The reason is structural: flattr's data is static (baked graph, unchanging DEM, stable geocodes), so there's nothing for a server to push. Request/response is the correct match, not a limitation. Anchor: *static data needs no realtime; recognizing that is the skill.*
+**Q: Does flattr use WebSockets or SSE?**
+> No — not yet exercised, and correctly so. Every API it calls is request/response and
+> read-only; nothing pushes. The closest mechanism is a 12-second self-heal *timer*
+> (`useTileGraph.ts:212`) that re-polls throttled regions — polling, not streaming.
 
-**Q: If you added turn-by-turn navigation, would you need a WebSocket?**
-Probably not. Nav needs a continuous *local* GPS stream and a re-run of A* as position moves — both local. No server has to push anything, so no network realtime transport is required. A live *traffic* overlay would be the first real case for SSE/WebSocket, and it'd need a backend first. Anchor: *even live nav stays local; traffic is the first push case.*
+```
+  no server-initiated data ⇒ no push transport ⇒ poll/timer instead
+```
+> Anchor: *realtime answers "can the server speak unprompted" — flattr's never can.*
+
+**Q: When would you add a WebSocket to flattr?**
+> Live turn-by-turn navigation — the one feature needing the server to push "off-route,
+> recompute." Today routing runs on-device from the static graph, so nothing needs a
+> held-open connection. Adding nav would also bring reconnect-with-backoff, which flattr
+> has no analog for today.
+
+```
+  add live nav ⇒ server pushes reroutes ⇒ full-duplex WebSocket + reconnect
+```
+> Anchor: *the trigger is on-device compute becoming server-pushed compute.*
 
 ## See also
 
-- `03-tcp-udp-connections-and-sockets.md` — the long-lived socket a WebSocket would need
-- `05-http-semantics-caching-and-cors.md` — how bodies are read whole today
-- `.aipe/study-distributed-systems/` — server-push and the consistency it implies
-- `.aipe/study-ai-engineering/` — LLM token streaming (SSE) as the next realtime pattern to learn
+- `07-timeouts-retries-pooling-and-backpressure.md` — the request/response hardening flattr uses instead.
+- `01-network-map.md` — confirms zero long-lived connections on the map.
+- `study-system-design` — why routing is on-device (no nav server).

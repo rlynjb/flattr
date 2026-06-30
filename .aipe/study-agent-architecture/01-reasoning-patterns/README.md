@@ -1,17 +1,30 @@
 # 01 — Reasoning patterns
 
-How one model thinks through a task. flattr has **no model**, so these files
-teach the patterns *by contrast* with flattr's deterministic control loop.
+**Anchor:** single-agent (primary) · workflow (secondary).
 
-Reading order (self-contained, but this order builds):
+How one decider thinks through a task. This is the substrate every
+multi-agent topology sits on. **The load-bearing file of the whole guide
+lives here:** `02-agent-loop-skeleton.md`, which teaches the agent loop by
+contrasting it with flattr's deterministic A* control loop (`astar.ts`).
 
-1. [`01-chains-vs-agents.md`](01-chains-vs-agents.md) — the boundary: is there
-   an autonomous loop at all? (flattr: no — engineer owns all control.)
-2. [`02-agent-loop-skeleton.md`](02-agent-loop-skeleton.md) — **the
-   load-bearing contrast.** `search()` in `astar.ts` IS the agent-loop
-   skeleton with code in the decision slot. The budget exit flattr gets free
-   is the one agents must engineer.
+## Reading order
 
-Not generated (flattr exercises none, and they're covered mechanically in
-`study-ai-engineering`): ReAct, plan-and-execute, reflexion, tree-of-thoughts,
-model routing. See `../audit.md` for each, with its attachment point.
+1. `01-chains-vs-agents.md` — is there an autonomous loop at all?
+   (flattr: no — `pipeline/` is a chain, the router is a code-decides loop)
+2. `02-agent-loop-skeleton.md` — ★ THE CONTRAST. The four-part kernel
+   (state · step · execute · terminate) walked line-for-line against
+   `astar.ts:30-77`. The budget exit is the lesson — flattr gets it free.
+3. `03-react.md` — the default step-slot fill (not exercised; placement only)
+4. `04-plan-and-execute.md` — plan once, execute cheap (not exercised)
+5. `05-reflexion-self-critique.md` — critic loop (flattr's `steepCount` is
+   the deterministic analogue)
+6. `06-tree-of-thoughts.md` — scored branching (flattr's A* IS this, cheaply)
+7. `07-routing.md` — ★ THE SEAM. Where flattr grows an agent: the four
+   router functions as pre-cut tools.
+
+## What's grounded here
+
+`02`, `01`, `07` are anchored in flattr's real code. `03`–`06` are study
+material — each names its flattr analogue (where one exists) and the
+attachment point. None re-teaches mechanics covered in
+`study-ai-engineering`; those are cross-referenced.

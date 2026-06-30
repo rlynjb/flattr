@@ -1,233 +1,260 @@
-# Runtime Map — what runs where
+# Runtime Map — the as-built execution model
 
-**Industry name(s):** runtime / execution-environment topology · process &
-resource map. **Type:** Language-agnostic (applied to this repo).
+**Industry name:** runtime / process / resource topology — *Project-specific*.
 
 ## Zoom out, then zoom in
 
-Before any single mechanism, here's the whole machine. flattr is two processes
-that never overlap in time, joined by one file. Everything in this guide hangs
-off this map.
+Before any mechanism, here's the whole machine. flattr isn't one program — it's two,
+joined by a file. One runs on your laptop at build time and dies. The other runs on a
+phone and lives for the session. Neither uses a thread you didn't already have.
 
 ```
-  Zoom out — the two runtimes and the resources each owns
+  Zoom out — the two runtimes and the seam between them
 
-  ┌─ Build-time runtime · Node 18+ via tsx ───────────────────┐
-  │  process owns:                                            │
-  │   • network sockets → Overpass, Open-Meteo               │
-  │   • node:fs handle  → writes data/graph.json             │ ← ★ runtime A
-  │   • the CPU for grade math (splitWays, computeGrades)    │
-  │  scheduler: none — top-level await, sequential           │
-  └───────────────────────────┬───────────────────────────────┘
-                              │  graph.json (544 KB, static)
-                              ▼
-  ┌─ Run-time runtime · Hermes (RN) on the phone ─────────────┐
-  │  one JS thread owns:                                      │ ← ★ runtime B
-  │   • the React render loop + A* (same thread!)            │   we live here
-  │   • the pump() single-flight work slot                  │     most of
-  │   • timers (debounce, retry, persist)                   │     the guide
-  │   • in-memory: baseGraph + merged graph + elevCache Map │
-  │  native side (other threads, not JS): MapLibre, GPS     │
-  └────────────────────────────────────────────────────────────┘
+  ┌─ BUILD-TIME runtime ── Node (via tsx) ───────────────────────┐
+  │  pipeline/run-build.ts  — one process, runs once, exits      │
+  └───────────────────────────────┬──────────────────────────────┘
+                                  │ writes
+                  ┌─ ARTIFACT SEAM ▼──────────────┐
+                  │ mobile/assets/graph.json      │ ★ THIS FILE'S SUBJECT:
+                  │   static, read-only JSON       │   the whole map, including
+                  └───────────────┬───────────────┘   this seam
+                                  │ bundled + loaded once
+  ┌─ RUN-TIME runtime ── Hermes JS thread (RN) ───▼──────────────┐
+  │  mobile/src/MapScreen.tsx  — event loop, lives for session   │ ← we are here
+  │    + on-device tile builds, A* on the JS thread              │
+  └───────────────────────────────────────────────────────────────┘
 ```
 
-Zoom in: this file answers *one* question for every box above — **where does the
-work execute and what does that box own?** Get this map straight and the next
-seven files are just zooming into individual boxes. The trap to avoid: thinking
-"no backend" means "no runtime concerns." It means the concerns all collapse
-onto the two single threads above.
+Zoom in: this file is the **map itself** — the inventory. What processes exist, what
+threads each owns (spoiler: one each), what tasks run on them, and what resources
+(memory, files, network sockets) they hold. The other seven files zoom into one region
+of this map. Read this one to know where everything sits before you walk any mechanism.
 
-## Structure pass
+## Structure pass — layers, one axis, the seams
 
-**Layers.** Three nested levels: (1) the OS process boundary — two separate
-processes, never co-resident; (2) within the run-time process, the JS thread vs
-the native threads MapLibre and GPS run on; (3) within the JS thread, the React
-render work vs the async I/O the `pump()` schedules.
-
-**Axis traced — "who decides what runs next (control)?"** Hold that one question
-across the layers and watch the answer flip:
+**The layers.** Three nested altitudes:
 
 ```
-  One axis — "who decides what runs next?" — down the layers
+  Three altitudes of "where does work run?"
 
-  ┌─ OS / process ─────────────────────────┐
-  │  the user / OS  (launch app, run CLI)   │  → HUMAN decides
-  └───────────────────┬─────────────────────┘
-        ┌─────────────▼──────────────────────┐
-        │  build-time pipeline (run-build.ts) │  → CODE decides
-        │  fixed sequence, top-level await    │    (linear order)
-        └─────────────┬──────────────────────┘
-              ┌────────▼───────────────────────┐
-              │  run-time event loop (Hermes)   │  → EVENTS decide
-              │  pan / tap / timer fire → queue │    (callbacks)
-              └────────┬───────────────────────┘
-                ┌───────▼──────────────────────┐
-                │  pump() work slot             │  → THE LOCK decides
-                │  busyRef gates one build      │    (busy? defer)
-                └───────────────────────────────┘
+  ┌─ outer: PROCESS ─────────────────────────────┐
+  │  Node pipeline process │ Hermes app process   │  → two separate OS processes,
+  └───────────────────────────────────────────────┘    never co-resident
+      ┌─ middle: THREAD ─────────────────────────┐
+      │  one JS thread per process               │  → no worker threads at all
+      └───────────────────────────────────────────┘
+          ┌─ inner: TASK ────────────────────────┐
+          │  async functions, timers, useMemos   │  → cooperatively scheduled
+          └───────────────────────────────────────┘   on the one thread
 ```
 
-The control answer flips four times: human → linear code → event callbacks →
-a boolean lock. Each flip is a seam.
+**The axis to trace: "who owns the thread of control?"** Hold that question constant
+and walk down:
 
-**Seams — where the axis flips, and what crosses each:**
-- `graph.json` (build → run) — the static artifact. Control flips from "linear
-  pipeline" to "nothing; it's a file now." → `06-filesystem-streams-and-resource-lifecycle.md`.
-- The JS-thread / native-thread boundary (`MapScreen.tsx` ↔ MapLibre/GPS) — the
-  only real parallelism in the app, and it's outside the code you write.
-- `onRegionDidChange` → debounce timer → `pump()` — event control becomes
-  queued work. → `02-processes-threads-and-tasks.md`.
+- **Process layer** → the OS owns it. Two processes, scheduled independently, sharing
+  nothing but the `graph.json` file. The pipeline can't see the app's memory; the app
+  can't see the pipeline's. The artifact is the *only* channel between them.
+- **Thread layer** → each process owns exactly one JS thread. No second thread to hand
+  work to. Hermes has native threads underneath (GC, MapLibre rendering) but *your* code
+  never runs on them.
+- **Task layer** → the **event loop** owns control. Async functions yield at every
+  `await`; the loop picks the next ready task. No task can preempt another mid-statement —
+  that's the property everything else in flattr leans on (see `04`).
+
+**The seams — where the axis-answer flips:**
+
+```
+  Two load-bearing seams in the runtime map
+
+  seam 1: the ARTIFACT (build ═╪═► run)
+    control flips: Node code STOPS, phone code STARTS
+    nothing shared but a JSON file — strongest isolation in the system
+
+  seam 2: JS thread ═╪═► native side (MapLibre / AsyncStorage)
+    control flips: your synchronous code STOPS at an await,
+    native does the I/O, resolves a promise back onto the JS thread
+```
+
+Seam 1 is why a build-time bug can't corrupt runtime memory and vice versa. Seam 2 is the
+*only* place flattr touches concurrency — and it's the cooperative, single-threaded kind.
+Hand off to How it works.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You already know the shape: it's a **build step that emits an asset, plus a
-client that consumes it** — the same shape as a webpack bundle feeding a browser,
-or a compiled binary feeding a runtime. The build runs once, ahead of time, and
-hands the client a frozen artifact. What's unusual here is that the *build code
-also runs inside the client* (on-demand tile fetching reuses `buildGraph`), so
-the two runtimes share more than just the file.
+You already know this shape from any frontend app you've shipped: a build step
+(`vite build`, `next build`) produces a static bundle, then a runtime loads it. flattr is
+that, with the bundle being a *graph* instead of HTML/JS. The strategy: **precompute the
+expensive thing at build time, ship it as data, do only cheap reads at runtime** — except
+flattr cheats a little and *also* builds more graph on-device when you pan past the bundled
+area.
 
 ```
-  Pattern — build-once artifact + client that can also build
+  The runtime-map kernel: precompute → ship → read (+ patch)
 
-           build time                 run time
-        ┌──────────────┐           ┌──────────────┐
-        │ run-build.ts │──graph────►│ loadGraph()  │
-        │ (Node, once) │  .json     │ baseGraph    │
-        └──────┬───────┘           └──────┬───────┘
-               │                          │ pan/route
-               │ both call                ▼
-               │            ┌──────────────────────────┐
-               └───────────►│ buildGraph() (shared)     │
-                            │ runs in Node AND in Hermes│
-                            └──────────────────────────┘
+   build time          artifact            run time
+   ──────────          ────────            ────────
+   [OSM + DEM] ──────► graph.json ───────► [base graph]
+   heavy, once         static, bundled     │
+                                           ├─ pan past edge?
+                                           │    fetch + build MORE on device
+                                           │    (pump → buildGraph)
+                                           └─ route? A* over merged graph (sync)
 ```
 
-### Move 2 — walking the boxes
+### Move 2 — walking the map, one region at a time
 
-**Box 1 — the build-time process (Node via tsx).** This is `pipeline/run-build.ts`.
-One `main()`, awaited top to bottom, then the process exits. There is no loop, no
-server, no listener. Look at the entry point:
+**The build-time process.** One Node process, launched by `tsx pipeline/run-build.ts`
+(`package.json` script `build:graph`). It runs `main()` top to bottom and exits.
+
+```
+  Build-time process — strictly sequential, single thread
+
+  main()  pipeline/run-build.ts:40-52
+    pickElevation()           ← choose provider from env vars
+    fetchOverpass(BBOX)       ── await (network) ──►  Overpass API
+    buildGraph(...)           ── await ──► parse → split → sampleElevations → grades
+    writeGraph(graph, path)   ── sync fs write ──►  data/graph.json
+    exit
+```
+
+The whole thing is `await`-chained. There's no parallelism because there's no reason for
+it: the elevation API is rate-limited, so serializing requests *is* the design (see `03`).
+Code anchor — the exit path is bare:
 
 ```ts
-// pipeline/run-build.ts:40-57
-async function main(): Promise<void> {
-  const { provider, sampleOpts, maxSegM } = pickElevation(); // env → provider
-  const osm = await fetchOverpass(BBOX);          // ① one network call, awaited
-  const graph = await buildGraph("seattle-mvp", BBOX, osm, provider, ...);  // ② CPU + more network
-  mkdirSync("data", { recursive: true });         // ③ fs handle
-  writeGraph(graph, "data/graph.json");           // ④ write artifact, then return
+// pipeline/run-build.ts:54-57 — no graceful shutdown, just a process exit
+main().catch((err) => {
+  console.error(err);
+  process.exitCode = 1;   // ← set exit code; in-flight nothing to clean up
+});
+```
+
+What breaks if you remove the `.catch`? An unhandled rejection crashes the process with a
+non-zero code anyway — but you'd lose the clean error log. There are no open handles to
+leak because every resource (network socket) is owned by an `await` that has already
+resolved by the time `main()` returns.
+
+**The artifact seam.** `mobile/assets/graph.json` is the entire contract between the two
+runtimes. The app reads it exactly once:
+
+```ts
+// mobile/src/loadGraph.ts:9-11 — a single synchronous cast, no parsing logic
+export function loadGraph(): Graph {
+  return graph as unknown as Graph;   // ← bundled JSON, already parsed by the bundler
 }
-main().catch((err) => { process.exitCode = 1; }); // ⑤ the only "shutdown" logic
 ```
 
-Line by line: ① and ② are the only places this process touches the network — and
-they're strictly sequential, no concurrency. ③–④ are the only filesystem work.
-⑤ is the entire error/shutdown story: print and set a non-zero exit code. This
-process owns network sockets and one file handle and nothing else.
+This is load-bearing: because the import is static, Metro inlines the JSON into the bundle
+at build time. There's no runtime file read, no async, no failure path beyond the
+try/catch in `MapScreen.tsx:28-34`. The graph is just *there* in memory the moment the
+component mounts.
 
-**Box 2 — the run-time JS thread (Hermes).** This is where it gets interesting.
-The phone runs one JS thread, and `MapScreen.tsx` puts *three different kinds of
-work* on it: React rendering, the synchronous A* search, and the async
-orchestration in `useTileGraph`. Here's the load-bearing surprise — A* is not
-offloaded anywhere:
-
-```ts
-// mobile/src/MapScreen.tsx:151-162
-const routed = useMemo(() => {
-  if (!graph || !startId || !endId) return { fc: null, summary: null, found: true };
-  const r = directedAstar(graph, startId, endId, userMax); // ← runs HERE, on the JS thread
-  ...
-}, [graph, startId, endId, userMax]);
-```
-
-`useMemo` runs during render. So `directedAstar` executes synchronously as part
-of React's render pass, on the same thread that's about to paint the next frame.
-The boundary condition: if the graph is large enough that A* takes longer than a
-frame (~16 ms), the UI janks for the whole search. There's no yielding point
-inside `search` (`astar.ts:48-76` is a tight `while` loop).
-
-**Box 3 — the native threads.** MapLibre rendering and GPS (`expo-location`) run
-on native threads the JS code never touches directly — it only sends them
-messages (camera moves, GeoJSON sources) and receives callbacks
-(`onRegionDidChange`, location fixes). This is the app's only true parallelism,
-and it's provided by the platform, not written here.
+**The run-time process.** One Hermes JS thread runs the React tree. Three kinds of task
+live on it, and this map is the place to name all three before later files go deep:
 
 ```
-  Layers-and-hops — run-time process, JS thread vs native threads
+  Run-time tasks on the single JS thread
 
-  ┌─ JS thread (Hermes) ────────────┐
-  │  React render → A* → setState   │
-  └───┬───────────────────────▲──────┘
-      │ hop: camera/source cmd │ hop: onRegionDidChange / GPS fix
-      ▼                        │     (callback marshalled to JS)
-  ┌─ Native threads (platform) ─────┐
-  │  MapLibre GL render · GPS       │  ← real parallelism, not your code
-  └──────────────────────────────────┘
+  ┌─ Region tasks ───────────────────────────────────────────┐
+  │  onRegionDidChange → debounce 600ms → queueViewport       │  useTileGraph.ts:245
+  │  → pump(): fetchOverpass + buildGraph (async, 1-at-a-time)│
+  └───────────────────────────────────────────────────────────┘
+  ┌─ Route tasks ────────────────────────────────────────────┐
+  │  ensureBbox → pump() (corridor, priority over view)       │  useTileGraph.ts:269
+  │  directedAstar in useMemo (SYNCHRONOUS, blocks the thread)│  MapScreen.tsx:155
+  └───────────────────────────────────────────────────────────┘
+  ┌─ Geocode tasks ──────────────────────────────────────────┐
+  │  scheduleSuggest → debounce 400ms → geocodeSuggest (async)│  MapScreen.tsx:73
+  └───────────────────────────────────────────────────────────┘
 ```
+
+The one that doesn't belong with the others is `directedAstar` — it's **synchronous**
+while everything around it is async. That asymmetry is the whole story of file `03` and
+`05`; this map just plants the flag.
+
+**The resources each runtime holds.** Trace the resource axis across the map:
+
+| Resource | Build-time process | Run-time process |
+|----------|-------------------|------------------|
+| Memory | OSM + graph, freed on exit | base graph + merged tiles, **never evicted** (`05`) |
+| Files | reads none, writes `graph.json` | reads bundled graph; writes AsyncStorage (`06`) |
+| Network | Overpass + elevation, then done | Overpass, Open-Meteo, Nominatim, on demand (`03`) |
+| Threads | 1 JS thread | 1 JS thread + native (GC, MapLibre) you don't control |
 
 ### Move 3 — the principle
 
-"No backend" doesn't delete the runtime; it relocates every concern onto the
-client's single thread. The map above is the thing to internalize: once you know
-which of the four control-owners (human / linear code / events / the lock) is
-driving a given piece of work, every later question — is it cancellable? does it
-block the frame? can it race? — has an obvious answer.
+A runtime map is the first thing to draw for *any* system, before you reason about a
+single mechanism: **name the processes, then the threads each owns, then the tasks on each
+thread, then the resources each holds.** flattr's map is unusually clean — two
+single-threaded processes joined by one read-only file — which is exactly why the few
+interesting runtime behaviors (sync A\*, the single-flight pump, no cancellation) stand out
+so sharply against it. A messy map hides its hot spots; a clean one spotlights them.
 
 ## Primary diagram
 
-The full machine, every box and hop labelled, is the Zoom-out diagram at the top
-combined with the JS-vs-native layers-and-hops diagram in Move 2. Those two
-together are the recap visual — return to them when any later file references "the
-build runtime" or "the JS thread."
+The full map, every layer and seam labeled — the frame to return to.
+
+```
+  flattr runtime map — processes, threads, tasks, resources, seams
+
+  ┌─ PROCESS: Node (tsx) ─ THREAD: 1 JS ─────────────────────────┐
+  │  TASKS (sequential await chain):                             │
+  │    fetchOverpass → buildGraph → writeGraph → exit            │
+  │  RESOURCES: transient OSM/graph mem; network; fs write       │
+  └──────────────────────────────┬───────────────────────────────┘
+                  seam 1: ARTIFACT │ graph.json (read-only, isolating)
+  ┌─ PROCESS: Hermes (RN) ─ THREAD: 1 JS ─────────▼──────────────┐
+  │  TASKS on the event loop:                                    │
+  │    region (debounce→pump)  route (ensureBbox→pump; A* sync)  │
+  │    geocode (debounce→fetch)                                  │
+  │  RESOURCES: base graph + merged tiles (never evicted);       │
+  │             network (Overpass/Open-Meteo/Nominatim);         │
+  │             AsyncStorage (elevCache)                         │
+  └──────────────────────────────┬───────────────────────────────┘
+                  seam 2: JS ═╪═► NATIVE │ MapLibre render · AsyncStorage I/O
+```
 
 ## Elaborate
 
-This split is the classic **static-site-generator runtime model** (Gatsby, Hugo,
-Next's SSG) applied to graph data instead of HTML: do the expensive,
-network-bound work once at build time, ship a frozen artifact, keep the client
-cheap. flattr's twist is that the client can *also* run the build pipeline for
-regions the artifact doesn't cover — so `buildGraph` had to be written to run in
-two runtimes, which is why it has no `node:fs` import (`build-graph.ts:2`). That
-single constraint — "this module must bundle for Hermes" — shapes the whole
-pipeline layer.
+The two-runtime-joined-by-an-artifact shape is the classic **static site generator**
+pattern (Jekyll, Next.js SSG, Astro) applied to graph data instead of HTML. The insight
+it buys is the same: push expensive work to a moment when latency doesn't matter (build),
+so the latency-sensitive moment (a user routing) only does cheap work. flattr stretches it
+by also building on-device — which is where the runtime gets interesting, because now the
+"cheap runtime" is doing pipeline work too (see `02` and `07`). For the artifact's shape
+and schema, see `study-data-modeling`; for why the build/run split is also a *system*
+boundary, see `study-system-design`.
 
 ## Interview defense
 
-**Q: This app has no backend and no database. So there are no runtime-systems
-concerns, right?**
+**Q: "Walk me through the runtime topology of this app."**
 
-Wrong, and that's the interesting part. Removing the server doesn't remove the
-work — it moves all of it onto one client thread. The map is two single-threaded
-runtimes joined by a static file.
+Two single-threaded processes joined by a read-only artifact. Build-time Node pipeline
+produces `graph.json`; the Hermes app loads it once and routes over it, building more graph
+on-device when you pan past the bundled area. No backend, no DB, no second thread.
 
 ```
-  no server ≠ no runtime — it concentrates the runtime
-
-  server model:  client ──► [N server threads] ──► DB
-  flattr model:  one JS thread does: render + A* + I/O orchestration
-                 → the thread IS the bottleneck and the scheduler
+  Node pipeline ──writes──► graph.json ──loaded once──► Hermes app
+   (sequential)              (static)                    (event loop + sync A*)
 ```
 
-Anchor: *"The most consequential runtime decision in flattr is that A* runs
-synchronously in a `useMemo` on the render thread — `MapScreen.tsx:151`. No
-backend means that search can't be offloaded to a server; it competes with the
-next frame."*
+*Anchor:* "The artifact seam is the strongest isolation in the system — the two runtimes
+share nothing but a JSON file."
 
-**Q: The same `buildGraph` runs at build time and on the phone. How is that
-possible across two runtimes?**
+**Q: "Where's the one thing that doesn't fit the pattern?"**
 
-Because it was deliberately written runtime-agnostic — no `node:fs`, all I/O
-injected through the `ElevationProvider` interface and an injectable `fetch`.
-Node supplies real `fetch` and writes the file; Hermes supplies its `fetch` and
-keeps the result in memory. Anchor: *"`build-graph.ts` line 2 is a comment
-explaining exactly this — no `node:fs` so it bundles for the app."*
+A\* runs synchronously on the JS thread (`MapScreen.tsx:155`) while everything around it is
+async. It's the only CPU-bound task on the render thread.
+
+*Anchor:* "Everything is async except the search — that asymmetry is where frame drops
+would come from if the graph grew."
 
 ## See also
 
-- `02-processes-threads-and-tasks.md` — zooms into Box 2's `pump()` scheduler.
-- `03-event-loop-and-async-io.md` — the JS thread's event loop and the A* block.
-- `06-filesystem-streams-and-resource-lifecycle.md` — the `graph.json` seam.
-- `.aipe/study-system-design/` — the same boundaries from the where-do-components-live angle.
+- `02-processes-threads-and-tasks.md` — the threads this map names, walked in depth.
+- `03-event-loop-and-async-io.md` — how the tasks on the JS thread are scheduled.
+- `05-memory-stack-heap-gc-and-lifetimes.md` — the "never evicted" resource line.
+- `study-system-design` (sibling guide) — the same boundary as an architectural seam.

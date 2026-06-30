@@ -1,306 +1,287 @@
 # B-tree, hash, and secondary indexes
 
-**Industry name(s):** index structures / primary & secondary indexes / B+tree /
-hash index / spatial index · **Type:** Industry standard.
+**Industry names:** primary index · secondary index · hash index · B-tree ·
+spatial index — *type label: Industry standard.*
 
 ## Zoom out, then zoom in
 
-This is the single richest database lesson flattr actually exercises — and the
-one it most visibly *misses*. flattr hand-builds two indexes and conspicuously
-lacks a third.
+flattr has two indexes it built by hand and one it's missing. This is the
+single richest database topic in the codebase, because the whole reason A*
+is fast and the whole reason `nearestNode` is slow both come down to *which
+index exists*. Find them on the map, then we walk each.
 
 ```
-  Zoom out — indexes sit between the query and the records
+  Zoom out — the indexes on the read store
 
-  ┌─ Query layer ───────────────────────────────────────────┐
-  │  astar.search()  ·  nearestNode()                       │
-  └────────────────────────────┬─────────────────────────────┘
-  ┌─ Index layer ──────────────▼─────────────────────────────┐
-  │  ★ nodes (PK hash)  ·  adjacency (2ndary)  ·  byId (txn) ★│ ← we are here
-  │  ✗ NO spatial index over node coordinates  (the gap)     │
-  └────────────────────────────┬─────────────────────────────┘
-  ┌─ Storage layer ────────────▼─────────────────────────────┐
-  │  records in graph.json (nodes map, edges array)          │
-  └───────────────────────────────────────────────────────────┘
+  ┌─ Storage layer — the in-memory Graph ───────────────────────┐
+  │                                                             │
+  │  ★ nodes: Record<id,Node> ★      PRIMARY index (hash)       │ ← have it
+  │      graph.nodes[id]   → O(1)                                │
+  │                                                             │
+  │  ★ adjacency: id→edgeId[] ★      SECONDARY index            │ ← have it
+  │      graph.adjacency[node] → O(1) neighbor edges            │
+  │                                                             │
+  │  ✗ (missing) spatial index       lat/lng → nearest node    │ ← the gap
+  │      nearestNode scans ALL nodes → O(N)                     │
+  └─────────────────────────────────────────────────────────────┘
 ```
 
-Zoom in. An index is a *second data structure whose only job is to find records
-fast without scanning all of them.* The cost: every index you add must be kept in
-sync on every write, so indexes trade write cost for read speed. flattr's writes
-happen offline at build time, so its indexes are "free" to maintain at runtime —
-which is exactly why it can afford a hand-built one (`adjacency`) and exactly why
-the *missing* one (spatial) hurts so visibly when present in the read path.
+Zoom in. An index is a **secondary data structure that turns a scan into a
+lookup**. A real database builds B-trees and hash indexes automatically and
+a query planner picks among them. flattr has no planner — every index is a
+deliberate hand-built object, and the one query that lacks an index
+(spatial nearest-neighbor) is stuck doing the full scan a planner would have
+avoided. Naming which index serves which query is the lesson.
 
 ## The structure pass
 
-**Layers** (by index role):
-1. **Primary index** — `nodes: Record<id,Node>` — the data, addressed by key.
-2. **Secondary index** — `adjacency: Record<id, edgeId[]>` — points *into* the
-   primary store by a non-key access path (node → its edges).
-3. **Transient index** — `byId: Map<id,Edge>` built per search in `astar.ts:11`.
-4. **The missing index** — no spatial index over `(lat,lng)`.
+**Layers.** Three access paths over the same graph: by node id (primary), by
+node→edges (secondary/adjacency), by coordinate (spatial — absent).
 
-**Axis traced — "how do I find a record by this access path: O(1), O(log N), or
-O(N)?"**
+**Axis — does this access path have an index?** Trace it:
 
 ```
-  axis — "lookup cost by access path" — across the indexes
+  Axis: "is this query indexed?" across the three access paths
 
-  access path                    structure              cost
-  ─────────────────────────────  ─────────────────────  ──────
-  node by id                     nodes Record (hash)    O(1)
-  edges incident to a node       adjacency (2ndary)     O(1) → list
-  edge by id (during search)     byId Map (transient)   O(1)
-  edge by id (no index)          edges array scan       O(E)  ← avoided
-  node nearest a coordinate      ✗ none — full scan     O(N)  ← the gap
+  ┌─ by node id ────────────────┐  → YES: Record hash → O(1)
+  │  graph.nodes["n42"]         │     (primary index)
+  └─────────────────────────────┘
+  ┌─ by node → its edges ───────┐  → YES: adjacency Record → O(1)
+  │  graph.adjacency["n42"]     │     (secondary index, hand-built)
+  └─────────────────────────────┘
+  ┌─ by lat/lng → nearest node ─┐  → NO: full scan → O(N)
+  │  nearestNode(graph, pt)     │     (missing spatial index)
+  └─────────────────────────────┘
+
+  two indexed, one not — the seam is at the third path
 ```
 
-The axis-answer flips hard at the last row. Every access path flattr's routing
-hot loop needs is O(1) — because someone built the index. The one path with no
-index, "nearest node to this tap," is O(N) and runs on every user interaction
-(`nearest.ts:8`). That's the load-bearing seam: **the boundary between an indexed
-access path and an unindexed one is where your latency cliff lives.**
+**Seam.** The boundary that flips is **"is this the hot path?"** A* runs
+millions of expansions and is fully indexed — every step is O(1).
+`nearestNode` runs twice per route (start + end tap) and is *not* indexed.
+flattr indexed exactly where the volume is and left the low-volume path
+scanning. That's a defensible call today and a latency cliff tomorrow.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You've built this. `me.md` says you wrote `Graph.ts` with an adjacency list and
-`Graph2.ts` (node+edge) for Dijkstra. An adjacency list *is* a secondary index:
-it's a side structure mapping "node → its edges" so traversal doesn't scan all
-edges. A database index is the same move generalized — a side structure that
-turns "scan everything to find matches" into "look it up."
+You know what an index does: you've written
+`const byId = new Map(items.map(i => [i.id, i]))` so you could look something
+up without `.find()` on every call. That one line *is* a hash index. flattr
+does exactly this — twice as persistent structures (`nodes`, `adjacency`),
+once as a per-query throwaway (`indexEdges`), and never for coordinates
+(the gap).
 
 ```
-  the pattern — an index is a sorted/keyed shortcut into the records
+  The index kernel — what every index is
 
-  WITHOUT index (scan):          WITH index (lookup):
-  records: [r0 r1 r2 … rN]       index:  key ─► location
-            └─ check all ─┘               └─ jump straight there ─┘
-  find by key = O(N)             find by key = O(1) hash / O(log N) B-tree
+  ┌─ the table (slow path) ──────────────────────┐
+  │  edges: Edge[]   → find by scanning  O(N)     │
+  └───────────────────────────────────────────────┘
+              │  build a lookup structure once
+              ▼
+  ┌─ the index (fast path) ──────────────────────┐
+  │  Map<id, Edge>   → find by key       O(1)     │
+  └───────────────────────────────────────────────┘
+   trade: extra memory + build cost, for O(N)→O(1) reads
 ```
 
-Two index shapes matter, and flattr uses (or misses) both:
-- **Hash index** — O(1) point lookup, no range queries. flattr's `nodes` and
-  `adjacency` are hash indexes (JS objects/Maps).
-- **B+tree index** — O(log N) lookup *and* ordered range scans. flattr uses none,
-  because it never asks "all nodes with lat between X and Y" — which is precisely
-  the query a spatial index would answer for `nearestNode`.
+### Move 2 — the three indexes, one at a time
 
-### Move 2 — flattr's indexes, one at a time
+**Primary index — `nodes` as a hash on id.** Nodes live in
+`Record<string, Node>` (`types.ts:25`). The key is the id; the lookup is one
+hash probe. This is a primary (clustered) index in the database sense: the
+key is the row's identity *and* its access path. No B-tree needed — there's
+no range-scan-by-id requirement, so a hash is strictly better (O(1) vs.
+O(log N)). This is why `astar.ts:39` can write `graph.nodes[goalId]` and
+trust it's instant.
 
-**The primary index: `nodes` as a hash map.** `features/routing/types.ts:25`
-declares `nodes: Record<string, Node>`. In a real DB this is the *primary key
-index* — the clustered structure that *is* the table, addressed by PK. flattr
-gets it for free from JavaScript: `graph.nodes[goalId]` (`astar.ts:39`) is a hash
-lookup, O(1) average. Every "get node by id" in the codebase rides this.
-
-```
-  primary index — nodes keyed by id (hash)
-
-  graph.nodes["n42"]
-       │ hash("n42")
-       ▼
-  ┌──────────────────────────────┐
-  │ {id:"n42", lat, lng, elevM}  │  one probe, O(1)
-  └──────────────────────────────┘
-```
-
-**The secondary index: `adjacency`, hand-built.** This is the one that earns its
-keep. It maps a node id to the ids of edges touching it — a non-key access path
-("which edges can I leave this node by?"). Built once at build time:
+**Secondary index — `adjacency`, the load-bearing one.** This is the index
+that makes the whole router work. It's built once in `buildAdjacency`:
 
 ```ts
 // features/routing/graph.ts:22-29 — building the secondary index
 export function buildAdjacency(edges: Edge[]): Record<string, string[]> {
   const adj: Record<string, string[]> = {};
-  for (const e of edges) {                    // line 24: one pass over all edges, O(E)
-    (adj[e.fromNode] ??= []).push(e.id);      // line 25: index the "from" endpoint
-    (adj[e.toNode]   ??= []).push(e.id);      // line 26: index the "to" endpoint
+  for (const e of edges) {
+    (adj[e.fromNode] ??= []).push(e.id);  // ← index entry: node → its edge ids
+    (adj[e.toNode] ??= []).push(e.id);    // ← both endpoints (undirected adj)
   }
-  return adj;                                 // line 28: nodeId → incident edgeIds
+  return adj;                              // O(E) build, once
 }
 ```
 
-Lines 25-26 are the index build: one O(E) pass produces a structure that makes
-"edges of node X" O(1). Without it, every A* expansion would scan all 1879 edges
-to find the few incident to the current node — turning each of potentially
-hundreds of expansions into an O(E) scan. *That's* what the index buys, and you
-see it spent at `astar.ts:64`:
+Without it, "what edges touch node X?" would be `edges.filter(e =>
+e.fromNode===X || e.toNode===X)` — O(E) per node, run for every node A*
+expands, making the search O(V·E). *With* it, A*'s inner loop is:
 
 ```ts
-// features/routing/astar.ts:64 — spending the secondary index in the hot loop
-for (const edgeId of graph.adjacency[current] ?? []) {  // O(1) lookup → small list
-  const edge = byId.get(edgeId)!;                        // O(1) via the transient index
+// features/routing/astar.ts:64 — the indexed expansion
+for (const edgeId of graph.adjacency[current] ?? []) {  // ← O(1) lookup,
+  const edge = byId.get(edgeId)!;                        //   then O(deg) edges
 ```
 
-Drop `adjacency` and A*'s inner loop goes from O(degree) to O(E) per node. The
-secondary index is what makes grade-aware routing tractable.
+`graph.adjacency[current]` is one hash probe returning the node's incident
+edge ids; the loop body is O(degree). That's the textbook **adjacency-list
+secondary index** — a covering index for the one query A* runs constantly.
+Strip it out and what breaks: A* degrades from near-linear to quadratic and
+the router stalls on a real city graph. It is the most load-bearing index
+in the repo.
 
-**The transient index: `byId` per search.** `astar.ts:11-16` builds a
-`Map<id,Edge>` at the start of every search:
+**Materialized index at query time — `indexEdges`.** A* also needs edge-by-id
+fast (to resolve the ids `adjacency` returns). Rather than scan `edges` per
+lookup, it builds a throwaway `Map` once per search:
 
 ```ts
-// features/routing/astar.ts:11-16 — a covering index over the edge array
+// features/routing/astar.ts:11-16
+/** Build an id->edge index once, so expansions are O(1) per edge, not O(E). */
 export function indexEdges(graph: Graph): Map<string, Edge> {
   const m = new Map<string, Edge>();
-  for (const e of graph.edges) m.set(e.id, e);  // O(E) build, once per search
+  for (const e of graph.edges) m.set(e.id, e);  // O(E) build, amortized over the search
   return m;
 }
 ```
 
-`adjacency` gives you edge *ids*; the records live in the `edges` *array* (O(E) to
-find by id). So `byId` is a second index that resolves id→record in O(1), spent at
-`astar.ts:65`. Two indexes compose: `adjacency` (node→edgeIds) then `byId`
-(edgeId→Edge). This is the cost of having stored edges as an array (`02`,
-Decision 2) — routing pays an O(E) build per search to undo it. **Inference:**
-building it per-search rather than once at load is a minor inefficiency (red-flag
-#5 territory); for the MVP's edge count it's negligible.
+This is a **materialized/temporary index** — built for one query, discarded
+after. The comment names the exact tradeoff: pay O(E) once so every
+expansion is O(1) instead of O(E). A real planner would build this hash
+join structure for you; flattr does it by hand.
 
-**The missing index: spatial.** Here's the gap. `nearestNode` answers "which node
-is closest to this tapped coordinate?" — a *nearest-neighbor* query — by scanning
-every node:
+**The missing index — spatial.** `nearestNode` answers "which node is
+closest to this lat/lng?" by scanning every node:
 
 ```ts
-// features/routing/nearest.ts:5-17 — the UNINDEXED full scan
+// features/routing/nearest.ts:5-18 — the unindexed full scan
 export function nearestNode(graph: Graph, point: LatLng): string {
-  let bestId; let bestDist = Infinity;
-  for (const id of Object.keys(graph.nodes)) {       // line 8: scan ALL 1621 nodes
+  let bestId: string | undefined;
+  let bestDist = Infinity;
+  for (const id of Object.keys(graph.nodes)) {   // ← O(N) over EVERY node
     const n = graph.nodes[id];
-    const d = haversine(point, { lat: n.lat, lng: n.lng });  // distance per node
-    if (d < bestDist) { bestDist = d; bestId = id; } // keep the running minimum
+    const d = haversine(point, { lat: n.lat, lng: n.lng });
+    if (d < bestDist) { bestDist = d; bestId = id; }
   }
+  if (bestId === undefined) throw new Error("nearestNode: graph has no nodes");
   return bestId;
 }
 ```
 
-Line 8 is a **sequential scan** — the database equivalent of a query with no
-usable index, forced into `Seq Scan` + a full sort-by-distance. It runs on every
-route endpoint tap. At 1621 nodes it's microseconds and totally fine. At a
-metro-scale graph (hundreds of thousands of nodes) it's a visible lag on every
-tap, and the fix is a **spatial index**: a k-d tree, an R-tree, or a geohash
-grid that prunes the search to a small candidate set.
+There is no index on `(lat, lng)`. Every start/end tap (`MapScreen.tsx:133-134`)
+scans all ~1750 nodes computing haversine each time. This is the
+flattr-shaped version of a missing index: a real database would build a
+**spatial index** — an R-tree, a k-d tree, or a geohash/quadkey bucket — and
+turn this O(N) scan into an O(log N) descent or an O(1) bucket probe.
 
 ```
-  the gap — nearest-neighbor with vs without a spatial index
+  Comparison — the scan vs. the spatial index it lacks
 
-  WITHOUT (flattr now):                WITH (k-d tree / R-tree):
-  ┌──────────────────────────┐         ┌──────────────────────────┐
-  │ for every node:          │         │ descend tree to the cell │
-  │   compute haversine      │         │ check only nearby nodes  │
-  │   keep min               │         │ prune the rest           │
-  └──────────────────────────┘         └──────────────────────────┘
-       O(N) per tap                          O(log N) per tap
+  TODAY (no index)                  WITH a k-d tree / R-tree
+  ┌──────────────────────────┐      ┌──────────────────────────┐
+  │ for each of N nodes:     │      │ descend tree by lat/lng  │
+  │   compute haversine      │      │ prune half-planes        │
+  │   track best             │      │ check O(log N) nodes     │
+  │ → O(N) every tap         │      │ → O(log N) every tap     │
+  └──────────────────────────┘      └──────────────────────────┘
+   1750 haversines per tap           ~11 comparisons per tap
 ```
 
-This is the same family as the **ANN / vector index** you shipped in `AdvntrCue`
-(pgvector) — "find the nearest point in a high-dimensional space" is exactly
-nearest-neighbor; pgvector's HNSW index is a spatial index for embeddings. flattr
-does the 2-D version by brute force.
+### Move 2.5 — current vs. future (why the gap is fine *now*)
 
-### Move 2 variant — the load-bearing skeleton of an index
+```
+  Phase A (now)                     Phase B (graph grows)
+  ┌─────────────────────────┐       ┌──────────────────────────┐
+  │ N ≈ 1750 nodes          │       │ N ≈ 100k+ nodes (a city) │
+  │ O(N) scan = ~1750 ops   │       │ O(N) scan = 100k+ ops    │
+  │ runs twice per route    │       │ runs on every map tap    │
+  │ → sub-millisecond       │       │ → visible UI jank        │
+  │ VERDICT: leave it       │       │ VERDICT: build a k-d tree│
+  └─────────────────────────┘       └──────────────────────────┘
+```
 
-Strip an index to what can't be removed:
-
-1. **The kernel:** a *key-ordered or key-hashed* structure that maps an access
-   path to record locations, kept *consistent with the records*. That's it — a
-   shortcut + the promise it stays in sync.
-2. **What breaks when each part is missing:**
-   - Drop the *consistency* and the index lies — `adjacency` listing an edge that
-     no longer exists routes through a ghost edge (flattr avoids this only because
-     both are built together at build time; nothing *enforces* it — red-flag #4).
-   - Drop the *ordering/hashing* and it's just a copy of the data — no faster.
-   - Drop the index entirely and every lookup is a scan — exactly `nearestNode`.
-3. **Skeleton vs hardening:** the shortcut + sync is the skeleton. Covering
-   indexes, partial indexes, multi-column composite keys, fill factor — all
-   hardening. flattr's `adjacency` is pure skeleton; it has none of the hardening
-   because it's rebuilt wholesale offline.
+What *doesn't* change: the rest of the router. The spatial index would only
+front `nearestNode` — A*, adjacency, cost all stay. You'd build the tree
+once at `loadGraph` time from the same `nodes` and swap the scan for a
+descent. Small, contained change. That's why shipping the scan now is
+correct: the cost to add the index later is one new module, not a rewrite.
 
 ### Move 3 — the principle
 
-An index is a bet: you pay write cost and storage to make one access path fast.
-The skill is knowing *which* access paths your queries actually use and indexing
-exactly those — no more (every extra index taxes writes), no fewer (an unindexed
-hot path is a latency cliff). flattr indexed its hot path (node→edges) perfectly
-and left its *other* hot path (coordinate→nearest node) unindexed. Reading a
-codebase for "which access paths are indexed vs scanned" is how you predict where
-it'll fall over under load.
+An index is a **bet that you'll read by this key more than you'll pay to
+maintain it.** flattr won the bet on `nodes` and `adjacency` (read
+constantly, built once, never invalidated because the graph is immutable)
+and *declined* the bet on coordinates (read twice per route — not worth the
+structure at 1750 nodes). The immutability is the cheat code: flattr's
+indexes never need maintenance because the data never changes. A real
+database pays index upkeep on every write; flattr pays it never.
 
 ## Primary diagram
 
 ```
-  flattr's index landscape — built, transient, and missing
+  flattr's index inventory
 
-  ┌─ QUERIES ─────────────────────────────────────────────────────┐
-  │  A* expansion          nearest-to-tap          heatmap render  │
-  └──────┬──────────────────────┬──────────────────────┬───────────┘
-         │                      │                      │
-  ┌──────▼──────┐        ┌──────▼──────┐        ┌──────▼──────┐
-  │ adjacency   │        │  ✗ NONE     │        │ edges array │
-  │ (2ndary,    │        │  full scan  │        │ (iterate    │
-  │  hash)O(1)  │        │  O(N)/tap   │        │  all) O(E)  │
-  └──────┬──────┘        └──────┬──────┘        └─────────────┘
-         │ edgeIds              │
-  ┌──────▼──────┐        ┌──────▼──────┐
-  │ byId (txn   │        │ nodes hash  │
-  │  index)O(1) │        │  O(1) probe │
-  └──────┬──────┘        └─────────────┘
-         ▼
-  ┌─ RECORDS in graph.json: nodes Record + edges Array ───────────┐
-  └───────────────────────────────────────────────────────────────┘
-            built index ✓        the gap ✗         primary index ✓
+  ┌─ the in-memory Graph ───────────────────────────────────────┐
+  │                                                             │
+  │  PRIMARY (hash on id)     nodes: Record<id,Node>            │
+  │    graph.nodes[id]  ──────────────────────────► O(1) ✓      │
+  │                                                             │
+  │  SECONDARY (adjacency list)  adjacency: id→edgeId[]         │
+  │    graph.adjacency[node] ─────────────────────► O(1) ✓      │
+  │    built by buildAdjacency() once, never invalidated        │
+  │    → THE load-bearing index: makes A* near-linear           │
+  │                                                             │
+  │  MATERIALIZED (per-query)  indexEdges → Map<id,Edge>        │
+  │    built once per search, O(E), then O(1) per edge ✓        │
+  │                                                             │
+  │  MISSING  spatial (lat/lng → nearest node)                  │
+  │    nearestNode scans all nodes ───────────────► O(N) ✗      │
+  │    fix: k-d tree / R-tree built at load → O(log N)          │
+  └─────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-The B+tree is the workhorse of relational databases because it does *both* point
-lookups (O(log N)) and ordered range scans (`WHERE x BETWEEN a AND b`) on one
-structure — its leaves are linked in key order. Hash indexes are faster for exact
-equality but can't range-scan at all. flattr's needs are all exact-match
-(`nodes[id]`, `adjacency[id]`) so JS hash maps are the right tool; the moment it
-needed a *range* query (nearest-in-a-region) it had no structure for it and fell
-back to a scan.
-
-The spatial index family — k-d trees, R-trees, quadtrees, geohashing, and in
-Postgres the GiST index that powers PostGIS — exists exactly for the
-`nearestNode` query. If flattr migrates to Postgres+PostGIS (the spec's
-direction), `nearestNode` becomes `ORDER BY geom <-> point LIMIT 1` backed by a
-GiST index, and the O(N) scan turns into an O(log N) index probe for free.
+The **B-tree** doesn't appear in flattr because no query needs ordered/range
+access — every lookup is exact-match by id, where a hash wins. B-trees earn
+their place when you query *ranges* ("all edges with grade between 4% and
+8%") or need sorted iteration; flattr never does. The **spatial index** is
+the one flattr genuinely wants. The canonical structures: a k-d tree (binary
+space partitioning, simplest to hand-roll given Rein's BST/heap background —
+it's a BST that alternates split axes), an R-tree (bounding-box hierarchy,
+what PostGIS uses), or geohashing (encode lat/lng to a sortable string, then
+it's a prefix scan on a B-tree). For 1750 static nodes, a k-d tree built
+once is the natural fit and maps directly onto the BST code already in the
+reincodes repo.
 
 ## Interview defense
 
-**Q: "What indexes does flattr have, and what's missing?"**
-
-> Two built, one missing. `nodes` is a hash primary index (O(1) by id).
-> `adjacency` is a hand-built secondary index (`graph.ts:22`) mapping node→edges,
-> spent in A*'s hot loop (`astar.ts:64`) to keep expansion O(degree) instead of
-> O(E). Missing: a spatial index. `nearestNode` (`nearest.ts:8`) does an O(N)
-> full scan over all nodes on every tap. Fine at 1621 nodes; a latency cliff at
-> metro scale. The fix is a k-d tree or, post-migration, a PostGIS GiST index.
+**Q: What makes A* fast in flattr — the heap or something else?**
+The heap (`pqueue.ts`) orders the frontier, but the thing that keeps each
+expansion O(1) is the **adjacency secondary index**. `graph.adjacency[node]`
+is a hash lookup returning the node's incident edge ids; without it, finding
+a node's neighbors would be an O(E) filter over all edges, making the search
+quadratic. It's the most load-bearing index in the repo, and it's free to
+maintain because the graph is immutable.
 
 ```
-  indexed hot path:   node→edges   adjacency  O(1) ✓
-  UNindexed hot path: tap→nearest  full scan  O(N) ✗  ← the cliff
+  adjacency[node] → [edgeIds]   O(1)   ← the index that makes A* work
+  (built once in buildAdjacency, never invalidated)
 ```
+*Anchor: the adjacency list is a covering secondary index for A*'s one
+hot query.*
 
-Anchor: *the boundary between an indexed and an unindexed access path is where
-the latency cliff lives — flattr indexed routing and forgot nearest-neighbor.*
-
-**Q: "What's the load-bearing part of an index people forget?"**
-
-> That it must stay *consistent* with the records. An index that drifts from the
-> data is worse than no index — it returns wrong answers fast. flattr dodges this
-> by building `adjacency` from the same edges at build time, but nothing
-> *enforces* the invariant; if a future build emits a graph where adjacency and
-> edges disagree, routing silently traverses or drops edges with no error.
-
-Anchor: *an index is a shortcut plus the promise it stays in sync — and the
-promise is the part that breaks.*
+**Q: Where's flattr missing an index, and what would you build?**
+`nearestNode` (`nearest.ts:5-18`) — it scans all nodes computing haversine to
+snap a tap to a node, O(N) per tap, no spatial index. At 1750 nodes it's
+sub-millisecond, so it's the right call now. At city scale I'd build a k-d
+tree once at load time (it's a BST alternating split axes) and turn the scan
+into an O(log N) descent. Contained change — only `nearestNode` is touched.
+*Anchor: the missing index is spatial; a k-d tree at load time is the fix,
+and nothing else moves.*
 
 ## See also
 
-- `02-records-pages-and-storage-layout.md` — why edges-as-array forces the byId index
-- `04-query-planning-and-execution.md` — Seq Scan vs Index Scan in flattr's reads
-- `09-database-systems-red-flags-audit.md` — the O(N) scan and unenforced adjacency
-- `../study-dsa-foundations/` — k-d trees, the heap behind A*, graph traversal
-- `../study-ai-engineering/` — pgvector ANN as the high-D cousin of spatial indexing
+- `04-query-planning-and-execution.md` — A* as the query operator that
+  *uses* these indexes.
+- `02-records-pages-and-storage-layout.md` — why nodes are keyed and edges
+  are an array.
+- `09-database-systems-red-flags-audit.md` — the spatial-index gap, ranked #1.

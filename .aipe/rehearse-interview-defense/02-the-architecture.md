@@ -1,302 +1,277 @@
-# Chapter 2 — The architecture
+# Chapter 2 — The Architecture
 
-Right after the pitch, someone hands you a marker and says "walk me through the
-system." This is the chapter where you draw flattr at a whiteboard, in ninety
-seconds, without backtracking. The goal isn't to show every module — it's to
-show that you understand the *shape* of the system: where the work happens, what
-crosses which boundary, and the one decision that defines the whole thing.
+After the pitch lands, the interviewer says "walk me through the system."
+This is the whiteboard moment. The goal is to draw flattr's architecture
+from scratch, confidently, in ninety seconds or less — and to trace a single
+request end-to-end so they see you understand the *flow*, not just the box
+diagram.
 
-That decision is the build-time / runtime split. flattr has no backend not
-because you ran out of time, but because the expensive work — turning streets +
-elevation into a grade-annotated graph — happens *once*, at build time, and gets
-frozen into a static file. Runtime just reads it. If you can draw that split and
-explain why it's deliberate, you've answered most of this chapter before the
-follow-ups even start.
-
----
-
-## The chapter-opening diagram — the architecture, full page
-
-This is the diagram you redraw at the whiteboard. Two halves joined by one
-artifact (`graph.json`), with the runtime hot path having zero network in it.
-Practice drawing it top to bottom until it's muscle memory.
-
-```
-  flattr architecture — build-time bakes, runtime reads
-
-  ══════════════════ BUILD TIME (pipeline/, run once) ══════════════════
-
-  ┌─ Provider layer (free APIs, build-time only) ─────────────────────┐
-  │   Overpass API              Open-Meteo Elevation API              │
-  │   (OSM street ways)         (Copernicus 90m DEM, free, no key)    │
-  └──────────┬──────────────────────────┬──────────────────────────────┘
-             │ hop 1: ways               │ hop 2: elevation per node
-             ▼                           ▼
-  ┌─ Pipeline layer (pure TS modules) ────────────────────────────────┐
-  │  parseOsm → splitWays → sampleElevations → computeGrades          │
-  │  osm.ts     split.ts     elevation.ts       grade.ts             │
-  │                              │                                     │
-  │                              ▼   buildGraph (build-graph.ts:12)    │
-  │              Node{id,lat,lng,elevationM} + Edge{...gradePct...}    │
-  │              + adjacency: nodeId → edgeIds  (graph.ts:22)          │
-  └───────────────────────────────┬────────────────────────────────────┘
-                                  │ hop 3: serialize
-                                  ▼
-                    ┌────────────────────────────┐
-                    │  graph.json  (STATIC SEAM)  │  1,621 nodes
-                    │  bundled into the app       │  1,879 edges
-                    └──────────────┬──────────────┘
-                                  │ hop 4: bundle import
-  ══════════════════ RUNTIME (mobile/, Expo + RN) ═════════════════════
-                                  ▼
-  ┌─ UI layer (React Native + MapLibre) ──────────────────────────────┐
-  │  MapScreen.tsx — tap two points / type addresses / grade slider   │
-  └───────────────────────────────┬────────────────────────────────────┘
-                                  │ hop 5: tapped coord
-                                  ▼
-  ┌─ Routing layer (the engine, pure TS, NO NETWORK) ─────────────────┐
-  │  loadGraph()  →  nearestNode(coord)  →  directedAstar(g,s,e,max)  │
-  │  loadGraph.ts    nearest.ts (O(N))      astar.ts:22 → search()    │
-  │                                              │                     │
-  │                                              ▼  hop 6: route line  │
-  │                                       routeToGeoJSON → MapLibre    │
-  └────────────────────────────────────────────────────────────────────┘
-```
-
-The single most important thing on that diagram is the box labeled STATIC SEAM.
-Everything above it costs an API quota and runs once; everything below it is
-free and runs on every tap.
+flattr's architecture has one organizing idea, and if you lead with it
+everything else falls into place: there are **two systems, not one**. A
+build-time pipeline that produces a static artifact, and a runtime app that
+reads it. They never run at the same time. They share exactly one thing —
+`graph.json`. Get that split on the board first, and every follow-up has a
+home.
 
 ---
 
-## "Walk me through the system"
+## The architecture — full diagram
+
+This is the diagram you draw at the whiteboard. Practice it until you can
+reproduce it cold. The horizontal line in the middle is the whole story.
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│ THEY ASK                                                          │
-│   "Walk me through the architecture / how does it work?"          │
-│                                                                   │
-│ WHAT THEY'RE TESTING                                              │
-│   Can you pick an altitude and hold it? Do you know what the      │
-│   load-bearing boundary is — or do you list modules flatly?       │
-│   Can you trace ONE request end to end without getting lost?      │
-│   The "no backend" choice: deliberate, or did you just not get   │
-│   around to it?                                                    │
-└─────────────────────────────────────────────────────────────────┘
+  flattr architecture — build time above the line, runtime below
+
+  ══════════════════ BUILD TIME (pipeline/, your machine, offline) ══════
+                                                                          
+   ┌──────────┐   ┌─────────┐   ┌──────────────┐   ┌─────────┐   ┌──────┐ 
+   │ Overpass │──►│ split   │──►│  Open-Meteo  │──►│ grade   │──►│build-│ 
+   │ OSM ways │   │ to edges│   │  elevation   │   │ per edge│   │graph │ 
+   │overpass.ts│  │split.ts │   │elevation.ts  │   │grade.ts │   │.ts   │ 
+   └──────────┘   └─────────┘   └──────┬───────┘   └─────────┘   └───┬──┘ 
+                                free API, 429s        signs grade        │ 
+                                under load            by direction       ▼ 
+                                                              ┌────────────────┐
+                                                              │  graph.json    │
+                                                              │ seattle-mvp    │
+                                                              │ 1621 nodes     │
+                                                              │ 1879 edges     │
+                                                              └───────┬────────┘
+  ════════════════════════════════════════════════════════════════════│══════
+                                                       bundled, read-only│
+  ══════════════════ RUNTIME (mobile/, Expo ~56 / RN 0.85 / React 19) ──▼──────
+                                                                          
+   ┌─ UI LAYER ──────────────────┐      ┌─ ENGINE LAYER (features/, pure TS)─┐
+   │ MapScreen.tsx               │      │                                    │
+   │  ├ AddressBar (geocode)     │      │  loadGraph()      reads graph.json │
+   │  ├ GradeSlider → userMax    │ ───► │  nearestNode()    coord → node id  │
+   │  ├ MapLibre <Map>           │      │  directedAstar()  ONE search()     │
+   │  └ RouteSummaryCard         │ ◄─── │    ├ cost.ts   directed penalty    │
+   │                             │      │    ├ pqueue.ts hand-rolled heap    │
+   └─────────────────────────────┘      │    └ summary.ts climb/dist totals  │
+                                        └────────────────────────────────────┘
+                                                                          
+   NO server. NO database. NO network in the routing hot path.            
 ```
 
-Here's the walkthrough, in your voice. Trace one tap, top to bottom.
-
-> "The system splits in two: build time and runtime, joined by one static file.
->
-> At build time — this is the `pipeline/` directory — I pull OSM street geometry
-> from Overpass, split the long ways into short edges (`splitWays`), sample
-> elevation for every node from Open-Meteo's free DEM (`sampleElevations`), then
-> compute the signed grade of each edge from the elevation difference
-> (`computeGrades`). `buildGraph` (build-graph.ts:12) stitches that into a
-> `Graph` — nodes, edges, and an adjacency map from node id to incident edge ids
-> — and serializes it to `graph.json`. That file is 1,621 nodes and 1,879 edges
-> of Seattle. It's the only thing that crosses into the app.
->
-> At runtime — the `mobile/` Expo app — `loadGraph()` just imports that JSON.
-> When you tap two points on the map, I snap each tapped coordinate to the
-> nearest graph node with `nearestNode` (nearest.ts), then call `directedAstar`
-> (astar.ts:156). That's one A* search with the directional grade cost. It
-> returns a path, I turn it into GeoJSON, MapLibre draws it colored by grade.
->
-> The key thing: there's no server. Routing has no network in the hot path.
-> The expensive work — elevation sampling, grade computation — happened once at
-> build time and got frozen into the file. Runtime just reads and searches."
-
-That's ~75 seconds. You held one altitude (modules, not lines), you named the
-seam, and you traced one tap from screen to route line.
-
-```
-┃ "The expensive work happened once at build time and
-┃  got frozen into a file. Runtime just reads and searches."
-```
-
-### The single axis to trace — where does the work happen?
-
-If the interviewer wants you to go deeper, don't list more modules. Trace one
-axis across the seam: **cost / lifecycle.** Same system, one question, the
-answer flips at the seam.
-
-```
-  One question across the seam: "when does the work happen?"
-
-  ┌─ build time ─────────────┐   seam    ┌─ runtime ────────────────┐
-  │ elevation sampling       │ ═══╪═════► │ load JSON (cheap)         │
-  │ grade computation        │  (flips)  │ nearestNode scan          │
-  │ edge splitting           │           │ A* search                 │
-  │ costs an API quota       │           │ costs nothing, no network │
-  │ runs ONCE                │           │ runs on EVERY tap         │
-  └──────────────────────────┘           └──────────────────────────┘
-       expensive, rare                         cheap, frequent
-```
-
-That contrast *is* the architecture. The whole "no backend" decision falls out
-of it: if the per-tap work is cheap and network-free, you don't need a server.
+The arrows below the line are all in-process function calls — no HTTP, no
+sockets, no query. That absence is a design choice, and Chapter 3 defends
+it. Here, the job is to make the interviewer *see* it.
 
 ---
 
-## Weak vs strong — the architecture walkthrough
+## The big question — "walk me through the system"
 
 ```
-┌──────────────────────────────┬──────────────────────────────┐
-│ WEAK WALKTHROUGH              │ STRONG WALKTHROUGH            │
-├──────────────────────────────┼──────────────────────────────┤
-│ "So there's a pipeline folder │ "It splits in two halves      │
-│ with osm.ts, overpass.ts,     │ joined by graph.json. Build   │
-│ elevation.ts, geocode.ts,     │ time bakes the grade-annotated │
-│ split.ts, grade.ts,           │ graph from OSM + elevation;   │
-│ build-graph.ts... and then    │ runtime loads it and routes   │
-│ features/routing has graph.ts,│ on-device with no network. Let │
-│ astar.ts, cost.ts, pqueue.ts, │ me trace one tap: snap to      │
-│ nearest.ts, summary.ts, and   │ nearest node, run directedAstar,│
-│ the mobile folder has the      │ draw the route. The seam is    │
-│ Expo app with MapScreen..."    │ the static file — that's why   │
-│                                │ there's no backend."           │
-├──────────────────────────────┼──────────────────────────────┤
-│ Why it's weak:                │ Why it works:                  │
-│ A flat file tour. The         │ Picks the altitude (halves +   │
-│ interviewer can't tell what's │ seam), names the load-bearing  │
-│ load-bearing from what's      │ boundary, traces ONE request,  │
-│ plumbing. No request traced.  │ and explains the "no backend"  │
-│ No seam named. You sound like │ as a consequence of the shape. │
-│ you're reading the directory. │ One coherent picture.          │
-└──────────────────────────────┴──────────────────────────────┘
+┌─────────────────────────────────────────────────────────┐
+│ THEY ASK                                                 │
+│   "Walk me through the architecture of flattr."          │
+│                                                          │
+│ WHAT THEY'RE REALLY ASKING                               │
+│   Can you operate at the right altitude — start at the   │
+│   system shape, not a function? Do you know where state  │
+│   lives and where the boundaries are? Can you trace a    │
+│   request without getting lost? And: is the "no backend" │
+│   a thing you understand, or a thing you didn't get to?  │
+└─────────────────────────────────────────────────────────┘
 ```
 
+The strong answer, in your voice — start wide, then trace one request:
+
+> "There are really two systems. There's a build-time pipeline that runs on
+> my machine, offline, and produces a single static artifact — `graph.json`.
+> And there's the runtime app, an Expo / React Native client, that reads
+> that artifact and does all the routing on-device. They never run together;
+> they meet at the one file.
+>
+> The pipeline pulls street geometry from OpenStreetMap via Overpass, splits
+> ways into edges, hits the Open-Meteo elevation API to get elevation at each
+> node, computes the grade per edge — signed, by direction — and writes
+> `graph.json`. For the Seattle slice that's about 1600 nodes and 1900 edges.
+>
+> At runtime, when you tap two points, here's the flow: the UI snaps each tap
+> to the nearest graph node with `nearestNode`, then calls `directedAstar`
+> with the two node ids and your `userMax`. That runs my A* search over the
+> graph, returns a path, and the UI renders it as a colored line on MapLibre
+> plus a summary card with distance and total climb. No server is involved at
+> any point — the graph is in memory, the search is a function call.
+>
+> The deliberate part is that 'no backend.' The graph is small and static,
+> so a server would just add a network hop and an availability dependency for
+> no benefit. I build offline and bundle."
+
+That last paragraph is the one that separates you. You're not apologizing
+for the missing backend — you're explaining why it isn't missing, it's
+*absent on purpose*.
+
+---
+
+## Trace one request — the move that proves you understand it
+
+A box diagram shows you can draw. A request trace shows you understand. When
+they say "what happens when I tap two points," walk this:
+
 ```
-        ▸ Don't tour the directory. Name the seam,
-          trace one request, and let the rest hang
-          off the picture.
+  One route request — every hop labelled (all in-process)
+
+  ┌─ UI: MapScreen.tsx ─────────────────────────────────────────┐
+  │ user taps START, then END                                    │
+  │   startPt = {lat, lng}     endPt = {lat, lng}                │
+  └───────────────────────────┬─────────────────────────────────┘
+              hop 1: snap each coord to a node
+                              │  nearestNode(graph, pt)   nearest.ts:5
+                              ▼
+  ┌─ ENGINE: nearest.ts ────────────────────────────────────────┐
+  │ scan every node, haversine distance, keep the closest        │
+  │   → startId, endId                                           │
+  └───────────────────────────┬─────────────────────────────────┘
+              hop 2: route under the grade limit
+                              │  directedAstar(graph, startId,
+                              │    endId, userMax)        astar.ts:156
+                              ▼
+  ┌─ ENGINE: astar.ts search() ─────────────────────────────────┐
+  │ A* with gradeCostDirected + haversineHeuristic               │
+  │   pop frontier → relax edges → cost = len*(1+penalty(grade)) │
+  │   → Path { nodes, edges, cost, lengthM, steepEdges }         │
+  └───────────────────────────┬─────────────────────────────────┘
+              hop 3: shape for display + totals
+                              │  routeToGeoJSON + routeSummary
+                              ▼
+  ┌─ UI: MapScreen.tsx ─────────────────────────────────────────┐
+  │ MapLibre draws the colored line; RouteSummaryCard shows       │
+  │ distance, total climb, steep-edge count                       │
+  └─────────────────────────────────────────────────────────────┘
+```
+
+Three hops, zero network calls. Name that explicitly while you draw it:
+"notice every arrow here is a function call — there's no HTTP in this path."
+That sentence is worth more than the whole diagram.
+
+```
+┃ "There are two systems — a build-time pipeline and a
+┃  runtime app — and they meet at exactly one file."
 ```
 
 ---
 
 ## Where they'll interrupt — and what to say
 
-Architecture walkthroughs get interrupted constantly. Here's the tree.
+Interviewers interrupt the architecture walk. It's a probe. Here's the tree
+of the three most likely interruptions and your line for each.
 
 ```
-  You're mid-walkthrough.
+  You're mid-walk through the architecture.
         │
-        ├─► "Wait, why no backend? Isn't that a limitation?"
-        │     "It's deliberate. The expensive work is build-time
-        │      (elevation, grades). Per-tap work is a graph search
-        │      over data already in memory — no network needed. A
-        │      server would add latency and a failure surface for
-        │      zero benefit at this scope. See Chapter 3."
+        ├─► "Wait — there's no database at all?"
+        │     "Correct. The graph is the only state, it's static, and it's
+        │      bundled with the app. There's nothing to persist between
+        │      sessions, so there's no DB. If I added saved routes or user
+        │      accounts, that's the first thing that changes." (→ Ch. 3, 7)
         │
-        ├─► "How does a tapped pixel become a graph node?"
-        │     "nearestNode (nearest.ts) — linear scan over every
-        │      node, haversine distance, keep the closest. It's
-        │      O(N). At 1,621 nodes that's nothing; at 100x it's
-        │      the first bottleneck — Chapter 4 covers the k-d
-        │      tree fix."
+        ├─► "How does the tap know which node to route from?"
+        │     "nearestNode does a linear scan — haversine to every node,
+        │      keep the closest (nearest.ts:5). It's O(N). At 1600 nodes
+        │      it's nothing; it's the first thing I'd index if N grew."
+        │      (→ Ch. 4: the k-d tree is the first bottleneck)
         │
-        ├─► "What's actually IN the graph file?"
-        │     "Node{id,lat,lng,elevationM} and Edge{id, fromNode,
-        │      toNode, geometry, lengthM, riseM, gradePct (signed),
-        │      absGradePct} plus adjacency: nodeId → edgeIds.
-        │      types.ts:1. Grade is signed from→to; that's what
-        │      makes routing directional."
-        │
-        └─► "Where does the elevation come from?"
-              "Open-Meteo's free elevation API — Copernicus 90m
-               DEM, no key. Build-time only. It's coarse (90m
-               smooths short steep pitches) which I'd upgrade to
-               a paid provider behind the ElevationProvider
-               interface. Chapter 3 + 7."
+        └─► "Where does the route actually get computed — client or server?"
+              "Client. On-device. The graph's in memory after loadGraph(),
+               and directedAstar is a synchronous function call. No round
+               trip." (→ Ch. 2 request trace, Ch. 5 failure surfaces)
 ```
 
-Every branch lands on a real file. That's the difference between sounding like
-you built it and sounding like you read about it.
+The `nearestNode` interruption is a gift — it's the natural on-ramp to your
+scale story (Chapter 4). When they ask about it, you get to volunteer "it's
+O(N), the k-d tree is my first optimization," which is exactly the
+forward-looking signal Chapter 4 is built on.
 
 ---
 
-## When they push on the data layer — the "I don't know" box
+## When the architecture question goes past your depth
 
-The interviewer who's done backend work will probe the static-file choice as if
-it were a database. Here's where you hold the line honestly.
+The architecture walk has one trapdoor: they ask you to redesign it as a
+served system, live. That's the gap.
 
 ```
 ╔═══════════════════════════════════════════════════════════════╗
 ║ WHEN YOU DON'T KNOW                                            ║
 ║                                                               ║
-║   They ask: "If this were a real product with live data       ║
-║   updates, how would you handle graph versioning, partial     ║
-║   updates, replication across regions, cache invalidation     ║
-║   when a street closes?"                                       ║
+║   They ask: "OK, now make the graph server-side and serve     ║
+║   routing as an API. Walk me through that architecture."      ║
 ║                                                               ║
-║   That's distributed-data-systems territory — multi-region    ║
-║   replication and cache invalidation under load. You have     ║
-║   NOT built that.                                              ║
+║   You can reason about this, but you haven't BUILT a served   ║
+║   routing system, and the real distributed-systems questions  ║
+║   underneath it — how you shard a graph that doesn't          ║
+║   partition cleanly, how you cache routes, how you handle a   ║
+║   cross-shard query — are genuinely outside what you've       ║
+║   shipped.                                                    ║
 ║                                                               ║
-║   Say:                                                         ║
-║   "Right now the graph is a single static artifact — there's  ║
-║    no versioning or replication story, because there's no     ║
-║    server to replicate from. If I had to make this a live     ║
-║    product, the honest answer is I'd be designing something    ║
-║    I haven't built: regional graph shards, an invalidation    ║
-║    path when streets change, a build pipeline that            ║
-║    re-bakes affected tiles. I can reason about the shape —     ║
-║    re-bake-the-tile is the natural unit since I already       ║
-║    build per-bbox at runtime (useTileGraph.ts) — but          ║
-║    multi-region replication under load is not something I've   ║
-║    shipped, so I'd flag that."                                 ║
+║   Say:                                                        ║
+║   "I can sketch the obvious version — the graph loads into a  ║
+║    stateless service, routing becomes a request that returns  ║
+║    a path, and you scale by adding instances since each       ║
+║    request is independent. Where I'd be honest about my       ║
+║    limits is sharding: a road graph doesn't partition         ║
+║    cleanly the way a user table does, because routes cross    ║
+║    any boundary you draw. I know that's the hard problem; I   ║
+║    haven't had to solve it in production. I'd want to read    ║
+║    how the real routing engines handle cross-shard queries    ║
+║    before I claimed a design."                                ║
 ║                                                               ║
-║   What this signals: you connected the question to something  ║
-║   real in your code (per-tile builds) AND drew the line at    ║
-║   what you haven't done. Both are senior moves.               ║
+║   What this signals: you can produce the stateless-service    ║
+║   answer, you can NAME the genuinely hard sub-problem          ║
+║   (graph partitioning), and you don't pretend to have solved  ║
+║   it. That's exactly the senior posture.                      ║
 ║                                                               ║
-║   Do NOT say:                                                  ║
-║   "I'd use a CDN and eventual consistency and..." strung      ║
-║   together from blog posts. The follow-up ("what              ║
-║   consistency model?") will expose it instantly.              ║
+║   Do NOT say:                                                 ║
+║   "I'd shard the graph by region and use consistent hashing." ║
+║   — said fast, it invites "what happens to a route that       ║
+║   crosses two regions?" and now you're underwater on a        ║
+║   design you invented thirty seconds ago.                     ║
 ╚═══════════════════════════════════════════════════════════════╝
 ```
 
-Deeper on the build/runtime boundary and state ownership →
-`.aipe/study-system-design/`.
+```
+┃ "Every arrow below the line is a function call.
+┃  There is no network in the routing path — on purpose."
+```
 
 ---
 
-## What you'd change about the architecture
+## What you'd change
 
-If I were rebuilding flattr today, I'd design the data-loading seam up front as
-a real interface instead of letting it emerge. Right now `loadGraph()`
-(loadGraph.ts:9) does a bare `graph as unknown as Graph` cast — it trusts the
-file completely. The runtime tile-loading in `useTileGraph.ts` grew *around*
-that static base rather than through a shared seam. If the static file and the
-dynamic tiles both went through one `GraphSource` interface, the architecture
-would be cleaner and the validation gap (Chapter 5) would have an obvious home.
-The split is right; the seam between the two data sources should have been a
-designed interface, not an emergent one.
+The one architectural decision worth reconsidering is the data-loading seam.
+Today `loadGraph()` (loadGraph.ts:9) just casts the bundled JSON to a `Graph`
+and trusts it completely — no validation, no schema check. That's fine while
+you're the only one producing the file, but it's the boundary I'd harden
+first: a real system has a validated, versioned graph-loading interface so a
+malformed or stale artifact fails loudly at load instead of silently
+mis-routing. Chapter 7 expands this into the full counterfactual.
 
 ---
 
-## One-page summary — Chapter 2
+## One-page summary — read this the night before
 
-**Core claim:** flattr is build-time-bakes / runtime-reads, joined by one static
-file. Name that seam, trace one tap, and the "no backend" choice explains
-itself.
-
-**The walkthrough:** build time (Overpass + Open-Meteo → split → sample → grade
-→ `buildGraph` → graph.json) | runtime (loadGraph → nearestNode → directedAstar
-→ GeoJSON → MapLibre). No network in the routing hot path.
+**Core claim:** flattr is two systems — a build-time pipeline and a runtime
+app — meeting at one static file (`graph.json`). Lead with that split, trace
+one request, and name "no backend" as a decision.
 
 **Questions covered:**
-- "Walk me through it" → two halves + seam + one traced tap (~75s).
-- "Why no backend?" → expensive work is build-time; per-tap work is cheap and network-free.
-- "Pixel → node?" → `nearestNode`, O(N) linear scan, fine at 1,621 nodes.
-- "What's in the graph?" → Node/Edge schema, signed `gradePct`, adjacency map (types.ts:1).
-- "Live data / replication?" → name the gap; connect to per-tile builds; don't fake distributed data.
+- *"Walk me through the architecture"* → two systems, the file between them,
+  one request traced UI → nearest → astar → render. All in-process.
+- *"No database at all?"* → graph is the only state, static, bundled.
+- *"Client or server routing?"* → client, on-device, synchronous call.
+- *"Make it a served system"* → stateless service is easy; graph sharding is
+  the hard part I haven't shipped. Say so.
+
+**Key files to name:** `nearestNode` (nearest.ts:5, O(N)), `directedAstar`
+(astar.ts:156), `loadGraph` (loadGraph.ts:9, unvalidated), the build pipeline
+under `pipeline/`.
 
 **Pull quotes:**
-- ┃ "The expensive work happened once at build time and got frozen into a file. Runtime just reads and searches."
-- ▸ Don't tour the directory. Name the seam, trace one request.
+- "Two systems, meeting at exactly one file."
+- "Every arrow below the line is a function call — no network, on purpose."
 
-**What you'd change:** Make the data-loading seam a real `GraphSource` interface up front, so the static base and the runtime tiles share one boundary (and one validation point) instead of one growing around the other.
+**What you'd change:** Harden the `loadGraph` seam — validate and version the
+graph artifact instead of trusting the cast.

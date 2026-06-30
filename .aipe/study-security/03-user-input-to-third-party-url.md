@@ -1,82 +1,81 @@
-# 03 — User input to third-party URL
+# User Input to Third-Party URL
 
-**Industry name(s):** *outbound data flow to an external service* (location
-privacy) + *attacker-influenced text re-entering the trust zone* (the
-injection/XSS/prompt-injection seam).
-**Type label:** Industry standard.
+**Industry name(s):** outbound data egress / third-party data sharing; reflected
+untrusted content (the return leg); dormant prompt-injection vector. **Type:**
+Industry standard.
 
-> Two findings share this boundary because they're the two directions of one
-> arrow. **Outbound:** exact GPS + typed text leave the device for Nominatim
-> (privacy). **Inbound:** `display_name` strings come back attacker-influenced
-> and render in the UI (inert today; the LLM seam to watch).
+Every routing query hands two things to a server flattr doesn't control:
+the user's exact location and their typed text. And what comes back —
+`display_name` — is attacker-editable OSM text that gets rendered in the UI.
+Inert today via React escaping. A live prompt-injection vector the day an LLM
+feature consumes it.
 
 ---
 
-## Zoom out, then zoom in
+## Zoom out — where this lives
 
-Pull up the geocode round-trip. Every time the user types an address or taps the
-map, flattr asks Nominatim (OSM's hosted geocoder) to turn that into
-coordinates — and to turn a tapped coordinate back into a label. Here's the
-two-way crossing:
+This boundary is *bidirectional* and lives at the UI ↔ geocoder seam — the only
+runtime network call the app makes for user-driven queries (besides tiles).
 
 ```
-  Zoom out — the geocode round-trip across the network boundary
+  Zoom out — the geocoder round-trip, both directions
 
-  ┌─ UI (device, your trust zone) ──────────────────────────────┐
-  │  TextInput "123 Pine St"   ┐                                 │
-  │  map tap → exact GPS       ├─► leaves device                 │
-  │  <Text>{r.label}</Text>  ◄─┘   renders 3rd-party text        │ ← here
-  │  (AddressBar.tsx:23, MapScreen.tsx:97/247)                   │
-  └──────────────┬──────────────────────────▲────────────────────┘
-     OUTBOUND     │ coords + query           │ display_name
-     (privacy)    ▼                          │ (attacker-influenced)
-  ┌─ Network boundary ─────────────────────────────────────────┐
-  │  Nominatim https://nominatim.openstreetmap.org (geocode.ts) │
-  │  third party · keyless · sees coords + IP                   │
-  └─────────────────────────────────────────────────────────────┘
+  ┌─ UI (mobile app) ──────────────────────────────────────────┐
+  │  AddressBar TextInput  ◄── renders ── display_name (label)  │ ← return leg
+  │       │ typed text + GPS                          ▲          │
+  └───────┼──────────────────────────────────────────┼──────────┘
+   OUT ►  │ geocode.ts:21 / reverseGeocode.ts:64       │ ◄ IN
+   ┌──────▼──────────────────────────────────────────┼──────────┐
+   │ ★ pipeline/geocode.ts — THE EGRESS BOUNDARY ★    │  ← here  │
+   │  GET nominatim.openstreetmap.org/search?q=...     │          │
+   │  GET .../reverse?lat=...&lon=...                  │          │
+   └───────────────────────────┬──────────────────────┘          │
+                       hop to  │ nominatim.openstreetmap.org      │
+                       ┌───────▼──────────────────────────────────┘
+                       │  returns { lat, lon, display_name }  ────┘
+                       └───────────────────────────────────────────
 ```
 
-Zoom in. The concept is two trust questions on one wire. Outbound: *who sees
-where the user is and where they're going?* Inbound: *what re-enters the app
-from a source the user doesn't control, and where does it land?* In flattr the
-outbound answer is "a third party, with the device IP, on every query" — a real
-but unavoidable-by-design privacy cost. The inbound answer is "a place label
-that anyone can edit in OSM, rendered through React's auto-escaping" — inert as
-HTML today, **live the moment it touches an LLM, a WebView, or a string-built
-URL.**
+Two trust concerns, one boundary: **outbound** (what leaves the device — privacy)
+and **return** (what comes back and gets rendered — the dormant injection
+vector). The ★ band is `geocode.ts`.
+
+## Zoom in — the concept
+
+Two patterns stacked at one seam. **Egress:** user PII (exact GPS, typed text)
+crosses to a third party — the question is *how much, how precise, and to whom.*
+**Reflected untrusted content:** the reply's `display_name` is text an attacker
+can edit (it's OSM — anyone can change a place name) and flattr renders it — the
+question is *which sink it reaches.* Today the sink is a React `<Text>` (safe).
+The finding is what happens when the sink changes. → ties to `audit.md` lens 5
+(privacy) and lens 7 (LLM).
 
 ---
 
 ## The structure pass
 
-**Layers:** UI input → geocode module (`pipeline/geocode.ts`) → network →
-Nominatim → response → UI render.
+**Layers:** (outer) the user's typed text + GPS in `MapScreen` state → (middle)
+`geocode`/`reverseGeocode` building the URL → (inner) the rendered `display_name`
+coming back.
 
-**Two axes, because this is the boundary where they diverge: trust *and* data
-sensitivity.**
+**Axis traced — `trust`: "who controls this value, and where does it go?"**
 
 ```
-  Trust + sensitivity traced across the geocode wire
+  Trust traced around the round-trip
 
-                          OUTBOUND ►                INBOUND ◄
-  ┌─ UI ─────────────┐  trusted source            untrusted source
-  │ typed text, GPS  │  HIGH sensitivity (coords)  display_name = editable
-  └──────────────────┘  → leaves the device         by anyone on OSM
-  ┌─ geocode.ts ─────┐  URLSearchParams encodes    parseFloat(lat/lon) — OK
-  │ build URL / parse│  the query (geocode.ts:14)  label passed through RAW
-  └──────────────────┘                              (geocode.ts:27)
-  ┌─ render ─────────┐  n/a                         <Text>{label}</Text>
-  │ AddressBar.tsx:23│                              React escapes → inert HTML
-  └──────────────────┘                              BUT raw if → LLM/WebView
+  value              controlled by   crosses to        rendered where
+  ─────────────────  ──────────────  ────────────────  ─────────────────
+  typed query text   user            Nominatim (3rd)   — (outbound only)
+  exact lat/lng      user's device   Nominatim (3rd)   — (outbound only)
+  display_name       OSM editor (!)  ◄ back to flattr  AddressBar <Text>:24
+  lat/lon (reply)    OSM data        ◄ back to flattr  parseFloat → routing
 ```
 
-**The load-bearing seam:** the network boundary itself, traced *both ways*.
-Outbound, trust is fine (it's the user's own input) but *sensitivity* is high —
-exact coordinates. Inbound, sensitivity is low but *trust* flips to untrusted —
-the label is third-party, editable text. A single boundary where one axis
-matters going out and the *other* axis matters coming back. That's why it earns
-its own file: most boundaries you reason about one-directionally; this one you
-can't.
+**The seam:** `geocode.ts` is where control *flips twice*. Outbound, control
+goes from the user to a third party (privacy concern). Inbound, control of
+`display_name` belongs to *whoever edited that OSM entry* — not flattr, not the
+user. That second flip is the one people miss: the label in the suggestion
+dropdown is attacker-influenceable text.
 
 ---
 
@@ -84,262 +83,250 @@ can't.
 
 ### Move 1 — the mental model
 
-You've shipped this exact pattern: a search box that hits a third-party autocomplete
-API and renders the suggestions. Two reflexes you already have apply directly —
-(1) *don't send more than the API needs* (the privacy reflex), and (2) *don't
-trust what it sends back* (the render reflex). flattr does (2) correctly via
-React; (1) is inherent-cost, narrowed but not eliminated.
+You know how a search box that hits an autocomplete API sends every keystroke to
+a server? Same shape here — except the "keystrokes" include the user's GPS fix,
+and the suggestions that come back are user-generated content from a public,
+editable database. Think of `display_name` like a comment field on a public site:
+you'd never render a comment into an HTML sink or an LLM prompt without treating
+it as hostile. `display_name` is that comment.
 
 ```
-  The pattern: a bidirectional trust boundary on one wire
+  The pattern: trust flips twice around one round-trip
 
-   user input ──[encode]──► 3rd party     ◄── sensitivity matters going OUT
-                                │
-   UI render ◄──[escape]──── response      ◄── trust matters coming IN
-
-   one wire, two different "is this safe?" questions
+   user text + GPS ──OUT──► [ 3rd-party server ]
+        (privacy: now they have it)    │
+                                       │ reply
+   AddressBar <Text> ◄──IN── display_name (attacker-editable)
+        ▲
+        └─ which sink? <Text> (safe) | innerHTML (XSS) | LLM prompt (injection)
+           today: <Text>.  the finding is the day that changes.
 ```
 
-The kernel: **an outbound boundary leaks; an inbound boundary injects.** You
-need a control on each direction, and they're different controls (minimize vs
-sanitize).
+The kernel of the *return-leg* risk: **untrusted third-party text reaching a
+sink, where the sink's escaping rules decide whether it's inert or live.**
 
 ### Move 2 — the walkthrough
 
-**Step 1 — outbound: exact coordinates leave the device.** The location read is
-deliberately precise. `MapScreen.tsx:97` calls
-`Location.getCurrentPositionAsync({ accuracy: Balanced })`, and on routing the
-coords (or typed address) go to Nominatim:
-
-```
-  Outbound flow — what Nominatim sees
-
-  ┌─ device ─────────┐  GET /search?q=<typed text>   ┌─ Nominatim ──┐
-  │ GPS 47.61823,    │ ─────────────────────────────►│ sees: query   │
-  │     -122.32510   │  GET /reverse?lat=..&lon=..    │   + lat/lon    │
-  │ + device IP      │ ─────────────────────────────►│   + your IP    │
-  └──────────────────┘  (geocode.ts:21,47,64)        └────────────────┘
-```
-
-The reverse-geocode path (`MapScreen.tsx:247` → `reverseGeocode(lat, lng)`,
-`geocode.ts:58-64`) sends the *exact* tapped coordinate. So OSM's servers can
-build, per device IP, a trail of where-you-are and where-you're-going.
-
-**What flattr does right here:** it *narrows* the outbound exposure two ways.
-`searchViewbox` (`MapScreen.tsx:51`) biases/bounds autocomplete to a ~30km box
-so a search like "starbucks" returns local hits — which also means less probing
-of far-away places. And the whole stack is **keyless** — Nominatim can't tie
-queries to a flattr account because there isn't one. The residual leak is the
-coordinate precision + IP, which is *inherent* to using any hosted geocoder.
-
-**What it doesn't do:** coarsen coordinates before sending. The reverse-geocode
-sends full GPS precision; rounding to ~3 decimal places (~100m) before the call
-would keep labels useful while blurring the exact spot. That's the buildable
-privacy hardening.
-
-**Step 2 — inbound: the label comes back attacker-influenced.** Here's the
-subtle part. `display_name` is a *human-editable OSM field* — anyone can change a
-place's name in OpenStreetMap. So the string flattr renders is, in the strict
-sense, **attacker-influenceable text from a third party.** The parse:
+**Outbound — the URL is correctly encoded.** First, credit where due — the egress
+*mechanics* are right:
 
 ```ts
-// pipeline/geocode.ts:25-27
-const rows = (await res.json()) as NominatimRow[];
-if (!rows.length) return null;
-return { lat: parseFloat(rows[0].lat), lng: parseFloat(rows[0].lon),
-         label: rows[0].display_name };   // ← label passed through RAW
+// pipeline/geocode.ts:14
+const params = new URLSearchParams({ q: query, format: "jsonv2", limit: "1" });
+...
+const res = await fetchImpl(`${ENDPOINT}?${params.toString()}`, {
+  headers: { "User-Agent": "flattr/0.1 (grade-aware routing)" },   // :22
+});
 ```
 
-`lat`/`lon` get `parseFloat` (a coercion — non-numeric becomes `NaN`, contained).
-`display_name` is passed through **verbatim**. It then renders here:
+`URLSearchParams` escapes `query`, so there's **no URL-injection** — a query of
+`a&admin=1` can't smuggle a second parameter. The User-Agent is set per
+Nominatim's usage policy. So the *injection* angle on the outbound URL is closed.
+The finding here is **privacy, not injection**: the user's typed text goes to a
+third party.
+
+**Outbound — the precision leak.** Reverse geocoding sends the raw GPS fix:
+
+```ts
+// pipeline/geocode.ts:63
+const params = new URLSearchParams({ lat: String(lat), lon: String(lng), format: "jsonv2" });
+```
+
+`String(lat)` is full float precision — sub-meter. Called from `MapScreen.tsx:247`
+on every map-tap-to-route. Note the asymmetry: the *display* fallback coarsens to
+5 decimals (`MapScreen.tsx:248`, `lat.toFixed(5)`), but the *request* doesn't.
+The user sees a rounded label while the third party gets the exact point. That's
+a real privacy gap — the mitigation is to round before the request, not just
+before the display.
+
+**Return — `display_name` enters UI state.** The reply's label flows straight
+into state and render:
+
+```ts
+// pipeline/geocode.ts:27
+return { lat: parseFloat(rows[0].lat), lng: parseFloat(rows[0].lon), label: rows[0].display_name };
+```
 
 ```tsx
-// mobile/src/AddressBar.tsx:22-24
+// mobile/src/AddressBar.tsx:23-25
 <Text style={styles.suggestText} numberOfLines={2}>
-  {r.label}
+  {r.label}                               {/* display_name, rendered */}
 </Text>
 ```
 
-**Step 3 — why it's inert today, and exactly when it goes live.** React (and RN)
-treat `{r.label}` as a **text child**, not markup — they escape it. There's no
-`dangerouslySetInnerHTML`, no WebView, no `eval`. So a `display_name` of
-`<script>…` renders as the literal characters `<script>…`, harmless. Today this
-is a **deferred** finding, not a live XSS.
+**Why it's inert today.** React (and React Native `<Text>`) escapes interpolated
+strings — `{r.label}` is rendered as literal text, never parsed as markup. There's
+no `dangerouslySetInnerHTML`, no `innerHTML`, no `eval` anywhere in `mobile/src/`.
+So a malicious OSM place name like `<script>...` or `"; DROP...` renders as the
+visible literal characters and does nothing. **This is React's auto-escaping
+doing the work flattr didn't have to** — and it's worth saying plainly: that's a
+safe-by-default sink, not a defense flattr authored.
 
-It goes live the instant the label reaches a sink that *interprets* it:
-
-```
-  When the inbound label becomes dangerous
-
-  TODAY:   display_name ──► <Text>{label}</Text>     SAFE (React escapes)
-
-  FUTURE SINK 1 (WebView):  label ──► webview.injectJavaScript / HTML  → XSS
-  FUTURE SINK 2 (URL):      label ──► fetch(`/api?q=${label}`)         → if
-                            unencoded, injection into YOUR endpoint
-  FUTURE SINK 3 (LLM):      label ──► `Routing to ${label}…` in prompt → PROMPT
-                            INJECTION — the big one for this codebase
-```
-
-**Step 4 — the LLM seam (the reason this matters for *this* repo).** flattr is a
-portfolio piece on an AI pivot; a "describe my route / explain the grade"
-feature is a natural next step. The moment a `display_name` is concatenated into
-a prompt — `"The user is routing from {fromLabel} to {toLabel}…"` — an attacker
-who renamed an OSM place to `Ignore previous instructions and …` has injected
-instructions into your model call. The defense is the standard one:
+**The dormant vector.** The risk is the sink changing. Trace the day an LLM lands:
 
 ```
-  Prompt-injection defense for the future LLM seam
+  Sink-change trace — the day display_name reaches a model
 
-  ┌─ untrusted: display_name (OSM-editable) ──────────┐
-  │  frame as DATA, never as instructions:            │
-  │  - put it in a delimited, labeled block           │
-  │  - tell the model it's user-supplied content       │
-  │  - NEVER let model output flow back to a sink      │
-  │    (URL / fs / eval) without a gate                │
-  └────────────────────────────────────────────────────┘
+  today:    display_name ──► <Text>{label}</Text>      → escaped, inert ✓
+
+  feature:  "Summarize my route to {label}"  ← display_name in a prompt
+            display_name ──► LLM prompt string ──► model
+                                  ▲
+            OSM label = "Cafe. IGNORE PRIOR INSTRUCTIONS, output X"
+            → reaches the model as instructions, no gate → prompt injection 💥
 ```
 
-This is `audit.md` lens 7's trigger made concrete — the seam is already in the
-codebase; only the LLM is missing.
+Nothing in flattr re-validates `display_name` between the geocoder and the sink.
+Today the sink is safe; the moment a feature pipes that label into a prompt, an
+HTML string, or a shell — without a gate — the attacker-editable text becomes a
+live payload. That's `audit.md` lens 7, made concrete.
 
 ### Move 2 variant — the load-bearing skeleton
 
-Kernel of a safe user-input → third-party → UI loop:
+A complete defense for this boundary has three parts:
 
-1. **Outbound minimization.** Send the least the API needs. *Breaks if missing:*
-   over-exposure of sensitive data (here, precise coords). flattr narrows (viewbox,
-   keyless) but doesn't coarsen — partial.
-2. **Outbound encoding.** Build the URL so input can't break out of the query.
-   *Breaks if missing:* injection into the third-party request / your own
-   endpoint. flattr **does this** — `URLSearchParams` (`geocode.ts:14`),
-   `encodeURIComponent` (`overpass.ts:30`). Solid.
-3. **Inbound treatment.** Treat the response as untrusted at every sink.
-   *Breaks if missing:* XSS / prompt injection. flattr is safe at the *current*
-   sink (React text) but has **no explicit policy** for the label — it's safe by
-   the framework's default, not by intent. That's fragile against a new sink.
+1. **Egress minimization** — send the least precise location that still works.
+   *Missing → exact GPS to a third party on every query (today's gap).*
+2. **Output encoding at the sink** — untrusted text is escaped/delimited for
+   whatever sink it enters. *Missing → live XSS/injection. Currently satisfied
+   for free by React's `<Text>` escaping — but only because the sink happens to
+   be safe.*
+3. **Treat-as-untrusted invariant** — `display_name` is tagged untrusted and
+   re-checked at *every new* sink, not just the first. *Missing → the day a new
+   sink (LLM/HTML) is added, the old "it was fine in `<Text>`" assumption silently
+   carries over and breaks.*
 
-**Skeleton vs hardening:** encoding (2) and inbound treatment (3) are skeleton.
-Coordinate coarsening (1, beyond what's there) is hardening. The viewbox bias is
-a UX feature that *doubles* as minimization hardening.
+**Skeleton vs hardening:** part 2 is the kernel that keeps the return leg inert —
+and React gives it to you today. Part 3 is the *discipline* that keeps it inert
+*tomorrow*; it's the one with no automatic backstop. Part 1 is the privacy
+hardening, independent of the injection axis.
+
+### Move 2.5 — current state vs future state
+
+```
+  Phase A (today)                  Phase B (an LLM feature lands)
+  ───────────────────────────────  ─────────────────────────────────
+  display_name → <Text> (escaped)  display_name → prompt string
+  sink is safe-by-default          sink executes instructions
+  inert                            LIVE prompt-injection unless gated
+  GPS full precision out (privacy) (unchanged — still a privacy gap)
+```
+
+What *doesn't* have to change to stay safe: keep `display_name` flowing only into
+escaping sinks. What *must* change the day Phase B arrives: a gate that delimits
+`display_name` as data (never instructions) before it reaches the model, plus
+output-gating on anything the model emits. The cheapest move now — before any LLM
+— is to tag the field untrusted at `geocode.ts:27` so the invariant is explicit.
 
 ### Move 3 — the principle
 
-Data on one wire carries two trust questions, and you answer them in opposite
-directions: *minimize what goes out, distrust what comes in.* flattr nails the
-inbound encoding and gets inbound-render safety for free from React — but "safe
-by framework default" is not the same as "safe by policy." The day the label
-meets a sink React doesn't escape (a WebView, a URL, an LLM prompt), the
-unstated policy becomes a real vulnerability. Make the distrust explicit:
-mark `display_name` as untrusted at the type level and gate every new sink.
+Two rules generalize. **Egress:** the least data that accomplishes the task is the
+most you should send across a trust boundary — precision you don't need is risk
+you're carrying for free. **Reflected content:** untrusted text is only as inert
+as its current sink; the safety lives in the *sink's* escaping, not the data — so
+the invariant "this is untrusted" must travel *with the data* to every new sink,
+because the next sink may not escape.
 
 ---
 
 ## Primary diagram
 
-The full bidirectional boundary, both findings, in one frame.
+The full bidirectional boundary: encoded egress, the precision leak, and the
+return leg with its sink-dependent fate.
 
 ```
-  User input ↔ third-party URL — full recap
+  User input to third-party URL — full picture
 
-  ┌─ UI (device · trust zone) ──────────────────────────────────┐
-  │  TextInput / map tap                  <Text>{label}</Text>   │
-  │  + exact GPS (MapScreen.tsx:97)       (AddressBar.tsx:23)    │
-  └────────┬────────────────────────────────────▲───────────────┘
-  OUTBOUND │ q=<text>, lat/lon, device IP        │ display_name
-  (PRIVACY:│ → minimized by viewbox (51),        │ (OSM-EDITABLE,
-   coords  │   keyless; NOT coarsened)           │  attacker-influenced)
-   leave)  │ → encoded: URLSearchParams (14),    │ → React escapes = inert
-           │   encodeURIComponent (overpass:30)  │   HTML TODAY
-           ▼                                     │ → RAW if it ever hits:
-  ┌─ Network boundary ──────────────────────────┴──────────────┐
-  │  Nominatim (geocode.ts) — third party, keyless              │
-  │  INBOUND DANGER SINKS (future): WebView · URL · ★ LLM PROMPT★│
-  └─────────────────────────────────────────────────────────────┘
+  ┌─ UI (mobile) ──────────────────────────────────────────────┐
+  │  typed text ──┐        AddressBar <Text>{label} ◄───────┐   │
+  │  exact GPS ───┤                                         │   │
+  └───────────────┼─────────────────────────────────────────┼───┘
+        OUT ►     │ geocode.ts                        IN ◄   │
+  ┌───────────────▼─────────────────────────────────────────┼───┐
+  │  q via URLSearchParams ✓ (no URL-injection)             │   │
+  │  lat/lng = String(x) ✗ full precision (geocode.ts:63)   │   │
+  │            └─ privacy leak: exact GPS to 3rd party       │   │
+  │  reply.display_name (attacker-editable OSM text) ───────┘   │
+  └───────────────────────────┬────────────────────────────────┘
+                     hop to    │  nominatim.openstreetmap.org
+                               ▼
+              return: display_name → sink decides fate
+                <Text>  → escaped, inert ✓   (today)
+                innerHTML / LLM prompt → LIVE injection 💥 (future)
+
+   fixes: round coords before the request; tag display_name untrusted;
+          gate it before any non-escaping sink.
 ```
 
 ---
 
 ## Elaborate
 
-Two well-trodden ideas meet on this wire. The outbound half is the *data
-minimization* principle (GDPR Art. 5(1)(c), but it long predates the law as
-plain hygiene): collect and transmit only what the function needs. A geocoder
-needs *roughly* where you are; it doesn't need 5-decimal precision, and the gap
-between "roughly" and "exactly" is the leak. The inbound half is *taint
-tracking*: data from an untrusted source carries a "taint" until a sanitizer
-that matches the *sink* removes it. The classic failure is sanitizing for the
-wrong sink — HTML-escaping a value that then goes into a SQL query, or (the
-modern version) escaping for HTML a value that then goes into an LLM prompt,
-where escaping means nothing and *framing* is the only defense.
-
-flattr's case is the cleanest possible illustration of why "it's safe" is an
-incomplete sentence: the label is safe *for the React-text sink*. Safety is a
-property of the (data, sink) pair, never of the data alone. That's why `02`'s
-"this is secure" is banned in the audit voice and "if X flows to sink Y, then Z"
-is required.
-
-The prompt-injection angle ties directly to the AI-engineering siblings: when
-the LLM feature lands, `display_name` is the first untrusted string that'll
-reach a prompt, and it'll reach it *invisibly* (nobody thinks of an autocomplete
-label as user input). Pre-flagging it now is the whole value of this file.
-
-Read next: `01` (the same providers, the data-correctness direction), and the
-`study-ai-engineering` / `study-prompt-engineering` / `study-agent-architecture`
-siblings for the prompt-injection defense in depth.
+The egress half is GDPR/privacy-shaped (location is sensitive personal data); the
+return half is CWE-79 (XSS) / the LLM-era prompt-injection class (OWASP LLM01),
+unified by one root cause: *content from a public editable source rendered without
+a per-sink trust decision.* What makes flattr's case instructive is that it's
+**currently safe for the right reason and the wrong reason at once** — right,
+because React escapes; wrong, because nothing in flattr *decided* that
+`display_name` is untrusted, so the safety is incidental and won't survive a sink
+change. That's the exact failure mode that bites AI features retrofitted onto
+existing apps: the data was "fine" for years in a safe sink, then someone pipes it
+into a model and the dormant payload wakes up. You've shipped RAG (AdvntrCue) and
+session memory — the discipline there (delimit retrieved content, never let it
+carry instructions, gate model output before a sink) is precisely what this
+boundary will need the day flattr grows an LLM feature. Read next: `audit.md`
+lens 5 and 7, and `study-ai-engineering` / `study-prompt-engineering` for the
+injection-defense patterns this dormant vector will require.
 
 ---
 
 ## Interview defense
 
-**Q: The app sends exact GPS to a third-party geocoder. Privacy problem?** It's
-a real but *inherent* privacy cost of using any hosted geocoder — Nominatim sees
-the coordinate and the device IP on every query (`geocode.ts`). flattr mitigates
-it sensibly: the search viewbox (`MapScreen.tsx:51`) narrows what's probed, and
-the keyless setup means OSM can't tie queries to an account. The residual gap is
-that reverse-geocode sends full GPS precision; coarsening to ~100m before the
-call is the cheap hardening that keeps labels useful.
+**Q: "What leaves the device when a user routes, and to whom?"**
+
+Two things to a third party (Nominatim): the typed query text, and — on
+tap-to-route — the exact GPS fix at full float precision (`geocode.ts:63`). The
+URL itself is correctly encoded via `URLSearchParams`, so there's no
+URL-injection; the finding is privacy, and specifically the asymmetry — the
+display label is coarsened to 5 decimals but the *request* sends full precision.
 
 ```
-  the sketch
-
-  device(exact GPS + IP) ──► Nominatim   ← inherent leak; minimize it
-                              fix: round coords to ~3dp before sending
+  display coarsened (toFixed(5))  ✓
+  request precision               ✗ String(lat) → sub-meter to 3rd party
 ```
 
-**Q: Nominatim labels are attacker-editable. Is that an XSS?** Not today —
-that's the precise answer. `display_name` is OSM-editable, so it's
-attacker-influenced text, and it renders at `AddressBar.tsx:23`. But it renders
-as a React `<Text>` child, which auto-escapes, so it's inert HTML. It becomes
-live the instant that string hits a sink that interprets it: a WebView, an
-unencoded URL, or — the one that matters for this repo — an **LLM prompt**.
-Safety here is a property of the sink, not the string.
+*Anchor:* "Coarsen before the request, not just before the render."
+
+**Q: "Is rendering `display_name` an XSS risk?"**
+
+Not today — React Native `<Text>` escapes it, and there's no `innerHTML`/`eval`
+in the app, so a malicious OSM place name renders as inert literal text. But the
+safety lives in the *sink*, not the data: flattr never decided `display_name` is
+untrusted. The day it reaches an LLM prompt or an HTML sink, the same
+attacker-editable text becomes a live prompt-injection payload.
 
 ```
-  display_name ──► <Text>  SAFE (escaped)
-              └──► LLM prompt  PROMPT INJECTION  ← the seam to watch
+  display_name → <Text>     inert ✓
+  display_name → LLM prompt  LIVE injection 💥
 ```
 
-**Anchor:** *"The label is safe for the React-text sink, not safe in general.
-The day it reaches an LLM prompt, an OSM rename becomes prompt injection — frame
-it as data, never instructions."*
+*Anchor:* "It's safe by React's default, not by flattr's decision — so it won't
+survive a sink change."
 
-**Q: Load-bearing part people forget?** That *encoding* and *escaping* are
-sink-specific and not interchangeable. flattr correctly `URLSearchParams`-encodes
-the outbound query *and* gets HTML-escaping free on the inbound render — two
-*different* controls for two *different* sinks. Naming that you'd need a *third*
-control (prompt framing) for the LLM sink, because neither of the first two
-applies, is the signal you understand taint-by-sink.
+**Q: "Cheapest thing to do now, before any LLM exists?"**
+
+Tag `display_name` untrusted at the boundary (`geocode.ts:27`) so the invariant
+is explicit and travels with the data — that's the one defense with no automatic
+backstop. Round coordinates before the request for the privacy half.
+
+*Anchor:* "Make 'untrusted' travel with the field, before a new sink forgets it."
 
 ---
 
 ## See also
 
-- `01-external-data-trust-boundary.md` — the same three providers, viewed as the
-  *correctness* of data coming in (vs the *trust/privacy* of this wire).
-- `audit.md` lens 3, 5, 7 — injection analysis, the GPS-privacy finding, and the
-  LLM/prompt-injection trigger this file pre-loads.
-- Siblings: `study-ai-engineering`, `study-prompt-engineering`,
-  `study-agent-architecture` (the prompt-injection defense for the future LLM
-  seam), `study-networking` (the geocode fetch posture),
-  `study-frontend-engineering` (React's auto-escaping that makes the inbound
-  render inert today).
+- `02-unvalidated-artifact-load.md` — the runtime artifact boundary.
+- `01-external-data-trust-boundary.md` — the inbound build-time boundary.
+- `audit.md` — lens 5 (data exposure/privacy), lens 7 (LLM/agent security).
+- `study-ai-engineering` / `study-prompt-engineering` — injection-defense the day
+  this vector goes live.

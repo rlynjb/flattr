@@ -1,33 +1,68 @@
-# 06 — Production Serving
+# 06 — Production Serving (flattr)
 
-How an AI feature behaves once it's *running in front of users*: caching, cost, security, and surviving flaky dependencies. These are the operational concerns that separate a demo from a product.
+The operational concerns of *running* an AI feature in production —
+caching, cost, rate limits, retries, and the security of untrusted input.
+flattr has **no LLM**: it's a local-first Expo app wrapping a hand-rolled
+A* router over a grade-annotated street graph. So some of these patterns
+are study material — but several have a **real, non-LLM home** in
+flattr's only external calls: Nominatim geocoding and Open-Meteo
+elevation. Those are rate-limited, throttle-on-quota services flattr
+already shapes its behavior around, which makes them the honest place to
+teach serving discipline.
 
-**Honest framing for flattr:** there is **no LLM in production** here — no model serving, no inference, no token bill. So most of this section is *study material*: the pattern, then the closest real seam or analog already in the codebase. flattr earns its place because it does the *underlying* serving patterns (caching, rate limiting, retry) correctly against real external APIs — the muscle transfers directly to LLM serving.
+## The honest framing
 
-**★ One genuine, latent concern: `03-prompt-injection.md`.** This is the single file where flattr has a real (future) security exposure, not just an absence. OSM `display_name` (`pipeline/geocode.ts:27,52,69`) is crowd-edited, server-controlled, **untrusted** text. Today it's a harmless map label. The moment it's templated into any prompt (e.g. route narration at `features/routing/summary.ts:11`), a place named *"Ignore previous instructions and…"* becomes a model instruction. Design the defense in before the first narration call ships.
+- **Rate limiting / retry / backpressure are NOT hypothetical.** flattr's
+  geocode and elevation HTTP calls are real, rate-limited dependencies.
+  `MapScreen.tsx:189` issues geocodes sequentially ("Nominatim allows ~1
+  req/sec"), autocomplete is debounced, and `geocode.ts:24` throws on
+  failure with no retry. These files teach the patterns *around those real
+  calls first*, then note the LLM versions attach at a future
+  route-describe call.
+- **Caching already ships** as `mobile/src/elevCache.ts` — an exact cache
+  keyed by DEM cell, mem + disk, that keeps the elevation API from being
+  re-hit. That's the caching instinct a describe cache would reuse.
+- **Cost is near zero.** Routing is local; the network calls are free.
+  The real cost lever for a future describe feature is on-device vs cloud,
+  not model tier.
+- **Prompt injection** has a latent vector already in the repo: the
+  untrusted OSM `display_name` (`geocode.ts:27`/`:52`).
 
-## Files
-
-| # | Concept | flattr status | Real seam / analog |
-|---|---------|---------------|--------------------|
-| 01 | [LLM Caching](01-llm-caching.md) | not exercised | `graph.json` is a prebuilt cache; `mobile/src/elevCache.ts` is a textbook cache |
-| 02 | [LLM Cost Optimization](02-llm-cost-optimization.md) | N/A (no token bill) | Open-Meteo quota cost — dedup, batch, provider routing in `pipeline/elevation.ts` |
-| 03 | [Prompt Injection](03-prompt-injection.md) ★ | **latent, real** | untrusted OSM `display_name` — `pipeline/geocode.ts:27,52,69` → future prompt seam |
-| 04 | [Rate Limiting & Backpressure](04-rate-limiting-backpressure.md) | not exercised (for LLM) | sequential Nominatim calls `MapScreen.tsx:189`; batch+throttle `elevation.ts` |
-| 05 | [Retry & Circuit Breaker](05-retry-circuit-breaker.md) | not exercised (for LLM) | **working** 429 retry-with-backoff `elevation.ts:107–119`; fail-fast geocode |
-
-## The thread
+## The five files
 
 ```
-  Every concept here already lives in flattr — pointed at a MAP API,
-  not a model. Caching, rate limiting, retry: all correct, all today.
-  Adding an LLM later reuses these exact shapes with a prompt as the
-  payload. The one NEW risk an LLM introduces is prompt injection (03),
-  and the untrusted vector for it is already flowing through the code.
+  01-llm-caching.md             exact/prompt/semantic; elevCache.ts is the
+                                shipped instinct; describe → exact cache by
+                                RouteSummary key
+  02-llm-cost-optimization.md   cheap-model-first; describe is on-device,
+                                cost ~$0; the real lever is on-device vs cloud
+  03-prompt-injection.md        the OSM display_name vector (geocode.ts:27/:52)
+  04-rate-limiting-backpressure.md  REAL home: Nominatim ~1 req/sec
+                                (MapScreen.tsx:189), elevation 429s
+  05-retry-circuit-breaker.md   REAL home: geocode/elevation throw
+                                (geocode.ts:24); no retry today — honest gap
 ```
 
-## See also
+## Reading order
 
-- `../05-evals-and-observability/` — verifying output (the backstop for injection)
-- `../04-agents-and-tool-use/` — injection severity scales with tool access
-- `../ai-features-in-this-codebase.md` — the honest inventory of where AI does / doesn't exist
+1. **`03-prompt-injection.md`** — the trust boundary already in the repo.
+2. **`04-rate-limiting-backpressure.md`** — flattr's real rate-limit home,
+   the Nominatim/Open-Meteo calls.
+3. **`05-retry-circuit-breaker.md`** — what happens when those throttled
+   calls fail; flattr's honest no-retry gap and where the wrapper belongs.
+4. **`01-llm-caching.md`** — `elevCache.ts` as the shipped pattern; a
+   describe cache keyed by `RouteSummary`.
+5. **`02-llm-cost-optimization.md`** — why flattr's cost is near zero and
+   the device boundary is the real lever.
+
+## Cross-links
+
+- **`../05-evals-and-observability/`** — knowing the served feature works
+  (evals) and seeing what it did (traces); a cache hit and a retry count
+  are span attributes.
+- **`features/routing/summary.ts:5`** — `RouteSummary`, the deterministic
+  output every future LLM call here keys off.
+- Sibling guides under `.aipe/`: `study-system-design` (elevation
+  provider fallback, on-device pipeline rerun), `study-networking`
+  (the geocode/elevation HTTP behavior), `study-performance-engineering`
+  (the cache as a latency lever).

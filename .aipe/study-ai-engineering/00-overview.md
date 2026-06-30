@@ -1,77 +1,69 @@
-# 00 — Overview
+# AI engineering in flattr — overview
 
-One page to orient. The verdict, the map, and the three seams.
+**Type label:** Guide orientation (per-codebase).
 
-## The verdict
+## The shape of AI work in flattr: none yet — but the seams are real
 
-flattr is a grade-aware routing engine. Its intelligence is **A* search
-over a hand-built, grade-annotated street graph** — classical algorithms,
-deterministic, every cost hand-coded in `features/routing/cost.ts`. There
-is **no LLM, no embedding, no vector store, no RAG, no trained ML model,
-no inference runtime** anywhere in the repo. The dependency tree confirms
-it; the grep confirms it.
-
-This guide's whole job: say that honestly, then point at the exact places
-AI/ML *would* attach — grounded in real files, not invented.
-
-## Where AI would sit (it doesn't yet)
+The spec names three shapes of AI codebase: LLM application engineering
+(loopd), prompt-tooling (aipe), classical ML (contrl-mo). **flattr is
+none of them.** It's a hand-rolled A\* router over a grade-annotated
+street graph — graph search and geometry, no model anywhere. So this
+guide is written in the spec's honest mode: it teaches each AI/ML
+concept as study material, then anchors it to the one place in *this*
+repo where that concept would attach if you built it. No invention, no
+hedging.
 
 ```
-flattr layers — the AI/ML band is empty (drawn as a gap)
+  flattr today — one diagram
 
-┌─ Build pipeline (build-time) ─────────────────────────────┐
-│ osm → overpass → elevation → geocode → split → grade →    │
-│ build-graph  ⇒  mobile/assets/graph.json                  │
-│   ◦ seam 1 lives here: pipeline/geocode.ts:9 (input→prompt)│
-└───────────────────────────┬───────────────────────────────┘
-                            ▼
-┌─ Core engine (pure TS) ───────────────────────────────────┐
-│ routing: graph · astar · bidirectional · pqueue · cost     │
-│ grade: classify · zones    map: geojson · tiles            │
-│   ◦ seam 2 lives here: features/routing/summary.ts:11      │
-│     (output→prompt)                                         │
-│   ◦ ML opportunity: features/routing/cost.ts (learned cost)│
-└───────────────────────────┬───────────────────────────────┘
-                            ▼
-┌─ ✗ AI / ML band ──────────── EMPTY ───────────────────────┐
-│   no LLM · no embeddings · no vector DB · no model         │
-└───────────────────────────┬───────────────────────────────┘
-                            ▼
-┌─ Mobile app (Expo + MapLibre) ────────────────────────────┐
-│ MapScreen · AddressBar · GradeSlider · RouteSummaryCard    │
-│   ◦ seam 3 (injection): OSM display_name → any prompt above│
-└────────────────────────────────────────────────────────────┘
+  ┌─ UI (mobile/, Expo + React Native) ─────────────────────┐
+  │  AddressBar → geocode   GradeSlider → userMax            │
+  │  MapScreen orchestrates   RouteSummaryCard renders       │
+  └───────────────────────────┬─────────────────────────────┘
+                              │ reads
+  ┌─ Core engine (features/, pipeline/, lib/) ──────────────┐
+  │  graph.json ─► astar.ts ─► summary.ts ─► RouteSummary    │
+  │      ▲           ▲  uses cost.ts penalty()               │
+  │      │           │                                       │
+  │  build pipeline (OSM + elevation → graph.json)           │
+  └─────────────────────────────────────────────────────────┘
+
+  No provider layer. No model. No prompt. No embedding.
 ```
 
-## The three seams (the only AI attachment points)
+## The three seams (memorize these)
 
-| # | seam | file:line | concept |
-|---|------|-----------|---------|
-| 1 | input→prompt | `pipeline/geocode.ts:9` | NL destination parsing → structured output |
-| 2 | output→prompt | `features/routing/summary.ts:11` | "describe my route" narration |
-| 3 | injection vector | `pipeline/geocode.ts:27,52,69` | OSM `display_name` untrusted text |
+Everything in this guide points back to four real anchors:
 
-And one ML attachment point, gated by flattr's admissibility invariant:
-`features/routing/cost.ts` (learned edge cost, must stay `≥ 0`).
+1. **Output → prompt seam** — `features/routing/summary.ts:5`
+   (`RouteSummary`), produced at `mobile/src/MapScreen.tsx:159`,
+   consumed at `RouteSummaryCard` (`MapScreen.tsx:368`). A
+   "describe my route" LLM feature attaches here.
+2. **Input → prompt seam** — `pipeline/geocode.ts:9` (`geocode`),
+   called at `MapScreen.tsx:82/182/189`. A natural-language destination
+   parser wraps this.
+3. **Trust boundary** — `geocode.ts:27/52` returns OSM `display_name`,
+   untrusted text, the injection vector for any future prompt.
+4. **ML attach point** — `features/routing/cost.ts:16` (`penalty()`).
+   A learned edge cost goes here, constrained by A\* admissibility (≥ 0,
+   monotone) and the finite-`BLOCKED` invariant.
+
+## What's deliberately NOT claimed
+
+Every LLM/embedding/eval/RAG/agent concept below is marked **not yet
+exercised** with its precise attachment point. The two root files —
+[ai-features-in-this-codebase.md](ai-features-in-this-codebase.md) and
+[ml-features-in-this-codebase.md](ml-features-in-this-codebase.md) —
+state the negatives plainly and kill the one tempting false positive
+(`classify.ts` is a threshold table, not a classifier).
 
 ## How to read this guide
 
-The two root files are the payload — read them first:
+Start with the two root honesty files. Then read by seam:
 
-- [`ai-features-in-this-codebase.md`](ai-features-in-this-codebase.md)
-- [`ml-features-in-this-codebase.md`](ml-features-in-this-codebase.md)
+- **Seam 1 (route-describe):** `01-llm-foundations/`, `02-context-and-prompts/`, `03-retrieval-and-rag/11-rag.md`.
+- **Seam 3 (injection):** `06-production-serving/03-prompt-injection.md`.
+- **ML attach point:** `08-machine-learning/`.
+- **Interview synthesis:** `07-system-design-templates/`, `09-ml-system-design-templates/`.
 
-The numbered sub-sections (`01-` … `09-`) teach the AI/ML concepts as
-study material. Each concept file is honest in its "In this codebase"
-block: **not yet exercised**, with the precise seam where it would attach.
-The concepts are real and worth knowing; flattr's usage is zero.
-
-## Calibration
-
-You've shipped the real versions of these patterns elsewhere — RAG in
-AdvntrCue (pgvector + GPT-4), on-device Gemini Nano in dryrun, on-device
-MediaPipe ML in contrl. So this guide doesn't re-teach you RAG; it tells you
-*where in flattr* the patterns you already know would bolt on. The LLM
-concepts move fast (you have the instincts); the ML section (`08-`) is
-taught as newer ground, since classical supervised ML beyond contrl is the
-named gap.
+See [README.md](README.md) for the full file index.

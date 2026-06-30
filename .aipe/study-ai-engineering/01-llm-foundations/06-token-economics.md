@@ -1,45 +1,187 @@
-# Token Economics
-*Token-based pricing — Industry standard*
+# Token economics
 
-## Zoom out
+**Industry name(s):** token economics / cost ledger / price-per-1K-tokens
+/ unit economics. **Type:** Industry operational discipline.
 
-LLM bills are denominated in tokens (file 02), split into input (prompt) and output (completion) — and output typically costs ~5x input per token. Knowing this changes design: you pay to make the model *talk*, not to make it *read*. You've watched this meter run on AdvntrCue; flattr's hypothetical volume is so small the meter would barely move.
+## Zoom out — where this would sit in flattr
+
+You pay per token — input and output, at different rates — and that's the
+whole bill for a cloud LLM. So cost scales with prompt size × call volume.
+flattr makes **no model call**, so its LLM bill is exactly zero. The
+would-be route-describe call is the cheapest possible kind: three numbers
+in, one sentence out — tens of tokens. And because flattr is local-first
+Expo, the *right* default is on-device inference (dryrun-style), where the
+marginal cost per call is literally zero — you pay for the download, not
+the request.
 
 ```
-LAYERS — where the bill is computed
-┌─────────────────────────────────────────────┐
-│ prompt tokens (cheap)   ─► [ LLM ] ─► output  │
-│                                       tokens   │
-│   cost = in·$_in  +  out·$_out                 │ ◄── out rate ≈ 5x in
-└─────────────────────────────────────────────┘
+  Zoom out — the (tiny) cost ledger flattr would have
+
+  ┌─ engine ────────────────────────────────────────────────┐
+  │ routeSummary() ─► RouteSummary {distanceM,climbM,steep}  │
+  └────────────────────────────┬─────────────────────────────┘
+                              │ summary.ts:5
+  ┌─ ★ would-be call — pick the cheap lane ─▼───────────────┐
+  │ on-device (dryrun-style)  → $0 marginal / call  ◄ default│
+  │ cloud fallback            → ~30 tok in + ~25 out         │
+  │                             = fractions of a cent / call │
+  └──────────────────────────────────────────────────────────┘
 ```
+
+flattr has **no cost ledger** because it has no model. The lesson: the
+describe seam is so small that cost is a non-issue, and local-first makes
+it zero — so cost should never be the reason *not* to add it.
+
+## Structure pass
+
+- **Layers:** engine (free) → would-be LLM call (priced) → UI.
+- **Axis — marginal cost per call:** above the LLM boundary every
+  operation is free CPU. At a *cloud* LLM boundary each call costs
+  input-tokens × rate + output-tokens × rate. At an *on-device* boundary
+  the marginal cost flips back to ~zero (fixed model download, free
+  inference). The axis is "what does the next call cost?"
+- **Seam:** the cost flips at `summary.ts:5` → the describe call. Which
+  lane you pick (on-device vs cloud) decides whether the marginal cost is
+  zero or a few hundredths of a cent.
 
 ## How it works
 
-**Move 1 — the mental model.** Two meters: input tokens (everything you send — system prompt + context + user text) and output tokens (everything generated). Output is the expensive one, often ~5x the input rate, because generation is the compute-heavy autoregressive loop. So a long prompt with a short answer is cheap; a short prompt that triggers a verbose answer is not. Cap output length; trim input only when it's actually large.
+### Move 1 — the mental model
+
+You know an n+1 query problem: one cheap call becomes thousands and the
+bill explodes. LLM cost is the same shape — per-call price × volume — but
+with a twist: the price is proportional to *token count*, and output
+tokens usually cost more than input. So a cost ledger tracks tokens-in,
+tokens-out, and calls.
 
 ```
-PATTERN — the two meters (illustrative rates)
-  input:  2000 tok × $X      ── the cheap meter
-  output:  200 tok × $5X     ── the expensive meter
-                              ── short answer ≠ cheap if you don't cap it
+  Pattern — the cost of an LLM feature
+
+  cost = calls × (in_tokens × in_rate + out_tokens × out_rate)
+
+  flattr describe (cloud):  ~30 in  + ~25 out  per route
+  big-RAG app:           ~4000 in  + ~600 out per query   ← 100x+ flattr
+  on-device (dryrun):       $0 marginal — fixed model download
 ```
 
-**Move 2 — the mechanism.** You're billed per token both directions; the provider counts after tokenization, so your char→token estimate (file 02) feeds your cost estimate. Levers, in order of impact: cap `max_tokens` on output, reuse/cache static prompt prefixes if the provider supports it, and only then prune input context. A "describe my route" call sends ~a few hundred input tokens and asks for one sentence (~20 output tokens) — fractions of a cent, even at scale.
+### Move 2 — the walkthrough
+
+**The input is three numbers — cost is structurally tiny.** `summary.ts:5`:
+
+```ts
+export type RouteSummary = { distanceM: number; climbM: number; steepCount: number };
+```
+
+A describe prompt over this is ~30 input tokens, ~25 output. Even at cloud
+rates that's a fraction of a cent per route. There's no document stuffing,
+no chat history, no retrieval context — the thing that makes RAG apps
+expensive is simply absent. The bounded prompt
+([02-tokenization.md](02-tokenization.md)) is also a bounded *bill*.
 
 ```
-MECHANISM — cost levers, biggest first
-  1. cap max_tokens (output) ──────────► biggest lever
-  2. cache static prompt prefix
-  3. trim input context  ──────────────► only if input is large
+  Layers-and-hops — where the meter would (barely) run
+
+  ┌─ engine ──┐ {3 numbers}   ┌─ describe call ──┐ blurb
+  │routeSummary│ ───────────► │ ~30 in / ~25 out │ ──► UI
+  └───────────┘  (free CPU)   └────────┬─────────┘
+                                  cost flips here (summary.ts:5)
+                          on-device → $0   |   cloud → ~¢0.00x
 ```
 
-**Move 3 — principle.** Budget the output first — you pay most to make the model speak, least to make it listen.
+**Local-first makes it zero.** flattr already runs offline-capable Expo;
+the dryrun pattern (on-device model with cloud fallback) fits naturally.
+On-device, the marginal cost per describe is zero — you amortize a
+one-time model download. Cloud is a *fallback* for when on-device isn't
+available, and even then the bill is trivial because the prompt is three
+numbers. (See [08-provider-abstraction.md](08-provider-abstraction.md) for
+the on-device-vs-cloud factory.)
 
-## In this codebase
+**Where cost could sneak up.** Volume. If you described *every* route on
+*every* slider drag, calls multiply. The cheap defense is the cache keyed
+on `RouteSummary` (sound because temp=0,
+[03-sampling-parameters.md](03-sampling-parameters.md)) — identical
+summaries don't re-call. That, plus on-device default, keeps the ledger at
+zero in practice.
 
-**Not yet exercised in flattr.** There is no LLM, no cost ledger, no metering — nothing to bill. If the `features/routing/summary.ts:11` narration existed, volume would be trivial: tiny structured input, one-sentence output, called only when a user resolves a route. No batching, no high-throughput path, no need for a cost guardrail. The honest answer is that token economics is a real discipline you've practiced elsewhere, but flattr would never feel it — there's no attachment point for a cost ledger because there's no spend to track.
+### Move 3 — the principle
+
+LLM cost is per-token × volume; design the input small and the call rare
+and the bill stays negligible. flattr's describe seam is the easy case —
+tiny input, low volume, and a local-first runtime that makes on-device the
+zero-cost default. Cost is not a reason to skip this feature.
+
+## Primary diagram
+
+```
+  Token economics — flattr's would-be ledger is ≈ $0
+
+  ┌─ engine (free CPU) ─────────────────────────────────────┐
+  │ RouteSummary {3 numbers}                                 │
+  └────────────────────────────┬─────────────────────────────┘
+                            summary.ts:5  ← cost flips here
+  ┌─ would-be describe call (NOT BUILT) ────▼───────────────┐
+  │ on-device (dryrun)  → $0 marginal  ◄ local-first default │
+  │ cloud fallback      → ~30 in/25 out → ¢0.00x, cache it   │
+  └──────────────────────────────────────────────────────────┘
+```
+
+## Elaborate
+
+The discipline in real apps: log tokens-in/out per call, attribute cost
+per feature, set a budget, and watch for volume amplification (loops,
+retries, per-keystroke calls). flattr inverts the usual worry — the prompt
+is so small that the *only* cost lever is call volume, killed by caching
+and on-device inference. In Rein's portfolio, AdvntrCue (cloud GPT-4) is
+where the ledger actually matters; flattr is the "cost is a non-issue"
+end of the spectrum, by design.
+
+## Project exercises
+
+### B-TE.1 — token+cost log on the stub
+
+- **Exercise ID:** B-TE.1
+- **What to build:** wrap `describeRoute` so each call logs estimated
+  tokens-in/out and a cost estimate (cloud rate constant), proving the
+  per-call bill is sub-cent.
+- **Why it earns its place:** it makes the "cost is negligible" claim a
+  measured ledger at the real seam.
+- **Files to touch:** new `features/routing/describe.ts`;
+  `mobile/src/MapScreen.tsx:159` (call site).
+- **Done when:** the log shows token counts and a sub-cent estimate.
+- **Estimated effort:** 1 hr.
+
+### B-TE.2 — volume guard via cache
+
+- **Exercise ID:** B-TE.2
+- **What to build:** cache `describeRoute` on the rounded `RouteSummary`
+  so slider drags that don't change the summary don't re-call, capping
+  volume.
+- **Why it earns its place:** it closes the one real cost lever (volume)
+  at the seam where slider changes drive recomputation.
+- **Files to touch:** `features/routing/describe.ts`;
+  `mobile/src/MapScreen.tsx:159` (recompute site), `:381` (GradeSlider).
+- **Done when:** repeated identical summaries hit the cache; a test proves
+  no extra calls.
+- **Estimated effort:** 1 hr.
+
+## Interview defense
+
+**Q: What would an LLM route description cost flattr?** Answer: Near zero.
+The input is three numbers (~30 tokens in, ~25 out), so even cloud rates
+are fractions of a cent per route — and flattr is local-first, so the
+right default is on-device inference (dryrun-style) where the marginal cost
+is literally zero. The only cost lever is volume, which a cache keyed on
+`RouteSummary` kills. Cost is never the reason to skip this.
+
+```
+  {3 numbers} → on-device → $0   |   cloud → ¢0.00x (cache it)
+```
+
+Anchor: *"the describe prompt is three numbers — tiny bill, and on-device
+makes it zero; cost is a non-issue at the summary.ts:5 seam."*
 
 ## See also
-- [02 — Tokenization](02-tokenization.md)
-- [05 — Streaming](05-streaming.md)
+
+- [02-tokenization.md](02-tokenization.md) — tokens as the billing unit.
+- [08-provider-abstraction.md](08-provider-abstraction.md) — on-device vs cloud lane.
+- [03-sampling-parameters.md](03-sampling-parameters.md) — temp 0 makes caching sound.

@@ -1,210 +1,167 @@
-# 13 — Forbidden patterns and rotating formulas
+# 13 · Forbidden patterns and rotating formulas
 
-*Industry name(s): "forbidden patterns," "rotation," "anti-repetition,"
-"diversity prompting," "negative constraints." Type label: Industry standard.*
+> Industry name: forbidden patterns / anti-repetition / rotating formulas · Type label: Industry standard
 
-> **Seam, not present.** flattr generates no repeated text. But it would, the
-> moment Seam 1 ships: a user requesting routes all day would get a route
-> description every time, and every one would open "This route is a flat..."
-> because LLMs converge on phrasings. This file teaches anti-repetition
-> against that future stream of descriptions.
+> **Status: seam, not feature.** flattr generates no text, so nothing repeats yet. But Seam 1's "describe my route" is a generative chain run *over and over for the same user* — every walk they plan gets a description — and that's exactly the setup where every output converges on the same phrasing. This file maps the anti-repetition technique onto that seam.
 
-## Zoom out — where repetition would set in
+## Zoom out — where this concept lives
 
-LLMs converge: run the same chain repeatedly and every output sounds the same.
-The fix lives in the prompt — an explicit list of forbidden openings and a set
-of rotating formulas. It matters only for *generative chains run repeatedly for
-the same user*. flattr's Seam 1 description is exactly that.
+This concern only exists for generative chains run repeatedly. Seam 1 is precisely that — and it's the only seam this applies to:
 
 ```
-  Zoom out — repetition across a stream of route descriptions
+  Zoom out — forbidden patterns, on the repeated describe chain
 
-  ┌─ Seam 1, called repeatedly (future) ────────────────────────────┐
-  │ route 1 → "This route is a flat 2 km..."                         │
-  │ route 2 → "This route is a flat 3 km..."   ← same opening        │
-  │ route 3 → "This route is a flat 1 km..."   ← same opening        │
-  │           ★ forbidden-openings list + rotation breaks this ★     │
-  └──────────────────────────────────────────────────────────────────┘
+  ┌─ Seam 1: describe (run per route, many times per user) ──────┐
+  │ route 1 → "Mostly flat, 2.1km, one short climb."            │
+  │ route 2 → "Mostly flat, 3.4km, one short climb."  ← same shape│
+  │ route 3 → "Mostly flat, 1.8km, one short climb."  ← AGAIN    │
+  │ ★ THIS FILE: stop every description sounding identical ★     │ ← we are here
+  └──────────────────────────────────────────────────────────────┘
+
+  ┌─ Seam 2: parse / classifiers ────────────────────────────────┐
+  │ output is a struct — repetition is CORRECT, not a problem    │
+  │ (this technique does NOT apply here)                         │
+  └──────────────────────────────────────────────────────────────┘
 ```
 
-## Zoom in
+Now zoom in. The pattern is: **LLMs converge on phrasings — run the same generative chain repeatedly and every output opens the same way — so you explicitly list forbidden openings and enumerate rotating formulas to force variety.** It matters for repeated generation and is meaningless (even harmful) for one-shot classifiers and structured outputs. Let me build it.
 
-The pattern: **explicitly list forbidden openings and enumerate rotating
-formulas in the prompt, optionally feeding recent outputs back as "don't
-repeat these."** It matters for any generative chain a user sees repeatedly. It
-does NOT matter for one-shot classifiers or structured outputs — there,
-convergence is a *feature* (you WANT the same label for the same input).
+## Structure pass
 
-## The structure pass
+**Layers.** Two: the *forbidden list* (phrasings the model must not use) and the *rotation state* (what it used recently, so it picks something different next time). The second layer is what makes it work over a sequence — without memory of recent outputs, you can forbid openings but not rotate through alternatives.
 
-**Layers:** the chain → one output → the stream of outputs.
-**Axis:** *desired variance* — do you want sameness or difference here?
-**Seam:** the classifier/generator boundary. Below it (classifiers) sameness is
-correct; above it (user-facing generation) sameness is the bug.
+**Axis — state (does the chain remember its prior outputs?).**
 
 ```
-  axis = "do you WANT the output to be the same each time?"
+  One axis — "does this call know what the last call said?" — for repetition
 
-  ┌─ classifier ──┐ want sameness: YES — same input → same label
-  │  ── seam ──      ◄── desired variance flips
-  └─ generator ───┘ want sameness: NO — repetition reads robotic
+  stateless describe:   each call independent → all converge on "Mostly flat"
+  rotation-aware:       call knows recent openings → picks an unused one
+
+  the seam: variety requires the chain to carry rotation STATE across calls
 ```
+
+**Seam.** The load-bearing boundary is *between stateless and rotation-aware generation*. A stateless chain has no way to avoid repeating itself — every call independently lands on the model's favorite phrasing. Variety requires threading a small piece of state (recent openings) into each call. That's the design flip.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You know `Math.random()` without a seed gives variety and a fixed seed gives
-the same value every time. An LLM run repeatedly is closer to the fixed-seed
-case than you'd expect — it has favorite phrasings and reaches for them every
-time. Anti-repetition is manually injecting variance: forbidding the favorite
-openings and rotating through alternatives, the way you'd cycle a list instead
-of always grabbing index 0.
+You know how a `Math.random()`-free shuffle that just picks "the next item" gives you the same order every time — you need to *track what you've shown* to avoid repeats. Anti-repetition for LLM output is that: the model's untracked default is to repeat its highest-probability phrasing, so you track recent outputs and forbid them, forcing it down to its second and third choices.
 
 ```
-  Pattern — rotation breaks convergence
+  The forbidden-patterns kernel — forbid + rotate with memory
 
-  WITHOUT:  [chain] → "This route is..." → "This route is..." → "This route..."
-                          ▲ model's favorite opening, every time
-
-  WITH:     forbid ["This route is", "Your route"] + rotate [
-              "Mostly flat —", "A gentle", "Expect", ...]
-            → varied openings across the stream
+  ┌─ forbidden openings (constant) ──────────────────────┐
+  │ never start with: "Mostly flat", "This route is",    │
+  │ "Your route"                                         │
+  ├─ rotating formulas (enumerated) ─────────────────────┤
+  │ A: lead with distance   B: lead with the climb       │
+  │ C: lead with the terrain feel                        │
+  ├─ rotation state (per user, recent) ──────────────────┤
+  │ last used: [A, A, C] → this call: avoid A, prefer B  │
+  └──────────────────────────────────────────────────────┘
 ```
 
-### Move 2 — anti-repetition on flattr's descriptions
+### Move 2 — the step-by-step walkthrough
 
-**Step 1 — forbid the convergent openings.** In the system prompt (concept 01,
-section 1), an explicit negative list:
+**Why outputs converge.** A model samples high-probability continuations. For "describe a flat route," "Mostly flat" is the highest-probability opening, so absent any pressure, *every* description opens with it. The user planning their fifth walk this week reads "Mostly flat, X km, one climb" for the fifth time and the feature feels robotic. flattr's whole value is being a *companion* for repeated self-powered travel — the same user routes daily — so this is the exact usage pattern where convergence shows.
 
-```
-  // FUTURE — system prompt
-  "Never open with: 'This route is', 'Your route', 'Here is'.
-   Vary the opening every time."
-```
+**Forbidden openings — the constant list.** In the system prompt, enumerate phrasings the model must not use: "Never open with 'Mostly flat', 'This route', or 'Your route'." This is a constant section (`01-anatomy.md`), part of the prompt's frame. It's blunt but effective — removing the model's defaults forces it to find alternatives. The boundary condition: forbid too much and you constrain the model into awkward phrasings, so the list is the few real offenders, not a thesaurus.
 
-Negative constraints are weaker than positive ones (the model may still drift
-back), which is why you pair them with rotation.
-
-**Step 2 — enumerate rotating formulas.** Give the model a set to cycle:
+**Rotating formulas — enumerate the structures.** Beyond forbidding openings, give the model a *menu* of description shapes for the same `RouteSummary`:
 
 ```
-  "Rotate openings across these shapes:
-   - lead with distance:  '3.2 km, mostly flat...'
-   - lead with terrain:   'Gentle the whole way...'
-   - lead with the catch: 'One steep block, otherwise flat...'"
+  Hop — same RouteSummary, rotated through formulas
+
+  RouteSummary {distanceM:2100, climbM:14, steepCount:1}
+        │
+   ┌────┼─────────────────────────────────────────┐
+   │ A  │ "2.1km, mostly easy — one short climb."  │ (distance-led)
+   │ B  │ "One short climb to watch, otherwise     │ (climb-led)
+   │    │  flat for 2.1km."                        │
+   │ C  │ "Gentle going, with a single steep       │ (terrain-led)
+   │    │  stretch over 2.1km."                    │
+   └────┴─────────────────────────────────────────┘
+   rotation state picks a formula not used recently
 ```
 
-For flattr these rotations are *grounded in the data* — the "lead with the
-catch" formula is only used when `steepCount > 0`, which means rotation and the
-honesty invariant (concept 10) cooperate rather than fight.
+All three describe the *same* route accurately — they differ in what they lead with. The rotation cycles the lead so consecutive descriptions feel distinct without ever being inaccurate.
 
-**Step 3 — feed recent outputs back (the loopd caption pattern).** The stronger
-version: pass the last N descriptions into the prompt as "don't repeat these
-openings." This is exactly loopd's caption chain with rotation history — the
-prompt sees what it already said and avoids it:
+**Rotation state — the memory that makes it work.** The chain carries a small per-user record of recent formulas/openings (the spec's "rotation history") and injects it: "you recently used formula A twice; use a different one." This is the state layer. flattr already has the infrastructure instinct for per-user state in `mobile/` (the app holds user context), so threading a 3-element recent-openings array into the describe call is cheap. Without this state, you can forbid the global defaults but you can't rotate — the chain has no idea what *it* said last time.
+
+**When it matters vs when it doesn't.** Matters: any generative chain run repeatedly for the same user — Seam 1's description is the case, especially given flattr's daily-companion usage. Doesn't matter, and is actively wrong: one-shot classifiers and structured outputs. Seam 2's parse *should* produce the same struct for the same query every time — repetition there is correctness, and forbidding "repeated" outputs would be nonsensical. So this technique is scoped tightly to repeated free-text generation. Applying it to a classifier is a category error.
 
 ```
-  // FUTURE — rotation history (concept 04: costs tokens)
-  context = `Recent openings to AVOID: ${recentOpenings.join(", ")}`
+  Scope — where forbidden patterns apply
+
+  Seam 1 describe (repeated, free text)  → APPLY (forbid + rotate)
+  Seam 2 parse (classifier, struct)      → DO NOT (repetition = correct)
+  one-shot generation (run once)         → DO NOT (no convergence to fight)
 ```
-
-Note the token cost (concept 04): rotation history grows the per-call payload,
-so cap it at the last 3–5.
-
-```
-  Layers-and-hops — rotation history feeding back into the prompt
-
-  ┌─ prior outputs ─┐ last 3 openings   ┌─ prompt ──────┐ vary opening
-  │ store           │ ────────────────► │ "avoid these" │ ──► new desc
-  └─────────────────┘                   └───────────────┘      │
-        ▲                                                       │
-        └───────────────── append new opening ─────────────────┘
-```
-
-### Step 4 — where it does NOT apply
-
-flattr's Seam 2 destination parser (NL → `{lat,lng}`) is a classifier —
-"somewhere flat near the water" should parse to the *same* structured args
-every time. Rotation there would be a bug. And the structured `RouteSummary`
-itself never rotates — three numbers are three numbers. Anti-repetition is
-*only* for the human-facing prose stream.
-
-### Move 2 variant — load-bearing skeleton
-
-Kernel: **forbidden openings + rotation, applied only to generative streams**.
-What breaks:
-
-- **No anti-repetition on a repeated generative chain** → every description
-  reads identically; the product feels robotic. *Load-bearing for UX.*
-- **Forbidden list without rotation** → model drifts back to a forbidden
-  opening; negatives alone are weak. *Load-bearing — pair them.*
-- **Rotation on a classifier** → same input yields different labels;
-  correctness bug. *Anti-pattern — wrong side of the seam.*
-- **Unbounded rotation history** → token bloat (concept 04). *Hardening — cap
-  it.*
 
 ### Move 3 — the principle
 
-LLMs converge on phrasings; variety is something you engineer, not something
-you get for free. Forbid the favorites and rotate alternatives — but only for
-user-facing generative streams. For classifiers and structured output,
-convergence is correct, and rotation would be a bug.
+Models converge on their highest-probability phrasing, so repeated generative chains need explicit anti-repetition: forbid the defaults, enumerate rotating formulas, and thread recent-output state so the chain can actually rotate. The scope is narrow and worth stating precisely — it applies only to free-text generation run repeatedly for the same user, and it's a category error on classifiers and structured outputs, where repetition is the correct behavior. flattr's daily-companion usage makes Seam 1 the textbook case; its structured Seam 2 is the textbook non-case.
 
 ## Primary diagram
 
+The full anti-repetition setup on the repeated describe chain, all three layers and the scope boundary marked.
+
 ```
-  Anti-repetition on flattr's description stream (FUTURE)
+  Forbidden patterns — anti-repetition on the repeated describe chain
 
-  ┌─ Seam 1 prompt ──────────────────────────────────────────────────┐
-  │ [system] forbid: "This route is", "Your route", "Here is"         │
-  │          rotate: [distance-lead | terrain-lead | catch-lead]      │
-  │ [context] recent openings to avoid (last 3, capped — concept 04)  │
-  │ [context] {d, climb, steep}                                       │
-  └───────────────────────────┬──────────────────────────────────────┘
-                              ▼ varied prose across the stream
-   route1 "3.2 km, mostly flat"  route2 "Gentle the whole way"  route3 ...
-
-  ✗ NOT applied to: Seam 2 parser (classifier) · RouteSummary (structured)
+  ┌─ Prompt (Seam 1, constant frame) ────────────────────────────┐
+  │ forbidden openings: "Mostly flat" | "This route" | "Your route"│
+  │ rotating formulas:  A distance-led | B climb-led | C terrain  │
+  └─────────────────────────┬────────────────────────────────────┘
+                            │ + per-call rotation state
+  ┌─ Per-call (rotation memory) ▼────────────────────────────────┐
+  │ recent openings: [A, A, C] → "avoid A, prefer B this call"   │
+  └─────────────────────────┬────────────────────────────────────┘
+                            │
+  ┌─ Output ────────────────▼────────────────────────────────────┐
+  │ each description accurate, distinct lead → no robotic sameness │
+  └──────────────────────────────────────────────────────────────┘
+   SCOPE: repeated free-text generation ONLY
+   NOT classifiers / structured outputs (repetition = correct there)
 ```
 
 ## Elaborate
 
-This is the least-academic concept in the set — pure production craft. It's the
-reason every "AI wrote this" blog post sounds identical: nobody engineered the
-variance. The reader has shipped exactly this in loopd's caption chain with
-rotation history, which is the canonical anchor. It interacts with token
-budgeting (rotation history costs tokens, cap it — concept 04) and with the
-honesty invariant (rotation formulas are gated on `steepCount`, so they
-cooperate with concept 10). Read `08-few-shot.md` for the inverse tension:
-strong few-shot makes outputs converge *toward the examples*, which fights
-rotation — balance the two.
+This is loopd's caption chain made literal (from `me.md`'s portfolio) — a caption generator run repeatedly converges, and the rotation-history mechanism is the fix. The underlying cause is sampling: a model maximizes likelihood, and the most-likely phrasing is most-likely *every time*, so without pressure the distribution collapses to one opening. The forbidden list and rotating formulas are crude but effective likelihood-shaping at the prompt level — you're manually removing the modes the model would otherwise camp on. There's a temperature lever too (higher temperature broadens sampling), but temperature alone gives you random variation, not *structured* variation across distinct, accurate formulas — which is why the enumerated-formula approach beats just turning the knob up. The scope discipline is the part people get wrong: applying anti-repetition to a structured-output chain (Seam 2) fights the exact determinism you want there.
+
+## Project exercises
+
+### EX-FORBID-1 — Rotating route descriptions with history
+
+- **Exercise ID:** EX-FORBID-1
+- **What to build:** A `describeRotating(summary, recentOpenings)` that injects a forbidden-openings list and a rotating-formula menu, threads a recent-openings array, and produces a distinct-leading description each call for the same `RouteSummary`.
+- **Why it earns its place:** Exercises the rotation-state layer (the part that makes anti-repetition actually work over a sequence) and the scope boundary (it's wrong on Seam 2).
+- **Files to touch:** new `features/routing/describe-rotating.ts`; consumes `RouteSummary` from `summary.ts`.
+- **Done when:** five consecutive descriptions of the same route lead differently and all remain accurate; the same code applied to a struct output is shown to be a no-op/error.
+- **Estimated effort:** 2-3 hours.
 
 ## Interview defense
 
-**Q: "Every output from your generative chain sounds the same. Fix?"** LLMs
-converge on favorite phrasings, so you engineer variance: forbid the convergent
-openings in the system prompt, enumerate rotating formulas, and for the strong
-version feed the last few outputs back as "don't repeat these." But only for
-user-facing generative streams — on a classifier, sameness is correct and
-rotation is a bug.
+**Q: Why do repeated generative outputs all sound the same, and how do you fix it?**
+
+The model maximizes likelihood, so its highest-probability phrasing wins every time and outputs converge. Fix: forbid the default openings, enumerate rotating formulas (same content, different lead), and thread recent-output state so the chain can rotate instead of repeating.
 
 ```
-  generative stream → forbid + rotate (variety is the feature)
-  classifier        → leave it (sameness is the feature)
+  no pressure: every route → "Mostly flat..."
+  + forbidden list + rotating formulas + rotation state → distinct leads
 ```
 
-Anchor: *"flattr's Seam 1 description stream would converge — every route
-opening 'This route is a flat...'. Forbidden openings + rotation fixes it,
-grounded in the data (the 'catch-lead' formula only fires when steepCount>0, so
-rotation and honesty cooperate). The Seam 2 parser and the `RouteSummary`
-struct are classifiers/structured — they must NOT rotate."*
+Anchor: flattr's daily-companion usage means the same user gets many descriptions — the exact setup where convergence shows.
+
+**Q: Would you apply this to flattr's destination parser?**
+
+No — category error. The parser (Seam 2) is a classifier emitting a struct; the same query *should* produce the same struct every time. Repetition there is correctness. Anti-repetition is scoped to repeated free-text generation, not structured outputs or one-shot calls.
 
 ## See also
 
-- [08-few-shot.md](08-few-shot.md) — strong few-shot fights rotation; balance
-- [04-token-budgeting.md](04-token-budgeting.md) — rotation history costs tokens
-- [10-self-critique.md](10-self-critique.md) — rotation gated on the honesty
-  invariant
-- [00-overview.md](00-overview.md) — the classifier-vs-generator seam map
-</content>
+- `01-anatomy.md` — the constant section the forbidden list lives in
+- `02-structured-outputs.md` — the non-case where repetition is correct
+- `10-self-critique.md` — the other selective-spend generation concern
+- `05-eval-driven-iteration.md` — measuring whether rotation actually improved variety

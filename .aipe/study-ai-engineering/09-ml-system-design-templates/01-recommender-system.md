@@ -1,107 +1,51 @@
-# Recommender System
+# 01 — Recommender System
 
-*Candidate generation -> ranking -> serving, with a learned model of user preference.*
+A reusable interview template, reframed against flattr. flattr has no recommender,
+so the honest answer below is "no" — the value here is knowing the standard shape
+well enough to say *why* it doesn't fit and what the nearest analog actually is.
 
-The classic ML-system-design interview prompt. "Design a system that recommends
-N items to a user." The whole genre lives or dies on one idea: you can't score
-every item for every user in real time, so you split the problem into a cheap
-recall stage and an expensive precision stage, and you learn the user's
-preference from their past behavior rather than hand-coding it.
+- **The prompt:** "Design a recommender that surfaces N items per user from a catalog of M items, maximizing engagement."
 
-## Standard architecture
+- **Standard architecture:** A recommender is a two-stage funnel — a cheap candidate generator narrows M to a few hundred, then an expensive ranker scores those for a single user. The diagram below shows the request path with the offline training loop feeding both stages.
 
-```text
-                     RECOMMENDER (generic reference shape)
-  ┌─────────────┐   ┌──────────────────┐   ┌───────────────┐   ┌─────────┐
-  │   user +    │──▶│ CANDIDATE GEN    │──▶│   RANKING     │──▶│ SERVING │
-  │   context   │   │ (recall, cheap)  │   │ (precision)   │   │ + rerank│
-  └─────────────┘   │ ~millions → ~500 │   │ ~500 → top N  │   │ filters │
-                    └──────────────────┘   └───────────────┘   └─────────┘
-                            │                      │                 │
-                            ▼                      ▼                 ▼
-                    embeddings / ANN       learned scorer      business rules
-                    (two-tower, co-occur)  (GBDT / DLRM)       (dedupe, dust)
-                            ▲                      ▲
-                            └──────── trained on ──┴──── interaction logs
-                                      (clicks, dwell, purchases)
+```
+                    Recommender — two-stage retrieve-then-rank
+  ┌──────────────┐   user_id    ┌─────────────────────┐
+  │  Client UI   │─────────────►│  Serving API        │
+  │ (feed/shelf) │◄─────────────│  (N ranked items)   │
+  └──────────────┘   N items    └──────────┬──────────┘
+                                            │ candidate request
+                                            ▼
+                          ┌───────────────────────────────┐
+                          │ Stage 1: Candidate Generation  │
+                          │ ANN / co-visitation  M ► ~500  │
+                          └───────────────┬───────────────┘
+                                          │ ~500 candidates
+                                          ▼
+                          ┌───────────────────────────────┐
+                          │ Stage 2: Ranker                │
+                          │ learned scorer  ~500 ► N       │
+                          └───────────────┬───────────────┘
+                                          │ logs (impression, click)
+                                          ▼
+                          ┌───────────────────────────────┐
+                          │ Offline training (batch)       │
+                          │ embeddings + ranker weights    │
+                          └───────────────────────────────┘
 ```
 
-The learned core is a function `score(user, item, context) -> R`. You fit it to
-historical interactions, then rank by predicted score. The interview tests
-whether you can stage recall vs. ranking, pick features, and reason about the
-training/serving loop.
+  The logged interactions close the loop: yesterday's impressions become today's training labels. flattr has none of these boxes.
 
-## Data and features (generic)
+- **Data model:** Three stores. A user/item interaction log (user_id, item_id, event, timestamp) is the label source. An item feature store (embeddings, categorical attributes) and a user feature store (history, demographics) feed the ranker. Item embeddings live in an ANN index for stage-1 retrieval. flattr stores none of this: its only persisted artifact is the static `mobile/assets/graph.json` (nodes and edges of a street graph), and it has no user identity, no event log, and no per-user state beyond the in-memory `userMax` slider value.
 
-- **Interaction log** — the training signal. (user, item, action, timestamp).
-  Implicit feedback (clicks/dwell) is noisy but plentiful; explicit (ratings) is
-  clean but sparse.
-- **Features** — user features, item features, cross features (user x item),
-  context (time, device, location).
-- **Scale concerns** — candidate gen must be sub-linear (ANN index, not a scan);
-  ranking is batched per request; the index is rebuilt offline and the model
-  retrained on a cadence. Cold start (new user/item) is the perennial gotcha.
+- **Key components:** Candidate generator — approximate-nearest-neighbor over item embeddings; the technical choice is ANN over exact search because at M in the millions, exact top-k per request blows the latency budget and recall@500 from a good ANN index is close enough. Ranker — a gradient-boosted or neural scorer over (user, item) features; the choice is a pointwise/pairwise learned model over hand-tuned weights because engagement objectives shift and a learned ranker re-fits from logs without a code change. Logging pipeline — append-only impression/click stream; the choice is to log impressions (not just clicks) so the ranker sees negatives, otherwise it overfits to whatever the old policy already surfaced.
 
-## Applies to this codebase
+- **Scale concerns (ordered by what hits first):** (1) Candidate latency — once M passes a few hundred thousand items, stage-1 must be ANN, not a scan; a 50ms per-request p99 budget breaks first. (2) Feature freshness — user features computed in nightly batch go stale within a session; a streaming feature path is needed past roughly daily-active users in the hundreds of thousands. (3) Cold start — new items have no interaction history and never get retrieved; content features must backfill the embedding. (4) Feedback-loop bias — the ranker trains on items the old ranker chose, narrowing the catalog over weeks; needs exploration injection.
 
-**Mostly no — and the difference is the interesting part.** flattr does not
-recommend by learned preference. It computes the *provably optimal* route
-deterministically: a hand-rolled A* (`features/routing/astar.ts`) over a
-grade-annotated street graph, minimizing a hand-coded cost
-(`features/routing/cost.ts`). There is no candidate-gen/ranking split, no
-interaction log, no trained scorer. A* *is* the search; its admissible heuristic
-*is* the recall+precision collapsed into one exact algorithm.
+- **Eval framing:** Offline — recall@N and NDCG against held-out future interactions, plus a counterfactual estimate (inverse-propensity) since logged data is biased by the serving policy. Online — A/B test on the real engagement objective (click-through, dwell, retention), because offline NDCG routinely disagrees with online lift. The gap between the two is the whole reason online testing exists.
 
-The honest tie is precise and lives in one function. flattr's cost is:
+- **Common failure modes:** Popularity collapse — the ranker learns to always surface head items; mitigate with diversity penalties or per-slot exploration. Feedback loop — narrowing catalog from training on own output; mitigate with epsilon-exploration and impression logging. Stale features — a user's last 5 actions aren't reflected; mitigate with a real-time feature path. Train/serve skew — the ranker sees different feature values offline vs online; mitigate with a shared feature-transformation library.
 
-```text
-  features/routing/cost.ts:16   penalty(g, max, k1, k2)
-    g <= 0     -> 0                 (downhill/flat: free)
-    g <= half  -> k1 * g            (moderate uphill: linear)
-    g <= max   -> k2*(g-half)^2 ... (steep uphill: quadratic)
-    g >  max   -> BLOCKED (1e9)     (cost.ts:5, finite on purpose)
-```
+- **Applies to this codebase: NO.** flattr is not a recommender and has no part of this architecture. There is no catalog of items, no user identity, no interaction log, no candidate generation, and no ranker trained on engagement. flattr solves a single deterministic query — shortest grade-penalized path between two points — with A* over a static graph. The closest thing to "scoring" in the codebase is the learned-ish edge cost in `features/routing/cost.ts`: `penalty(g, max, k1, k2)` (cost.ts:16) produces a per-edge multiplier, and `gradeCostDirected` (cost.ts:32) is the `CostFn` that A* minimizes. That *is* a ranking of edges in the sense that A* prefers cheaper ones — but it is optimization inside a graph search, not recommendation. It has no user model, no candidate set, and no engagement objective; it is admissible scalar cost minimization, not top-N selection over a catalog. Calling it a recommender would be wrong.
 
-That `penalty()` is exactly the slot a *learned route-preference model* would
-occupy. Today `k1=0.4, k2=1.0` are hand-tuned constants (`cost.ts:8-9`). A model
-that learned "this rider tolerates short steep kicks but hates sustained climbs"
-would replace those constants — turning the optimizer into a *personalized*
-recommender over routes. The seam already exists: every cost variant is a
-`CostFn = (edge, fromNodeId, userMax) => number` (`features/routing/types.ts:40`),
-so A* never knows whether the number came from arithmetic or a model.
-
-## How to make it apply
-
-Concrete, against flattr's real files:
-
-1. **Collect choices.** Log which route a rider actually took vs. the
-   alternatives flattr offered (the rejected-but-presented routes are the
-   negative examples). flattr has no such log today — this is the missing
-   dataset, and it's the real blocker.
-2. **Train a constrained edge-cost model.** Target: a per-edge penalty. The
-   model *must* respect the invariants A* relies on, or correctness breaks:
-   - **`>= 0`** — A* admissibility needs non-negative edge weights.
-   - **monotone in grade** — steeper must never cost less, or the heuristic lies.
-   - **BLOCKED stays finite** — the spec's §14.4 "honest fallback" depends on an
-     over-max edge being expensive-but-traversable, not `Infinity`, so a
-     steep-only path is still returned and *flagged* rather than reported as
-     disconnected.
-   Enforce these structurally (monotone GBDT / isotonic calibration / a clamped
-   output head) rather than hoping the data teaches them.
-3. **Swap behind the interface.** Implement
-   `learnedCost: CostFn = (edge, fromNodeId, userMax) => ...` and drop it in
-   where `gradeCostDirected` is wired today. A* (`astar.ts`), the priority queue
-   (`pqueue.ts`), and the summary (`summary.ts`) need zero changes — the
-   `CostFn` boundary is the whole point.
-
-This is the cleanest "add ML to an existing deterministic system" story flattr
-has: the optimizer stays exact, only the cost oracle becomes learned. It's out
-of current scope only because the interaction dataset doesn't exist yet.
-
-## See also
-
-- `features/routing/cost.ts` — the hand-coded penalty (the model's future home)
-- `features/routing/types.ts:40` — the `CostFn` seam a model must satisfy
-- `features/routing/astar.ts` — the optimizer that consumes any `CostFn`
-- `docs/flattr-spec.md` §14.4 — why BLOCKED is finite (a constraint on the model)
-- `02-anomaly-detection.md` — the other "where could a model attach" reframe
+- **How to make it apply (honest stretch):** The only flattr surface with anything recommender-shaped is the `userMax` preset chooser. `USERMAX_PRESETS` in `features/grade/classify.ts:46` already lists three presets (Kick scooter = 5, Walking = 8, Any = 15) and `GradeSlider` lets the user pick one. A genuinely tiny single-user, content-based / rules recommender would suggest a default preset instead of making the user choose blind: take the just-completed route's realized grade distribution (the `gradePct`/`absGradePct` on the chosen edges), and rule-recommend "you took a Walking route but hit three red segments — try Kick scooter next time." That is content-based filtering with a population of one and a catalog of three, which is barely a recommender at all — be honest that it is a UX nicety dressed in the vocabulary, not a system worth the two-stage architecture above. To make it real you would add: an interaction log of (route_query, chosen_preset, completed?) persisted locally, and a rules table mapping realized-grade summaries to a suggested preset. The learned cost in `cost.ts` is *not* the place this attaches — that ranks edges, not presets. I've shipped on-device ML before (contrl runs a MediaPipe pose-landmark model to count reps end-to-end on device), so I know what a real model-backed feature costs to build; the honest read is that flattr's preset suggestion does not need one and shouldn't pretend to.

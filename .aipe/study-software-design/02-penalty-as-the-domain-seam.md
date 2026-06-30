@@ -1,255 +1,278 @@
-# Penalty as the domain seam
+# 02 — Penalty as the domain seam
 
-> **Domain isolation / single responsibility / the "knowledge boundary"**
-> — Language-agnostic. The "seam where the domain lives" framing is APOSD
-> information-hiding applied.
+**Industry names:** policy function / domain kernel / information hiding.
+**Type label:** Project-specific (the move is universal; the grade model is flattr's).
+
+The entire definition of "flat" — what flattr is *about* — lives in one
+five-line function. The search loop never mentions grade.
+
+---
 
 ## Zoom out, then zoom in
 
-flattr's entire reason to exist — "optimize for flat, not fast" — is one
-idea: penalize uphill grade. The question that decides whether the codebase
-is clean or a mess is *where that idea is allowed to live*. flattr's answer:
-one file, 33 lines, `cost.ts`. The search loop, the heap, the UI — none of
-them know what grade means.
+This is the inner half of the seam `01` introduced. If `01` is "the loop
+has a hole," this is "what fills the hole, and why all the domain knowledge
+hides inside it."
 
 ```
-  Zoom out — the grade domain is sealed in one box
+  Zoom out — where the penalty lives
 
-  ┌─ UI ─────────────────────────────────────────────┐
-  │  GradeSlider → userMax (just a number)            │
-  └──────────────────────┬─────────────────────────────┘
-                         │ userMax
-  ┌─ search loop (astar.ts) ──────────────────────────┐
-  │  knows: cost = number to minimize                 │  NO grade knowledge
-  └──────────────────────┬─────────────────────────────┘
-                         │ costFn(edge, from, userMax)
-  ┌─ ★ cost.ts ★ ────────▼─────────────────────────────┐
-  │  penalty curve · downhill-free · BLOCKED · userMax │ ← THE domain, all here
-  └────────────────────────────────────────────────────┘
+  ┌─ ROUTING CORE ───────────────────────────────────────────────┐
+  │  search()  ── costFn ──►  gradeCostDirected   cost.ts:32      │
+  │  (grade-blind)               │                                │
+  │                              ▼                                │
+  │                    ┌──────────────────────┐                   │
+  │                    │ ★ penalty(g, max) ★   │  cost.ts:16       │
+  │                    │   THE grade model     │  ← we are here    │
+  │                    └──────────────────────┘                   │
+  └───────────────────────────────────────────────────────────────┘
+  ┌─ DISPLAY (parallel users of the same idea, NOT the same fn) ──┐
+  │  classifyDirected  classify.ts:33   (color bands, mirrors curve)│
+  └───────────────────────────────────────────────────────────────┘
 ```
 
-Zoom in: this is **information hiding** in its purest form. The grade model
-is the thing most likely to change (different curve, different rider
-profile, different bands). APOSD's rule: isolate what changes behind a stable
-interface. The interface here is the `CostFn` type; the secret behind it is
-the entire penalty model.
+Zoom in: the pattern is a **domain kernel** — the one function that
+encodes the product's core decision, with everything else deferring to
+it. You've done this whenever you put all your validation rules in one
+`validate()` and let the form, the API, and the test all call it instead
+of re-deriving "is this valid." Here the rule is "how much should an
+uphill grade cost," and `penalty()` is the single home for it.
+
+---
 
 ## Structure pass
 
-**Layers.** Two, with `cost.ts` as the floor:
-- *Above*: `search()` / `bidirectional()` — consume a `number` per edge.
-- *The seam*: `CostFn` type (`types.ts:40`).
-- *Below*: `cost.ts` — `penalty()` and the three cost functions.
+**Layers.** Cost function (outer, `gradeCostDirected`) → penalty kernel
+(inner, `penalty`). The cost function knows about *edges and length*; the
+penalty knows about *grade percentages and the user's max*. Clean split.
 
-**Axis — "who knows what 'flat' means?"**
+**Axis held constant — "where is the grade curve defined?"**
 
 ```
-  axis = "who knows the grade model?"
+  "where does the shape of 'flat' live?" — trace down
 
-  GradeSlider  →  search loop  →  cost.ts
-  ──────────      ───────────     ───────
-  picks a number  minimizes a     KNOWS:
-  (userMax)       number          downhill free,
-  knows nothing   knows nothing   linear band,
-  about curve     about curve     quadratic band,
-                                  BLOCKED over max
-
-  all the knowledge sits in ONE box; the rest pass a number through
+  ┌────────────────────────────────────┐
+  │ search()        astar.ts:22         │  → not here (grade-blind)
+  └────────────────────────────────────┘
+      ┌────────────────────────────────┐
+      │ gradeCostDirected  cost.ts:32  │  → not here (just multiplies length)
+      └────────────────────────────────┘
+          ┌────────────────────────────┐
+          │ penalty()       cost.ts:16 │  → HERE. the whole curve.
+          └────────────────────────────┘
 ```
 
-**Seam.** The `CostFn` type is the contract. It promises the search loop one
-thing: give me an edge, the node you're leaving from, and the user's max, and
-I'll give you back a non-negative number. Everything about *how* that number
-encodes "uphill is bad" is hidden. The axis-answer flips hard at this seam —
-above it, zero domain knowledge; below it, all of it.
+**Seam.** `gradeCostDirected │ penalty`. The cost function knows
+*nothing about the curve* — it just does `length * (1 + penalty(...))`.
+Swap the curve (different bands, different steepness math) and the cost
+function, the search, and the callers all stay put. That's the
+information-hiding win the audit praises (lens 3).
+
+---
 
 ## How it works
 
 ### Move 1 — the mental model
 
-Think of a `formatCurrency(amount, locale)` function. The rest of your app
-passes around plain numbers; the *one* place that knows about currency
-symbols, decimal rules, and thousands separators is that function. Swap it
-for a different locale and nothing upstream changes. `cost.ts` is
-`formatCurrency` for grade: the rest of the router passes around plain cost
-numbers; the one place that knows "uphill is expensive, downhill is free" is
-here.
+The shape: a piecewise function of one signed number. Below zero, free.
+Above the user's max, a wall. In between, a curve that bends from gentle
+to punishing. Like a tax bracket — flat regions and a progressive ramp —
+except the "wall" at the top is finite on purpose (`05`).
 
 ```
-  the pattern — knowledge funneled to one point
+  Pattern — the penalty curve over signed grade g
 
-  many callers ──┐
-  (search,       ├──► CostFn seam ──► cost.ts ──► one number
-   bidirectional,│         (type)      (the ONLY
-   summarizePath)┘                      grade-aware code)
+  penalty
+    │                                   ┌── BLOCKED (1e9) for g > max
+    │                              ___/
+    │                         __/   ← quadratic (steep band)
+    │                    __/
+    │              ___/        ← linear (moderate band)
+    │     ________/
+    │____/______________________________________________ g
+    │ downhill/flat   0.5*max        max
+    │  (penalty 0)
 ```
 
-In one sentence: **the domain knowledge has exactly one home, and a typed
-interface is the only thing that leaves it.**
+### Move 2 — the walkthrough
 
-### Move 2 — the step-by-step walkthrough
-
-#### The penalty curve is the whole domain, in seven lines
+**The kernel — five lines, two parameters.** `cost.ts:16-22`:
 
 ```ts
-// cost.ts:16-22 — penalty(signedGrade, max), annotated
-export function penalty(g, max, k1 = DEFAULT_K1, k2 = DEFAULT_K2) {
-  if (g <= 0) return 0;            // downhill or flat is FREE — the core rule
-  if (g > max) return BLOCKED;     // over your max → large-finite (pattern 05)
+// features/routing/cost.ts:16-22
+export function penalty(g: number, max: number, k1 = DEFAULT_K1, k2 = DEFAULT_K2): number {
+  if (g <= 0) return 0;                       // downhill/flat: free
+  if (g > max) return BLOCKED;                // over the user's max: wall (finite, see 05)
   const half = 0.5 * max;
-  if (g <= half) return k1 * g;    // moderate band: linear, gentle
-  return k2 * (g - half) ** 2 + k1 * half;  // steep band: quadratic, biting
+  if (g <= half) return k1 * g;               // moderate band: linear
+  return k2 * (g - half) ** 2 + k1 * half;    // steep band: quadratic, offset to stay continuous
 }
 ```
 
-Read top to bottom and you've read the entire product philosophy. Downhill is
-free (`g <= 0`). A small uphill costs a little (linear). A big uphill costs a
-*lot* (quadratic). Past your limit, it's effectively blocked. **What breaks if
-this leaks out of `cost.ts`?** The moment a second module re-derives "downhill
-is free," the two can disagree — and now `summarizePath` might count an edge
-the search loop priced differently. The domain has to have one home or it
-desynchronizes.
+**Part 1 — the free case.** `if (g <= 0) return 0`. Bridge: this is the
+single decision that makes flattr "optimized for flat, not fast" — a
+descent or a level edge adds *no* penalty, so the router will happily
+take a longer flat path over a shorter steep one. Remove this line and
+downhill stretches start costing something and the whole product
+character changes.
 
-The continuity detail at `cost.ts:14` ("continuous at the 0.5\*max boundary by
-construction") is the kind of decision only a comment can carry: the linear
-and quadratic pieces are designed to meet at `half` so there's no cliff at the
-band boundary. A reader editing the curve must preserve that.
+**Part 2 — the wall.** `if (g > max) return BLOCKED`. An edge steeper
+than the user can stand costs a billion. **Boundary condition:** it's
+finite, not `Infinity` — that's a whole pattern (`05`), and it's why a
+steep-only route still returns rather than reporting "no route."
 
-#### Three cost functions, one shared secret
+**Part 3 — the two bands, joined continuously.** Below `0.5*max`: linear
+(`k1*g`). Above: quadratic, but offset by `+ k1*half` so the two pieces
+*meet* at `g = half`. Check it: at `g = half`, linear gives `k1*half`;
+quadratic gives `k2*0 + k1*half = k1*half`. Equal. **The boundary
+condition the comment at `cost.ts:13-15` names: C⁰ continuity by
+construction.** Drop the `+ k1*half` offset and the cost jumps
+discontinuously at the band edge, which would make routes flip
+erratically as a grade crosses `0.5*max`. The offset is load-bearing.
+
+**The cost function just wraps it.** `cost.ts:32-33`:
 
 ```ts
-// cost.ts:25-33 — three CostFns, annotated
-export const distanceCost = (edge) => edge.lengthM;            // no grade at all
-export const gradeCostAbs = (edge, _from, max) =>
-  edge.lengthM * (1 + penalty(edge.absGradePct, max));        // steepness, symmetric
-export const gradeCostDirected = (edge, from, max) =>
-  edge.lengthM * (1 + penalty(directedGrade(edge, from), max)); // signed, downhill-free
+// features/routing/cost.ts:32-33
+export const gradeCostDirected: CostFn = (edge, fromNodeId, userMax) =>
+  edge.lengthM * (1 + penalty(directedGrade(edge, fromNodeId), userMax));
 ```
 
-All three satisfy the same `CostFn` type, so the search loop can't tell them
-apart — it just calls one. The difference is entirely *which grade* they feed
-`penalty`: none (distance), absolute (symmetric steepness), or directed
-(signed, free downhill). Note `distanceCost` ignores `from` and `max`
-entirely — it still matches the type. **What breaks if the type weren't
-shared?** The stage wrappers in pattern `01` couldn't treat them as
-interchangeable; you'd lose the one-engine-four-algorithms property.
+`length * (1 + penalty)` — a flat edge costs its real length (penalty 0
+→ ×1), a steep edge costs a multiple. The cost function knows *length*
+and *direction* (via `directedGrade`, see `03`); it delegates the entire
+"how bad is this grade" question to `penalty`. That delegation is the
+seam.
 
-#### The cost is a multiplier on length, not an additive term
+**The abs variant shares the kernel.** `gradeCostAbs` (`cost.ts:28`) calls
+the *same* `penalty` with `absGradePct` instead of the directed grade —
+symmetric, A→B equals B→A. Two cost functions, one curve. If you change
+the curve, both move together correctly *because* they share the kernel.
 
-```
-  cost = lengthM × (1 + penalty)
-         ──────    ───────────────
-         real      ≥ 1 always (penalty ≥ 0)
-         distance
-
-  flat edge:      cost = lengthM × 1.0   (no detour incentive)
-  moderate climb: cost = lengthM × 1.4   (worth a small detour)
-  steep climb:    cost = lengthM × 9.0+  (worth a big detour)
-  over max:       cost = lengthM × 1e9   (avoid unless it's the only way)
-```
-
-Multiplying by `(1 + penalty)` keeps the units honest — cost stays
-proportional to distance, so a long gentle hill and a short steep one trade
-off the way a rider actually experiences them. **What breaks if it were
-additive (`lengthM + penalty`)?** Penalty would dominate or vanish depending
-on absolute edge length, and the `≥ 0` admissibility guarantee for A\* (the
-penalty only *adds* to the haversine lower bound) would be harder to reason
-about. The `(1 + penalty)` form keeps cost `≥ lengthM ≥ haversine`, which is
-exactly what pattern `01`'s heuristic needs.
+**Where the seam is honored vs mirrored — an honest note.** The display
+layer has its *own* grade classifier, `classifyDirected` (`classify.ts:33`),
+with the same band structure (`0`, `0.5*max`, `max`). That's not a leak —
+it's a deliberately separate concern (color, not cost) — but it does mean
+the band *boundaries* (`0.5*userMax`, `userMax`) appear in two places.
+They agree today. If you ever retune where the steep band begins, you'd
+touch both `cost.ts:20` and `classify.ts:36`. Worth a shared constant if
+the bands ever diverge from the curve; not urgent today.
 
 ### Move 3 — the principle
 
-Find the thing most likely to change, and give it exactly one home behind a
-stable interface. "Uphill is expensive" will get retuned a dozen times;
-because it lives only in `cost.ts`, every retune is a one-file diff and the
-search loop never recompiles its understanding of the world. The general
-lesson: **a clean seam isn't where two modules touch — it's where knowledge
-*stops*.** The search loop's knowledge of grade stops at the `CostFn` type.
+Find the one decision your product is *about* and give it exactly one
+home. Everything else — search, rendering, summaries — should *ask* that
+home rather than re-encode the rule. The test: when the product
+definition changes ("actually, gentle downhills should cost a little to
+discourage detours"), you should edit one function, run its unit test,
+and be done. flattr passes that test for the cost curve.
+
+---
 
 ## Primary diagram
 
-The seam in full: one number crosses up, all the domain stays down.
+The seam and the kernel together.
 
 ```
-  penalty as the domain seam — complete
+  Penalty as the domain seam — full recap
 
-  ┌─ UI ──────────────────────────────────────────────┐
-  │  GradeSlider → userMax : number                    │
-  └──────────────────────┬─────────────────────────────┘
-                         │ userMax
-  ┌─ search loop / bidirectional / summarizePath ──────┐
-  │   for each edge:  n = costFn(edge, from, userMax)  │ ← sees only `n`
-  └──────────────────────┬─────────────────────────────┘
-                         │ CostFn  (types.ts:40) — the contract
-  ┌─ cost.ts (the ONLY grade-aware module) ────────────┐
-  │   distanceCost     → lengthM                       │
-  │   gradeCostAbs     → lengthM × (1+penalty(abs))    │
-  │   gradeCostDirected→ lengthM × (1+penalty(dir))    │
-  │        └─ penalty(): downhill 0 | lin | quad | 1e9 │
-  └────────────────────────────────────────────────────┘
+  ┌─ search() astar.ts:22 ──────────────────────────────┐
+  │  grade-blind; calls costFn(edge, from, userMax)      │
+  └──────────────────────┬───────────────────────────────┘
+                         │ costFn
+  ┌─ cost.ts:32 gradeCostDirected ──────────────────────┐
+  │  length * (1 + penalty(directedGrade(edge,from),max))│
+  └──────────────────────┬───────────────────────────────┘
+                         │ delegates the whole curve to:
+  ┌─ cost.ts:16 penalty(g, max) — THE domain kernel ────┐
+  │   g≤0      → 0           (free downhill/flat)         │
+  │   g>max    → BLOCKED     (finite wall, see 05)        │
+  │   g≤½max   → k1·g        (linear moderate)            │
+  │   else     → k2(g-½max)²+k1·½max  (quadratic steep,   │
+  │                                    continuous at ½max)│
+  └──────────────────────────────────────────────────────┘
 ```
+
+---
 
 ## Elaborate
 
-This is information hiding (Parnas, 1972) and single-responsibility, and it
-pairs with the strategy pattern of file `01`: `01` is the *mechanism* for
-injecting a cost; `02` is the *discipline* of keeping the domain that
-produces that cost in one place. Together they're why you can change the
-grade model without touching the algorithm and change the algorithm without
-touching the grade model — the two axes are genuinely independent.
+This is information hiding (Parnas, 1972) at its purest: the module that
+hides the decision most likely to change. Ousterhout's framing is "design
+for the change you expect" — and the grade curve is *exactly* the thing a
+routing product re-tunes constantly (different vehicle classes, different
+comfort models). Putting it behind one function means those re-tunings
+are local. The piecewise-with-continuity construction is standard cost-
+shaping (you see it in RL reward design, in image-processing tone curves);
+the offset-to-stay-continuous trick is the part people forget, and it's
+the thing that keeps the optimizer from oscillating.
 
-The directed grade it depends on (`directedGrade`) is itself a pattern — see
-`03`, which keeps the *graph* from having to know about travel direction the
-way `cost.ts` keeps the *search loop* from having to know about grade. Same
-move, one layer down. For the conceptual depth on information hiding, read
-the matching `read-aposd` chapter.
+---
+
+## Project exercises
+
+### EX-02-A — Make the penalty curve a parameter
+
+- **What to build:** extract the curve into a `PenaltyModel` object
+  (`{ free, blocked, band1, band2 }`) so a caller can pass a different
+  model without editing `penalty`.
+- **Why it earns its place:** turns the kernel into a swappable strategy
+  (composes with `01`) and forces you to find every place the band
+  boundaries are assumed.
+- **Files to touch:** `features/routing/cost.ts`, its test.
+- **Done when:** a test routes with a custom model and the default path
+  is unchanged.
+- **Estimated effort:** 1 hr.
+
+### EX-02-B — Prove C⁰ continuity is load-bearing
+
+- **What to build:** a property test sweeping `g` across `0.5*max` and
+  asserting `penalty` has no jump; then a second test that *removes* the
+  `+ k1*half` offset and shows the jump appears.
+- **Why it earns its place:** makes the most-forgotten line in the kernel
+  visible as the thing that prevents route oscillation.
+- **Files to touch:** `features/routing/cost.test.ts`.
+- **Done when:** both tests pass/fail as designed.
+- **Estimated effort:** 45 min.
+
+---
 
 ## Interview defense
 
-**Q: "The grade penalty is the core feature. Wouldn't inlining it into the
-relaxation step be faster and more obvious — one fewer function call per
-edge?"**
+**Q: Why is the grade logic in its own function instead of inline in the
+cost calculation?**
 
-The call is trivially cheap and inlining it would scatter the most-changed
-logic in the repo across every algorithm that relaxes edges. Right now,
-retuning the curve — say, making the steep band bite harder — is a diff to
-`penalty()` and nothing else; the four search variants, the bidirectional
-search, and the route summarizer all pick it up for free because they all go
-through the `CostFn` seam. Inline it and I'd be editing the same formula in
-`search()`, in `bidirectional()`'s forward *and* reverse relaxation, and in
-`summarizePath` — four places that must stay in sync or the displayed cost
-won't match the routed cost.
+Because the grade curve is the single most-tuned thing in a routing
+product, and inlining it spreads that decision across every call site.
+One function means re-tuning is one edit plus one unit test. The cost
+function (`gradeCostDirected`) stays a one-liner that just multiplies
+length by `(1 + penalty)` — it doesn't need to know the curve has bands.
 
 ```
-  inlined penalty            vs      sealed in cost.ts
-  ┌─────────────────┐                ┌──────────────┐
-  │ search relax    │ edit           │  penalty()   │ edit ONCE
-  │ bidir fwd relax │ edit           └──────┬───────┘
-  │ bidir rev relax │ edit                  │ everyone reads it
-  │ summarizePath   │ edit           ┌──────┴────────┐
-  └─────────────────┘ (4× drift risk) all 4 callers stay in sync
+  the forgettable part: continuity at the band seam
+
+  at g = ½max:  linear → k1·½max
+                quad   → k2·0 + k1·½max  = k1·½max   ✓ equal
+  drop the +k1·½max offset → discontinuity → routes oscillate
 ```
 
-*Anchor: a seam is where knowledge stops — grade knowledge stops at the
-`CostFn` type, so the curve has exactly one home.*
+**Q: Why bands at all — why not just linear?** A linear penalty treats a
+6% and a 12% grade as merely "twice as bad," but a 12% pitch is
+*disproportionately* worse for self-powered travel. The quadratic steep
+band encodes "it gets bad fast near your limit." It's a modeling choice,
+and isolating it in `penalty` means it's the only place you'd revisit if
+that model is wrong.
 
-**Q: "What's the contract `cost.ts` owes the search loop, and what happens if
-it breaks it?"**
+**Anchor:** "The whole definition of 'flat' is five lines in
+`cost.ts:16` — and the offset that keeps the two bands continuous is the
+line people forget."
 
-Two promises: the returned number is `≥ 0` (penalty never negative), and over
-the user's max it's large-but-finite, not `Infinity` (pattern `05`). Break
-the first and A\*'s heuristic stops being admissible — suboptimal routes,
-silently. Break the second by returning `Infinity` and "the only route is
-steep" becomes indistinguishable from "there is no route," so the app can't
-honestly tell the user "this is steep but it's your only option."
-
-*Anchor: penalty ≥ 0 keeps A\* optimal; large-finite (not Infinity) keeps
-"steep" distinct from "disconnected."*
+---
 
 ## See also
 
-- `01-parametric-search-over-cost-fns.md` — the mechanism that injects this.
-- `03-directed-traversal-over-undirected-storage.md` — `directedGrade`, the
-  same hiding move one layer down.
-- `05-blocked-as-large-finite.md` — the BLOCKED contract this seam upholds.
-- `audit.md` Lens 3 (information hiding), Lens 6 (errors defined out).
+- `01-parametric-search-over-cost-fns.md` — the loop that calls this.
+- `03-directed-traversal-over-undirected-storage.md` — `directedGrade`,
+  the input to the directed cost.
+- `05-blocked-as-large-finite.md` — why the `g > max` wall is finite.
+- `audit.md` lens 3 (info hiding praise), lens 5 (the k1/k2 knob).

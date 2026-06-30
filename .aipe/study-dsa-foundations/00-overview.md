@@ -1,127 +1,124 @@
 # DSA Foundations — flattr
 
-> The repo-grounded map. flattr is a hand-rolled graph router that finds
-> flat-not-fast routes over a grade-annotated street graph. The DSA spine
-> is `features/routing/` — one parametric search engine, a hand-built
-> binary heap, an undirected adjacency graph, and a percentile sort. This
-> guide teaches the fundamentals *that explain those files*, plus the
-> foundations the repo deliberately leaves on the table.
+> The reusable data-structures-and-algorithms vocabulary behind flattr's
+> hand-rolled grade-aware router — plus the foundations the repo deliberately
+> doesn't exercise yet, ranked so you know what to practice next.
 
----
+The whole guide hangs off one file: `features/routing/astar.ts`. That single
+`search()` at line 22 is Dijkstra, A*, grade-A*, and directed-A* — all four —
+selected by which `(costFn, heuristicFn)` pair you hand it. Everything else in
+the routing package is the supporting cast: the heap that orders the frontier
+(`pqueue.ts`), the maps that hold `g`/`came`/`closed` (`astar.ts`), the
+adjacency that models the graph (`graph.ts`), the cost shaping (`cost.ts`), and
+the percentile sort that builds the heatmap (`grade/zones.ts`).
 
-## The whole thing in one frame
+## The system in one diagram
 
-This is the system the rest of the guide takes apart. Every box is a real
-data structure or algorithm; every arrow is a real call.
+The DSA spine of flattr, top to bottom — every concept file in this guide marks
+one band of this picture.
 
 ```
-  flattr routing — the DSA spine (features/routing/)
+  flattr's routing engine — which DSA primitive lives where
 
-  ┌─ Input ─────────────────────────────────────────────────────┐
-  │  tapped (lat,lng)  +  userMax (max comfortable uphill %)     │
-  └───────────────────────────┬──────────────────────────────────┘
-                              │  nearest.ts: O(N) linear scan
-                              ▼
-  ┌─ Snap ──────────────────────────────────────────────────────┐
-  │  nearestNode()  →  startId, goalId   (graph node ids)        │
-  └───────────────────────────┬──────────────────────────────────┘
-                              │
-  ┌─ Search ────────────────────────────────────────────────────┐
-  │  astar.ts  search(costFn, heuristicFn)                       │
-  │    ┌──────────────┐   ┌──────────────┐   ┌────────────────┐  │
-  │    │ open: PQueue │   │ g: Map<id,n> │   │ closed: Set    │  │
-  │    │ (binary heap)│   │ came: Map    │   │ (visited)      │  │
-  │    └──────┬───────┘   └──────────────┘   └────────────────┘  │
-  │           │  pop min-f → expand neighbors → relax → push     │
-  │           ▼                                                    │
-  │   graph.ts: adjacency[nodeId] → edgeIds → otherEnd / grade   │
-  │   cost.ts: penalty() turns signed grade into a cost multiplier│
-  └───────────────────────────┬──────────────────────────────────┘
-                              │  reconstruct via came-from
-                              ▼
-  ┌─ Output ────────────────────────────────────────────────────┐
-  │  Path { nodes, edges, cost, lengthM, steepEdges }           │
-  │  + grade/zones.ts: percentile() heatmap (full-sort p85)     │
-  └──────────────────────────────────────────────────────────────┘
+  ┌─ Entry layer ─────────────────────────────────────────────┐
+  │  nearestNode()  ──snap tap→node id──►  search()            │
+  │  nearest.ts:5    O(N) linear scan      astar.ts:22         │
+  └────────────────────────────┬──────────────────────────────┘
+                               │  startId, goalId, userMax
+  ┌─ Algorithm layer ──────────▼──────────────────────────────┐
+  │  search()  — one parametric Dijkstra/A* loop               │
+  │    open    : PQueue<string>     ← frontier ordering        │
+  │    g       : Map<string,number> ← best cost so far         │
+  │    came    : Map<string,{edge}> ← reconstruction trail     │
+  │    closed  : Set<string>        ← finalized nodes          │
+  └──────┬───────────────────────┬─────────────────────┬──────┘
+         │ push/pop              │ costFn(edge,…)       │ adjacency[id]
+  ┌─ Structure layer ──▼──┐ ┌────▼─────────┐ ┌──────────▼────────┐
+  │ PQueue (binary heap)  │ │ cost.ts       │ │ graph.ts          │
+  │ pqueue.ts             │ │ penalty()     │ │ adjacency + dir   │
+  │ siftUp/siftDown       │ │ BLOCKED=1e9   │ │ otherEnd, grade   │
+  └───────────────────────┘ └───────────────┘ └───────────────────┘
+
+  ┌─ Side path: heatmap (not routing) ────────────────────────┐
+  │  computeZones()  →  percentile()  ← full sort, O(M log M)  │
+  │  grade/zones.ts:23   zones.ts:5                            │
+  └────────────────────────────────────────────────────────────┘
 ```
 
-The router is the centerpiece. The product knob — `userMax` — feeds
-`cost.ts`, which is the only thing that makes flattr different from any
-shortest-path demo. Everything else is the standard A* machinery you'd
-recognize from any algorithms course, implemented by hand.
+## Ranked findings — verdict first
 
----
+The honest read on flattr's DSA, ordered by how much it teaches you:
 
-## The verdict — what this repo actually exercises
+1. **The parametric `search()` is the centerpiece and it's genuinely good.**
+   One loop, four algorithms, lazy-deletion frontier, closed-set skip,
+   reconstruction off the exact relaxed edge. `astar.ts:22-78`. This is the
+   file to be able to rebuild from memory. → `05-graphs-and-traversals.md`.
 
-Ranked by how load-bearing each foundation is to flattr working at all:
+2. **The binary min-heap is hand-rolled and correct.** Array-backed,
+   `siftUp`/`siftDown`, lazy deletion instead of decrease-key, NaN guard at
+   `pqueue.ts:24`, a `checkInvariant()` oracle. `pqueue.ts:1-78`. You've built
+   this before (`BinaryHeap.ts`, `PriorityQueue.ts` in reincodes) — flattr is
+   the same primitive minus `updatePriority`. → `03-stacks-queues-deques-and-heaps.md`.
 
-| Rank | Foundation | Where | Verdict |
-|------|-----------|-------|---------|
-| 1 | **Graph + traversal (A*/Dijkstra)** | `astar.ts`, `graph.ts`, `bidirectional.ts` | The whole product. One parametric `search()` is Dijkstra, A*, grade-A*, and directional-A* via `(costFn, heuristicFn)` pairs. |
-| 2 | **Binary min-heap / priority queue** | `pqueue.ts` | Hand-rolled, array-backed, lazy-deletion. The frontier. Without it, A* is O(V²). |
-| 3 | **Hash maps + sets** | `g`, `came`, `closed`, `adjacency`, `indexEdges` | The bookkeeping that makes the search O(1) per lookup. |
-| 4 | **Complexity / cost models** | every routing file | `BLOCKED = 1e9` (large-finite, not Infinity) is a deliberate cost-model choice, not a bug. |
-| 5 | **Recursion / reconstruction** | `reconstruct()` in `astar.ts` | Path rebuilt by walking `came` backward — iterative, but the same backtrack shape. |
-| 6 | **Sorting / selection** | `zones.ts` `percentile()` | Full `.sort()` to get a p85. Correct, but O(N log N) where O(N) selection would do. |
-| 7 | **Strings** | node/edge ids (`"row,col"`) | Used as map keys. Composite-key encoding, nothing more. |
+3. **The cost model is the most surprising design choice.** `BLOCKED = 1e9`
+   is large-*finite*, not `Infinity` (`cost.ts:5`), so "only-steep route"
+   stays distinct from "no route." That one constant is a correctness
+   invariant, not a hack. → `01-complexity-and-cost-models.md`,
+   `02-arrays-strings-and-hash-maps.md`.
 
-And the honest gaps — foundations a senior would expect but the repo does
-**not yet exercise**:
+4. **The optimality oracle is the test worth copying.** A* cost is asserted
+   equal to Dijkstra cost (`astar.test.ts:38-45`) — a differential test that
+   pins admissibility. → `05`, `06`.
 
-| Missing foundation | Where it would belong | Why it matters |
-|--------------------|----------------------|----------------|
-| **Spatial index (k-d tree / grid)** | `nearest.ts` | `nearestNode` is O(N) per snap — the single clearest algorithmic gap. |
-| **Decrease-key heap** | `pqueue.ts` | The repo uses lazy deletion instead. A defensible choice — but you should know the alternative. |
-| **Union-find (DSU)** | connectivity preflight | "Is goal even reachable?" is currently answered by running the full search. |
-| **Binary search** | sorted lookups | `nearestNode` and `zones` both do linear scans where a sorted structure could binary-search. |
-| **Quickselect** | `zones.ts` percentile | A full sort to find one percentile is selection done the expensive way. |
-| **Trie** | — | No prefix/autocomplete surface yet (address bar is in `mobile/`). |
-| **Dynamic programming** | — | No overlapping-subproblem structure in the repo. |
+5. **`nearestNode()` is the one real algorithmic gap that's exercised.**
+   O(N) linear scan over every node on every tap (`nearest.ts:8`). Correct,
+   but the place a k-d tree or grid index would earn its keep. →
+   `04-trees-tries-and-balanced-indexes.md`, `06-sorting-searching-and-selection.md`.
 
-You've **already built** most of these in `reincodes` (BinaryHeap,
-PriorityQueue with `updatePriority`, Graph BFS/DFS, connected-components,
-all five sorts). The practice map (file 08) maps each gap to the
-reincodes implementation you can lift from.
+6. **`zones.ts` sorts the whole array to read one percentile** (`zones.ts:6`).
+   Fine at build-frequency; quickselect territory if it ever moved hot. →
+   `06-sorting-searching-and-selection.md`.
 
----
+## not yet exercised — the foundations to practice
+
+These don't appear in flattr at all. The practice map (`08`) ranks them; each
+concept file flags its own gaps inline with `not yet exercised`.
+
+- **k-d tree / spatial grid index** — would replace `nearest.ts`'s O(N) scan.
+- **decrease-key heap (indexed PQ)** — flattr uses lazy deletion instead; you
+  *did* build `updatePriority` in reincodes' `PriorityQueue.ts`.
+- **union-find / DSU** — no connectivity-under-union anywhere.
+- **binary search** — no sorted-array lookup; `percentile` interpolates a rank
+  but never bisects.
+- **quickselect** — `zones.ts` full-sorts where partition-select would do.
+- **trie** — no prefix structure (would matter for address autocomplete).
+- **dynamic programming** — no memoized subproblem tables; the router is greedy
+  best-first, not DP.
 
 ## Reading order
 
 ```
-  00-overview.md            ← you are here
-  01-complexity-and-cost-models.md      cost models, BLOCKED, amortized heap
-  02-arrays-strings-and-hash-maps.md    g / came / closed / adjacency
-  03-stacks-queues-deques-and-heaps.md  PQueue: the binary min-heap
-  04-trees-tries-and-balanced-indexes.md the heap-as-tree; the index gaps
-  05-graphs-and-traversals.md           ★ the spine: A*, Dijkstra, bidir
-  06-sorting-searching-and-selection.md percentile sort; the search gaps
-  07-recursion-backtracking-and-dynamic-programming.md  reconstruct; DP gap
-  08-dsa-foundations-practice-map.md    ranked plan: exercised → missing
+  01  complexity-and-cost-models           ← the cost model + BLOCKED invariant
+  02  arrays-strings-and-hash-maps          ← adjacency, g/came/closed, byId index
+  03  stacks-queues-deques-and-heaps        ← the PQueue (the frontier engine)
+  04  trees-tries-and-balanced-indexes      ← mostly gaps (k-d tree for nearest)
+  05  graphs-and-traversals                 ← THE SPINE: search() + bidirectional
+  06  sorting-searching-and-selection       ← percentile sort, the binary-search gap
+  07  recursion-backtracking-and-dynamic-programming  ← reconstruct(); DP gap
+  08  dsa-foundations-practice-map          ← ranked plan: exercised → missing
 ```
 
-Start with **05** if you want the payoff first — it's the spine, and
-everything else is in service of it. Read **01** first if you want the
-cost-model framing (`BLOCKED`, amortized heap) that the rest leans on.
-
----
-
-## not yet exercised — the honest list
-
-So you don't go looking for these in the code: **spatial indexing,
-decrease-key, union-find, binary search, quickselect, tries, dynamic
-programming, balanced BSTs (red-black/AVL), B-trees, segment trees,
-suffix structures.** None are in `features/` or `pipeline/`. Each is
-named where it would belong, in the file that owns that family.
-
----
+Read `05` first if you only read one — it's the centerpiece. `01` and `03`
+are its prerequisites. `04`, `06`, `07` are where the gaps live.
 
 ## Cross-links to sibling guides
 
-- **system-design** — owns the architectural shape (static `graph.json`
-  artifact, mobile/engine split). This guide owns the algorithms inside.
-- **performance-engineering** — owns the `bench/` harness and latency
-  budgets; this guide owns the complexity that drives them.
-- **runtime-systems** — owns the JS execution model the heap runs on.
-- **data-modeling** — owns the `Graph`/`Node`/`Edge` schema shape; this
-  guide owns how the algorithms traverse it.
+- **system-design** owns the architectural shape (static `graph.json`,
+  build-time pipeline, the four-stage progression as a product story). This
+  guide owns the *algorithms inside* those boxes.
+- **performance-engineering** owns the benchmark harness (`bench/`) as a
+  measurement discipline; this guide owns the complexity classes it measures.
+- **testing** owns the oracle pattern as a testing technique; this guide owns
+  why the A*==Dijkstra equality is *algorithmically* load-bearing.
+- **runtime-systems** owns the event loop / async; flattr's router is
+  synchronous CPU work, so the overlap is thin.

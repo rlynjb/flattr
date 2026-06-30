@@ -1,73 +1,64 @@
-# Overview — the data model at a glance
+# Overview — flattr's data model in one page
 
-flattr's persistent data is a single read-only file. There's no Postgres, no
-SQLite, no Notion-as-DB here (the spec proposed Next.js; the repo shipped an Expo
-app reading a bundled JSON graph). The whole "database" is `mobile/assets/graph.json`
-— 544 KB, 1621 nodes, 1879 edges of Capitol Hill, Seattle. The schema is declared
-in TypeScript at `features/routing/types.ts:1-28` and serialized to JSON.
-
-That makes the audit verdict easy to state up front:
-
-**The model fits the access pattern almost perfectly — and that fit is the whole
-point.** The app does exactly one kind of read: load the whole graph once, then run
-A\* / heatmap traversals over all of it in memory. For "read everything, traverse,
-never write at runtime," a static file beats a database — no connection, no query
-planner, no round-trip. The adjacency map is the access-pattern index baked into the
-artifact. This is a good call, made deliberately.
-
-The weak spots are all the things a database would have given you for free and a
-hand-rolled JSON blob does not:
+One entity, one artifact, zero databases. flattr persists a single thing: a
+grade-annotated street graph, built once at compile-time and shipped as
+`mobile/assets/graph.json` (544 KB, 1621 nodes, 1879 edges). The app reads it
+whole into memory and never writes it back. So the data-modeling questions
+here aren't about tables and joins — they're about how this one graph is
+*shaped*, what's *derived vs stored*, what *index* makes the hot query fast,
+and what *integrity* (none, currently) protects it.
 
 ```
-  Worst-first — what to fix, ranked
+  Where the data model sits in the system
 
-  1. No referential integrity on edges     ── a dangling fromNode/toNode
-     (04-integrity)                            crashes deep inside A* with a
-                                               cryptic null, not at load.
-
-  2. No schema version on graph.json        ── a field rename in types.ts
-     (04-integrity)                            silently mis-reads an old
-                                               bundled artifact. No drift guard.
-
-  3. nearestNode is an O(N) full scan       ── every tap snapping to a node
-     (03-indexes)                              walks all 1621 nodes. No spatial
-                                               index. Fine now, quadratic later.
-
-  4. edgeById is O(E) find, called per-edge ── route summary + GeoJSON rebuild
-     (03-indexes)                              scan all 1879 edges per path edge.
-                                               astar.ts already fixed this with
-                                               a Map; summary.ts/geojson.ts didn't.
-
-  5. absGradePct stored, not derived        ── |gradePct| copied onto every edge.
-     (02-denormalization)                      Cheap, justified for the heatmap
-                                               hot path — but it's duplication.
+  ┌─ Build time (pipeline/, runs on your laptop) ──────────────────┐
+  │  OSM → split → elevation → computeGrades → buildAdjacency      │
+  │                                    │  writes                    │
+  │                                    ▼                            │
+  │                            graph.json (the artifact)            │ ★ the model
+  └────────────────────────────────────┬───────────────────────────┘
+                                        │  bundled into the app
+  ┌─ Runtime (mobile/, Expo RN) ────────▼───────────────────────────┐
+  │  loadGraph() → cast to Graph → A* / nearestNode / GeoJSON      │  read-only
+  │  (useTileGraph fetches MORE regions, merges them — see          │
+  │   study-system-design; the SHAPE of what it merges is here)     │
+  └─────────────────────────────────────────────────────────────────┘
 ```
 
-None of 1–5 is on fire. The graph is small, single-region, rebuilt by hand. But
-each is the kind of thing that's invisible at 1.6k nodes and a wall at 160k —
-exactly the seam between "works in the demo" and "works in the city."
+## The model, named
 
-## What's genuinely good
+| Entity | Identity | Fields | Relations |
+|--------|----------|--------|-----------|
+| `Node` | `id` (string PK) | `lat`, `lng`, `elevationM` | referenced by `Edge.fromNode`/`toNode` and by `adjacency` keys |
+| `Edge` | `id` (string PK) | `geometry`, `lengthM`, `riseM`, `gradePct`, `absGradePct`, `kind?` | `fromNode`, `toNode` (FK→`Node.id`); listed in `adjacency` values |
+| `adjacency` | — (materialized index) | `Record<nodeId, edgeId[]>` | duplicates the endpoint relation for O(1) lookup |
+| `Graph` | `city` | `bbox`, `nodes`, `edges`, `adjacency` | the container artifact |
 
-- **adjacency as a denormalized index** (`02`) — duplicating each edge's endpoints
-  into `adjacency[nodeId]` is the right denormalization: it turns A\* expansion from
-  O(E) into O(degree). Named and justified in `02`.
-- **the build pipeline is a clean stage chain** (`05`) — parse → split → sample
-  elevation → grade → adjacency. Each stage has one job; the schema fills in left to
-  right (`split.ts` leaves grade at 0; `grade.ts` fills it).
-- **signed grade as the source field, abs as the derived one** — `gradePct` is the
-  primary fact (signed, direction-dependent); `absGradePct` is its derivation. The
-  model knows which is canonical.
+Canonical schema: `features/routing/types.ts:1-28`. Spec: `docs/flattr-spec.md` §4.
 
-## What's not exercised (honestly)
+## The five findings, ranked worst-first
 
-- **No transactions** — there are no runtime writes, so there's nothing to make
-  atomic. `not exercised`, and correctly so for a read-only artifact.
-- **No migration framework** — schema evolution is "edit the type, rebuild the
-  artifact, re-bundle." No reversible migrations, no backfills, no live data to
-  migrate. `not exercised` — see `05` for what a versioning story would look like.
-- **No FK constraints / unique / check constraints** — there's no engine to enforce
-  them. The build code is the only guard, and it's partial. See `04`.
+1. **No referential integrity, no schema version, blind cast** (`04`). A
+   `graph.json` with a dangling `edge.fromNode` doesn't fail at load — it
+   crashes mid-A* with a confusing error. `loadGraph()` is
+   `graph as unknown as Graph` (`mobile/src/loadGraph.ts:10`). No `version`
+   field anywhere, so a shape change silently mis-reads.
 
-Read `audit.md` next for the lens-by-lens walk, then the pattern files for the
-deep dives.
+2. **`nearestNode` is an O(N) full scan** (`03`). Every tap-to-route snaps a
+   coordinate by scanning all 1621 nodes (`nearest.ts:8`). No spatial index
+   (grid / k-d tree). The one query that *isn't* served by an index.
+
+3. **`edgeById` is an O(E) linear find, called per path edge** (`03`). The
+   read path (`summary.ts`, `geojson.ts`) resolves each route edge with
+   `graph.edges.find(...)` — an N+1-shaped pattern. A* already solved this
+   internally with `indexEdges()` (`astar.ts:12`); the read path didn't reuse it.
+
+4. **`absGradePct` is derived but stored** (`02`). It's exactly
+   `Math.abs(gradePct)` (`grade.ts:31`). A deliberate denormalization for the
+   heatmap read path — defensible, but it's a second copy of one fact.
+
+5. **`adjacency` denormalizes the endpoint relation** (`02`, `03`). It stores
+   what's already in `edge.fromNode`/`toNode`, re-derivable by `buildAdjacency`.
+   This one earns its keep: it's the index that makes A* expansion O(1).
+
+Full lens-by-lens walk: `audit.md`.

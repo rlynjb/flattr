@@ -1,40 +1,42 @@
-# Study — Debugging & Observability (flattr)
+# Study — Debugging & Observability · flattr
 
-How flattr reveals its own behavior in development and (eventually) production:
-reproduction, evidence, logs, metrics, traces, state snapshots, incidents, and
-prevention. Audited against an 8-lens inventory, then deep-walked for the
-patterns the repo actually exercises.
+How this repo reveals its own behavior: how you reproduce a wrong route, what
+evidence exists when grades go wrong, and where the blind spots are.
 
-flattr's defining trait here: **the evidence is in the return values, not a side
-channel.** No Sentry, no logger, no metrics backend — and yet the search hands
-back the counters that explain its work, the route hands back its compromises,
-and the degraded build hands back a flag saying its grades are fake. That makes
-this a short but unusually clean observability story.
+The through-line: **when a route is wrong, what evidence exists to explain it
+quickly and stop it coming back?**
+
+flattr is a pure-TypeScript grade-aware A* router plus an Expo/React Native map.
+There is no live backend, no log aggregator, no APM, no error tracker. The
+observability surface is almost entirely *in-band*: search metrics the algorithm
+counts as it runs, an optimality oracle the tests assert, and route-honesty
+signals the UI paints. That shape — rich in-band signal, nothing persisted —
+is the whole story here, and the audit names exactly where it leaves you blind.
 
 ## Reading order
 
-1. **`00-overview.md`** — the repo-grounded map, ranked findings, the four
-   `not yet exercised` gaps with triggers, and the curl-first habit.
-2. **`audit.md`** — Pass 1. The 8-lens audit. Each lens grounded in `file:line`
-   or marked `not yet exercised` honestly. Final lens ranks the blind spots.
-3. **`01-in-band-search-instrumentation.md`** — the `nodesExpanded / pushes /
-   pops` counters: where they live, where they increment, how the bench reports
-   them across five stages.
-4. **`02-optimality-oracle-probe.md`** — A* vs Dijkstra as a correctness probe.
-   Compute the answer a second way; disagreement localizes the bug to the
-   heuristic.
-5. **`03-route-honesty-signals.md`** — `BLOCKED`-finite, `steepEdges`, and the
-   three-state `RouteSummaryCard`. How the router never lies about its answer.
-6. **`04-degrade-and-surface-seam.md`** — 429 → flat fallback → `degraded` flag
-   → "Grades approximate" note → self-heal retry. The "all grades green"
-   incident, end to end.
+1. `00-overview.md` — the evidence map, ranked findings, what's `not yet exercised`.
+2. `audit.md` — Pass 1: the 8-lens debugging-&-observability audit, grounded `file:line`.
+3. Pattern files (Pass 2), each a deep walk of one mechanism the repo actually runs:
+   - `01-search-instrumentation-counters.md` — `nodesExpanded / pushes / pops` threaded through the search loop; the bench table that reads them.
+   - `02-optimality-oracle.md` — A* asserted equal to Dijkstra; a differential correctness probe.
+   - `03-degrade-and-surface.md` — elevation 429 → flat fallback → degraded flag → user-visible "Grades approximate" note.
+   - `04-finite-blocked-as-diagnostic.md` — `BLOCKED = 1e9` (not `Infinity`) keeps "no flat route" distinct from "no route at all".
+   - `05-curl-the-api-first.md` — the operational discipline: probe the external API before debugging your own pipeline.
 
-## Neighboring guides (cross-links, not duplicated here)
+## Cross-links to neighboring guides
 
-- **`study-testing`** — owns the optimality oracle *as a release gate*. This
-  guide borrows it as a *debugging probe*. Same mechanism, different posture.
-- **`study-performance-engineering`** — owns the bench counters *as a budget*.
-  This guide reads them *as a diagnosis*.
-- **`study-system-design`** — `04-honest-fallback-routing.md` and
-  `05-elevation-provider-fallback.md` describe the architecture that the
-  honesty and degrade signals ride on.
+- **`study-testing`** — owns *whether* the optimality oracle and fallback cases
+  are covered as tests. This guide owns what those same checks reveal *as
+  evidence* when behavior is wrong. The oracle file (`02-`) sits on that seam.
+- **`study-performance-engineering`** — owns the bench harness as a *measurement*
+  tool (latency, throughput, the algorithm progression). This guide borrows the
+  same `nodesExpanded` counters as *diagnostic* evidence. Cross-link, don't re-teach.
+- **`study-dsa-foundations`** — owns A*, Dijkstra, the binary heap, BFS-for-
+  reachability as algorithms. This guide uses them as the thing being observed.
+- **`study-networking`** — owns the 429/backoff/retry transport mechanics of the
+  Open-Meteo and Overpass calls. This guide owns how a 429 becomes *visible*
+  downstream.
+- **`study-system-design`** / **`software-design`** — own the network seam and
+  the fallback architecture as design. This guide owns the seam as an
+  observability boundary.

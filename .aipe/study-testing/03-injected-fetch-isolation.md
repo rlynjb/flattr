@@ -1,64 +1,67 @@
 # 03 — Injected-Fetch Network Isolation
 
-**Industry names:** dependency injection · seam-based testing · the
-"humble object" / functional core–imperative shell · fake-at-the-boundary.
-**Type:** Industry standard.
+**Industry names:** *dependency injection at the network seam* / *test double (mock/stub)
+for I/O* / *hermetic testing*. **Type:** Industry standard.
 
 ---
 
-## Zoom out — where this lives
+## Zoom out, then zoom in
 
-The build pipeline talks to three external APIs (Overpass for OSM, Open-Meteo /
-Google for elevation, Nominatim for geocoding). Tests for this layer never touch
-the real network — every I/O function takes its `fetch` as a parameter, and
-tests pass a fake.
+The build pipeline calls real HTTP APIs — Overpass for streets, Open-Meteo/Google for
+elevation, Nominatim for geocoding. You cannot test against those: they're slow, they rate-
+limit (the project context literally warns Open-Meteo 429s under heavy testing), and they
+go down. So flattr never lets a test touch a socket. Every networked function takes `fetch`
+as a *parameter*, and tests pass a fake.
 
 ```
-  Zoom out — the network seam, faked in tests
+  Zoom out — the injected-fetch seam in the pipeline
 
-  ┌─ pipeline layer (build-time I/O) ───────────────────────────┐
-  │  fetchOverpass(bbox, url, ★fetch★)                          │
-  │  openMeteoProvider(★fetch★)   geocode(q, {★fetchImpl★})     │ ← we are here
-  └───────────────────────────────┬─────────────────────────────┘
-                  real run │       │ test run
-            ┌──────────────▼──┐  ┌─▼──────────────────┐
-            │ global fetch    │  │ vi.fn() fake fetch  │
-            │ → Overpass API  │  │ → canned Response   │
-            └─────────────────┘  └─────────────────────┘
+  ┌─ Build pipeline: pipeline/ (build-time only) ──────────────┐
+  │   fetchOverpass(bbox, url, fetch?, opts)  ◄── fetch injected│
+  │   openMeteoProvider(fetch?, opts)         ◄── fetch injected│
+  │   googleProvider(key, fetch?)             ◄── fetch injected│
+  │            │                                               │
+  │   ★ tests pass a vi.fn() mock here ★  ← THIS CONCEPT       │
+  └────────────────────────────────────────────────────────────┘
+            │ real run uses global fetch │ tests use a fake
+            ▼                            ▼
+  ┌─ Network boundary ──────┐   ┌─ no network at all ─────────┐
+  │ Overpass / Open-Meteo / │   │ vi.fn returns a canned       │
+  │ Google / Nominatim      │   │ Response, delayMs: 0         │
+  └─────────────────────────┘   └──────────────────────────────┘
 ```
 
-Zoom in: the function never reaches for a module-level `fetch`. It accepts one.
-In production you hand it the real `fetch`; in tests you hand it a `vi.fn()` that
-returns a canned `Response`. The exact same code path runs both times — the only
-thing that changes is what's behind the seam.
+The thing being tested isn't the network — it's *flattr's code around the network*: does it
+build the right Overpass query, batch elevation requests by 100, parse the response shape,
+and — the hard part — retry a 504 but not a 400? All of that is deterministic and testable,
+*if* you can control what `fetch` returns. Injection is how you get that control.
 
 ---
 
-## Structure pass
+## The structure pass
 
-**Layers:** the pipeline logic (parse, retry, batch) on top; the network
-transport underneath. The `fetch` parameter is the horizontal seam between them.
-
-**Axis — "where does the non-determinism come from, and is it inside or outside
-the seam?"**
+Layer it, pick the axis — **"who controls what the network returns?"** — and watch it flip.
 
 ```
-  axis = "is this part deterministic?"
+  axis traced: "who controls the network response?"
 
-  ┌─ pipeline logic ─┐  seam (fetch param)  ┌─ network ──────────┐
-  │ DETERMINISTIC    │ ════════╪═══════════► │ NON-DETERMINISTIC  │
-  │ parse, retry,    │      (flips)          │ latency, 429s,     │
-  │ batch, dedup     │                       │ quota, outages     │
-  └──────────────────┘                       └────────────────────┘
-         ▲ test THIS                              ▲ fake THIS away
+  ┌─ pipeline fn: fetchOverpass (overpass.ts) ──────┐
+  │  controls NOTHING — it just calls fetch()        │
+  └───────────────────────┬──────────────────────────┘
+                          │  seam: fetch is a PARAMETER
+  ┌─ production ──────────▼──────────────────────────┐
+  │  global fetch → the real internet decides         │  ← uncontrollable
+  └──────────────────────────────────────────────────┘
+  ┌─ test ────────────────▼──────────────────────────┐
+  │  vi.fn() → THE TEST decides the response & status │  ← fully controlled
+  └──────────────────────────────────────────────────┘
 ```
 
-The axis flips at the `fetch` parameter: everything above it is deterministic
-and worth testing; everything below it is non-deterministic and gets replaced.
-This is the same determinism seam the README draws between testing and AI evals
-— here it's drawn between *your logic* and *the network*.
-
-**Seam:** the `fetch` / `fetchImpl` parameter on every I/O function.
+The seam is the `fetch` parameter, and the axis flips hard across it: in production the
+internet decides, in test the test decides. That single injected parameter is what converts
+an untestable I/O call into a deterministic, fully-controlled unit. Everything downstream —
+the retry matrix, the batching, the parse — becomes assertable because the input is now in
+the test's hands.
 
 ---
 
@@ -66,194 +69,236 @@ This is the same determinism seam the README draws between testing and AI evals
 
 ### Move 1 — the mental model
 
-You've passed a callback into a function so the caller controls part of the
-behavior — `arr.map(fn)`. Injecting `fetch` is the same: the function does the
-parsing and retry logic, but *you* supply how bytes arrive. In tests, "how bytes
-arrive" is a function that returns whatever Response you want, instantly.
+You've passed a function as a prop to make a component testable — `onSubmit={mockFn}` so the
+test can assert it was called without a real form post. Injecting `fetch` is the same move
+at the network boundary: hand the function its dependency instead of letting it reach for a
+global, and the test gets to choose what that dependency does.
 
 ```
-  the seam — same logic, swappable transport
+  the injection shape — swap the dependency at the seam
 
-         ┌──────────────────────────────┐
-   call ─┤  fetchOverpass(bbox, url, F)  │
-         │   F(url, init) → Response      │── parse ── retry ──► result
-         └──────────────┬───────────────┘
-                        │ F is...
-            real:  global fetch  ───►  Overpass
-            test:  vi.fn()       ───►  canned Response (no network)
+   production:   fn( ..., fetch )         ──► real network ──► real, slow, flaky
+   test:         fn( ..., vi.fn(canned) ) ──► no network   ──► instant, deterministic
+                          ▲
+                  same code path runs;
+                  only the injected dep changed
 ```
+
+Strategy in one sentence: **make the network a parameter so the test owns the response.**
 
 ### Move 2 — the walkthrough
 
-**The parameter, not the import.** Every pipeline I/O function takes `fetch`:
+**Part 1 — the function signature is the whole trick: `fetch` is an optional parameter.**
+Default to the real one in production, override in tests:
 
 ```ts
-// overpass.ts signature (tested at overpass.test.ts:21)
-fetchOverpass(bbox, url, fetch, opts?)
-// elevation.ts (tested at elevation.test.ts:33, :58)
-googleProvider(key, fetch)    openMeteoProvider(fetch, opts?)
-// geocode.ts (tested at geocode.test.ts:12)
-geocode(query, { fetchImpl })
-```
-
-The test hands in a `vi.fn()` that returns a real `Response` object — not a mock
-of Response, the actual web `Response`, so the parsing code under test runs for
-real:
-
-```ts
-// overpass.test.ts:18-27 — fake fetch, real Response, real parsing
-const body: OverpassResponse = { elements: [{ type: "node", id: 1, lat: 47.6, lon: -122.33 }] };
-const fakeFetch = vi.fn(async (_url, _init?) =>
-  new Response(JSON.stringify(body), { status: 200 }));
-const res = await fetchOverpass(bbox, "https://example/api", fakeFetch as ...);
+// pipeline/overpass.test.ts:20-27  (annotated — the production fn takes fetch as a param)
+const fakeFetch = vi.fn(async (_url: string, _init?: RequestInit) =>
+  new Response(JSON.stringify(body), { status: 200 }));   // a canned 200 + body
+const res = await fetchOverpass(bbox, "https://example/api",
+                                fakeFetch as unknown as typeof fetch);  // ← injected here
 expect(res.elements).toHaveLength(1);
 expect(fakeFetch).toHaveBeenCalledOnce();
 const call = fakeFetch.mock.calls[0];
-expect((call[1] as RequestInit).method).toBe("POST");   // ← assert the REQUEST
+expect(call[0]).toBe("https://example/api");              // assert the URL it called
+expect((call[1] as RequestInit).method).toBe("POST");     // assert it POSTed
 ```
 
-The fake isn't just a stand-in — it's an *observation point*. The test asserts
-on what was *sent* (POST method, the URL, the query string) as well as what
-comes back. That's the seam earning its keep in both directions.
+The fake is a `vi.fn()` returning a real `Response` object — so the *parsing* code runs for
+real against a real `Response`, only the *transport* is faked. And because `vi.fn` records
+its calls, the test asserts not just the parsed output but *how* `fetch` was called — URL
+and POST method. You're testing the request-building, not just the response-handling.
 
-**The payoff: deterministic testing of non-deterministic network behavior.**
-The retry/backoff logic is pure control flow once you control the responses.
-The fake fetch can return a 504 *then* a 200 to drive the retry path:
+**Part 2 — the retry matrix: the genuinely valuable thing this unlocks.** Retry logic is
+notoriously under-tested because you can't make a real server return a 504 on demand. With
+an injected fetch you script the exact failure sequence. flattr tests all four cases:
 
 ```ts
-// overpass.test.ts:37-47 — transient 504 → retry → success, NO real network
+// pipeline/overpass.test.ts — the full retry matrix (annotated)
+
+// :29  400 is non-retryable → throws WITHOUT retrying
+const f400 = vi.fn(async () => new Response("bad", { status: 400 }));
+await expect(fetchOverpass(bbox, url, f400, { delayMs: 0 })).rejects.toThrow(/400/);
+expect(f400).toHaveBeenCalledOnce();          // ← proves it did NOT retry a client error
+
+// :37  504 is transient → retries once, then succeeds
 let n = 0;
-const fakeFetch = vi.fn(async () => {
-  n++;
+const f504 = vi.fn(async () => { n++;
   return n === 1 ? new Response("busy", { status: 504 })
-                 : new Response(JSON.stringify({ elements: [] }), { status: 200 });
-});
-const res = await fetchOverpass(bbox, "...", fakeFetch, { delayMs: 0 });
-expect(fakeFetch).toHaveBeenCalledTimes(2);   // retried exactly once
+                 : new Response(JSON.stringify({elements:[]}), { status: 200 }); });
+await fetchOverpass(bbox, url, f504, { delayMs: 0 });
+expect(f504).toHaveBeenCalledTimes(2);        // ← proves it retried exactly once
+
+// :49  429 persists → gives up after exhausting retries
+const f429 = vi.fn(async () => new Response("rate", { status: 429 }));
+await expect(fetchOverpass(bbox, url, f429, { retries: 2, delayMs: 0 })).rejects.toThrow(/429/);
+expect(f429).toHaveBeenCalledTimes(3);        // ← initial + 2 retries, then gives up
 ```
 
-`delayMs: 0` is the second half of the isolation: the retry *delay* is also
-injected, so the test doesn't actually sleep. Real backoff, zero wall-clock.
-The full retry matrix (`overpass.test.ts:29-55`) is then trivially testable:
-400 → no retry (called once), 504 → retry then succeed, persistent 429 → give up
-after exact count. None of it touches a real server. → this is why `audit.md`
-lens 4 (flakiness) and lens 5 (error paths) both come back clean.
+Read the matrix as a decision table:
 
 ```
-  retry behavior, driven entirely by the fake
+  the retry decision table — each row is a test
 
-  fake returns:   404 ──► throw, 1 call      (not retryable)
-                  504,200 ─► 2 calls         (transient → retry)
-                  429,429,429 ─► throw, 3 calls (give up at limit)
-                  delayMs:0 ──► no real sleep ever
+  status   class         expected behavior         asserted call count
+  ──────   ─────         ─────────────────         ───────────────────
+  200      success       parse & return            1   (overpass.test.ts:18)
+  400      client error  throw, do NOT retry       1   (:29)
+  504      transient     retry, then succeed       2   (:37)
+  429      rate limit    retry to exhaustion, fail 3   (:49, retries:2)
 ```
 
-**Same pattern, every API.** `elevation.test.ts:53` drives Open-Meteo batching
-(150 points → exactly 2 calls of 100+50) by inspecting the fake's URL params;
-`geocode.test.ts:12` asserts the Nominatim query encoding (`q=space+needle`) and
-the no-results→null branch. One discipline, applied uniformly across the I/O
-surface.
+The call-count assertion is the load-bearing one: `toHaveBeenCalledOnce()` on the 400 case
+*proves* the code distinguishes retryable from non-retryable — you can't fake that with a
+real server.
+
+**Part 3 — `delayMs: 0` kills the only source of slowness/flake left.** Retry logic has
+backoff waits. In production those are real `setTimeout`s; in tests they'd add seconds and
+nondeterminism. Every retrying call passes `{ delayMs: 0 }`:
+
+```ts
+// pipeline/elevation.test.ts:58  (annotated)
+const p = openMeteoProvider(fakeFetch as unknown as typeof fetch, { delayMs: 0 });
+//                                                                   ▲
+//                          retry logic runs; the BACKOFF WAIT is zeroed → instant, no flake
+```
+
+So the retry *behavior* (does it back off and try again?) is tested while the retry *time*
+(how long it waits) is eliminated. That's why the whole 22-file suite finishes in 306ms with
+zero flake (`audit.md` lens 4).
+
+**Part 4 — a provider abstraction makes the fake even cleaner.** Elevation goes one level
+further: the code is written against a `provider` interface, so a test can inject a plain
+object instead of even a fake fetch:
+
+```ts
+// pipeline/elevation.test.ts:81-90  (annotated — fixtureProvider / inline provider)
+const provider = {
+  async sample(pts) { calls.push(pts.length); return pts.map((_, i) => 1000 + i); }
+};
+const out = await sampleElevations(nodes, provider, { dedupePrecision: 0.0008 });
+expect(calls[0]).toBe(2);   // ← asserts the DEDUP logic queried 2 unique cells, not 3 nodes
+```
+
+Here the injected double isn't even a fetch — it's the whole provider — so the test can
+assert flattr's *dedup* logic (collapse nodes in the same ~90m cell to one query) without
+any HTTP at all. Same pattern, higher seam.
 
 ### Move 2 variant — the load-bearing skeleton
 
-```
-  I/O function with the transport as a PARAMETER
-  +  a fake transport that returns canned responses
-  +  injected timing (delayMs) so retries don't sleep
-  +  assertions on BOTH the request sent and the response handling
-```
+Strip injected-fetch isolation to its kernel:
 
-What breaks without each:
+1. **The I/O dependency is a parameter, not a global** — `fetch` passed in. *Remove it*
+   (call global `fetch` directly) and the test is forced onto the real network: slow, flaky,
+   rate-limited, untestable retry logic.
+2. **The double returns realistic shapes** — a real `Response`, the real JSON the API sends.
+   *Make it too fake* (return a bare object) and the parsing code never runs, so the test
+   proves nothing about parse correctness.
+3. **Time is controllable** — `delayMs: 0`. *Remove it* and retry tests either take real
+   seconds or go nondeterministic.
 
-- **Hard-code `fetch` instead of injecting** → the test must hit the real API:
-  slow, flaky, quota-limited (the Open-Meteo 429-on-heavy-testing caveat in
-  `context.md` is exactly this failure). The whole suite would be
-  network-dependent.
-- **Mock `Response` instead of using the real one** → you test your mock's
-  shape, not the real parsing — the classic "tests the mock, not the code" smell
-  (`audit.md` lens 2 marks this CLEAR *because* real Response is used).
-- **Don't inject `delayMs`** → retry tests sleep for real backoff durations,
-  slowing the suite and adding timing flake.
-- **Only assert the response, not the request** → you'd miss a bug that sends
-  the wrong bbox order or HTTP method.
+The part people forget is **asserting the call shape, not just the return value**. A weak
+version of this pattern checks only the parsed output and never inspects `fetch.mock.calls`
+— so it can't tell a retry from a non-retry, or a correct Overpass query from a wrong one.
+flattr asserts both sides of the seam: what went in (`call[0]`, `call[1].method`,
+`toHaveBeenCalledTimes`) and what came out.
+
+**Skeleton vs hardening:** the kernel is inject + realistic-double + controllable-time. The
+provider abstraction (Part 4) is hardening — a cleaner seam — but plain injected fetch is
+already the pattern.
 
 ### Move 3 — the principle
 
-**Push non-determinism to the edge and inject it, so your logic stays a pure
-function of its inputs.** This is the functional-core / imperative-shell split:
-the parsing, retrying, and batching is the testable core; the network is the
-shell, handed in as a parameter. The same move works for the system clock
-(inject `now()`), randomness (inject the seed — see `02`), and the filesystem.
-Anything non-deterministic becomes a parameter, and your test controls it.
+**Push every uncontrollable dependency to a parameter at the boundary, and the boundary
+becomes a place you can stand.** Networks, clocks, randomness, the filesystem — anything the
+test can't control is something it can't test *around* until you inject it. Once injected,
+the hard-to-test behaviors (retry, backoff, batching, dedup, error classification) turn into
+plain deterministic units. This is the same determinism discipline as the seeded RNG in
+`02-property-invariant-tests.md`, applied to I/O instead of randomness — and it's exactly
+the seam an LLM client would slot into if flattr grew an AI feature (`audit.md` lens 6).
 
 ---
 
 ## Primary diagram
 
 ```
-  the injected-fetch discipline across the pipeline
+  INJECTED-FETCH ISOLATION — full recap
 
-  ┌─ pipeline functions (DETERMINISTIC, all tested) ────────────┐
-  │  fetchOverpass · openMeteoProvider · googleProvider ·       │
-  │  geocode · reverseGeocode · geocodeSuggest                  │
-  │         each takes  fetch  +  delayMs  as parameters         │
-  └───────────────────────────┬─────────────────────────────────┘
-              prod │           │ test
-       ┌───────────▼───┐   ┌───▼──────────────────────────┐
-       │ global fetch  │   │ vi.fn() → canned Response     │
-       │ real backoff  │   │ delayMs:0 → no sleep          │
-       │ → live APIs   │   │ → asserts request AND response│
-       └───────────────┘   └───────────────────────────────┘
-
-  result: 307ms suite, zero network, full retry/error coverage
+  ┌─ pipeline code (overpass.ts / elevation.ts) ───────────────┐
+  │  fetchOverpass(bbox, url, fetch, opts)                      │
+  │      build query → call fetch → classify status → retry?   │
+  │      → parse Response → return                              │
+  └─────────────┬───────────────────────────┬──────────────────┘
+                │ fetch param                │ delayMs / retries opts
+                ▼                            ▼
+  ┌─ TEST controls the seam (vi.fn) ───────────────────────────┐
+  │  scripts the response per call:                            │
+  │    200 → parse & assert output + assert URL/method         │
+  │    400 → assert throws, called ONCE (no retry)             │
+  │    504 → assert retried, called TWICE                      │
+  │    429 → assert exhausted, called 3× (initial + 2)         │
+  │  delayMs:0 → retry logic runs, backoff wait eliminated     │
+  └─────────────────────────────────────────────────────────────┘
+        result: zero sockets · zero flake · 306ms whole suite
 ```
 
 ---
 
 ## Elaborate
 
-This is dependency injection at the function level (no DI container, just
-parameters) and the "humble object" pattern (Feathers / Fowler) — keep the
-hard-to-test boundary (network) thin and dumb, move all logic into a testable
-core. The honest gap: the *mobile* runtime re-runs these same functions but
-*doesn't* preserve the seam — `mobile/src/useTileGraph.ts` calls
-`openMeteoProvider(fetch, ...)` with the real `fetch` closed over inside a React
-hook, so the hook's own orchestration (degraded fallback, self-heal retry) can't
-be tested the way the pipeline can. The pattern exists and works; it just stops
-at the mobile boundary. → `audit.md` lens 1 & 3, and the buildable target in
-lens 7: a hook test that injects a fake fetch the same way the pipeline tests do.
+This is dependency injection used as a *test seam* — the cleanest application of the
+technique. The double here is specifically a **mock** (it records calls, and assertions
+check those calls: `toHaveBeenCalledTimes`) layered over a **stub** (it returns canned
+data). The retry matrix is **contract testing** of flattr's side of the HTTP contract: "on
+504 we retry, on 400 we don't" is a contract, and the test pins it.
+
+It connects straight to the **`study-networking`** sibling guide, which owns the *why* of
+the retry/backoff/idempotency semantics this pattern *tests*. The seam also generalizes:
+the provider abstraction in elevation (`fixtureProvider`, `googleProvider`,
+`openMeteoProvider` all implementing one `sample` interface) is the same shape you'd use to
+swap an LLM provider — which is why the AI-eval seam (`audit.md` lens 6) notes the
+infrastructure is already here even though the AI feature isn't.
+
+Where to read next: `02-property-invariant-tests.md` (determinism, applied to RNG), and
+`study-networking` for retry/timeout semantics.
 
 ---
 
 ## Interview defense
 
-**Q: How do you test code that calls an external API without hitting it?**
+**Q: "How do you test code that calls an external API with retries?"**
 
-> Inject the transport. Every I/O function in flattr's pipeline takes `fetch` as
-> a parameter (`overpass.test.ts:21`), so in tests I pass a `vi.fn()` returning a
-> canned `Response` — the real Response object, so the parsing runs for real.
-> The function's logic is then a pure function of its inputs.
+> "I inject `fetch` as a parameter — production passes the global, tests pass a `vi.fn`
+> double that returns canned `Response` objects. That lets me script the exact failure
+> sequence: a 504 then a 200, and I assert `fetch` was called twice — it retried. A 400, and
+> I assert it was called *once* — it correctly did not retry a client error. A persistent
+> 429 with `retries: 2`, and I assert three calls then a throw. I pass `delayMs: 0` so the
+> backoff runs but doesn't wait, keeping it instant and deterministic. That's
+> `overpass.test.ts:29-55`."
 
 ```
-  fetchOverpass(bbox, url, FAKE) → canned Response → parse/retry → assert
+  sketch while you talk:
+
+  fetch param ─► vi.fn scripts status per call
+       │
+   200→parse  400→throw,1×  504→retry,2×  429→exhaust,3×
+                    │
+            assert mock.calls count = the retry contract
 ```
 
-**Q: How do you test retry/backoff without waiting for real timeouts?**
+**Anchor:** *"The injected double lets me assert the call count — and the call count is how
+I prove it distinguishes retryable from non-retryable, which you can't fake with a real
+server."*
 
-> Inject the delay too. `delayMs: 0` makes the backoff instant, and the fake
-> fetch returns `504` then `200` to drive the retry path — I then assert it was
-> called exactly twice (`overpass.test.ts:37`). Real retry logic, zero
-> wall-clock. Anchor: "anything non-deterministic — network, clock, randomness —
-> becomes a parameter the test controls."
+**Q: "Why not just hit the real API in a test?"** Slow, flaky, rate-limited — the project
+context literally warns Open-Meteo 429s under heavy testing. A test that depends on a third
+party's uptime isn't testing your code; it's testing their server.
 
 ---
 
 ## See also
 
-- `02-property-invariant-tests.md` — injecting the *seed* is the same move for
-  randomness.
-- `04-fixture-driven-graph-tests.md` — the deterministic graph inputs paired
-  with this.
-- `audit.md` lens 2 (no over-mocking), lens 3 (design pressure), lens 4 (flake).
-- siblings `study-networking` (the retry/backoff semantics),
-  `study-software-design` (DI as a deep-module property).
+- `02-property-invariant-tests.md` — the same determinism discipline applied to randomness
+- `04-fixture-driven-graph-tests.md` — the no-mock half of flattr's testing (real fixtures)
+- `audit.md` lens 4 (determinism), lens 5 (error paths), lens 6 (the AI seam this prefigures)
+- sibling guide **`study-networking`** — retry/backoff/timeout semantics this pattern tests

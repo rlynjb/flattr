@@ -1,87 +1,185 @@
-# Train / Validation / Test Splits
+# Train / val / test — split BY USER, or you lie to yourself
 
-*Industry name: dataset splitting — guarding against information leakage.*
+**Industry name(s):** train/validation/test split; held-out evaluation.
+**Type:** Industry standard (the discipline that makes a metric trustworthy).
 
-## Zoom out
+## Zoom out — the split is the only thing that tells you the cost generalizes
+
+A learned edge cost is trained on accept/reroute events. The split
+decides which events train the model and which judge it. flattr has no
+events and no model, so no split exists — but the *right* split is
+non-obvious here and worth teaching as new ground: split **by user**, not
+by event, or your test score is a fantasy.
 
 ```
-ONE DATASET, THREE JOBS
-┌──────────────┬───────────┬──────────┐
-│    TRAIN     │   VAL     │   TEST   │
-│ fit params   │ tune knobs│ final    │
-│ (~70%)       │ (~15%)    │ score    │
-│              │           │ (~15%)   │
-└──────────────┴───────────┴──────────┘
-   model sees   model peeks  model NEVER
-   answers      indirectly   sees until end
+  Zoom out — the split sits between data and training, off to the side
+  of A* (A* never sees it)
+
+  accept/reroute events (NOT collected)
+        │
+        │  split BY USER (NOT done)
+        ▼
+  ┌ train users ┐  ┌ val users ┐  ┌ test users ┐
+  │ fit penalty │  │ tune k1k2 │  │ FINAL score│
+  └──────┬──────┘  └─────┬─────┘  └─────┬──────┘
+         └─────► cost.ts penalty() ◄────┘
+                 (A* unaffected by the split)
 ```
 
-The single most important defense in supervised ML: **never measure success on data the
-model trained on.** Split your labeled data three ways — fit on train, pick
-hyperparameters on validation, and report the honest number on a test set you touch exactly
-once. This is new ground for you; contrl never trained, so it never split.
+The split never touches the router. It's purely an evaluation honesty
+mechanism for the model that *would* sit behind `penalty()`.
+
+## Structure pass
+
+- **Layers:** all events → split → {train, val, test} → fit / tune /
+  final-score.
+- **Axis — by-event vs by-user.** Split by event and the same user
+  appears in train *and* test; the model memorizes that user's
+  preference and the test looks great but generalizes to nobody. Split by
+  user and the test measures the only thing that matters: a *new* user.
+- **Seam:** the grouping key. For flattr it's the user id on each event,
+  not the edge or the route.
 
 ## How it works
 
-### Move 1 — the mental model: an exam with leaked answers
+### Move 1 — the mental model
+
+In DSA terms you already know the trap: train/test on overlapping data is
+like benchmarking a cache against the exact queries you warmed it with.
+Of course it's fast — it's seen them. The fix is a *cold* held-out set.
+For a per-user cost model, "cold" means a user the model has never
+trained on.
 
 ```
-LEAKAGE = studying the exact exam questions
-train on rows ──► memorize them ──► ace the same rows ──► fail reality
-                                    (overfitting)
+  Pattern — group-aware split
+
+  events ──► group by user ──► assign whole users to splits
+                                 ┌ train: users A,B,C
+                                 ├ val:   users D
+                                 └ test:  users E
+  NEVER: user A's events in both train and test
 ```
 
-A model that has seen a row can memorize it. Scoring on that row tells you nothing about
-new inputs. The split exists so your reported accuracy is a *forecast of production*, not a
-report on memorization.
+### Move 2 — the walkthrough
 
-### Move 2 — walk it, then hit the flattr gotcha
-
-1. **Random split** is the default: shuffle rows, slice 70/15/15.
-2. **Tune on val.** Try `k1`, tree depth, learning rate; keep what scores best on val.
-   Validation gets "soft-contaminated" by this peeking — hence a separate test set.
-3. **Touch test once.** The moment you tune against test, it stops being honest.
-
-Now the gotcha that matters for flattr — **spatial autocorrelation**:
+**Sub-step A — why by-user, concretely for flattr.**
 
 ```
-RANDOM SPLIT ON GEOGRAPHIC DATA  (BROKEN)
-   ●train ●test ●train ●test   ← adjacent edges on the SAME hill
-   └─────── same Capitol Hill block ───────┘
-   test edge is ~identical to a train edge → fake-high score
+  The leak — same user in train and test
 
-SPATIAL SPLIT  (HONEST)
-   ┌── train cities/blocks ──┐   ┌── held-out region ──┐
-   │  Capitol Hill, Ballard  │   │   Queen Anne (test) │
-   └─────────────────────────┘   └─────────────────────┘
+  user A hates hills (reroutes every >5% edge)
+  random split: A's events land in train AND test
+  model learns "A reroutes steep edges"
+  test: A's held-out events → model nails them → 95%!
+  reality: new user B → model has no idea → fails
 ```
 
-A learned **edge-cost model** for flattr would have rows = edges, and edges on the same
-hill are nearly duplicates (same DEM cell, same slope). A random split puts near-twins in
-both train and test → you'd report a great score that collapses on a new neighborhood.
-**Split by geography** (hold out whole blocks/cities), not by random row.
+The grade penalty is *supposed* to be personalized (`userMax` is per
+user). That's exactly why a by-event split lies: the model can cheat by
+identifying the user, not learning the grade→effort relationship.
+
+**Sub-step B — the three splits and their jobs.**
+
+```
+  Three sets, three jobs
+
+  train (≈70% of users)  fit the cost: k1,k2 or GBT
+  val   (≈15% of users)  tune: pick k1/k2 grid, model type, stop early
+  test  (≈15% of users)  touch ONCE, at the end, for the reported number
+```
+
+The test set is sacred: every time you peek and adjust, you've leaked it
+into your decisions and it stops being a held-out measure. Val absorbs
+all the tuning.
+
+**Sub-step C — flattr already has a split utility (different purpose).**
+
+`pipeline/split.ts` exists — but it splits *edge geometry*, not data for
+ML (it segments long edges so none exceed `MAX_SEGMENT_M`, config.ts:13).
+Do not mistake it for a train/test split. The ML split would be new code,
+keyed on user id.
+
+```
+  False friend — two unrelated "splits"
+
+  pipeline/split.ts   → cut long edges into ≤12m segments (geometry)
+  ML train/val/test   → partition USERS' events (does NOT exist)
+```
 
 ### Move 3 — the principle
 
-**Your split must mimic the gap between training and deployment.** Deployment means *new
-streets the model never saw*. So the test set must contain *spatially disjoint* streets —
-otherwise the test is easier than reality and your number lies.
+A held-out test set answers one question: *will this work on data it has
+never seen?* The grouping key defines "never seen." For a personalized
+cost where the user id is itself predictive, the only honest key is the
+user — group-wise splitting. Get the key wrong and every downstream
+number, every "we improved routing by X%," is measuring memorization.
 
-## In this codebase
+## Primary diagram
 
-**NOT YET EXERCISED — no dataset exists, so nothing is split.** This file is here so that
-*when* you build a learned cost for **`features/routing/cost.ts`**, you don't fall into the
-random-split trap. flattr's data is intrinsically spatial: every `Edge` in
-`features/routing/types.ts` carries `geometry` (a lat/lng polyline) and lives in a DEM
-cell. A geographic split is mandatory, not optional.
+```
+  By-user split for flattr's cost model (none exists)
 
-The hand-coded `penalty()` needs no split — it's not fit to data. And
-`features/grade/classify.ts` is a threshold table; there's nothing to validate it against
-because nothing was learned. (Its thresholds were *chosen*, not *measured*.)
+  all accept/reroute events (NOT collected)
+        │  key = user id
+        ▼
+  ┌───────────┬──────────┬───────────┐
+  │ TRAIN     │ VAL      │ TEST      │
+  │ users A-C │ user D   │ user E    │
+  │ fit cost  │ tune     │ score 1×  │
+  └─────┬─────┴────┬─────┴─────┬─────┘
+        ▼          ▼           ▼
+     penalty()  pick k1k2   reported metric
+   no user appears in two sets  ← the invariant
+```
+
+## Elaborate
+
+There's a second leak to watch: *route* overlap. If user A's morning and
+evening commute share edges, and you split A's events at all, those edges
+correlate across the split. By-user splitting handles this for free
+(A is wholly in one set), which is another reason to prefer it over
+by-route. The amount of data flattr would need before any of this matters
+is real — a handful of users isn't enough to hold one out — which is why
+the honest first move is hand-tuned rules, not a model (see cold-start).
+
+## Project exercises
+
+### SPLIT.1 — by-user splitter for the cost dataset
+
+- **Exercise ID:** SPLIT.1
+- **What to build:** a `splitByUser(events, ratios)` function that
+  partitions accept/reroute events into train/val/test *by user id*, with
+  an assertion that no user id appears in more than one set.
+- **Why it earns its place:** it encodes the one non-obvious decision
+  (group key = user) and makes the leak structurally impossible.
+- **Files to touch:** new `pipeline/cost-split.ts`,
+  `pipeline/cost-split.test.ts` (assert disjoint user sets; assert ratios
+  are approximately met by user count).
+- **Done when:** the test proves the user-id sets are pairwise disjoint
+  and a synthetic single-user dataset raises (too small to hold out).
+- **Estimated effort:** half a day.
+
+## Interview defense
+
+**Q: You're building a personalized routing cost. How do you split your
+data, and what's the trap?** Answer: split by user, not by event. The
+cost is personalized (flattr's `userMax` is per-user), so a random split
+lets the same user land in train and test — the model learns to identify
+the user instead of the grade→effort relationship, and the test score is
+inflated memorization. Group-wise by user makes "held-out" mean "a new
+user," which is the only number that matters. Watch the false friend:
+`pipeline/split.ts` splits edge geometry, not data.
+
+```
+  by-event split → user in train+test → memorize → fake score
+  by-user split  → user in one set    → generalize → real score
+```
+
+Anchor: *"the user id is predictive, so it must be the grouping key —
+otherwise the model cheats by recognizing the user."*
 
 ## See also
 
-- `06-domain-gap.md` — the deployment-distribution mismatch a spatial split tries to expose
-- `05-class-imbalance.md` — splitting when rare steep edges must appear in every split
-- `01-supervised-pipeline.md` — eval stage that consumes the test set
-</content>
+- [01-supervised-pipeline.md](01-supervised-pipeline.md) — where the split sits in the pipeline.
+- [02-feature-engineering.md](02-feature-engineering.md) — `steepEdges` as a feature-level leak.
+- [11-cold-start.md](11-cold-start.md) — too few users to hold one out → hand-tuned rules first.

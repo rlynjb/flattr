@@ -1,89 +1,177 @@
-# Prompt Chaining
-*Industry name: prompt chaining · Type: multi-step decomposition pattern*
+# Prompt chaining — and the geocode (input→prompt) seam
 
-## Zoom out
+**Industry name(s):** prompt chaining / multi-step LLM pipeline.
+**Type:** Industry standard.
+
+## Zoom out — no chains in flattr, but the input seam is `geocode()`
+
+flattr runs no LLM chains. But the spec's second seam — natural-language
+destination parsing — is a two-step chain that would *wrap*
+`pipeline/geocode.ts`. Today the user types a literal address and it
+goes straight to Nominatim. A query like *"flattest park near me, skip
+the hill"* needs an LLM step first: parse intent → geocode the place →
+set `userMax` from the constraint.
 
 ```
-ONE BIG PROMPT  vs  A CHAIN OF SMALL ONES
-┌───────────────────────┐      ┌────────┐   ┌────────┐   ┌────────┐
-│ do everything at once  │      │ step 1 │──►│ step 2 │──►│ step 3 │
-│ (vague, hard to debug) │      │ extract│   │ decide │   │ phrase │
-└───────────────────────┘      └────────┘   └────────┘   └────────┘
-        one tangled job              each step: ONE job, inspectable output
+  Zoom out — the input seam (where an NL parse chain would wrap geocode)
+
+  ┌─ UI (mobile/) ──────────────────────────────────────────┐
+  │  AddressBar text  ──►  geocode(text)  [MapScreen.tsx:82] │
+  └────────────────────────────┬─────────────────────────────┘
+                  ★ a parse-chain would sit HERE, before geocode
+  ┌─ Core engine (pipeline/) ──▼─────────────────────────────┐
+  │  geocode() → Nominatim → { lat, lng, label }  geocode.ts:9│
+  └──────────────────────────────────────────────────────────┘
 ```
 
-Prompt chaining is splitting a task into a sequence of model calls where each
-call does exactly one thing and hands a clean, structured result to the next.
-The wins: every step is debuggable in isolation, you can swap a cheap model into
-the easy early steps and reserve the expensive model for the synthesis at the
-end, and a wrong answer tells you *which* step failed instead of "the prompt is
-bad."
+## Structure pass
 
-You already shipped this shape in loopd-style work: summarize the clip, then
-caption it with tone. That's a two-link chain — extraction feeding generation.
+- **Layers:** UI text input → `geocode` → engine routing.
+- **Axis — who interprets the input?** Today: nobody — the raw string is
+  a Nominatim query verbatim. In an NL-parse chain: an LLM interprets it
+  into `{place, constraints}` before geocoding. The axis (input
+  interpretation) flips at the `geocode` call site.
+- **Seam:** `MapScreen.tsx:82` (and `:182/:189`), where text reaches
+  `geocode`. A chain wraps the call: `text → parse() → geocode(place)`.
 
 ## How it works
 
-**Move 1 — One step, one job, one checkable output.**
+### Move 1 — the mental model
+
+You know how flattr already runs a *deterministic* two-step pipeline at
+build time (OSM → elevation → graph)? A prompt chain is the same shape
+with an LLM as one step: each step has one job, output of step 1 feeds
+step 2. For NL parsing: step 1 extracts `{place, maxGrade}`, step 2
+geocodes `place` and pipes `maxGrade` into `userMax`.
 
 ```
-STEP CONTRACT
-input ──► [ prompt with a single objective ] ──► structured output
-                                                  (JSON / typed, not prose)
-              ▲ if this step is wrong, you see it HERE, not three steps later
+  Pattern — two-step parse chain wrapping geocode
+
+  "flattest park near me, skip the hill"
+        │
+        ▼ Chain 1: LLM parse (one job: extract intent)
+   { place: "park near me", maxGrade: 3 }
+        │ place
+        ▼ Chain 2: geocode(place)  ← existing geocode.ts:9
+   { lat, lng, label }
+        │  + maxGrade → userMax
+        ▼
+   route + grade slider preset
 ```
 
-Mental model: treat each link like a pure function. It takes typed input,
-returns typed output, and you can write an assertion on that output before it
-flows downstream. Prose-to-prose chaining hides errors; structured handoffs
-expose them.
+### Move 2 — the walkthrough
 
-**Move 2 — Stage the chain by cost and certainty.**
+**The existing geocode call (step 2 already exists).** `geocode.ts:9`:
 
-```
-COST-AWARE CHAIN
-[ cheap/fast model ]      [ cheap model ]      [ expensive model ]
- normalize + extract  ──►  classify/route  ──►  synthesize final answer
-   high volume, easy        deterministic         where quality matters
+```ts
+export async function geocode(query: string, opts: { … } = {}): Promise<GeocodeResult | null> {
+  const params = new URLSearchParams({ q: query, format: "jsonv2", limit: "1" });
+  …
+  return { lat: parseFloat(rows[0].lat), lng: parseFloat(rows[0].lon), label: rows[0].display_name };
+}
 ```
 
-Step by step: (1) do mechanical work (parsing, extraction, normalization) with a
-small model or even plain code; (2) make routing/decisions in the middle, cheap;
-(3) spend your strongest model only on the final synthesis where phrasing and
-judgment count; (4) validate each handoff so a bad early output doesn't silently
-poison the expensive last call.
+This takes a clean place string and returns a coordinate. It is already
+the second step of the chain — you don't change it.
 
-**Move 3 — Principle:** *decompose until each step is trivially verifiable, then
-spend compute where it actually moves quality.*
+**Where the chain wraps it.** `MapScreen.tsx:182`:
 
-## In this codebase
-
-**Not yet exercised in flattr.** No LLM runs today, so no chain exists. But of
-the three concepts in this section, chaining is the one with a genuinely
-plausible attachment point — **seam 2**, the output-to-prompt path.
-
-```
-PROPOSED 2-STEP CHAIN over summary.ts:11  (not built)
-RouteSummary                  step 1 (code/cheap)        step 2 (model)
-{distanceM, climbM,   ──►  shape numbers into facts  ──►  narrate in a
- steepCount}               "1.2km, 80m climb, 2       tone ("encouraging",
- summary.ts:11             steep segments"            "terse")
-                                  │                          │
-                           assert: units correct      consumed where the
-                           before narrating           card renders today
-                                                       (MapScreen.tsx:159 →
-                                                        RouteSummaryCard.tsx)
+```ts
+const a = await geocode(from, { viewbox });
 ```
 
-Today `routeSummary` returns the typed payload, `MapScreen.tsx:159` consumes it,
-and `RouteSummaryCard.tsx` renders it as plain UI — no model in the loop. A
-chain would slot step 1 as pure formatting (no model needed — it's three
-numbers) and reserve a single model call for step 2's tone. Note the asymmetry:
-the "extract" link is so trivial here it shouldn't be a model call at all, which
-is itself the lesson — chain only where a step earns its compute. Still **not
-exercised**; this is the design, not the deployment.
+A parse step inserts before: `const { place, maxGrade } = await
+parseDestination(from); const a = await geocode(place, { viewbox });`.
+Step 1 is new; step 2 is untouched.
+
+```
+  Layers-and-hops — wrapping geocode with one LLM step
+
+  ┌─ UI ──────┐ hop1: raw NL text   ┌─ (NOT BUILT) parse ─┐
+  │AddressBar │ ──────────────────► │ LLM → {place,grade} │
+  └───────────┘                     └─────────┬───────────┘
+                            hop2: clean place  │
+  ┌─ engine ──┐ ◄──────────────────────────────┘
+  │geocode.ts │  geocode(place) — UNCHANGED (geocode.ts:9)
+  └───────────┘
+```
+
+**Boundary conditions.** Two. (1) The chain output must be
+[structured](../01-llm-foundations/04-structured-outputs.md) — `{place:
+string, maxGrade: number}` — or step 2 gets garbage. (2) `geocode`
+returns `display_name` (`geocode.ts:27`), which is untrusted; if you
+ever feed that label back into a *describe* prompt, you've opened the
+injection vector
+([prompt-injection](../06-production-serving/03-prompt-injection.md)).
+
+### Move 3 — the principle
+
+Chain steps isolate jobs and errors: parsing is one model's job,
+geocoding is the engine's job, and a bad parse fails loudly before a
+malformed query hits Nominatim. flattr already separates concerns this
+way in its build pipeline; the NL-parse chain just adds an LLM as the
+first link. The principle: keep each step single-purpose, and never let
+the LLM step do the geocoding it should only *prepare*.
+
+## Primary diagram
+
+```
+  NL destination parse — full chain over the geocode seam
+
+  ┌─ UI ────────────────────────────────────────────────────┐
+  │  AddressBar text (MapScreen.tsx:82/182/189)              │
+  └────────────────────────────┬─────────────────────────────┘
+  ┌─ (NOT BUILT) Chain 1: parse ▼ ───────────────────────────┐
+  │  LLM → { place: string, maxGrade: number }  (schema'd)   │
+  └────────────────────────────┬─────────────────────────────┘
+  ┌─ Chain 2: geocode (EXISTS) ▼─────────────────────────────┐
+  │  geocode(place) → { lat, lng, label } [geocode.ts:9]     │
+  └────────────────────────────┬─────────────────────────────┘
+                  maxGrade → userMax; coords → router
+```
+
+## Elaborate
+
+Chaining is the workhorse of LLM apps — most "agents" are really fixed
+chains. The discipline that matters is single-purpose steps so you can
+swap a cheap model into the parse step and keep the engine deterministic.
+flattr's build pipeline already demonstrates the staged-pipeline
+instinct; adding an LLM front-end is a small, contained extension.
+
+## Project exercises
+
+### B-CHAIN.1 — NL destination parse step
+
+- **Exercise ID:** B-CHAIN.1
+- **What to build:** `parseDestination(text): {place, maxGrade}` with a
+  schema'd output, wrapping the existing `geocode` call so the engine is
+  untouched.
+- **Why it earns its place:** it makes the input→prompt seam concrete
+  and demonstrates single-purpose chaining.
+- **Files to touch:** new `pipeline/parse-destination.ts`;
+  `mobile/src/MapScreen.tsx:182/189` (call parse before geocode).
+- **Done when:** typing "flat park near me, max 3%" geocodes "park near
+  me" and sets `userMax = 3`.
+- **Estimated effort:** half a day with a stub model.
+
+## Interview defense
+
+**Q: How would natural-language search attach to flattr?** Answer: a
+two-step chain at `MapScreen.tsx:182` — an LLM parse step extracting
+`{place, maxGrade}`, then the *existing* `geocode(place)`
+(`geocode.ts:9`) unchanged. Load-bearing point: the LLM only *prepares*
+the query; geocoding and routing stay deterministic, so a bad parse
+can't corrupt the route.
+
+```
+  NL text → [LLM parse] → place → geocode(place) [existing]
+```
+
+Anchor: *"the geocode step already exists; the chain just adds a
+single-purpose parse step in front of it."*
 
 ## See also
-- `01-context-window.md` — why each short step keeps its window near-empty
-- `02-lost-in-the-middle.md` — chaining sidesteps it by never building long context
-- `features/routing/summary.ts:11` · `mobile/src/MapScreen.tsx:159` — the seam
+
+- [../01-llm-foundations/04-structured-outputs.md](../01-llm-foundations/04-structured-outputs.md) — the parse output schema.
+- [../03-retrieval-and-rag/11-rag.md](../03-retrieval-and-rag/11-rag.md) — the output (describe) seam.
+- [../06-production-serving/03-prompt-injection.md](../06-production-serving/03-prompt-injection.md) — `display_name` from geocode is untrusted.

@@ -1,89 +1,88 @@
-# 00 — Overview: the trust axis in flattr
+# Security — Overview
 
-One page. Where untrusted data enters, what trusts it, what breaks if it's
-hostile, and the ranked list of what to fix first.
+One page. Where flattr's trust line sits, what crosses it, and what's honestly
+absent. Read this, then `audit.md` for the full lens walk.
 
-## Zoom out — the whole system on the trust axis
+## The shape of the threat model
 
-flattr has no users-other-than-you, no server, no stored secrets. So the
-classic security questions (*who's logged in? who's allowed? whose data is
-this?*) mostly don't apply. The one question that **does** apply, everywhere:
-*is this data trustworthy, and what happens when it isn't?*
+flattr is not a server. Hold that thought — it determines everything. There's
+no request handler accepting bodies, no database executing queries, no session
+cookie to forge, no logged-in user to impersonate. The code is two halves:
 
-```
-  Trust axis traced across flattr's layers
-
-  ┌─ UI layer (mobile/, React Native) ──────────────────────────┐
-  │  TextInput → typed text       ← user-controlled, trusted as  │
-  │  map tap → GPS coords           "from our own UI" (it is)    │
-  │  renders display_name labels  ← THIRD-PARTY text, escaped    │
-  └─────────────────────────┬────────────────────────────────────┘
-            user input ─────┤  leaves device → 3rd-party URL
-  ┌─ Network boundary ──────▼────────────────────────────────────┐
-  │  Nominatim · Overpass · Open-Meteo — keyless free APIs        │
-  │  responses re-enter as JSON, minimally validated              │
-  └─────────────────────────┬────────────────────────────────────┘
-   external data ───────────┤  feeds the pipeline
-  ┌─ Pipeline layer (pipeline/) ────────────────────────────────┐
-  │  parseOsm → splitWays → sampleElevations → computeGrades      │
-  │  ONE guard: ±40% grade clamp (grade.ts:30). No schema check. │
-  └─────────────────────────┬────────────────────────────────────┘
-   artifact handoff ────────┤  graph.json written / bundled
-  ┌─ Routing layer (features/routing/) ─────────────────────────┐
-  │  loadGraph() casts graph.json `as Graph` — NO validation     │
-  │  A* trusts every field exists and is the right type          │
-  └──────────────────────────────────────────────────────────────┘
-```
-
-Notice the axis-answer **never flips to "untrusted → rejected."** It flips to
-"untrusted → lightly cleaned → trusted." That's the whole finding. There's no
-boundary in flattr that *refuses* malformed input; there are boundaries that
-*clamp one field* and boundaries that *cast and hope*.
-
-## The verdict, ranked
-
-The teacher's call before the list: **this is an availability and
-route-integrity story, not a confidentiality or access-control one.** Nothing
-here leaks data or lets an attacker do something as someone else, because there
-is no "someone else" and no secret. Rank the exposures by what actually breaks:
+- **`pipeline/`** — runs at *build time* (`npm run build:graph`) on your machine,
+  or *on-device* inside the app to load map tiles. It turns OSM + elevation into
+  a `Graph`.
+- **`features/` + `mobile/`** — the *runtime* routing engine and the Expo UI that
+  consumes the graph and talks to geocoding.
 
 ```
-  Worst → least, by real consequence
+  Two halves, one trust question per half
 
-  1. graph.json cast `as Graph`            ── crash deep in A*
-     (loadGraph.ts:10)                        on any drift/corruption
-     → availability. Highest. See 02.
-
-  2. External OSM/elevation, one clamp     ── wrong/unsafe route
-     (grade.ts:30, no other validation)       (bad geometry → bad grade)
-     → route integrity. See 01.
-
-  3. User input → Nominatim + label back   ── privacy (coords leave device);
-     (geocode.ts, MapScreen.tsx)              injection vector IF labels ever
-     → privacy + future-LLM seam. See 03.    reach an LLM unframed.
-
-  4-8. authn / authz / session / CSRF /    ── NOT YET EXERCISED.
-     SQLi / secrets-in-bundle                  No surface exists. Triggers
-     → none today. See audit.md.               named in the audit.
+  ┌─ BUILD-TIME / TILE-LOAD ───────────────────────────────────┐
+  │  Overpass ─► parseOsm ─► splitWays ─► sampleElevations      │
+  │  Open-Meteo ──────────────────────────► computeGrades       │
+  │     trust Q: do I trust the 3rd-party data I just fetched?  │ ← boundary 1
+  └────────────────────────────────────────────────────────────┘
+                    │ emits graph.json (build) ──────────┐
+                    ▼                                     │ boundary 2
+  ┌─ RUNTIME (mobile app) ─────────────────────────────────────┐
+  │  loadGraph ─► directedAstar ─► routeToGeoJSON ─► <Map/>     │
+  │  AddressBar text ─► geocode ─► Nominatim ─► display_name    │ ← boundary 3
+  │     trust Q: do I trust the artifact / the geocoder reply?  │
+  └────────────────────────────────────────────────────────────┘
 ```
 
-## What's genuinely fine here (state it plainly)
+Every finding in this guide hangs off one of those three boundaries.
 
-- **No secrets to manage.** Overpass, Open-Meteo, and Nominatim are keyless
-  free APIs. The only key in the codebase, `GOOGLE_ELEVATION_KEY`, is read from
-  `process.env` at *build time only* (`pipeline/run-build.ts:23`), never
-  bundled into the app, and the build output dir `data/` is git-ignored
-  (`.gitignore`). There is no secret to leak. This is the right posture — don't
-  invent a secrets-management story the project doesn't need.
-- **Lockfiles present** at both `package-lock.json` and
-  `mobile/package-lock.json` — supply chain is pinned.
-- **React escapes by default**, so the third-party `display_name` rendered in
-  `AddressBar.tsx:23` is not a live XSS today. The risk is *deferred*, not
-  present — see `03`.
+## The three live boundaries (ranked)
 
-## How to use this guide
+**Ranked by what an attacker actually reaches.** The verdict-first call:
+boundary 2 is the worst because it's the easiest to trip and crashes hardest.
 
-Open `audit.md` for the lens-by-lens walk. Open the three numbered files for
-the deep walk on each real boundary. Each pattern file is full
-`format.md` shape: zoom out → structure pass → how it works (with the real
-file:line) → primary diagram → interview defense.
+| # | Boundary | Untrusted source | Validation today | Worst case | Severity |
+|---|----------|------------------|------------------|-----------|----------|
+| 2 | Artifact load | `graph.json` | none (`as unknown as Graph`) | hard crash deep in A* | **High (availability)** |
+| 1 | External data | Overpass, Open-Meteo | ±40% grade clamp only | wrong/garbage routes, NaN coords | Medium |
+| 3 | Input → 3rd-party URL | typed text + exact GPS | none; React-escaped on render | privacy leak; dormant prompt-injection | Medium (privacy) |
+
+The deep walks live in `01-`, `02-`, `03-`. The full lens-by-lens evidence
+(including the absent lenses) lives in `audit.md`.
+
+## What's honestly NOT exercised
+
+Don't pad the audit with vulnerabilities that can't exist here. These lenses
+have no surface in flattr today — each with the trigger that would change that:
+
+```
+  Absent surfaces — and what activates them
+
+  authn / authz   → no users, no protected resources.
+                    TRIGGER: a backend, saved routes, accounts.
+  sessions/CSRF   → no cookies, no server-side state.
+                    TRIGGER: a login + cookie/session.
+  SQL injection   → no database, no query string built anywhere.
+                    TRIGGER: persisting routes to a DB.
+  XSS (classic)   → React escapes by default; no dangerouslySetInnerHTML,
+                    no eval, no innerHTML in the repo.
+                    TRIGGER: raw HTML injection of geocoder text.
+  server secrets  → keyless free APIs; nothing to leak server-side.
+                    GOOGLE_ELEVATION_KEY is build-time env only (run-build.ts:23),
+                    never bundled; data/ is gitignored.
+  LLM / agent     → no model in the loop yet.
+                    TRIGGER: an LLM consuming display_name or route data → 03-.
+```
+
+Naming these honestly — with the trigger — is the signal. A "secure because no
+attack surface" verdict that can't say *what would create the surface* is
+hand-waving. → `audit.md` carries each with `file:line` proof of absence.
+
+## One-line fixes, top three
+
+1. **Validate `graph.json` at load** — a runtime schema check (node refs
+   resolve, coords finite, adjacency consistent) at `loadGraph.ts:9` turns a
+   deep A* crash into a clean "bad artifact" error. → `02-`.
+2. **Clamp/validate coordinates leaving the pipeline** — `parseOsm` and
+   `computeGrades` trust lat/lng and elevation blindly past the ±40% grade
+   clamp; a NaN or out-of-range coordinate propagates into haversine and A*. → `01-`.
+3. **Don't render geocoder `display_name` into any non-escaped sink** — it's
+   inert in React today; gate it before it ever reaches an LLM prompt or HTML. → `03-`.

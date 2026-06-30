@@ -1,127 +1,166 @@
 # ML features in this codebase
 
-**Verdict first: flattr does not currently use any machine-learning
-features.** No trained model, no inference runtime (no ONNX, no TFLite, no
-MediaPipe, no Core ML), no training pipeline, no feature engineering, no
-dataset. SECTION 04's ML concepts are covered in `08-machine-learning/` as
-study material — taught as new ground, not as a refresher.
+**Type label:** Honesty file (per-codebase). The ML companion to
+[ai-features-in-this-codebase.md](ai-features-in-this-codebase.md).
 
-## What's "intelligent" in flattr — and why it isn't ML
+## The one-line verdict
 
-flattr's decision-making is **classical search over a hand-built graph**,
-decided by deterministic rules. It is the opposite of a learned model:
-every output is reproducible and every cost is hand-coded.
+flattr contains **no trained model**. There is no training pipeline, no
+labeled dataset, no feature engineering for a model, no `train/val/test`
+split, no inference of learned weights. Nothing in `features/`,
+`pipeline/`, or `mobile/` loads or runs an ML model. The closest thing
+to "intelligence" is a hand-tuned analytic cost function and a
+fixed-threshold color classifier — both are **deterministic math**, not
+learned.
+
+The spec asks for one honest call here, and it matters because it's a
+tempting false positive: **`features/grade/classify.ts` is NOT a machine
+learning classifier.** Read on.
+
+## Kill the false positive: `classify.ts` is a threshold table
+
+The name `classify` and the type `Band` make this look like a
+classifier. It isn't. Look at the actual code (`classify.ts:11`):
+
+```ts
+export function classifyAbs(absGradePct: number, bands: Bands = DEFAULT_BANDS): Band {
+  const g = Math.abs(absGradePct);
+  if (g <= bands.greenMax) return "green";   // ← fixed threshold, 4%
+  if (g <= bands.yellowMax) return "yellow"; // ← fixed threshold, 8%
+  return "red";
+}
+```
+
+That's an `if`-ladder over two constants (`DEFAULT_BANDS = { greenMax:
+4, yellowMax: 8 }`, `classify.ts:8`). There are no learned weights, no
+training data, no probability output, no model file. "Classify" here is
+the everyday English verb (sort into buckets), not the ML noun (a fitted
+model). An ML classifier would have been *trained* on labeled grade →
+comfort examples and would output a calibrated probability. This outputs
+a hard band from a hand-picked threshold. **It is a lookup table with
+branches.** Do not call it ML in an interview — it's the kind of mistake
+that signals you can't tell a heuristic from a model.
 
 ```
-flattr's "intelligence" — algorithmic, not learned
+  Threshold table vs ML classifier — the distinction
 
-  Node {lat, lng, elevationM}
-  Edge {lengthM, riseM, gradePct (signed), absGradePct}
-        │
-        ▼  hand-written cost function (features/routing/cost.ts)
-  ┌──────────────────────────────────────────────────┐
-  │ A* search, admissible haversine heuristic         │
-  │ (features/routing/astar.ts + pqueue.ts binary heap)│
-  └──────────────────────────────────────────────────┘
-        │
-        ▼
-  shortest "flat-enough" path — DETERMINISTIC, no weights learned
-
-  contrast: an ML pipeline would LEARN the edge costs from data.
-            flattr SETS them with a formula. That's the whole difference.
+  classify.ts (what's here)        ML classifier (what's NOT here)
+  ┌──────────────────────┐         ┌──────────────────────────────┐
+  │ grade %              │         │ features (grade, surface,    │
+  │   │                  │         │   weather, user history...)  │
+  │   ▼  if g <= 4       │         │   │                          │
+  │ "green"  (constant)  │         │   ▼  learned weights θ       │
+  │   if g <= 8          │         │ P(comfortable) = σ(θ·x)      │
+  │ "yellow" (constant)  │         │   │  trained on labels       │
+  │   else "red"         │         │   ▼  calibrated probability  │
+  └──────────────────────┘         └──────────────────────────────┘
+   hand-picked numbers              fitted to data
+   no data, no training             data IS the program
 ```
 
-There's a tempting false positive worth killing explicitly: the **grade
-classifier** in `features/grade/classify.ts` has "classifier" in the name.
-It is **not** an ML classifier. It's a threshold table — signed grade →
-band → color — pure `if`/range logic. No training, no parameters fit to
-data. A confusion matrix would be meaningless against it because there's
-nothing learned to be confused.
+## What is NOT here — be explicit
 
-## You've shipped ML elsewhere — here's where it'd attach here
+- **No supervised pipeline.** No data → features → split → train →
+  deploy. Nothing trains.
+- **No feature engineering.** `Edge.gradePct`, `riseM`, `lengthM` are
+  geometric facts computed in the build pipeline (`pipeline/grade.ts`),
+  not features fed to a model.
+- **No on-device inference.** `mobile/` runs A\* over a static graph.
+  No TFLite / ONNX / Core ML / MediaPipe model is loaded. (Contrast your
+  own **contrl**, which genuinely does on-device MediaPipe inference.)
+- **No recommender.** No ranking model, no collaborative filtering.
+- **No drift detection, no retraining, no training-run logging** —
+  because there's no model to monitor.
 
-Your one shipped ML pipeline is **contrl**: on-device MediaPipe
-pose-landmark detection feeding a rep counter, inside a real-time
-frame-rate budget, no network in the hot path. That's the closest analog
-to anything flattr could grow.
+## The ONE legitimate ML attach point: `cost.ts` `penalty()`
 
-Where ML would plausibly attach in flattr (all currently absent):
+If flattr ever grew an ML model, this is where it would go — a **learned
+edge cost** replacing the hand-tuned `penalty()` (`cost.ts:16`):
+
+```ts
+export function penalty(g: number, max: number, k1 = 0.4, k2 = 1.0): number {
+  if (g <= 0) return 0;            // downhill / flat: free
+  if (g > max) return BLOCKED;     // over user's max: 1e9 (finite!)
+  const half = 0.5 * max;
+  if (g <= half) return k1 * g;            // moderate: linear
+  return k2 * (g - half) ** 2 + k1 * half; // steep: quadratic
+}
+```
+
+Today `k1` and `k2` are hand-tuned constants. A learned model would fit
+them — or replace the whole function — from data like *"which routes did
+users actually accept / reroute away from."* That's a legitimate ML
+problem: learn the perceived-effort cost of a grade per user.
+
+**But it carries a hard correctness constraint that pose-landmarking
+never had.** The router is A\*, and A\* only returns optimal paths if the
+edge cost obeys two invariants the project treats as must-not-change:
+
+1. **Admissible / non-negative.** `penalty() ≥ 0` always (note `g <= 0
+   → 0`). A\*'s heuristic is the haversine lower bound; if a learned cost
+   went negative, the heuristic stops being a lower bound and A\* can
+   return a non-optimal path. **A learned cost must be clamped ≥ 0.**
+2. **`BLOCKED` is large-finite, not `Infinity`** (`cost.ts:5`, `BLOCKED
+   = 1e9`). This is what lets "no flat route, here's the flattest steep
+   one" stay distinct from "no route at all" (disconnected graph). A
+   learned cost must preserve this: over-max edges stay finite-but-huge,
+   never literally infinite, or the "flattest-but-steep" fallback
+   collapses into "no route."
+
+So the interview-grade framing is: *"the ML attach point is the edge
+cost, but the learned function has to stay non-negative and monotone in
+grade to preserve A\* admissibility, and over-threshold has to map to a
+large finite penalty to preserve the BLOCKED-vs-disconnected
+distinction."* That's a constraint a generic "just learn the cost"
+answer misses.
 
 ```
-hypothetical ML attachment points (none exist today)
+  Where a learned cost attaches — and what it must NOT break
 
-  ┌─ build pipeline ──────────────────────────────────────┐
-  │ pipeline/elevation.ts  → learned elevation infill      │
-  │   (today: Open-Meteo API lookup, not a model)          │
-  │ pipeline/grade.ts      → learned surface/grade smoothing│
-  │   (today: arithmetic from rise/length)                 │
+  ┌─ A* search (astar.ts) ─────────────────────────────────┐
+  │  f(n) = g(n) + h(n)                                     │
+  │           │       └── h = haversine LOWER BOUND         │
+  │           └── g = Σ edge costs                          │
+  │                      │                                  │
+  │                      ▼  cost.ts gradeCostDirected       │
+  │              edge.lengthM × (1 + penalty(grade, max))   │
+  │                                    │                    │
+  │                       ★ LEARNED penalty would go here   │
+  │                       must stay: ≥ 0  AND  monotone     │
+  │                       over-max → finite BLOCKED, not ∞  │
   └────────────────────────────────────────────────────────┘
-  ┌─ routing cost ────────────────────────────────────────┐
-  │ features/routing/cost.ts → LEARN edge cost from rider   │
-  │   behavior instead of the hand-coded grade penalty.     │
-  │   This is the real ML opportunity: a learned-to-rank or │
-  │   regression model over edge features.                  │
-  └────────────────────────────────────────────────────────┘
+   break ≥0  → A* may return non-optimal path
+   break finite → "flattest-but-steep" becomes "no route"
 ```
 
-The honest read: flattr's project constraint is **hand-rolled graph +
-router only** (`docs/flattr-spec.md` §14) — no Valhalla/OSRM, and by
-extension the routing logic is deliberately *not* a black box. Replacing
-the hand-coded `cost.ts` with a learned model would be a real architectural
-shift, not a drop-in. That's why it's a future exercise, not a seam you'd
-add casually.
+## What you've shipped elsewhere — where it would attach here
 
-## The one place a learned cost would attach
+- **contrl** (on-device MediaPipe, pose-landmark → rep counter) is your
+  one real end-to-end ML project. The flattr analog is the learned
+  `cost.ts` — both run a model on-device in a local-first app. The
+  *difference* worth naming: contrl's model output feeds a rep counter
+  with no global optimality constraint; flattr's learned cost feeds A\*,
+  which imposes the admissibility/finite-BLOCKED invariants above. Same
+  on-device deployment story, stricter correctness contract.
 
-**Where:** `features/routing/cost.ts` — the signed directed-grade penalty.
+## Per-feature table (honest)
 
-Today this is a formula: grade in, penalty out, with two hard invariants
-from the spec — the penalty must stay **≥ 0** (so A*'s heuristic remains
-admissible) and `BLOCKED` is a large-finite value, not `Infinity` (so
-"no flat route" stays distinct from "disconnected"). Any learned model
-that replaced it would have to preserve both invariants, which constrains
-the model class hard: you'd need a **monotone, non-negative** cost — closer
-to isotonic regression or a constrained GBM than a free-form neural net.
-
-That constraint is itself the lesson. flattr's invariants tell you which ML
-you're allowed to use here, before you pick a model.
-
-## Project exercises
-
-### MLX.1 — Learned edge cost (replace the hand-coded penalty)
-
-- **What to build:** a regression/learned-to-rank model over edge features
-  (`gradePct`, `lengthM`, `kind`, maybe surface) that predicts a
-  rider-perceived cost, swapped in behind the existing `cost.ts` interface.
-- **Why it earns its place:** it's the only ML feature that touches the
-  *core* of flattr, and it forces you to respect the admissibility (`≥ 0`)
-  and `BLOCKED`-finite invariants — real ML-under-constraints, not a toy.
-- **Files to touch:** `features/routing/cost.ts` (interface stays, body
-  becomes model inference), a new training script under `pipeline/` or a
-  sibling `ml/`, plus `bench/` to prove route quality didn't regress.
-- **Done when:** the learned cost produces routes a held-out set of riders
-  prefer over the hand-coded penalty, *and* `npm run bench` confirms A*
-  still terminates with the heuristic admissible (no negative costs leaked).
-- **Estimated effort:** multi-day; needs a labeled dataset that doesn't
-  exist yet — call that out before starting.
-
-### MLX.2 — On-device elevation/grade infill (contrl-shaped)
-
-- **What to build:** a small on-device model to infill or smooth elevation
-  where Open-Meteo returns gaps, removing a network dependency from the
-  build pipeline.
-- **Why it earns its place:** closest to your shipped contrl pattern
-  (on-device inference, no network in the path) and directly addresses the
-  documented Open-Meteo 429 caveat in the project context.
-- **Files to touch:** `pipeline/elevation.ts`, `pipeline/grade.ts`, plus a
-  model artifact + inference shim.
-- **Done when:** the build produces a complete `graph.json` with Open-Meteo
-  unavailable, and grade values stay within a measured error band of the
-  API ground truth.
-- **Estimated effort:** multi-day; the contrl experience transfers.
+```
+  ┌────────────────────┬──────────────────┬───────────────────────┐
+  │ Candidate          │ What it is today │ ML status             │
+  ├────────────────────┼──────────────────┼───────────────────────┤
+  │ classify.ts bands  │ threshold table  │ NOT ML — if-ladder    │
+  │                    │ (if/else)        │ over 2 constants      │
+  ├────────────────────┼──────────────────┼───────────────────────┤
+  │ cost.ts penalty()  │ hand-tuned       │ ML ATTACH POINT —     │
+  │                    │ analytic fn      │ learned cost, must    │
+  │                    │ (k1, k2 consts)  │ stay ≥0 + finite      │
+  │                    │                  │ BLOCKED               │
+  └────────────────────┴──────────────────┴───────────────────────┘
+```
 
 ## See also
 
-- [`ai-features-in-this-codebase.md`](ai-features-in-this-codebase.md) — the LLM half (also: none) + the three seams
-- [`08-machine-learning/01-supervised-pipeline.md`](08-machine-learning/01-supervised-pipeline.md)
-- [`08-machine-learning/12-on-device-inference.md`](08-machine-learning/12-on-device-inference.md)
+- [ai-features-in-this-codebase.md](ai-features-in-this-codebase.md) — the LLM side (no LLM either).
+- [08-machine-learning/01-supervised-pipeline.md](08-machine-learning/01-supervised-pipeline.md) — the learned-cost exercise in full.
+- [08-machine-learning/12-on-device-inference.md](08-machine-learning/12-on-device-inference.md) — contrl-style on-device serving.

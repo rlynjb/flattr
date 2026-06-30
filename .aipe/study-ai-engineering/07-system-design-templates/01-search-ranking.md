@@ -1,72 +1,117 @@
-# 01 — Design a Search + Ranking System
+# Search & Ranking
 
-**Query → candidate retrieval → ranking → results. The classic interview reframe — and flattr has a search UI but no ranking layer of its own.**
+An interview-reframe template. The same flattr code, viewed through the lens of a
+search-ranking system-design prompt. Answered honestly about flattr's current state.
 
-This is a generic system-design template, not a flattr walkthrough. The shape shows up in every search loop: a user types a query, you retrieve a cheap candidate set, you re-score those candidates with something more expensive, and you return the top few. In the LLM era the "expensive" stage is often a learned re-ranker (cross-encoder) or an embedding-similarity step. The interview question is always the same: *where does each stage live, and what's the latency/quality tradeoff at each boundary?*
+## The prompt
 
-## The standard architecture
+"Design a search ranking system that takes a query and returns top-k relevant items."
+
+## Standard architecture
+
+The canonical answer is a two-stage funnel: a cheap retrieval pass narrows millions
+of candidates to hundreds, then an expensive learned ranker reorders them using
+features, with click logs feeding a training loop that closes back onto the ranker.
 
 ```
-Search + ranking pipeline (generic)
-┌──────────┐   ┌──────────────────┐   ┌─────────────────┐   ┌──────────┐
-│  query   │──▶│ candidate         │──▶│ ranker           │──▶│ top-k    │
-│  "elm st"│   │ retrieval         │   │ (score & sort)   │   │ results  │
-└──────────┘   │ (recall stage)    │   │ (precision stage)│   └──────────┘
-               │ cheap, high-recall│   │ expensive, learned│
-               │ inverted index /  │   │ cross-encoder /  │
-               │ ANN / BM25        │   │ feature model    │
-               └──────────────────┘   └─────────────────┘
-                       │                       │
-                  thousands              re-score top ~100
-                  of hits                keep top ~10
+                 SEARCH RANKING — canonical two-stage funnel
+  ┌─────────┐    ┌──────────────┐    ┌───────────────┐    ┌──────────────┐
+  │  query  │──► │  retrieval   │──► │ feature build │──► │ learned rank │──► top-k
+  └─────────┘    │ (recall, ~k0)│    │ per candidate │    │ (precision)  │
+                 └──────────────┘    └───────────────┘    └──────────────┘
+                       ▲                                          │
+                       │                                          ▼
+                 ┌──────────┐         ┌──────────────────┐   ┌─────────┐
+                 │  index   │ ◄────── │  training loop    │◄──│ click   │
+                 │ (ANN/BM25)│        │ (offline retrain) │   │  logs   │
+                 └──────────┘         └──────────────────┘   └─────────┘
 ```
 
-The whole game is **two stages with different cost profiles**: retrieval is tuned for recall (don't miss the right answer), ranking is tuned for precision (put it at the top). You never run the expensive ranker over the whole corpus.
+The load-bearing idea is the feedback edge: the system gets better because it watches
+which result the user picked and trains on that signal.
 
-## Data model + scale concerns (brief)
+## Data model
 
-- **Index**: an inverted index (term → doc ids) or an ANN index (vector → neighbors). Updated incrementally as the corpus changes.
-- **Candidate set size**: the knob between latency and recall. Retrieve 100, re-rank 100, show 10.
-- **Ranking features**: text-match score, freshness, popularity, personalization, geographic proximity. A learned ranker combines them.
-- **Scale**: shard the index by term or by space; cache hot queries; debounce keystroke traffic; budget the ranker's per-candidate cost (a cross-encoder at 100 candidates is 100 model calls).
+- **Index**: inverted index (BM25) or vector index (ANN over embeddings), keyed by item.
+- **Feature store**: per-(query,item) features — text match, freshness, popularity, prior CTR.
+- **Click/interaction logs**: (query, shown list, clicked position, dwell) — the training fuel.
+- **Model artifact**: serialized ranker (GBDT / learned-to-rank weights), versioned.
+
+## Key components
+
+- **Retriever** — recall-optimized first pass. Technical choice: ANN (HNSW) when
+  relevance is semantic; BM25 when it's lexical. Pick by whether synonyms matter.
+- **Ranker** — precision-optimized reorder over the candidate set. Technical choice:
+  pairwise/listwise LTR over pointwise, because ranking quality is about *order*, not
+  absolute score.
+- **Feature pipeline** — must compute identically offline (training) and online
+  (serving) or you get train/serve skew. Choice: shared feature code, one definition.
+- **Logging** — log impressions, not just clicks, or you can't model what was *not*
+  chosen.
+
+## Scale concerns
+
+Ordered by what hits first as the corpus grows.
+
+- **At ~10k items**: linear scan retrieval is fine; no index needed. This is where
+  flattr's graph lives today (`nearest.ts` scans every node).
+- **At ~1M items**: linear scan dies; you need an inverted or ANN index, and index
+  build/refresh becomes its own pipeline with staleness budgets.
+- **At ~10M+ items**: feature computation dominates latency. You shard the index, cache
+  hot queries, and move feature joins off the request path into a feature store.
+- **Logging volume** outgrows the serving fleet before the model does — click logs at
+  scale are a data-engineering problem (sampling, partitioning) before they're an ML one.
+
+## Eval framing
+
+- **Offline**: NDCG@k / MRR / MAP against a held-out judged set; replay click logs as
+  counterfactual relevance.
+- **Online**: CTR, click-through position, abandonment rate, session success — measured
+  by interleaving or A/B, because offline NDCG and online CTR routinely disagree.
+
+## Common failure modes
+
+- **Train/serve skew** — features differ between training and serving. Mitigation: one
+  feature definition, shared code path, monitored feature distributions.
+- **Feedback loop / popularity bias** — the ranker only ever shows popular items, so
+  only popular items get clicks, so they stay popular. Mitigation: exploration
+  (epsilon-random slots), position-debiased training.
+- **Stale index** — new items aren't retrievable until the next build. Mitigation:
+  incremental indexing with a real-time tier for fresh items.
+- **Cold-start query/item** — no logs, no features. Mitigation: content-based fallback
+  features and sane retrieval-only ordering.
 
 ## Applies to this codebase
 
-Partially — and the honest answer is *the shape is there, the ranking is not.*
-
-- **There is a real search UI.** `mobile/src/AddressBar.tsx` renders From/To inputs with a live suggestion dropdown (`Suggestions`, line 9; rendered at lines 84 and 103). It is a genuine query→results loop visually.
-- **But the "ranker" is Nominatim's, not flattr's.** `pipeline/geocode.ts` `geocodeSuggest` (line 31) is a **thin pass-through**: it builds a query string, hits `https://nominatim.openstreetmap.org/search`, and maps the rows straight to `GeocodeResult` (line 52) — no flattr-side scoring, no re-sort, no learned features. The order you see is whatever OSM returned. The only flattr-side knobs are `limit` (line 41) and the `viewbox`/`bounded` bias (lines 42–45) — that's recall shaping, not ranking.
-- **A\* "ranks" routes — but by objective, not by learning.** `features/routing/cost.ts` is the closest thing to a ranking function in the whole repo. `gradeCostDirected` (line 32) scores each edge by distance × grade-penalty, and A* (`features/routing/astar.ts`) returns the *single* lowest-cost path. That's **ranking-by-explicit-objective** — a hand-written cost function, the opposite of a learned ranker. There is no candidate *set* of routes being re-scored; A* returns one winner.
-- **The nearest LLM seam:** if you ever fed candidates into a model, the output→prompt seam is `features/routing/summary.ts:11` (route totals, the natural thing to describe) and the input→prompt seam is `pipeline/geocode.ts:9`. Neither is wired to anything ranking-shaped today.
-
-Verdict: flattr is a **retrieval pass-through + an objective-cost optimizer**. It has neither half of a learned search-ranking system.
+**Partially.** flattr has two genuine retrieval surfaces and zero ranking. The
+autocomplete (`geocodeSuggest`, `pipeline/geocode.ts:31`, called from
+`MapScreen.tsx:82`) is a query-to-candidates surface — you type, it returns up to five
+place matches. And `features/routing/nearest.ts` is a literal nearest-neighbor search:
+given a tapped coordinate, scan every node in the static `graph.json` and return the
+closest by haversine distance. That is the retrieval *instinct* — query in, ranked-by-
+distance candidates out. But the resemblance stops at the funnel's first box. There is
+no learned ranker, no embeddings, no feature store, and critically no click logs:
+flattr never records which suggestion the user picked, so there is no signal to learn
+from and nothing closes the feedback loop. The "ranking" in `geocodeSuggest` is
+whatever order Nominatim returns; the "ranking" in `nearestNode` is pure geographic
+distance. Both are deterministic geometry, not relevance learning. Calling flattr a
+search-ranking system would overclaim — it does stage-one retrieval and stops.
 
 ## How to make it apply
 
-Two concrete, in-repo refactors if you wanted to actually build the template here:
+The cheapest honest step is to start logging. Today `MapScreen.tsx:82` calls
+`geocodeSuggest` and the user taps one of the returned `GeocodeResult` rows, but that
+choice evaporates. Add a `(query, shownLabels[], pickedIndex)` log at the tap site —
+that's the click log the canonical architecture is built around, and flattr has no
+backend so it'd start as a local append-only file behind the same INPUT seam.
 
-**A. A learned (or heuristic) re-ranker over geocode results.**
-Today `geocodeSuggest` returns OSM's order verbatim. Insert a ranking stage in `pipeline/geocode.ts` between the `rows.map(...)` (line 52) and the return:
-
-```
-Re-ranked autocomplete (proposed)
-geocodeSuggest ─▶ rows (OSM order) ─▶ rankSuggestions(rows, ctx) ─▶ top-k
-                                       │
-                                       ├─ proximity to map center / current loc
-                                       ├─ string-match strength vs query
-                                       └─ (later) a learned scorer from tap logs
-```
-
-Concretely: add `rankSuggestions(results: GeocodeResult[], ctx: { center?: [lat,lng]; query: string }): GeocodeResult[]`, sort by a feature blend, and have `AddressBar.tsx` render the re-sorted list. Start heuristic (distance + match), then — if you log which suggestion the user actually taps — train a tiny logistic ranker offline and ship it as the scoring function. That turns the pass-through into a real two-stage search.
-
-**B. Learned route ranking in `features/routing/cost.ts`.**
-The cost weights `DEFAULT_K1`/`DEFAULT_K2` (lines 8–9) and the penalty shape (line 16) are hand-tuned. The "make it learned" version: emit *multiple* candidate routes (e.g. run A* with several cost profiles, or k-shortest-paths), then rank them with a model trained on which route users accepted. That's the candidate-retrieval → ranking split applied to routes instead of documents — `astar.ts` becomes the recall stage, a learned scorer becomes the precision stage.
-
-Both are real features, not toys — but both are net-new ML that flattr deliberately doesn't have. As shipped, flattr's "ranking" is a 6-line cost function, and that's the right call for a routing engine.
-
-## See also
-
-- `03-retrieval-and-rag/07-reranking.md` — the reranking concept in isolation (also N/A in flattr today)
-- `03-retrieval-and-rag/06-hybrid-retrieval-rrf.md` — merging retrieval signals; note A* ranks by cost, not by signal merge
-- `01-search-ranking.md`'s sibling `02-tech-support-chatbot.md` — the other generic template here
-- Real seams: output→prompt `features/routing/summary.ts:11`; input→prompt `pipeline/geocode.ts:9`; injection vector `pipeline/geocode.ts:27,52,69`
+Once logs exist, rank the suggestions before display: a `rankSuggestions(query,
+results, history)` shim between `geocodeSuggest` and the render, scoring by features
+flattr already has — distance from current map center, prior pick frequency, prefix
+match strength. Start with a hand-weighted score (mirrors `cost.ts:16` `penalty()`,
+which is also a tunable hand-weighted function), then swap the weights for a learned
+model once the pick-log is large enough. That is exactly the retrieval-then-rank
+instinct I shipped in AdvntrCue (pgvector recall into a GPT-4 rerank); here it would
+attach at flattr's geocode INPUT seam rather than over documents. Keep the framing
+honest in the room: flattr today is retrieval-only, and the refactor adds the ranking
+stage it currently lacks.

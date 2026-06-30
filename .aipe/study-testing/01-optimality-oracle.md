@@ -1,66 +1,68 @@
 # 01 — The Optimality Oracle
 
-**Industry names:** differential testing · oracle test · cross-implementation
-verification · "test against a known-correct reference." **Type:** Industry
-standard (the specific A*-vs-Dijkstra form is project-shaped here).
+**Industry names:** *oracle test* / *differential testing* / *metamorphic testing*
+(the "two implementations must agree" variant). **Type:** Industry standard.
 
 ---
 
-## Zoom out — where this lives
+## Zoom out, then zoom in
 
-This is the single most load-bearing test in the repo. It sits at the runtime
-engine layer, guarding the optimizer that the whole product depends on.
+You've got two ways to solve the same problem: a slow, obviously-correct one and a fast,
+easy-to-break one. How do you test the fast one? You don't hand-type the expected answer —
+you make the slow one *be* the answer. That's the oracle.
 
 ```
-  Zoom out — the oracle guards the optimizer
+  Zoom out — where the oracle sits in flattr's test stack
 
-  ┌─ BUILD layer ───────────────────────────────────────────────┐
-  │  pipeline → graph.json                                       │
-  └───────────────────────────────┬─────────────────────────────┘
-                                  │
-  ┌─ RUNTIME engine layer ────────▼─────────────────────────────┐
-  │  dijkstra (uninformed, slow, PROVABLY optimal)              │
-  │      ║  same cost?  ◄══ ★ THE ORACLE ★                       │ ← we are here
-  │  astar / directedAstar / bidirectional (fast, MUST match)  │
-  └───────────────────────────────┬─────────────────────────────┘
-                                  │
-  ┌─ MOBILE layer ────────────────▼─────────────────────────────┐
-  │  MapScreen renders the route the engine returned            │
-  └─────────────────────────────────────────────────────────────┘
+  ┌─ Routing core: features/routing/ ──────────────────────────┐
+  │                                                            │
+  │   dijkstra()  ─────────── the trusted, simple baseline     │
+  │      │                    (no heuristic, floods outward)   │
+  │      │ its result is the ORACLE                            │
+  │      ▼                                                     │
+  │   ★ astar.test.ts:38 ★  ← THIS CONCEPT                     │
+  │      asserts:  astar.cost  ==  dijkstra.cost               │
+  │      ▲                                                     │
+  │      │ the implementation under test                       │
+  │   astar()  ───────────── fast, informed, easy to break     │
+  │                          (haversine heuristic prunes)      │
+  └────────────────────────────────────────────────────────────┘
+        same oracle extends to → bidirectional.test.ts:8,16
 ```
 
-Zoom in: A* is fast because it's *greedy with a heuristic* — it skips nodes it
-guesses can't be on the best path. But a heuristic that guesses wrong returns a
-path that's plausible and *wrong*, and on a 144-node grid no human can tell.
-The oracle is how you check the guesser: run the slow algorithm that can't be
-wrong, and demand the fast one return the **same cost**.
+The thing you're routing for — flat-not-fast paths — is only *correct* if the optimizer
+returns the genuinely optimal path, not just a plausible one. A* is an optimization over
+Dijkstra: same answer, fewer nodes expanded. The instant A* and Dijkstra disagree on cost,
+A* has a bug (usually an inadmissible heuristic). This test is the tripwire. It is the
+single most valuable test in the repo.
 
 ---
 
-## Structure pass
+## The structure pass
 
-**Layers:** two algorithms at the same level — a reference (Dijkstra) and a
-candidate (A* family). The oracle is the *vertical seam* between them.
-
-**Axis — "can this algorithm be wrong?"** Trace it across the seam:
+Layer the players, pick one axis — **"who is the source of truth for the correct
+answer?"** — and watch where it flips.
 
 ```
-  axis = "is this provably optimal, or does it depend on a heuristic?"
+  axis traced: "who decides what the correct cost IS?"
 
-  ┌─ Dijkstra ──────┐   seam    ┌─ A* / directed / bidi ──┐
-  │ PROVABLY optimal│ ════╪════► │ optimal ONLY IF the     │
-  │ (no heuristic)  │  (flips)   │ heuristic is admissible │
-  └─────────────────┘            └─────────────────────────┘
-         ▲                                    ▲
-         └──── the oracle pins the seam: ─────┘
-               candidate.cost === reference.cost
+  ┌─ layer: the test ───────────────────────────────┐
+  │  decides NOTHING — it only compares two numbers  │
+  └───────────────────────┬──────────────────────────┘
+                          │   seam: the test trusts dijkstra
+  ┌─ layer: dijkstra (oracle) ──▼───────────────────┐
+  │  DECIDES the correct cost. trusted by fiat       │  ← truth lives here
+  └───────────────────────┬──────────────────────────┘
+                          │   seam: must AGREE across it
+  ┌─ layer: astar (under test) ─▼───────────────────┐
+  │  PROPOSES a cost. believed only if it matches    │  ← truth is checked here
+  └──────────────────────────────────────────────────┘
 ```
 
-The axis flips hard across this seam: Dijkstra cannot be wrong, A* can. That's
-exactly why the boundary is worth a test — the contract "A* equals Dijkstra"
-*is* the admissibility proof, checked by execution instead of by hand.
-
-**Seam:** `expect(a.path!.cost).toBeCloseTo(d.path!.cost, 6)`.
+The load-bearing seam is between dijkstra and astar: the axis flips from *defines truth* to
+*must match truth*. That's the whole pattern. The reason it works is that the two sides
+share **nothing but the answer** — different traversal order, different pruning, different
+code paths — so a bug in one almost never hides behind the same bug in the other.
 
 ---
 
@@ -68,227 +70,248 @@ exactly why the boundary is worth a test — the contract "A* equals Dijkstra"
 
 ### Move 1 — the mental model
 
-You know how you'd check a fast hand-written `sort()` against the language's
-built-in `[...arr].sort()`? You don't re-derive the sorted order yourself — you
-trust the reference and demand your version agrees. The optimality oracle is the
-same move: Dijkstra is the built-in you trust; A* is your fast version that has
-to match.
+You already do this without naming it. When you refactor a function, you keep the old one
+around and assert `newImpl(x) === oldImpl(x)` over a bunch of inputs before deleting the
+old one. The oracle test is that, formalized: **the trusted implementation is the expected
+value.**
 
 ```
-  the oracle — two paths into the same graph, one assertion
+  the oracle shape — two paths to one truth
 
-         ┌─────────────┐
-   graph │  REFERENCE  │── cost_ref ──┐
-   ──────┤  dijkstra   │              │
-     │   └─────────────┘              ▼
-     │                          ┌───────────┐   pass if
-     │   ┌─────────────┐        │  EQUAL?   │   cost_ref
-     └───┤  CANDIDATE  │── cost_cand ──►     │   == cost_cand
-         │  astar      │        └───────────┘
-         └─────────────┘
+         same graph, same start, same goal
+                      │
+          ┌───────────┴───────────┐
+          ▼                       ▼
+     ┌─────────┐             ┌─────────┐
+     │ dijkstra│  ORACLE     │  astar  │  UNDER TEST
+     │ floods  │             │ pruned  │
+     └────┬────┘             └────┬────┘
+          │ cost = 200            │ cost = 200
+          └───────────┬───────────┘
+                      ▼
+              assert EQUAL  ──►  ✓ astar is optimal
+              (to 6 decimals)    ✗ astar has a bug
 ```
 
-The beauty: the test author never computes the optimal cost. They only assert
-two methods agree — and two correct methods *must*.
+The strategy in one sentence: **prove the fast algorithm correct by forcing it to agree
+with the slow one it's allowed to replace.**
 
 ### Move 2 — the walkthrough
 
-**The reference must be the trustworthy one.** Dijkstra is the oracle because it
-has no heuristic to get wrong — it floods outward by true accumulated cost. The
-test in `features/routing/astar.test.ts:38`:
+**The two engines are the same function with different knobs.** This is what makes the
+oracle clean. `features/routing/astar.ts:22` defines one `search(...)` engine; the
+"progression stages" are just `(costFn, heuristicFn)` choices:
 
 ```ts
-// astar.test.ts:37-45
+// features/routing/astar.ts:135-144  (annotated)
+export function dijkstra(graph, startId, goalId) {
+  return search(graph, startId, goalId, Infinity, distanceCost, zeroHeuristic);
+  //                                                ▲            ▲
+  //                                    distance cost      zeroHeuristic → it's
+  //                                                       plain Dijkstra (no pruning)
+}
+export function astar(graph, startId, goalId) {
+  return search(graph, startId, goalId, Infinity, distanceCost, haversineHeuristic);
+  //                                                ▲            ▲
+  //                                     SAME cost        haversine lower bound
+  //                                                       → A* (prunes, same optimum)
+}
+```
+
+Same `distanceCost`, *different heuristic*. A* layers a heuristic on top of Dijkstra. If
+the heuristic is admissible (never overestimates — haversine is a straight-line lower bound
+on real distance), the optimal cost is *identical*. The test is checking exactly that
+admissibility, indirectly, by checking the costs match.
+
+**The assertion: compare to the oracle, not to a literal.** Here is the test itself:
+
+```ts
+// features/routing/astar.test.ts:37-45  (annotated)
 describe("astar (stage 2, informed search)", () => {
   it("returns the SAME optimal path as Dijkstra (correctness gate)", () => {
-    const g = makeGridGraph(12);              // 12×12 = 144 nodes — too big to
-                                              //   eyeball the optimum
-    const d = dijkstra(g, "0,0", "11,11");    // reference: provably optimal
-    const a = astar(g, "0,0", "11,11");       // candidate: heuristic-driven
+    const g = makeGridGraph(12);              // a 12x12 lattice fixture
+    const d = dijkstra(g, "0,0", "11,11");    // ① the ORACLE computes truth
+    const a = astar(g, "0,0", "11,11");       // ② the engine under test
     expect(a.path).not.toBeNull();
-    expect(a.path!.cost).toBeCloseTo(d.path!.cost, 6);     // ← THE GATE
+    expect(a.path!.cost).toBeCloseTo(d.path!.cost, 6);     // ③ THE GATE
     expect(a.path!.lengthM).toBeCloseTo(d.path!.lengthM, 6);
   });
 ```
 
-Line by line: `makeGridGraph(12)` is chosen *because* it's big — a fixture small
-enough to hand-verify wouldn't stress the heuristic. `toBeCloseTo(..., 6)`
-allows floating-point slop (6 decimals) but nothing more — costs that differ by
-a real amount fail. Note it checks **cost**, not the node sequence: there can be
-two distinct paths of equal cost, and the oracle correctly accepts either, as
-long as the *cost* matches. Pinning the node list would make the test brittle to
-tie-breaking; pinning the cost is the actual correctness property.
+Walk it one line at a time:
 
-**The oracle scales up the cost ladder.** Each new algorithm is verified against
-the previously-trusted one — a chain of oracles:
+- **① The oracle runs first.** `d` is Dijkstra's result. We trust it. Dijkstra is simple
+  enough to eyeball-verify and has its own tests against hand-known answers
+  (`astar.test.ts:6` checks the diamond's known shortest path is exactly `["S","A","G"]`,
+  cost 200). The oracle is itself anchored — that's what makes it trustworthy.
+- **② The engine under test runs on the *same* graph and endpoints.** No new fixture, no
+  re-typing the answer. Whatever the correct cost is, both must find it.
+- **③ The gate: `toBeCloseTo(d.path!.cost, 6)`.** Not `toBe`. Floating-point haversine sums
+  won't be bit-identical across two traversal orders, so it asserts agreement to 6 decimal
+  places — tight enough to catch a real bug, loose enough to ignore IEEE-754 noise.
 
-```
-  the oracle chain — each link verified against the last
-
-  dijkstra ──proven by──► hand-computed diamond (S→A→G = 200)
-     │                         astar.test.ts:8-12
-     ▼  oracle
-  astar ───────────────► matches dijkstra cost (grid12)
-     │                         astar.test.ts:43
-     ▼  oracle
-  directedAstar ───────► matches on directional fixtures
-     │                         bidirectional.test.ts:21
-     ▼  oracle
-  bidirectional ───────► matches dijkstra AND directedAstar cost
-                               bidirectional.test.ts:11, :22
-```
-
-`features/routing/bidirectional.test.ts:11` and `:22` close the chain — the
-most complex algorithm (meet-in-the-middle bidirectional A*) is pinned against
-*two* references:
+**The oracle's reach: it extends to the harder engines.** Once you have the pattern, you
+reuse it. `bidirectional.test.ts:8` does the exact same move for the meet-in-the-middle
+engine:
 
 ```ts
-// bidirectional.test.ts:16-24 — directed cost, interior pair
-const g = makeGridGraph(30);
-const ref = directedAstar(g, "12,12", "17,17", 10);          // trusted candidate
-const b = bidirectional(g, "12,12", "17,17", 10, gradeCostDirected);
-expect(b.path!.cost).toBeCloseTo(ref.path!.cost, 4);          // ← oracle
+// features/routing/bidirectional.test.ts:8-14  (annotated)
+const b = bidirectional(g, "S", "G", Infinity, distanceCost);
+const d = dijkstra(g, "S", "G");
+expect(b.path!.nodes).toEqual(d.path!.nodes);          // same path
+expect(b.path!.cost).toBeCloseTo(d.path!.cost, 6);     // same cost — oracle again
 ```
 
-**The oracle also guards the *performance* claim, separately from correctness.**
-A* must be correct (same cost) *and* faster (fewer expansions). The repo splits
-these into two assertions so a regression tells you which property broke:
+And it composes with the *next* engine up the chain: `bidirectional.test.ts:16` checks
+bidirectional's directed-cost result against `directedAstar`'s — the oracle for stage N is
+the already-verified stage N-1. The trust chain is:
 
-```ts
-// astar.test.ts:47-52 — the performance half, NOT the correctness half
-expect(a.nodesExpanded).toBeLessThanOrEqual(d.nodesExpanded);
+```
+  the oracle trust chain — each stage validates the next
+
+  hand-known answer  (diamondGraph: S,A,G = 200, astar.test.ts:6)
+        │ validates
+        ▼
+  dijkstra  ──validates──►  astar  ──validates──►  directedAstar
+                                                        │ validates
+                                                        ▼
+                                                  bidirectional
 ```
 
-This is the bidirectional.test.ts:26 comment's whole point: the authors knew a
-near-exact Euclidean heuristic can make bidirectional expand *slightly more*
-than one-directional A*, so they compare against uninformed *Dijkstra* on an
-*interior* pair (`:35`), where meet-in-the-middle's win is provable
-(`~43 << ~203`). The oracle's correctness half and its performance half are
-deliberately different comparisons.
+Every link asserts equality against the link before it. Break any engine and the chain
+lights up red at exactly that link.
 
 ### Move 2 variant — the load-bearing skeleton
 
-Strip the oracle to its kernel:
+Strip the oracle test to its irreducible kernel:
 
-```
-  reference impl (trusted)  +  candidate impl (under test)
-  +  shared input (a fixture both run on)
-  +  equality assertion on the OUTPUT PROPERTY THAT MUST AGREE
-```
+1. **A trusted oracle** — a second way to get the answer you believe by fiat (here:
+   Dijkstra, itself anchored to a hand-known fixture). *Remove it* and you're back to
+   hand-typing expected values, which can't keep up as the cost function evolves.
+2. **The same input fed to both** — identical graph, start, goal. *Remove the sameness*
+   (different fixtures) and a disagreement tells you nothing — maybe they just had different
+   inputs.
+3. **An equality assertion with the right tolerance** — `toBeCloseTo(..., 6)`. *Remove the
+   tolerance* (use `toBe`) and float noise makes it flaky; *make it too loose* (`, 1`) and
+   a real 0.5% routing bug slips through.
 
-Name each part by what breaks without it:
+The **independence of the two sides** is the part people forget. An oracle test only works
+because the oracle and the code-under-test fail *differently*. If you implemented A* by
+calling Dijkstra internally, the test would be a tautology — it'd pass even when both are
+wrong. Here they share only `distanceCost`; the search/prune logic is genuinely separate.
+That independence is what you'd name in an interview to show you understand *why* the
+pattern catches bugs.
 
-- **Drop the trusted reference** → you're back to hand-computing answers, which
-  doesn't scale past tiny fixtures. The whole reason the oracle exists.
-- **Drop the shared input** → comparing two algorithms on different graphs
-  proves nothing.
-- **Assert the wrong property** → pinning the *node sequence* instead of the
-  *cost* makes the test fail on legitimate equal-cost ties. The property you
-  assert has to be the one that's actually invariant.
-- **Reference isn't independent** → if A* and Dijkstra shared the buggy cost
-  function, they'd agree on a wrong answer. (Here they *do* share `cost.ts` —
-  see the honest limit below.)
-
-Optional hardening: the `toBeCloseTo(..., 6)` float tolerance, the separate
-performance assertion, the metrics check (`nodesExpanded > 0`).
+**Skeleton vs hardening:** the kernel is oracle + same-input + tolerant-equality.
+Everything else — checking `nodesExpanded <= dijkstra.nodesExpanded` (`astar.test.ts:47`,
+proving A* actually prunes), the metrics asserts — is hardening. Nice to have, not what
+makes it an oracle.
 
 ### Move 3 — the principle
 
-**An oracle test lets you verify code whose correct answer you don't know.**
-That's the move that unlocks testing optimizers, compilers, parsers, anything
-where the output space is too large to enumerate by hand. You don't need to know
-the answer; you need a second, independent way to produce it. The honest limit:
-the oracle only catches bugs the two implementations *don't share*. flattr's A*
-and Dijkstra both call `cost.ts`, so a bug *inside* `cost.ts` would fool both —
-which is exactly why `cost.ts` is tested separately with closed-form expected
-values (`cost.test.ts`, → audit lens 5). The oracle guards the *search*; the
-closed-form tests guard the *cost*. Together they cover what either alone misses.
+**When you have two implementations that must agree, you don't need to know the right
+answer — you need them to never disagree.** The slow, simple one is a test fixture you
+don't have to maintain. This generalizes far past routing: a new SQL query vs the old one
+on the same DB snapshot, a SIMD path vs the scalar path, a cache vs a recompute. Any time
+"the optimized version" exists alongside "the obvious version," the obvious version is your
+oracle. flattr's router is the clean case because optimality is *exactly* the property
+that's easy to break and hard to eyeball.
 
 ---
 
 ## Primary diagram
 
-The full picture: the oracle chain plus the independent cost-function guard that
-closes its blind spot.
+The whole pattern, one frame:
 
 ```
-  flattr's correctness architecture
+  THE OPTIMALITY ORACLE — full recap
 
-  ┌─ closed-form guards (catch shared-dependency bugs) ─────────┐
-  │  cost.test.ts → penalty bands, BLOCKED, directed cost       │
-  │  exact expected values, hand-derived from the formula       │
-  └───────────────────────────┬─────────────────────────────────┘
-                              │ both A* and Dijkstra depend on cost.ts
-  ┌─ the oracle chain (catch search bugs) ──▼───────────────────┐
-  │                                                             │
-  │  hand-computed   ──►  dijkstra   ──►  astar  ──►  directed  │
-  │  (diamond=200)        (reference)     (gate)     (gate)     │
-  │                            │                        │       │
-  │                            └────► bidirectional ◄───┘       │
-  │                               (pinned to BOTH)              │
-  │                                                             │
-  │  assertion at every arrow:  candidate.cost ≈ reference.cost │
-  └─────────────────────────────────────────────────────────────┘
+  ┌─ fixture layer (features/routing/fixtures.ts) ─────────────┐
+  │  makeGridGraph(12) / diamondGraph()  — known, hand-built   │
+  └────────────────────────────┬───────────────────────────────┘
+                               │ same g, start, goal to BOTH
+            ┌──────────────────┴──────────────────┐
+            ▼                                      ▼
+  ┌─ ORACLE ─────────────┐            ┌─ UNDER TEST ───────────┐
+  │ dijkstra()           │            │ astar()                │
+  │ astar.ts:136         │            │ astar.ts:141           │
+  │ zeroHeuristic, floods│            │ haversineHeuristic,    │
+  │ → cost = TRUTH       │            │   prunes → cost = ?    │
+  └──────────┬───────────┘            └───────────┬────────────┘
+             │  d.path.cost                        │  a.path.cost
+             └──────────────────┬──────────────────┘
+                                ▼
+                ┌─ assertion (astar.test.ts:42) ─┐
+                │ toBeCloseTo(d.cost, 6 decimals)│
+                │  match → A* provably optimal   │
+                │  differ → A* has a bug         │
+                └────────────────────────────────┘
+                                │ pattern reused, stage by stage
+                                ▼
+                dijkstra ⇒ astar ⇒ directedAstar ⇒ bidirectional
 ```
 
 ---
 
 ## Elaborate
 
-Differential testing (compare two implementations of the same spec) is the
-classic technique behind compiler fuzzers (csmith vs gcc/clang), database query
-testers, and floating-point libraries. The variant here — a *known-correct slow
-reference* vs a *fast optimized candidate* — is the textbook way to validate an
-optimized algorithm. Dijkstra is provably optimal (Dijkstra 1959); A* is optimal
-*iff* its heuristic is admissible (Hart, Nilsson, Raphael 1968). The oracle test
-is the admissibility proof discharged by execution: if A* ever disagrees with
-Dijkstra on cost, the haversine heuristic has become inadmissible — which is
-exactly the failure mode the project's "heuristic must stay admissible"
-constraint (`docs/flattr-spec.md` §14) is guarding against. The test is the
-enforcement mechanism for that constraint.
+This is **differential testing** (run two implementations, compare outputs) and its cousin
+**metamorphic testing** (assert a relation that must hold even when you don't know the
+absolute answer — e.g. `gradeAstar(S→G)` reversed equals `gradeAstar(G→S)` for an
+abs-grade cost, `astar.test.ts:65`). Both dodge the oracle problem: the hardest part of
+testing is usually *knowing the right answer*, and these techniques sidestep it by relating
+outputs instead of pinning them.
 
-Next: `02-property-invariant-tests.md` (the other way to test without knowing
-the answer), `05-finite-blocked-sentinel-tests.md` (why the cost guard matters).
+It's the same instinct behind property-based testing (next file, `02`), which is why those
+two patterns cluster in flattr's routing tests. The optimality oracle pins a *relation
+between two functions*; the property test pins a *relation an output must always satisfy*.
+Both replace "I typed in what I think the answer is" with "here's a law that must hold."
+
+Where to read next: `04-fixture-driven-graph-tests.md` (the hand-built graphs the oracle
+runs on), `02-property-invariant-tests.md` (the sibling technique), and the
+**`study-dsa-foundations`** guide for the A*/Dijkstra admissibility theory the oracle is
+silently enforcing.
 
 ---
 
 ## Interview defense
 
-**Q: How do you test a shortest-path algorithm when you can't compute the
-optimal answer by hand?**
+**Q: "How do you test that A* returns the optimal path, not just a valid one?"**
 
-> You don't compute it — you compare it. Run a slow algorithm you know is
-> correct (Dijkstra, no heuristic, provably optimal) on the same graph, and
-> assert your fast algorithm returns the same *cost*. That's a differential /
-> oracle test. In flattr, `astar.test.ts:43` does exactly this on a 144-node
-> grid where no human knows the optimum.
+The strongest possible answer, because it shows you know the failure mode:
+
+> "I don't hand-type the expected path — I use Dijkstra as an oracle. Dijkstra is the simple
+> uninformed baseline, provably optimal and easy to verify against known small graphs. A* is
+> the optimization. I run both on the same graph and assert their costs are equal to 6
+> decimals. The key is that they share *only* the cost function — different traversal,
+> different pruning — so a bug in A*'s heuristic shows up as a disagreement. If I'd
+> implemented A* by calling Dijkstra, the test would be a tautology. It's
+> `astar.test.ts:38`."
 
 ```
-  dijkstra (trusted) ──cost_ref──┐
-                                 ▼ equal?  → A* is admissible
-  astar (under test) ──cost_cand─┘
+  sketch while you talk:
+
+  dijkstra ──┐
+             ├──► same graph ──► assert costs EQUAL ──► A* is optimal
+  astar ─────┘                   (independent code paths
+                                  = real bug detection)
 ```
 
-> Anchor: I assert the *cost*, not the node list — there can be two equal-cost
-> paths, and pinning the sequence makes the test brittle to tie-breaking.
+**Anchor:** *"The oracle and the code under test must fail differently — that independence
+is the whole reason it catches the bug."*
 
-**Q: What's the blind spot of an oracle test, and how do you cover it?**
-
-> It only catches bugs the two implementations *don't share*. flattr's A* and
-> Dijkstra both call `cost.ts` — a bug inside the cost function would fool both
-> and the oracle would pass on a wrong answer. So `cost.ts` is tested separately
-> with closed-form expected values derived from the penalty formula. The oracle
-> guards the search; the closed-form tests guard the shared dependency.
-
-> Anchor: "An oracle is only as independent as its two sides — name the shared
-> dependency and test it directly."
+**Q: "Why `toBeCloseTo(..., 6)` and not `toBe`?"** Because two different traversal orders
+sum the same haversine floats in a different sequence, so IEEE-754 makes them differ in the
+last bit or two. `toBe` would be flaky; `toBeCloseTo(6)` is tight enough to catch any real
+routing error (which would be off by meters, not by 1e-7) and loose enough to ignore float
+noise. Naming *why* the tolerance is 6 and not 1 is the senior signal.
 
 ---
 
 ## See also
 
-- `02-property-invariant-tests.md` — the sibling technique for the heap.
-- `04-fixture-driven-graph-tests.md` — the graphs the oracle runs on.
-- `05-finite-blocked-sentinel-tests.md` — the cost guard that closes the blind spot.
-- `audit.md` lens 1 (risk map), lens 2 (pyramid).
-- sibling `study-dsa-foundations` — the A*/Dijkstra primitives themselves.
+- `04-fixture-driven-graph-tests.md` — the known-answer graphs the oracle runs on
+- `02-property-invariant-tests.md` — the sibling "assert a law, not a value" technique
+- `05-finite-blocked-sentinel-tests.md` — why the oracle still returns a path on steep graphs
+- `audit.md` lens 1 (coverage) and lens 7 (red-flags) — where this test sits in the suite
+- sibling guide **`study-dsa-foundations`** — A*/Dijkstra admissibility the oracle enforces

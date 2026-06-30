@@ -1,168 +1,281 @@
-# Sagas, Outbox & Cross-Boundary Workflows
+# 08 — Sagas, Outbox, and Cross-Boundary Workflows
 
-**Status: `not yet exercised`.** flattr has no multi-step workflow that writes across more than one system, so there's nothing to compensate, no dual-write to make atomic, nothing to reconcile. This file teaches the concepts and names the trigger — a workflow that writes to a database *and* a second system in one logical operation — that would force each in.
+**Industry names:** saga pattern / compensating transactions / transactional
+outbox / reconciliation / two-phase commit (and why you avoid it). **Type:**
+Industry standard.
 
-> Per `me.md`: distributed transactions / cross-boundary workflows belong to the horizontal-scale gap. Taught honestly; the repo has no instance.
+> **Status in flattr: NOT YET EXERCISED.** A saga is a multi-step *write* that
+> spans services and must stay consistent when a middle step fails. flattr issues
+> no writes across services — every remote call is a single, standalone, pure read
+> (`03`). There is no "step 2 succeeded, step 3 failed, now undo step 1" anywhere.
+> This file teaches the pattern and names the trigger. The one place flattr does
+> multi-step orchestration (`buildGraph`) is a *local* pipeline, labelled below as
+> the non-example.
 
 ## Zoom out, then zoom in
 
-```
-  Zoom out — where a saga/outbox WOULD live (all empty)
-
-  ┌─ Coordination layer ─────────────────────────────────────────┐
-  │  every cross-boundary call is a SINGLE-STEP READ              │ ← we are here
-  │   fetchOverpass · sample · geocode — one call, no follow-up   │
-  │  (saga slot: EMPTY · outbox slot: EMPTY · reconcile: EMPTY)   │
-  └────────────────────────┬─────────────────────────────────────┘
-                           │ no write spans two systems
-  ┌─ would-be multi-write tier (does not exist) ─────────────────┐
-  │  [ no DB+queue dual write, no multi-service transaction ]     │
-  └───────────────────────────────────────────────────────────────┘
-```
-
-**Zoom in.** A saga is how you do a multi-step business transaction across systems that *don't share a transaction* — you can't `BEGIN…COMMIT` across a database and a payment API and an email service, so instead you run the steps one by one, and if step 3 fails you run *compensating* actions to undo steps 1–2. The transactional outbox solves a narrower problem: writing to your DB *and* publishing a message must either both happen or neither — so you write the message into an `outbox` table *in the same DB transaction*, and a separate process relays it, guaranteeing the message goes out iff the DB write committed. Both exist because there is no distributed `COMMIT`. flattr has neither because it never writes to two systems in one operation.
-
-## Structure pass
-
-**Layers.** Today: single-step reads. Future: a workflow chaining writes across systems.
-
-**The axis: `failure` — when a multi-step op fails halfway, what state are you left in?**
+You know how a database transaction gives you all-or-nothing — either every write
+commits or none do, and you never see a half-done state? Now take those writes and
+spread them across *different services* that each have their own database. You've
+lost the transaction: there's no `BEGIN`/`COMMIT` that spans a payment service and
+an email service. A saga is how you get *approximately* all-or-nothing back when a
+real transaction is impossible.
 
 ```
-  The failure axis — partial completion
+  Zoom out — where a saga would sit IF flattr had cross-service writes
 
-                   │ today (flattr)        │ multi-step workflow
-  ─────────────────┼───────────────────────┼──────────────────────────
-  steps per op     │ 1 (one read)          │ N (write A, write B, notify)
-  fail halfway?    │ impossible (1 step)   │ A done, B failed → INCONSISTENT
-  recovery         │ retry the one read    │ compensate A (saga) / reconcile
-  atomicity        │ trivial               │ none across systems → engineered
+  ┌─ Client / backend (you own) ──────────────────────────────────┐
+  │  today: single READ calls, each standalone (03)               │
+  │  ★ NO multi-step write workflow exists ★                      │ ← not yet
+  └───────────────────────┬───────────────────────────────────────┘   exercised
+                          │  HTTP
+                          ▼
+  ┌─ multiple services flattr DOES NOT HAVE ─────────────────────┐
+  │  step 1: reserve  →  step 2: charge  →  step 3: notify        │
+  │  if step 2 fails: COMPENSATE step 1 (the saga)               │
+  └────────────────────────────────────────────────────────────────┘
 ```
 
-**The seam that doesn't exist.** It's the second write in one logical operation. A single read can't be "halfway done." The moment an operation has two writes to two systems, a new failure state appears — *partially applied* — that single-step flattr cannot reach. That seam is what sagas and outboxes exist to manage.
+Zoom in: the concepts are the **saga** (a sequence of local transactions, each with
+a **compensating** action that undoes it), the **transactional outbox** (commit a
+local DB write and a "publish this event" record in the *same* transaction, so the
+event can't be lost), and **reconciliation** (a sweeper that finds and fixes
+half-finished workflows). flattr exercises none because it has no multi-step
+cross-service write.
+
+## The structure pass
+
+**Layers (hypothetical, the day flattr grows a write workflow).** Three: the
+workflow (the ordered steps), the durability (how an intent to do step N survives a
+crash), and the recovery (how a stuck workflow gets unstuck).
+
+**Axis — trace `what happens if this step fails halfway?` across the layers.**
+
+```
+  One axis — "step fails halfway — what un-does the damage?" — across the layers
+
+  ┌─ a single DB transaction ───────────┐
+  │ failure → automatic ROLLBACK         │  → the DB un-does it for you (free)
+  └──────────────────┬───────────────────┘
+                     │  cross a service boundary ↓ (the answer flips)
+  ┌─ multi-service workflow (a saga) ───┐
+  │ failure → NO automatic rollback;     │  → YOU write a compensating action
+  │ you run compensation by hand         │     for every step (undo the reserve)
+  └──────────────────┬───────────────────┘
+                     │  add a crash mid-workflow ↓
+  ┌─ outbox + reconciliation ───────────┐
+  │ failure → the intent survived (outbox)│  → a sweeper resumes/compensates
+  │ a sweeper finishes or undoes it      │     the stuck workflow
+  └───────────────────────────────────────┘
+```
+
+The flip is the whole lesson: a database gives you rollback for free *within* one
+store; the instant a workflow crosses a service boundary, rollback becomes *your*
+code (compensation), durability becomes *your* problem (outbox), and recovery
+becomes *your* sweeper (reconciliation). flattr never crosses that boundary with a
+write, so it owes none of this.
+
+**Seam.** The seam that *would* matter is the commit boundary of step N — the gap
+between "I committed my local write" and "I told the next service to do its part."
+A crash in that gap is the bug the outbox pattern exists to close.
 
 ## How it works
 
-### Move 1 — the mental model
+### Move 1 — the mental model: local transactions + undo steps
 
-You know a DB transaction: all-or-nothing within one database. The problem sagas solve is that there's no such thing *across* databases or services. So you fake atomicity with a sequence of steps plus undo actions.
-
-```
-  Saga = forward steps + compensating (undo) steps
-
-  forward:   [save route]──►[charge user]──►[email receipt]
-                                  │ FAILS
-                                  ▼
-  compensate: [refund]◄──[delete route]   (run undos in reverse)
-
-  the saga guarantees: either all forward steps complete,
-  or every completed step is compensated. No middle state survives.
-```
-
-### Move 2 — the walkthrough (concept + trigger)
-
-**Part 1 — sagas, and their trigger.** A saga is a sequence of local transactions where each step has a compensating action; an orchestrator (or a chain of events) drives it and triggers compensation on failure. flattr has zero multi-step *write* workflows today — every cross-boundary call is one read with no follow-up write. The trigger is a real business workflow:
+A saga replaces one impossible distributed transaction with a *chain* of local
+ones, each paired with a compensating action that semantically undoes it. You don't
+get atomicity; you get **eventual consistency with explicit rollback logic**.
 
 ```
-  Trigger for a saga in flattr
+  The pattern — a saga is forward steps + compensating steps
 
-  TODAY                          TRIGGER                       THEN
-  ─────                          ───────                       ────
-  geocode (1 read)          →    "save route + charge for  →   saga:
-  fetchOverpass (1 read)         premium + email confirm"      step + compensate
-                                 (writes across 3 systems)     per step
+  forward:   reserve ──► charge ──► notify
+                │           │ FAILS
+                │           ▼
+  compensate:  └──◄── refund/release ◄── (run compensations in REVERSE)
+
+  each forward step Tn has a compensation Cn that undoes it.
+  fail at step k → run Ck-1, Ck-2, … C1 in reverse → system back to consistent.
+  note: compensation is SEMANTIC undo (refund), not a rollback —
+        the charge happened and is visible; you reverse its effect.
 ```
 
-Note: the *closest thing* flattr has to multi-step is `buildGraph` (Overpass → split → elevation → grade → assemble). But that's a pure read pipeline that produces one artifact — if any step fails, nothing was written anywhere, so there's nothing to compensate. A pipeline of reads is not a saga; a saga requires committed side effects you'd need to undo.
+The kernel parts, named by what breaks without each:
 
-**Part 2 — the transactional outbox, and its trigger.** The dual-write problem: you write a row to your DB and publish an event to a queue. If the DB commit succeeds but the publish fails (or vice versa), the two systems disagree. The outbox fix:
+- **the compensating action per step** — drop it and a mid-workflow failure leaves
+  a permanent half-done state (money reserved, never charged or released). This is
+  the load-bearing part.
+- **the ordering / state tracking** — drop it and you can't know *which* steps ran,
+  so you can't know which to compensate.
+- **idempotent steps** — drop it and a retried saga step double-applies (`03`'s
+  problem returns: compensation and forward steps must both be safe to re-run).
 
-```
-  Transactional outbox — make DB-write + message-publish atomic
+### Move 2 — outbox, reconciliation, and flattr's non-example
 
-  ┌─ ONE DB transaction ──────────────────┐
-  │  INSERT route                          │
-  │  INSERT into outbox (event payload)    │  ← both commit together, or neither
-  └────────────────┬───────────────────────┘
-                   │ (committed)
-                   ▼
-  relay process: poll outbox ──► publish to queue ──► mark sent
-   (message goes out IFF the DB write committed — no dual-write gap)
-```
-
-flattr's trigger: the day it both saves user data to a DB *and* publishes an event (analytics, a sync notification to other devices). Until there's a DB write *and* a second system to notify in the same operation, there's no dual-write to make atomic.
-
-**Part 3 — reconciliation, the backstop.** Even with sagas and outboxes, distributed state drifts (a compensation itself fails, a relay misses a message). Reconciliation is a periodic job that compares the systems and fixes divergence — the "eventually someone audits the books" safety net. It's the last thing you build, after you have multiple writable systems that *can* drift. flattr has one writable thing (the local cache, `04`) and it self-heals locally, so there's nothing to reconcile across a boundary.
-
-### Move 2.5 — current vs future
+**The transactional outbox — closing the dual-write gap.** The classic bug: you
+commit a row to your DB, then publish an event to a queue — two separate writes. If
+you crash *between* them, the row exists but the event is lost forever. The outbox
+fixes this by writing the event *into your own database, in the same transaction* as
+the business row:
 
 ```
-  Phase A (now)                  Phase B (cross-system write workflow)
-  ─────────────                  ─────────────────────────────────────
-  single-step reads only         multi-step writes across systems
-  buildGraph = read pipeline     "save + charge + notify" = saga
-   (no compensation needed)      compensating actions per step
-  no dual write                  DB-write + publish → outbox pattern
-  no cross-system drift          periodic reconciliation job
+  The pattern — outbox makes "DB write + event publish" atomic
+
+  ┌─ ONE local transaction ─────────────────┐
+  │  INSERT order row                        │   both commit together
+  │  INSERT outbox row ("OrderPlaced event") │   or both roll back — no gap
+  └────────────────────┬─────────────────────┘
+                       │ a separate poller reads the outbox AFTER commit
+                       ▼
+                publish "OrderPlaced" → queue   (at-least-once → needs idempotency, 03)
+                then mark the outbox row done
+
+  drop the outbox → dual write → crash between the two → event lost, order silently
+                    never processed (the bug)
 ```
 
-The cost of Phase B is the highest in this whole guide: workflow orchestration, idempotent compensations (a refund retried must not double-refund — note this loops back to `03`), an outbox table + relay, and reconciliation. This is exactly the "distributed transactions" territory `me.md` names as the gap. It's also the most worth building once for the portfolio, because it's where idempotency (`03`), ordering (`07`), and consistency (`04`) all compound at once.
+**Reconciliation — the sweeper that finishes stuck work.** Sagas and outboxes still
+leave workflows that got stuck (a step's service was down). Reconciliation is a
+periodic sweep that finds workflows in a non-terminal state past their deadline and
+either resumes them or compensates them. It's the safety net under at-least-once
+delivery: anything that fell through gets caught on the next sweep.
+
+**flattr's non-example — `buildGraph` is a local pipeline, not a saga.**
+`buildGraph` (`build-graph.ts:12-30`) orchestrates ordered steps: parse → split →
+sample elevation → compute grades. That *looks* saga-shaped (multi-step,
+sequential) but it is not a saga, and the distinction is the lesson:
+
+```
+  build-graph.ts:12-30 — multi-step, but NOT a saga
+
+  parseOsm → splitWays → sampleElevations → computeGrades → return Graph
+     │           │             │ (the only remote step)        │
+     └───────────┴─────────────┴───────────────────────────────┘
+  why it's NOT a saga:
+   • no cross-service WRITE — it's a pure in-process transform that READS
+     once (elevation) and returns a value
+   • a mid-pipeline failure needs NO compensation — nothing was committed
+     anywhere; the function just throws and the caller keeps last data
+     (useTileGraph.ts:219) or exits (run-build.ts:54)
+   • no durable intermediate state to reconcile
+```
+
+Calling `buildGraph` a saga would be the overclaim the anchoring rules forbid. A
+saga is defined by *cross-service writes that must be undone on failure* — `buildGraph`
+has neither writes nor a service boundary, so a failure is just a thrown exception,
+not a half-committed distributed state. The difference between "a sequence of steps"
+and "a saga" is exactly: does a failed middle step leave committed state on another
+service that you must explicitly undo?
+
+### Move 2.5 — current vs future: the trigger
+
+```
+  Phase A (now)                vs   Phase B (the trigger)
+  ─────────────────                ──────────────────────
+  every remote call = standalone    a multi-step cross-service WRITE arrives:
+  READ (03)                         e.g. "save route" + "charge for premium" +
+  buildGraph = local transform      "email confirmation" across 3 services
+  failure = throw, keep last data   ↓
+  no compensation, no outbox        saga: each step gets a compensating undo
+  no reconciliation                 outbox: local commit + event publish atomic
+                                    reconciliation: sweep stuck workflows
+                                    + every step idempotent (03 becomes mandatory)
+```
+
+The trigger from `00`: a **multi-step write that crosses services** — book + pay +
+notify, or any workflow where step 2 can fail after step 1 committed somewhere you
+can't roll back. The moment that exists, you owe compensation (saga), durable
+intent (outbox), and a sweeper (reconciliation) — and `03`'s idempotency stops
+being free and becomes mandatory infrastructure.
 
 ### Move 3 — the principle
 
-There is no distributed `COMMIT`. Every pattern in this file — saga, outbox, reconciliation — is a workaround for that single hard fact: you cannot atomically change two systems that don't share a transaction. The escape is always the same shape: make each step locally atomic, make it idempotent so you can retry it, and add an undo (saga) or an atomic hand-off (outbox) so partial failure resolves to a consistent end state. flattr avoids the whole category by keeping every cross-boundary operation a single read — which is the cleanest way to not need a saga: don't have a multi-step distributed write.
+A database transaction gives you all-or-nothing for free, but only *within one
+store*. The instant a workflow's writes span services, that guarantee is gone and
+you rebuild it by hand: a saga substitutes compensating actions for rollback, an
+outbox substitutes a same-transaction event record for the lost dual-write, and
+reconciliation substitutes a sweeper for the recovery the DB used to do. flattr owes
+none of this because its remote calls are standalone reads — and recognizing that
+its multi-step `buildGraph` is a *local transform*, not a saga, is the same skill in
+reverse. **A saga is not "a sequence of steps" — it's a sequence of cross-service
+writes each carrying its own undo, and you only need it when a failed middle step
+leaves committed state somewhere you can't roll back.**
 
 ## Primary diagram
 
-```
-  Sagas / outbox / reconciliation — flattr's status
+What flattr would grow, and the non-example it already has.
 
-  ┌─ TODAY: single-step reads ────────────────────────────────────┐
-  │  fetchOverpass / sample / geocode — one call, no write, no     │
-  │  follow-up. buildGraph = read pipeline (no committed effects). │
-  │  saga ✗   outbox ✗   reconciliation ✗                          │
-  └───────────────────────────────────────────────────────────────┘
-        │ trigger: one logical op writes to 2+ systems
-        ▼
-  ┌─ atomicity stops being free ──────────────────────────────────┐
-  │  saga:   forward steps + compensations (undo on failure)       │
-  │  outbox: DB-write + message in ONE txn, relayed separately     │
-  │  reconcile: periodic drift audit + repair                      │
-  │  (idempotent compensations ← loops back to 03)                 │
-  └───────────────────────────────────────────────────────────────┘
+```
+  saga machinery (not yet exercised) vs flattr's local pipeline (exercised)
+
+  ┌─ A SAGA (Phase B — not here) ─────────────────────────────────┐
+  │  reserve ─► charge ─► notify       forward steps               │
+  │     ▲          │ FAIL                                          │
+  │     └─ release ◄─ refund            compensations (reverse)    │
+  │  + outbox (atomic commit+publish) + reconciliation (sweeper)  │
+  └────────────────────────────────────────────────────────────────┘
+
+  ┌─ flattr's buildGraph (Phase A — here) ────────────────────────┐
+  │  parse ─► split ─► sample ─► grade ─► return    LOCAL transform│
+  │  failure = throw (no committed state to undo) → NOT a saga     │
+  └────────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-The saga pattern comes from Garcia-Molina & Salem (1987), originally for long-lived DB transactions, revived by microservices where cross-service transactions are impossible. The transactional outbox is the standard fix for the dual-write problem in event-driven systems (often paired with change-data-capture, e.g. Debezium tailing the outbox table). Two-phase commit (2PC) is the *other* answer — a coordinator that gets all participants to prepare then commit — but it blocks on coordinator failure and doesn't scale, which is why sagas (compensation over locking) won for most use cases. flattr is `not yet exercised` here because the precondition — a multi-step write across systems — never occurs. Sibling `study-system-design` owns the orchestration-vs-choreography architecture choice; `study-database-systems` owns the outbox table and 2PC mechanics.
+Sagas come from a 1987 paper on long-lived database transactions and became the
+backbone of microservice consistency precisely because two-phase commit (the
+"proper" distributed transaction) is too slow and too fragile at scale — it blocks
+every participant while the coordinator decides, and a coordinator crash can hang
+the whole set. The industry traded 2PC's strong atomicity for the saga's eventual
+consistency plus explicit compensation, accepting that intermediate states are
+*visible* (a charge briefly exists before its refund) in exchange for availability.
+The transactional outbox is the companion pattern that makes saga steps reliably
+*emit* their events, and it's why `03`'s idempotency becomes non-negotiable in
+Phase B: outbox delivery is at-least-once, so every consumer must dedup. flattr
+gets to skip the whole chapter today because it never writes across a service
+boundary — the cleanest way to avoid saga complexity is to not need a saga.
 
 ## Interview defense
 
-**Q: "flattr has a `buildGraph` pipeline with several steps — is that a saga?"**
-Verdict: no, and the distinction is the point.
+**Q: "Does this app have any distributed transactions or sagas?"**
+Verdict first: "No — every remote call is a standalone read, so there's no
+multi-step write to keep consistent and nothing to compensate. The one multi-step
+thing, `buildGraph`, is a local in-process transform, not a saga: a failed step
+just throws, because nothing was committed on another service to undo." Then the
+trigger: "Sagas arrive the day a write workflow crosses services — say save +
+charge + notify. Then each step needs a compensating action, I'd use a
+transactional outbox so the local commit and the event publish are atomic, and a
+reconciliation sweep for stuck workflows — and idempotency stops being free." Drawing
+the line between "a sequence of steps" and "a saga" is the senior signal.
 
 ```
-  read pipeline vs saga — committed effects decide
+  the sketch you draw
 
-  buildGraph: read → read → read → ONE artifact
-              fail anywhere → nothing written → just retry
-  saga:       write → write → write
-              fail anywhere → UNDO the committed writes (compensate)
+  sequence of steps  → just a function (buildGraph) → failure = throw
+  SAGA               → cross-service WRITES → each step has a compensating undo
+                       + outbox (atomic commit+publish) + reconciliation
 ```
 
-"No — `buildGraph` is a multi-step *read* pipeline. If a step fails, nothing has been written to any external system, so there's nothing to undo; I just retry the whole thing. A saga is specifically for multi-step *writes* across systems that don't share a transaction, where step 2 failing means I have to compensate step 1's committed effect. The trigger for a real saga here would be something like 'save route + charge for premium + email a receipt' — three writes to three systems. That's when I'd need compensating actions and probably an outbox for the DB-write-plus-publish step."
+**Q: "Why a saga instead of a distributed transaction (2PC)?"**
+"2PC blocks every participant while the coordinator decides and hangs the whole set
+if the coordinator crashes — too slow and fragile at scale. A saga trades strong
+atomicity for eventual consistency: each step commits locally and carries a
+compensating undo, so failures are recovered by running compensations instead of a
+global rollback. The cost is that intermediate states are briefly visible." That
+trade — availability over atomicity, visible intermediate state — is the fact
+interviewers check.
 
-**Anchor:** *A pipeline of reads isn't a saga — sagas exist to undo committed writes, and I have none.*
-
-**Q: "How would you make a DB write and an event publish atomic?"**
-"Transactional outbox: insert the domain row and an outbox row in the *same* DB transaction, so they commit together or not at all, then a separate relay polls the outbox and publishes. That closes the dual-write gap — the event goes out if and only if the DB write committed. And I'd make the consumer idempotent, because the relay is at-least-once."
-
-**Anchor:** *Outbox makes DB-write + publish one atomic act — no distributed commit required.*
+**Anchor:** *A saga is cross-service writes each carrying its own undo — not just a
+sequence of steps. flattr's calls are standalone reads, so it owes no compensation,
+no outbox, no reconciliation; `buildGraph` is a local transform, not a saga.*
 
 ## See also
 
-- `03-idempotency-deduplication-and-delivery-semantics.md` — compensations must be idempotent; outbox is at-least-once.
-- `04-consistency-models-and-staleness.md` — reconciliation is cross-system convergence.
-- `07-clocks-coordination-and-leadership.md` — workflow steps need ordering.
-- sibling `study-system-design` — orchestration vs choreography.
-- sibling `study-database-systems` — outbox table + 2PC mechanics.
+- `03` — idempotency: free today, mandatory the day a saga + outbox arrives.
+- `04` — eventual consistency is what a saga delivers in place of atomicity.
+- `06` — the outbox publishes to a queue flattr doesn't have yet.
+- `07` — cross-boundary workflows need the coordination flattr also lacks.
+- sibling **database-systems** — local transactions (what you lose at the service
+  boundary); sibling **system-design** — workflow orchestration as architecture.

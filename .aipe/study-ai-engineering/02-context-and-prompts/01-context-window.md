@@ -1,79 +1,192 @@
-# The Context Window
-*Industry name: context window · Type: hard model constraint*
+# Context window — and why flattr's "context" is a struct, not a window
 
-## Zoom out
+**Industry name(s):** context window / prompt token budget.
+**Type:** Industry standard.
+
+## Zoom out — flattr has no window to manage, because it has no prompt
+
+flattr runs no LLM, so there is no token container to fill. But the
+concept is worth holding next to flattr's one real LLM seam — the
+route-describe handoff at `MapScreen.tsx:368`. The point lands by
+contrast: when AI engineers fight the context window, they're fighting
+*how much unstructured text fits*. flattr's "context" is three typed
+numbers (`RouteSummary`), so there's nothing to fit and nothing to
+budget. The window problem is a corpus problem; flattr has no corpus.
 
 ```
-THE CONTEXT WINDOW = one finite token budget, shared by EVERYTHING
-┌──────────────────────────────────────────────────────────┐
-│  system prompt │ tools │ history │ retrieved docs │ USER   │  ← all
-│  ───────────── │ ───── │ ─────── │ ────────────── │ ─────  │    compete
-└──────────────────────────────────────────────────────────┘
-        every token you spend here is a token NOT available there
-                                                    ▼
-                                              model output
+  Zoom out — where a context window WOULD sit (it doesn't)
+
+  ┌─ engine (features/routing/) ────────────────────────────┐
+  │  routeSummary() → { distanceM, climbM, steepCount }      │ summary.ts:5
+  └────────────────────────────┬─────────────────────────────┘
+                  produced at MapScreen.tsx:159
+  ┌─ (NOT BUILT) LLM layer ────▼─────────────────────────────┐
+  │  describeRoute(summary) → prompt → window                │
+  │  ★ the window would hold ~30 tokens — no management problem│
+  └────────────────────────────┬─────────────────────────────┘
+                  consumed at MapScreen.tsx:368
+  ┌─ UI (mobile/) ─────────────▼─────────────────────────────┐
+  │  RouteSummaryCard renders the text                       │
+  └──────────────────────────────────────────────────────────┘
 ```
 
-A context window is the model's whole working memory for a single call: there is
-no "long-term" anything, just this one box. Everything you want the model to
-consider — instructions, tool schemas, prior turns, retrieved chunks, the user's
-actual question — gets packed into the same budget and counted in tokens. When
-the box is full, something has to give: you truncate, summarize, or drop.
+## Structure pass
 
-You've felt this in AdvntrRAG — pgvector hands you N chunks and you decide how
-many actually fit alongside the GPT-4 system prompt and the session memory from
-MemoRAG. That triage *is* context-window management.
+- **Layers:** engine struct → (would-be) prompt → model → UI.
+- **Axis — what competes for token space?** In a typical RAG app:
+  system prompt, history, retrieved docs, and response space all fight
+  over a fixed budget. In flattr's would-be describe call: nothing
+  competes — the input is `{distanceM, climbM, steepCount}`, a
+  fixed-size struct that templates to a couple dozen tokens.
+- **Seam:** `MapScreen.tsx:368`. If an LLM ever sits here, the "window"
+  is the templated struct plus a one-line instruction. The axis (space
+  pressure) never flips into "a problem" because the input can't grow.
 
 ## How it works
 
-**Move 1 — Treat it as a budget, not a bucket.**
+### Move 1 — the mental model
+
+You know how a fixed-size buffer works — allocate N bytes, and
+everything you want to keep has to fit or get evicted? A context window
+is that buffer for tokens. Everything the model sees on a call —
+instructions, history, retrieved text, and the room left for its reply —
+shares one fixed length. When the inputs grow past it, something gets
+dropped or truncated, and that's where the management problem lives.
 
 ```
-BUDGETING (numbers illustrative)
-total = 128k tokens
-├─ system + tools ........  2k   (fixed overhead)
-├─ conversation history .. 10k   (grows every turn → cap it)
-├─ retrieved context ..... 40k   (the dial you actually turn)
-└─ headroom for output ... leave room or the model gets cut off
+  Pattern — the context window as a fixed buffer
+
+  ┌──────────────── window (fixed token length) ─────────────┐
+  │ system │ history │ retrieved docs │ ░░░ response space ░░░│
+  └──────────────────────────────────────────────────────────┘
+   everything competes for the same fixed length
+
+  flattr's case:
+  ┌──────────────── window (fixed token length) ─────────────┐
+  │ "Distance 1200m, climb 8m, 0 steep blocks. Describe..."   │
+  │ ░░░░░░░░░░░░░░░░░░░░░ tons of room left ░░░░░░░░░░░░░░░░░░░│
+  └──────────────────────────────────────────────────────────┘
+   the input is a struct; it can't grow to fill the buffer
 ```
 
-Mental model: you are not "filling" the window, you are *allocating* it. Output
-needs room too — if you cram input to the brim, the completion truncates
-mid-sentence. The retrieved-context line is the one knob worth tuning; the rest
-is mostly fixed cost.
+### Move 2 — the walkthrough
 
-**Move 2 — When it won't fit, reduce before you send.**
+**What would fill flattr's window.** The entire prompt input is the
+struct from `summary.ts:5`:
 
-```
-OVERFLOW HANDLING
-raw material (300k) ──► [ rank / filter ] ──► top-k (35k) ──► send
-                  │
-                  └─► [ summarize older turns ] ──► compact history
+```ts
+export type RouteSummary = { distanceM: number; climbM: number; steepCount: number };
 ```
 
-Step by step: (1) count tokens, don't guess; (2) rank candidate context by
-relevance and keep only top-k; (3) compress conversation history into a running
-summary once it crosses a threshold; (4) verify the final assembled prompt still
-leaves headroom for the answer.
+Three numbers. Template them into one instruction line and you have a
+prompt that's tens of tokens, not thousands. There is no history (each
+route is stateless), no retrieved corpus (the facts are computed), and no
+document stuffing. The thing AI engineers spend weeks managing — *what to
+keep, what to drop* — has no analog here, because nothing variable-length
+ever enters.
 
-**Move 3 — Principle:** *the window is finite and shared; curate what enters it.*
+**Why the struct beats a window.** This is the load-bearing contrast.
+A context window is the failure mode of *unstructured* context: you have
+more text than fits, so you retrieve, rank, truncate, summarize. flattr
+sidesteps all of it by computing the exact facts the model needs and
+handing them over typed. The route facts are produced once at
+`MapScreen.tsx:159` and consumed at `:368` — a fixed handoff, not a
+growing buffer.
 
-## In this codebase
+```
+  Layers-and-hops — the struct handoff (no window pressure)
 
-**Not yet exercised in flattr.** flattr has no LLM call, so there is no context
-window to budget — nothing assembles a prompt today.
+  ┌─ engine ──┐ hop1: RouteSummary (3 fields)  ┌─ (NOT BUILT) prompt ─┐
+  │summary.ts │ ─────────────────────────────► │ template → ~30 tokens│
+  └───────────┘                                 └──────────┬───────────┘
+                              hop2: tiny prompt             │
+  ┌─ UI ──────┐ ◄──────────────────────────────────────────┘
+  │SummaryCard│  renders the model's one sentence
+  └───────────┘
+```
 
-The seam where one *would* open is `features/routing/summary.ts:11`. A future
-"Describe my route" feature would template the `RouteSummary` return value
-(`{distanceM, climbM, steepCount}`) into a prompt. That payload is three numbers.
-Even with a system prompt and a tone instruction wrapped around it, the assembled
-context would be a few hundred tokens against a window of 100k+ — the box would be
-nearly empty. So for flattr specifically, window *pressure* is a non-issue: the
-constraint exists, but this workload never approaches it. The interesting
-constraints here are latency and prompt-injection (see seam at
-`pipeline/geocode.ts`), not token budget.
+**The boundary condition.** The only way flattr ever grows a window
+problem is if it stops handing the model a struct and starts handing it
+raw text — for instance, feeding the geocoded `display_name`
+(`geocode.ts:27`) or a long list of every edge in the path into the
+prompt. Don't. The discipline is: keep the model's input a small typed
+struct, and the window never becomes a problem to manage.
+
+### Move 3 — the principle
+
+The context window is a constraint you feel only when context is
+unstructured and unbounded. The fix most teams reach for — retrieval,
+truncation, summarization — is really *imposing structure on text after
+the fact*. flattr starts structured: the route facts are a typed struct,
+so the window is always near-empty. The principle: structure the
+model's input upstream and the token-budget problem disappears.
+
+## Primary diagram
+
+```
+  flattr's "context" is a struct, never a window
+
+  ┌─ Core engine ───────────────────────────────────────────┐
+  │ routeSummary() → RouteSummary {distanceM,climbM,steep}    │ summary.ts:5
+  └────────────────────────────┬─────────────────────────────┘
+              produced: MapScreen.tsx:159
+  ┌─ (NOT BUILT) prompt ───────▼─────────────────────────────┐
+  │ template(struct) → ~30 tokens — fits in any window        │
+  │ no history · no retrieved docs · no truncation needed     │
+  └────────────────────────────┬─────────────────────────────┘
+              consumed: MapScreen.tsx:368
+  ┌─ UI ───────────────────────▼─────────────────────────────┐
+  │ RouteSummaryCard renders the sentence                    │
+  └──────────────────────────────────────────────────────────┘
+```
+
+## Elaborate
+
+The context window is the hard ceiling of every LLM call, and most
+production prompt work is window management — picking what survives the
+cut. You've fought this for real in **AdvntrCue** (RAG over a corpus that
+won't fit a window, so retrieval picks the few chunks that do). flattr is
+the inverse: the relevant facts are computed and typed, so the window is
+trivially satisfied. Naming *why* one app needs window management and
+another doesn't — corpus vs struct — is the transferable insight.
+
+## Project exercises
+
+### B-CTX.1 — keep the describe prompt struct-bounded
+
+- **Exercise ID:** B-CTX.1
+- **What to build:** the route-describe prompt template that takes only
+  `RouteSummary` (never raw labels or the full edge list), plus a test
+  asserting the rendered prompt stays under a small fixed token budget.
+- **Why it earns its place:** it makes the "structure upstream, no window
+  problem" discipline a checked invariant instead of a hope.
+- **Files to touch:** new `features/routing/describe.ts`;
+  `features/routing/summary.ts:5` (the struct it reads);
+  `mobile/src/MapScreen.tsx:159` (where the struct is produced).
+- **Done when:** a unit test fails if the prompt grows past the budget,
+  proving the input stays bounded.
+- **Estimated effort:** an hour.
+
+## Interview defense
+
+**Q: How would you manage the context window for flattr's route
+description?** Answer: there's nothing to manage. The prompt input is
+`RouteSummary` (`summary.ts:5`) — three computed numbers — so the
+template is tens of tokens with no history and no corpus. The window is
+only a problem when context is unstructured; flattr's is a typed struct.
+Load-bearing point: I'd *keep* it that way — never feed raw labels or the
+full edge list into the prompt, or I'd invent a window problem that
+doesn't need to exist.
+
+```
+  RouteSummary (3 fields) → tiny prompt → huge headroom in any window
+```
+
+Anchor: *"flattr's context is a struct, not a window — structure it
+upstream and there's nothing to budget."*
 
 ## See also
-- `02-lost-in-the-middle.md` — position effects *inside* a full window
-- `03-prompt-chaining.md` — splitting work so no single window has to hold it all
-- `features/routing/summary.ts:11` — the only realistic prompt input in flattr
+
+- [03-prompt-chaining.md](03-prompt-chaining.md) — the input (geocode) seam.
+- [02-lost-in-the-middle.md](02-lost-in-the-middle.md) — the same "surface few, not many" discipline.
+- [../03-retrieval-and-rag/11-rag.md](../03-retrieval-and-rag/11-rag.md) — the output (describe) seam this prompt would fill.

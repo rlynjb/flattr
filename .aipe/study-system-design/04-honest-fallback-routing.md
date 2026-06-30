@@ -1,288 +1,260 @@
-# Honest Fallback Routing
+# Honest fallback routing
 
-**Industry names:** graceful degradation / soft constraints / fail-open with
-flagging. **Type:** Project-specific (encoding "best available, honestly
-labeled" into the cost model and UI).
+**Industry names:** graceful degradation / sentinel-vs-infinity / fail-honest UX /
+distinguishable failure modes. **Type:** Industry standard (with a project-specific
+sentinel choice).
 
 ---
 
 ## Zoom out, then zoom in
 
-flattr's whole pitch is "flat, not fast." So the obvious implementation is: make
-edges steeper than `userMax` impassable, and route around them. The trap: in a
-hilly city there often *is* no flat route. A hard constraint would return "no
-route" — and the user can't tell whether that means "everything's too steep" or
-"these two points genuinely aren't connected." Those are completely different
-situations and the app must not conflate them.
+flattr promises "flat, not fast." But sometimes there *is* no flat route, and
+sometimes there's no route at all, and sometimes the grades it's showing you are
+guesses because the elevation API was down. A lazy system collapses all three into
+"error." flattr keeps them distinct, end to end — the cost function, the path
+summary, and the UI card each preserve the difference.
 
 ```
-  Zoom out — where honest fallback lives
+  Zoom out — honesty threads through cost → summary → UI
 
-  ┌─ ROUTER (features/routing) ──────────────────────────────────────────┐
-  │  cost.ts: penalty(grade, userMax)                                     │
-  │     downhill→0  moderate→linear  steep→quadratic  over-max→★BLOCKED★  │ ← here
-  │                                                  (1e9, FINITE)        │
-  │            │                                                          │
-  │            ▼  directedAstar still returns a path                     │
-  │  astar.ts: summarizePath flags steepEdges (over userMax)             │
-  └───────────────┬────────────────────────────────────────────────────── ┘
-                  │ steepCount
+  ┌─ Engine ────────────────────────────────────────────────────┐
+  │  cost.ts: BLOCKED = 1e9 (large-FINITE, not Infinity)         │ ← we are here
+  │      ▼                                                       │
+  │  astar.ts summarizePath: flag steepEdges (don't drop them)   │
+  └───────────────┬─────────────────────────────────────────────┘
                   ▼
-  ┌─ UI (mobile) ────────────────────────────────────────────────────────┐
-  │  RouteSummaryCard: "Flat all the way" | "⚠ Flattest available (N)"    │
-  └────────────────────────────────────────────────────────────────────── ┘
+  ┌─ UI ────────────────────────────────────────────────────────┐
+  │  RouteSummaryCard: "Flat all the way" | "⚠ Flattest          │
+  │     available (N steep)" | "No route" | "Grades approximate" │
+  └─────────────────────────────────────────────────────────────┘
 ```
 
-Zoom in: the concept is **a soft constraint that always returns the best
-available answer and tells the truth about its quality.** The question it
-answers: *how do you keep "no flat route" distinct from "no route" while still
-giving the user something?*
+You've used a sentinel value instead of a null to keep a result *in band* — return
+`-1` for "not found" so the caller can still do arithmetic. Same trick, load-bearing
+here: `BLOCKED` is a huge *finite* number, not `Infinity`, so an only-steep path
+still has a comparable cost and still gets returned. The question it answers: *when
+the ideal route doesn't exist, does the system lie, error out, or tell the truth?*
 
-## Structure pass
+---
 
-**Layers.** The honesty threads through three layers: the *cost model*
-(`cost.ts`) decides how much a steep edge hurts, the *search* (`astar.ts`)
-returns the path and flags the steep edges it had to use, and the *UI*
-(`RouteSummaryCard`) reports quality.
+## The structure pass
 
-**Axis — `guarantees` (hard vs soft constraint).** Trace what `userMax`
-*promises* across the layers:
+**Layers:** cost function → search/summary → UI card.
+
+**Axis = guarantees (what does each layer promise about route quality?).**
 
 ```
-  "is userMax a hard wall or a soft preference?" — traced down the layers
+  One question down the layers: "what is being promised about the route?"
 
-  ┌──────────────────────────────────────┐
-  │ cost.ts penalty()                     │  → SOFT: over-max = 1e9, not ∞
-  └──────────────────────────────────────┘     (huge cost, still finite)
-        │  so the search can still traverse it
-        ▼
-  ┌──────────────────────────────────────┐
-  │ astar.ts search + summarizePath       │  → returns a path EVEN IF all steep
-  └──────────────────────────────────────┘     + collects steepEdges
-        │
-        ▼
-  ┌──────────────────────────────────────┐
-  │ RouteSummaryCard                      │  → labels honesty (steepCount)
-  └──────────────────────────────────────┘
-
-  userMax is a PREFERENCE the whole way down, never a wall — that's the design
+  ┌───────────────────────────────────┐
+  │ cost.ts penalty()                 │  → "steep is expensive, not impossible"
+  └───────────────────────────────────┘     (BLOCKED finite)
+      ┌─────────────────────────────────┐
+      │ summarizePath / routeSummary    │  → "here's the path AND which blocks are steep"
+      └─────────────────────────────────┘     (steepEdges, climbM, steepCount)
+          ┌─────────────────────────────┐
+          │ RouteSummaryCard            │  → "flat / flattest-but-steep / none /
+          └─────────────────────────────┘      approximate" — the truth, labeled
 ```
 
-**Seam.** The `BLOCKED = 1e9` constant (`cost.ts:5`) is the seam between
-"steep" and "impassable." Choosing finite-vs-infinity here is the single
-decision that keeps "no flat route" separate from "no route." That one line
-carries the whole contract.
+**Seam = `BLOCKED = 1e9` (`cost.ts:5`).** The single most load-bearing line in the
+product's reliability story. Trace the *guarantees* axis across it: if `BLOCKED`
+were `Infinity`, a steep-only path would be uncomparable and the search would return
+`null` — indistinguishable from a genuinely disconnected graph. Because it's finite,
+the path comes back, flagged. The constraint is even pinned in the project rules:
+*"BLOCKED is large-finite, not Infinity — so 'no flat route' (steep flagged) stays
+distinct from 'no route' (disconnected)."*
+
+---
 
 ## How it works
 
-### Move 1 — the mental model
+#### Move 1 — the mental model
 
-You know the difference between a form field that's *invalid* (red border, but
-the value's still there) and one that's *blocked* (won't accept input at all).
-flattr treats steep grades like the first: discouraged, heavily penalized, but
-not forbidden. A truly disconnected graph is the second — genuinely no path.
-
-The strategy in one sentence: **penalize hard but stay finite, so the search
-always finds the cheapest path that exists, then flag which parts violated the
-preference.**
+The shape is a banded penalty with a finite ceiling, plus a flag that rides along
+the path. Downhill is free, moderate uphill is linear, steep is quadratic,
+over-the-max is `BLOCKED` (huge but finite). The search minimizes total cost, so it
+*avoids* steep edges but will still traverse one if there's no alternative — and
+marks it.
 
 ```
-  The pattern — soft penalty curve, finite ceiling
+  Pattern — banded penalty, finite ceiling, flagged path
 
-   cost
-    │                                    ┌─ over max: +BLOCKED (1e9, FINITE)
-    │                              ┌─────┘   path still returned, flagged
-    │                       ┌──────┘ steep: quadratic
-    │              ┌────────┘ moderate: linear
-    │   ───────────┘ downhill / flat: 0 (free)
-    └──────────────┴────────┴──────┴────────► directed grade
-    0            0.5·max    max
+  directed grade g vs userMax:
 
-   the ceiling is a step UP, not a wall — A* avoids it but can climb it
+  cost
+   │                                   ┌─ BLOCKED (1e9, FINITE)
+   │                              _____│   g > max → flagged steep
+   │                         ____/      quadratic band
+   │              ______ k1·g           (0.5max .. max)
+   │   __________/        linear band (0 .. 0.5max)
+   │  0  (downhill/flat → free)
+   └──────────────────────────────────────► g
+      g≤0      0.5·max        max
+
+  finite ceiling ⇒ an only-steep path still has a comparable cost ⇒ still returned
 ```
 
-### Move 2 — the walkthrough
+#### Move 2 — the walkthrough
 
-**Step 1 — the penalty curve makes steep expensive, downhill free.** The cost
-is directional: going downhill costs nothing extra, moderate uphill is linear,
-steep is quadratic, over-max jumps to `BLOCKED`:
+**`BLOCKED` is finite on purpose.** The whole pattern hinges on this:
 
 ```ts
-// features/routing/cost.ts:16-22 (penalty)
-if (g <= 0) return 0;                         // 17: downhill/flat → free
-if (g > max) return BLOCKED;                  // 18: over userMax → 1e9 (finite!)
-const half = 0.5 * max;
-if (g <= half) return k1 * g;                 // 20: moderate → linear
-return k2 * (g - half) ** 2 + k1 * half;      // 21: steep → quadratic
-```
-
-Line 18 is the crux. `BLOCKED` is `1e9` (`cost.ts:5`), **not** `Infinity`. The
-comment says it outright: *"Large but FINITE, so an only-steep path is still
-returned and flagged."* A path made entirely of over-max edges costs ~N×1e9 —
-astronomically expensive, so A* avoids it whenever any alternative exists, but
-it's a real number, so the path is still found.
-
-The penalty uses the *signed directed* grade (`cost.ts:32-33`,
-`directedGrade(edge, fromNodeId)`), so the same physical hill is free downhill
-and penalized uphill — `gradePct` negated by travel direction
-(`graph.ts:17-19`).
-
-**Step 2 — the search returns the cheapest existing path, no special-casing.**
-A* doesn't filter BLOCKED edges; it just relaxes every edge with its cost
-(`astar.ts:64-75`). Because BLOCKED is finite, an over-max edge has a finite
-`g`-value and can be on the final path. The only way A* returns null is a
-genuinely disconnected graph — which is exactly the distinction we wanted.
-
-```
-  Layers-and-hops — the honesty signal crossing from router to UI
-
-  ┌─ Router (features/routing) ──────────────────────────────────────────┐
-  │  directedAstar → search → reconstruct (astar.ts:86-103)              │
-  │            │ hop 1: summarizePath collects steepEdges                │
-  │            ▼                                                          │
-  │  Path { ..., steepEdges: [ids over userMax] }   astar.ts:126-127     │
-  └───────────────┬────────────────────────────────────────────────────── ┘
-                  │ hop 2: routeSummary → { steepCount }  summary.ts
-                  ▼
-  ┌─ UI (mobile) ────────────────────────────────────────────────────────┐
-  │  RouteSummaryCard: steepCount === 0 ? "Flat" : "⚠ Flattest available" │
-  │  (RouteSummaryCard.tsx:28-36)                                         │
-  └────────────────────────────────────────────────────────────────────── ┘
-```
-
-**Step 3 — flag the violations during reconstruction.** As A* rebuilds the
-path, it records which edges exceeded `userMax` — that's the honesty payload:
-
-```ts
-// features/routing/astar.ts:120-129 (summarizePath, the flagging loop)
-cost += costFn(edge, from, userMax);
-lengthM += edge.lengthM;
-if (Number.isFinite(userMax) && directedGrade(edge, from) > userMax) {
-  steepEdges.push(edge.id);             // 127: this edge violated the preference
+// features/routing/cost.ts:5 — large but FINITE
+export const BLOCKED = 1e9;   // so an only-steep path is still returned and flagged
+// :16 — the banded penalty
+export function penalty(g, max, k1, k2) {
+  if (g <= 0) return 0;                       // downhill/flat: free
+  if (g > max) return BLOCKED;                // over max: huge but comparable
+  const half = 0.5 * max;
+  if (g <= half) return k1 * g;               // moderate: linear
+  return k2 * (g - half) ** 2 + k1 * half;    // steep: quadratic
 }
 ```
+What breaks if `BLOCKED = Infinity`: adding `Infinity` to a path cost makes it
+uncomparable; A*'s `tentative < g.get(next)` relaxation can't order steep paths, so
+the only-steep route never gets reconstructed and the search returns `null` —
+identical to a disconnected graph. The user can't tell "your route is steep" from
+"there is no route." The finite sentinel keeps the two distinct.
 
-Note `Number.isFinite(userMax)` — the "Any" preset effectively turns flagging
-off. `steepEdges` flows into `routeSummary` (`summary.ts`) as `steepCount`.
-
-**Step 4 — the UI tells the truth.** The card reads `steepCount` and labels the
-route's quality plainly:
+**The path carries which edges are steep — it doesn't drop them.**
+`summarizePath` flags any edge whose *directed* grade exceeds `userMax`, but keeps
+it in the route:
 
 ```ts
-// mobile/src/RouteSummaryCard.tsx:28-36
-const clean = summary.steepCount === 0;
-// renders "Flat all the way" when clean,
-// else "⚠ Flattest available" + the count of steep blocks over userMax
+// features/routing/astar.ts:110 — flag, don't drop
+if (Number.isFinite(userMax) && directedGrade(edge, from) > userMax) {
+  steepEdges.push(edge.id);                   // mark it, route still includes it
+}
+// summary.ts:11 — surface the honest totals
+return { distanceM: path.lengthM, climbM, steepCount: path.steepEdges.length };
+```
+Directed grade matters here: the same edge is uphill one way, downhill the other
+(`graph.ts:17`), so reversing From/To genuinely changes which blocks are steep —
+the summary reflects the actual direction of travel.
+
+**The UI renders three honest states + a quality note.** The card is a pure function
+of `(found, summary)`:
+
+```
+  State machine — RouteSummaryCard (mobile/src/RouteSummaryCard.tsx)
+
+  found=false ───────────────────────────► "No route between those points." (red)
+  found=true, steepCount=0 ──────────────► "Flat all the way" (green)
+  found=true, steepCount>0 ──────────────► "⚠ Flattest available · N steep blocks" (amber)
+       │
+       └─ + note "Grades approximate — elevation unavailable, retrying"
+                 when corridorDegraded  (MapScreen.tsx:376)
+```
+Grounded: `RouteSummaryCard.tsx:18` (no route), `:32` (clean vs flattest),
+`:35` (steep count). The fourth signal — *grade quality* — comes from the degraded
+flag threaded up from `useTileGraph` (`MapScreen.tsx:376`), so even a *returned*
+route admits when its grades are guesses (→ `05-elevation-provider-fallback.md`).
+
+The hop, drawn:
+
+```
+  Layers-and-hops — honesty from engine to pixel
+
+  ┌─ cost.ts ───────┐ hop1: BLOCKED finite   ┌─ astar.ts ──────────┐
+  │ penalty()       │ ─────────────────────► │ search returns path │
+  └─────────────────┘                        │ + steepEdges flagged│
+                                             └──────────┬──────────┘
+                              hop2: routeSummary(steepCount, climbM)
+                                                        ▼
+  ┌─ MapScreen ─────┐ hop3: found + summary  ┌─ RouteSummaryCard ──┐
+  │ corridorDegraded│ ─────────────────────► │ 3 states + quality  │
+  │ → note prop     │                        │ note                │
+  └─────────────────┘                        └─────────────────────┘
 ```
 
-There's a *second* honesty channel for a different failure: when elevation data
-is missing (`05-elevation-provider-fallback.md`), the card shows "Grades
-approximate — elevation unavailable, retrying" (`MapScreen.tsx:375-376`). So the
-UI distinguishes three states: flat route, flattest-available route, and
-grades-not-yet-known.
+#### Move 3 — the principle
 
-#### Move 2 variant — what breaks if you remove it
+Distinguishable failure modes are a feature, not a nicety. The instinct to collapse
+"no good answer" into one error throws away the exact information the user needs:
+*how* it failed determines what they do next (reroute vs widen the grade slider vs
+wait for elevation). A finite sentinel instead of `Infinity`, a flag that rides the
+result instead of being discarded, and a UI that names each state — that's how you
+keep the distinction alive from the algorithm all the way to the pixel.
 
-The kernel is one decision plus its propagation:
-
-1. **`BLOCKED` is finite** (`cost.ts:5,18`). Make it `Infinity` and an
-   only-steep route becomes unreachable — A* returns null, the UI says "no
-   route," and the user can't tell that from a genuinely disconnected pair.
-   *Breaks: the steep-vs-disconnected distinction — the entire point.*
-2. **`steepEdges` flagging** (`astar.ts:126-127`). Remove it and the route is
-   returned but the UI can't tell if it's clean. *Breaks: honest labeling — the
-   user trusts a flat-looking route that's actually all hills.*
-3. **The UI read of `steepCount`** (`RouteSummaryCard.tsx:28`). Remove it and
-   the honesty payload exists but never reaches the user.
-
-Optional hardening: the piecewise linear/quadratic shape (`cost.ts:20-21`) tunes
-*how much* steepness hurts, but the finite ceiling is the load-bearing part.
-
-### Move 3 — the principle
-
-The principle is **prefer fail-open with honest labeling over fail-closed
-silence.** When a constraint can't always be satisfied, returning "the best
-available, clearly labeled as imperfect" beats returning nothing — provided you
-preserve the distinction between "best available is bad" and "nothing exists."
-flattr encodes that distinction in a single constant choice (finite vs infinite)
-and carries the quality signal all the way to the UI. The same instinct shows up
-in search ranking (return results, flag low confidence), form validation (accept
-with warnings), and LLM systems (answer, but surface uncertainty).
+---
 
 ## Primary diagram
 
 ```
-  Honest fallback routing — the full picture
+  Honest fallback routing — full pattern
 
-  ┌─ cost.ts: the soft constraint ───────────────────────────────────────┐
-  │  penalty(signed grade, userMax):                                      │
-  │    g≤0 → 0 | g≤½max → linear | g≤max → quadratic | g>max → 1e9 FINITE │
-  │  BLOCKED = 1e9 (cost.ts:5) ← finite keeps only-steep paths reachable  │
-  └───────────────────────────────┬────────────────────────────────────── ┘
-                                   │ directedAstar (astar.ts:156-163)
-                                   ▼
-  ┌─ astar.ts: search + flag ────────────────────────────────────────────┐
-  │  returns cheapest EXISTING path (null only if disconnected)          │
-  │  summarizePath collects steepEdges where directedGrade > userMax      │
-  └───────────────────────────────┬────────────────────────────────────── ┘
-                                   │ routeSummary → steepCount
-                                   ▼
-  ┌─ UI: three honest states ────────────────────────────────────────────┐
-  │  steepCount 0   → "Flat all the way"                                  │
-  │  steepCount >0  → "⚠ Flattest available (N steep blocks)"             │
-  │  grades missing → "Grades approximate — retrying" (MapScreen:375)     │
-  │  no path at all → genuinely disconnected (distinct from above)        │
-  └────────────────────────────────────────────────────────────────────── ┘
+  ┌─ cost.ts ───────────────────────────────────────────────────┐
+  │  penalty: free / linear / quadratic / BLOCKED(1e9, FINITE)   │
+  └───────────────┬─────────────────────────────────────────────┘
+                  ▼
+  ┌─ astar.ts search + summarizePath ───────────────────────────┐
+  │  minimize cost (avoids steep) · return path even if steep    │
+  │  steepEdges = directedGrade > userMax  (flag, don't drop)    │
+  └───────────────┬─────────────────────────────────────────────┘
+                  ▼
+  ┌─ summary.ts ────────────────────────────────────────────────┐
+  │  distanceM · climbM (uphill only) · steepCount               │
+  └───────────────┬─────────────────────────────────────────────┘
+                  ▼
+  ┌─ RouteSummaryCard ──────────────────────────────────────────┐
+  │  green "Flat all the way" | amber "⚠ Flattest available · N" │
+  │  | red "No route"  + note "Grades approximate" if degraded   │
+  └─────────────────────────────────────────────────────────────┘
 ```
+
+---
 
 ## Elaborate
 
-This is graceful degradation done at the algorithm layer rather than the infra
-layer. Most "graceful degradation" talk is about services (fall back to a cache,
-serve stale). Here it's about a *search constraint*: the cost function is
-designed so the constraint can never make a reachable destination unreachable.
-The finite-BLOCKED trick is a known move in pathfinding — soft constraints via
-large penalties rather than edge removal — but it's easy to get wrong by reaching
-for `Infinity` because it "feels" like "impassable." The whole spec calls this
-out (`context.md` must-not-change: "`BLOCKED` is large-finite, not Infinity").
+The finite-sentinel trick is the same one you've used returning `-1` from a search
+instead of throwing, or a max-int weight in a graph instead of a missing edge — it
+keeps the result *in the same type* so downstream math still works. The deeper idea
+is graceful degradation: a system under partial failure should narrow the user's
+options honestly rather than fail closed. flattr threads four distinct truths —
+flat, steep, disconnected, approximate-grades — from `cost.ts` to the card.
 
-The directional cost (free downhill, penalized uphill) is what makes flattr's
-routes feel right — a loop that climbs gently and descends steeply is genuinely
-more comfortable than its reverse, and the signed grade captures that
-(`cost.ts:32-33`). Read `03-tile-merge-stitch.md` for why degraded tiles are
-still merged into the *routing* graph (connectivity beats fidelity) and
-`05-elevation-provider-fallback.md` for the "grades approximate" channel.
+The "approximate grades" branch is owned by `05-elevation-provider-fallback.md`;
+the directed-grade math is `graph.ts:17` / `study-data-modeling`. The A* relaxation
+that the finite ceiling protects is `06-parametric-search-engine.md`.
+
+---
 
 ## Interview defense
 
-**Q: How do you distinguish "no flat route" from "no route at all"?**
-By making the over-max penalty large but *finite*. `BLOCKED = 1e9`
-(`cost.ts:5`), not `Infinity`, so an over-max edge is heavily penalized but
-still traversable. A* returns null *only* when the graph is genuinely
-disconnected; an all-steep route comes back with every steep edge flagged in
-`steepEdges` (`astar.ts:126-127`) and the UI says "flattest available."
+**Q: Why is `BLOCKED` `1e9` and not `Infinity`?**
+So an only-steep path stays comparable and gets returned, flagged — distinct from a
+disconnected graph that returns `null`. With `Infinity`, A*'s relaxation can't order
+steep paths and you'd return `null` for "steep" too, collapsing "no flat route" into
+"no route." The user couldn't tell them apart.
 
 ```
-  BLOCKED = Infinity  →  only-steep route = "no route"  (WRONG: conflates)
-  BLOCKED = 1e9       →  only-steep route = returned + flagged  (correct)
-                         null = truly disconnected (distinct)
+  Infinity:  steep path → null  ┐
+  no path  → null               ┘ same → user can't distinguish
+  1e9:       steep path → returned+flagged  ≠  no path → null  → distinguishable
 ```
-Anchor: *finite ceiling keeps "best available" and "nothing exists" separate.*
+Anchor: finite sentinel keeps "bad" and "impossible" distinct. This is the single
+most load-bearing line in the reliability story (`cost.ts:5`).
 
-**Q: Why directional cost?**
-Comfort is asymmetric — descending a hill is fine, climbing it isn't. The cost
-uses the *signed* directed grade (`cost.ts:32-33`, `directedGrade`), so the same
-edge is free downhill and penalized uphill (`graph.ts:17-19`). A symmetric
-penalty would treat a gentle-up/steep-down loop the same as its painful reverse.
+**Q: How does the UI avoid lying when elevation was unavailable?**
+The degraded flag rides up from `useTileGraph` and the card shows "Grades
+approximate — elevation unavailable, retrying" (`MapScreen.tsx:376`) even on a
+returned route. So a route can be *shown* and *labeled as provisional*
+simultaneously.
+Anchor: a returned answer can still admit it's a guess.
 
-**Q: The load-bearing part people forget?**
-That `BLOCKED` is finite. It's a one-line constant (`cost.ts:5`) and the
-instinct is to use `Infinity` for "impassable." Getting it finite is what
-preserves the entire steep-vs-disconnected distinction the product depends on.
+**Q: Why store steep edges instead of just a boolean "has steep"?**
+The exact `steepEdges` ids let the route line color those segments and the summary
+count them; reversing direction recomputes them via directed grade. A boolean would
+lose which blocks and break on reversal.
+Anchor: keep the granular flag; directed grade makes it direction-aware.
+
+---
 
 ## See also
 
-- `03-tile-merge-stitch.md` — degraded tiles merged for routing, not display
-- `05-elevation-provider-fallback.md` — the "grades approximate" honesty channel
-- `audit.md` §6 (failure handling)
-- neighboring: **study-dsa-foundations** (A*, admissible heuristic, cost models)
+- `05-elevation-provider-fallback.md` — the "approximate grades" degraded branch.
+- `06-parametric-search-engine.md` — the A* the finite ceiling protects.
+- `03-tile-merge-stitch.md` — routing-includes-degraded vs display-excludes-degraded.
+- `audit.md` lens 6 — failure-handling-and-reliability.
+</content>

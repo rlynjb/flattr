@@ -1,122 +1,181 @@
-# Options and Opportunity Cost — flattr
+# Options and Opportunity Cost
 
-> Four options, including `do nothing`. Each names what it buys and what it costs
-> you to choose it (the opportunity cost = the next-best option you give up).
-> Coach posture: there's a recommended call, and it's stated up front.
+The mistake here is presenting one option ("build the thing") and calling
+it analysis. A staff reviewer wants to see you *consider not building*,
+rank the alternatives, and name what each one costs you. `do nothing` is
+a real option and it ranks higher than your instinct wants it to —
+because the engine is already built, so the marginal value of *more*
+building is low until demand is shown.
 
-## The verdict first
+---
 
-> **Recommended: Option B — run the discovery slice.** It is the only option
-> that buys information about the empty column (demand). Every other option
-> spends solo-dev hours improving the column that's already full (solvability).
-
-Now the four options, and why B wins.
-
-## The decision in one frame
+## The options, as a decision shape
 
 ```
-  flattr — four moves, what each buys, what each gives up
+  Zoom out — five live options, ranked by what they cost a
+  single developer with zero demand evidence
 
-                    buys you...              opportunity cost
-                    ───────────              ────────────────
-  A  do nothing     a finished portfolio     never learn if anyone
-     (ship as-is)   artifact, zero new       wants it; no demand datum
-                    risk                      ever
+  ┌────────────────────────────────────────────────────────┐
+  │  A. DO NOTHING / freeze        ← cheap, real, ranked #2 │
+  │  B. VALIDATE the built slice   ← cheap, decisive, #1    │
+  │  C. EXPAND coverage            ← expensive, premature   │
+  │  D. HARDEN grade accuracy      ← medium, only if B says │
+  │                                  trust is the blocker    │
+  │  E. PIVOT to the algorithm     ← reframe: it's a        │
+  │     as the artifact              portfolio piece        │
+  └────────────────────────────────────────────────────────┘
 
-  B  discovery ★    the FIRST real demand     ~1-2 weeks of dev time
-     slice          signal (5 travelers,      (and the answer might be
-                    one bbox, A→B prefs)      "no one cares")
-
-  C  more engine    a more impressive         hours sunk into the PROVEN
-     (bidir, k-alt) DSA portfolio piece       column; demand still 0
-
-  D  more coverage  a bigger map              cost-before-demand; free
-     (multi-city)   (city-scale graph)        elevation 429s; still 0 demand
+  the axis being traced: $ of single-dev time spent BEFORE
+  any human says "yes." B spends the least to learn the most.
 ```
 
-Read the right column top to bottom. Three of four options pay their cost into a
-column that's already full. Only B pays into the empty one.
+---
 
-## Option A — do nothing more (ship/freeze as-is)
+## Option A — Do nothing (freeze it where it is)
 
-**This is a real option, not a strawman.** flattr today is a working, tested,
-on-device grade-aware router with a clean correctness story. As a *portfolio
-artifact* it already does its job: it proves Rein can build a routing engine from
-the graph up, with an admissible heuristic, an oracle-checked optimality gate,
-a measured algorithm progression, and an honest fallback.
+**What it is:** stop. The engine is built, tested, oracle-correct, and
+runs on one neighborhood. Leave it as a finished portfolio artifact and
+invest your hours elsewhere.
 
-- **Buys:** a finished, defensible artifact. Zero new risk. Frees 100% of hours
-  for other projects in the pivot-to-AI arc (`me.md`).
-- **Opportunity cost:** you never find out if the *problem* is real. The §3 user
-  table stays a hypothesis forever. If flattr's value is "I built a router,"
-  that's fine; if its value is "I solved a real travel problem," A forecloses it.
-- **When A is correct:** if flattr is explicitly a DSA/system-design portfolio
-  piece and *not* a product attempt. Then there's nothing to validate — the
-  artifact is the deliverable. Be honest about which one it is.
-
-## Option B — run the discovery slice  ★ recommended
-
-Build nothing new; bundle one neighborhood and put the existing colored-path +
-climb-number UI in front of 5 real self-powered travelers (full cut in `02`).
-
-- **Buys:** the first demand evidence flattr has ever had. Converts the empty
-  column of `00`'s diagram into a data point — even a *negative* result is a win
-  (it cheaply kills the product question).
-- **Opportunity cost:** ~1-2 weeks, and the emotional cost that the answer might
-  be "people shrug." That risk is the *reason* to run it cheaply before
-  investing more.
-- **Why it wins:** it's the only option whose output changes what you'd do next.
-  A, C, and D all leave you exactly as ignorant about demand as you are today.
-
-## Option C — build more engine (bidirectional, k-alternatives, CH)
-
-The spec §14.5 stretch goals: bidirectional A*, k alternative routes,
-contraction hierarchies, ALT landmarks.
-
-- **Buys:** genuine DSA depth and a more impressive benchmark table (the
-  bench harness already supports adding stages — `bench/run.ts`).
-- **Opportunity cost:** every hour here is an hour not spent learning whether
-  anyone wants the thing. You'd be optimizing the search over a graph nobody has
-  asked to route across.
-- **When C is correct:** *only* under Option A's framing (pure portfolio) — if
-  the goal is to show algorithmic range, C is the strongest portfolio move. As a
-  *product* move it's premature optimization of demand-unvalidated software.
-
-## Option D — expand coverage (multi-city / city-scale)
-
-Spec §10 Phase 4: vehicle presets, multi-city pipeline, saved routes.
-
-- **Buys:** a bigger map; more places to route.
-- **Opportunity cost:** the worst ratio of the four. Coverage is a cost you pay
-  to *serve* demand; paying it before demand exists is backwards. Plus it
-  collides with a hard constraint: free Open-Meteo elevation **429s under heavy
-  testing** (project context) — scaling the pipeline fights the free-tier
-  ceiling that spec §11.A already flagged as make-or-break.
-- **When D is correct:** after B returns positive *and* you know which
-  neighborhoods the validated users actually travel.
-
-## The opportunity-cost principle
+**Opportunity cost:** you never learn whether the demand is real — but
+you also stop pouring single-developer time into an unvalidated
+hypothesis. Given zero users and zero telemetry, that's not a weak
+option. It's the baseline every other option must beat.
 
 ```
-  spend hours where the uncertainty is, not where the comfort is
+  Do-nothing — what you keep, what you forgo
 
-       certainty  ◄─────────────────────────────►  uncertainty
-       ───────────                                  ───────────
-       engine works        ░░░░░░░░░░░░░░░░░░        anyone wants it?
-       (A* == Dijkstra)                              (no data at all)
-            ▲                                              ▲
-            │                                              │
-       C and D invest here                          B invests here
-       (the easy, proven side)                      (the hard, unknown side)
+  KEEP (already banked)            FORGO
+  ─────────────────────            ─────
+  oracle-correct router  ✓         any demand signal
+  bench-measured A*      ✓          any path to a product
+  shipped on a city      ✓          the answer to "do they
+  a clean portfolio piece            want it?"
 ```
 
-The senior move is to invest against uncertainty. The engine being done is
-*exactly* the reason the next dollar should not go to the engine.
+**When A is correct:** if your goal for flattr was always "prove I can
+hand-roll a correct, measured graph router" — and `me.md` says you build
+fundamentals from scratch to make them real — then A is *already a win*.
+The DSA portfolio gained a directional A* with an optimality oracle. Don't
+let "ship a product" pressure erase a completed learning artifact.
 
-## See also
+## Option B — Validate the built slice (recommended)
 
-- `02-scope-cuts-and-non-goals.md` — what Option B actually bundles, and the
-  engine work it deliberately cuts.
-- `04-success-metrics-and-feedback-loop.md` — how you'd know Option B succeeded.
-- `05-skeptical-reviewer-questions.md` — defending the "do nothing more on
-  features" stance in a review.
+**What it is:** run the experiment chapter 02 names. One real
+self-powered traveler, one known route, one question: "is this the path
+you'd actually take?" No code. No infrastructure. An afternoon.
+
+**Opportunity cost:** a few hours of your time and the small ego risk of
+hearing "no, I'd just take the short way." That risk *is the value* —
+it's the cheapest way to learn the one thing the repo can't tell you.
+
+```
+  Option B — the cheapest decisive move
+
+  cost:   ~1 afternoon, 0 lines of code
+  learns: the ONE unprovable thing (demand / trust)
+  unlocks: a real reason to pick C, D, A, or E next
+
+  every other option is better-informed AFTER B runs.
+  that's why it ranks #1.
+```
+
+**Why B beats jumping to C or D:** expanding coverage or sharpening grade
+accuracy both assume you already know users want this. B is the test of
+that assumption. Spend the afternoon before the month.
+
+## Option C — Expand coverage (more neighborhoods / a city)
+
+**What it is:** generalize the pipeline from one bbox to many; ship a
+bigger graph or on-device tile rebuilds.
+
+**Opportunity cost:** real engineering against two hard constraints. The
+free Open-Meteo tier 429s under heavy elevation sampling
+(`pipeline/elevation.ts` has retry/backoff and a flat-0m fallback for
+exactly this), and the offline bundle must stay phone-friendly
+(`data/graph.json` is already 532 KB for 0.35 km²). You'd spend weeks on
+a scale problem to validate a demand hypothesis that one afternoon (B)
+answers for free.
+
+```
+  Why C is premature — scale before signal
+
+  ┌─ C builds: many neighborhoods ────────────────────────┐
+  │  cost: weeks. constraint: free-tier 429s, bundle size  │
+  │  validates: nothing new about DEMAND                   │
+  │  → you'd have a bigger map nobody's asked for           │
+  └────────────────────────────────────────────────────────┘
+```
+
+**When C becomes correct:** after B returns "yes, and I'd use it daily if
+it covered my commute." Then coverage is the validated next bottleneck.
+
+## Option D — Harden grade accuracy (better DEM)
+
+**What it is:** replace or augment the 90m Open-Meteo DEM with finer
+elevation so short steep pitches stop getting smoothed (spec §12 calls
+grade accuracy "the whole product").
+
+**Opportunity cost:** likely a paid elevation source — which breaks the
+free-tier constraint — or a heavier sampling scheme that strains
+build-time rate limits. Medium effort, and only worth it if B reveals
+that *distrust of the colors* is what stops users, not lack of interest.
+
+**When D is correct:** B says "I'd use it but I don't trust the green —
+that block is steeper than it shows." Then accuracy is the validated
+blocker. Not before.
+
+## Option E — Reframe as the algorithm artifact (pivot the goal)
+
+**What it is:** explicitly stop treating flattr as a product-in-waiting
+and treat it as what the repo most strongly *is*: a hand-rolled,
+oracle-verified, benchmarked directional A* — a portfolio centerpiece
+for an AI/systems-engineering pivot.
+
+**Opportunity cost:** you give up the product story. But you gain an
+honest, defensible artifact that matches the constraint that's been true
+all along — "the graph work is the point" (spec §14).
+
+```
+  Option E — what the repo is strongest at being
+
+  product framing            artifact framing
+  ───────────────            ────────────────
+  needs users to win   →     wins on correctness alone
+  demand unproven      →     oracle + bench ARE the proof
+  one-dev disadvantage →     one-dev hand-roll is the FLEX
+```
+
+This isn't giving up. It's matching the claim to the evidence. The repo
+proves Claim A (technically solvable) overwhelmingly; E is the option
+that scores entirely on Claim A.
+
+---
+
+## The ranking, and why
+
+```
+  Ranked — most leverage per dev-hour, given zero demand data
+
+  #1  B  validate the slice    cheap, decisive, unlocks all else
+  #2  A  do nothing            free, banks a finished artifact
+  #2  E  reframe as artifact   free, matches evidence to claim
+  #4  D  harden accuracy       only if B says "trust" is blocker
+  #5  C  expand coverage       only if B says "demand + reach"
+```
+
+A and E tie at #2 because they cost nothing and both are *honest landing
+spots* — one stops, one re-labels. B is #1 because it's the only option
+that buys you the missing information for the price of an afternoon. C
+and D are real, but every reason to pick them depends on an answer only
+B produces.
+
+**The line you say:** "Before I write another line, I'd run the
+afternoon test in option B. If it says no, I take option A or E and call
+it a strong portfolio artifact. I don't expand coverage or chase DEM
+accuracy until a real user tells me which one is the actual blocker."
+
+That's the whole posture: cheap experiment first, `do nothing` on the
+table, no scope spent ahead of signal.
+
+Next: `04-success-metrics-and-feedback-loop.md`.

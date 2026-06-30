@@ -1,264 +1,267 @@
-# Directed traversal over undirected storage
+# 03 — Directed traversal over undirected storage
 
-> **Derive-don't-materialize / single source of truth / computed property**
-> — Language-agnostic. The "store once, compute the variant" move.
+**Industry names:** derived value / single source of truth / don't-materialize.
+**Type label:** Language-agnostic.
+
+The graph stores each edge *once*, undirected, with a signed grade. The
+direction of travel is **derived** at traversal time by one function —
+never stored as two opposing edges.
+
+---
 
 ## Zoom out, then zoom in
 
-A street has a grade. Walk it east-to-west and you're going uphill (+6%);
-walk it west-to-east and you're going downhill (−6%). You could store *both*
-directed edges in the graph. flattr stores *one* undirected edge with a
-signed grade and derives the direction at query time. One function,
-`directedGrade`, three lines, turns "the grade of this street" into "the
-grade *I* experience walking it this way."
+This is the storage-shape decision underneath the routing core. It's why
+`graph.json` is half the size it could be and why the sign of every grade
+is correct everywhere.
 
 ```
-  Zoom out — where the direction is derived
+  Zoom out — where the derivation lives
 
-  ┌─ build pipeline ──────────────────────────────────┐
-  │  computeGrades → Edge { gradePct: +6 (from→to) }   │  store ONE sign
-  └──────────────────────┬─────────────────────────────┘
-                         │ Edge (one per street, undirected adjacency)
-  ┌─ graph.ts ───────────▼─────────────────────────────┐
-  │  ★ directedGrade(edge, fromNode) ★                  │ ← we are here
-  │     fromNode === edge.fromNode ?  +gradePct         │
-  │                                : −gradePct          │
-  └──────────────────────┬─────────────────────────────┘
-                         │ signed grade in travel direction
-  ┌─ cost.ts ────────────▼─────────────────────────────┐
-  │  gradeCostDirected → penalty(directedGrade(...))    │
-  └────────────────────────────────────────────────────┘
+  ┌─ STORAGE (graph.json, static) ───────────────────────────────┐
+  │  Edge { fromNode, toNode, gradePct (signed from→to),          │
+  │         absGradePct }   — stored ONCE, undirected             │
+  └───────────────────────────────┬──────────────────────────────┘
+                                  │ at traversal time
+  ┌─ ROUTING CORE ───────────────▼──────────────────────────────┐
+  │  ★ directedGrade(edge, fromNode)  graph.ts:17 ★ ← we are here │
+  │     │ used by                                                 │
+  │     ├─ cost.ts:32 gradeCostDirected (signed cost)            │
+  │     ├─ astar.ts:126 summarizePath (steep flag)              │
+  │     ├─ summary.ts:16 routeSummary (climb)                   │
+  │     └─ geojson.ts:55 routeToGeoJSON (color)                 │
+  └───────────────────────────────────────────────────────────────┘
 ```
 
-Zoom in: the graph is stored *undirected* (one edge, in both nodes'
-adjacency lists — `graph.ts:22-29`) but traversed *directed* (the sign flips
-with travel direction). The single edge is the source of truth; the directed
-view is computed, never stored. That's the "derive, don't materialize" move,
-and it's why there's exactly one place to fix if the sign convention is ever
-wrong.
+Zoom in: the pattern is **derive, don't materialize.** You've made this
+call every time you chose to compute `fullName` from `first + last`
+rather than store a third column that can drift out of sync. Here the
+"derived value" is the signed grade *in your direction of travel*, and
+the function that derives it is the single source of truth for the sign.
+
+---
 
 ## Structure pass
 
-**Layers.** Storage vs query, split by `directedGrade`:
-- *Storage*: `Edge.gradePct` — one signed number, from→to (`types.ts:17`).
-- *The seam*: `directedGrade(edge, fromNode)` (`graph.ts:17`).
-- *Query*: `cost.ts` and `summary.ts` ask "grade in MY direction."
+**Layers.** Undirected storage (one `Edge`, one signed `gradePct`) →
+directed view (computed per traversal). The adjacency list
+(`buildAdjacency`, `graph.ts:22`) lists each edge under *both* endpoints,
+so the same stored edge is reachable walking either way.
 
-**Axis — "what's the direction of travel?"**
+**Axis held constant — "is grade a stored field or a computed value?"**
 
 ```
-  axis = "does direction matter, and who resolves it?"
+  "directed grade: stored or derived?" — trace across the seam
 
-  ┌─ Edge (storage) ──────────┐  direction-AGNOSTIC: one signed number
-  │  gradePct = +6 (from→to)  │  the street doesn't know which way you walk
-  └──────────┬─────────────────┘
-             │ seam: directedGrade(edge, fromNode)
-  ┌─ traversal (query) ───────┐  direction-AWARE: +6 forward, −6 reverse
-  │  the search arrives FROM   │  the answer depends on WHERE you came from
-  │  a specific node           │
-  └────────────────────────────┘
-
-  "which way?" is unanswerable in storage, answered at the seam
+  ┌─ storage ─────────────┐   seam    ┌─ traversal ──────────────┐
+  │ gradePct: +6 (from→to)│ ════╪════► │ directedGrade(e, A) = +6 │
+  │ stored ONCE           │ (it flips)│ directedGrade(e, B) = −6 │
+  └───────────────────────┘           └──────────────────────────┘
+         one number                      two views, neither stored
 ```
 
-**Seam.** `directedGrade(edge, fromNodeId)` is the boundary. Below it, the
-edge has no notion of "your" direction. Above it, every consumer that cares
-about uphill-vs-downhill asks this one function. The axis flips here:
-storage is symmetric, traversal is signed.
+**Seam.** `Edge.gradePct │ directedGrade`. The axis flips from *stored*
+to *derived* exactly at this function. Everything above the seam sees a
+directed grade and never touches the raw sign; everything below stores a
+single signed number. → the directed grade feeds the penalty seam (`02`).
+
+---
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You know computed properties — a Vue `computed` or a React `useMemo` that
-derives `fullName` from `firstName` + `lastName` instead of storing a third
-field that can drift out of sync. `directedGrade` is a computed property over
-an edge: the directed grade is *derived* from the stored grade plus which
-endpoint you're standing on, never stored as its own field.
+The shape: one undirected edge, two ways to walk it, and a sign flip that
+distinguishes them — computed, not stored. If you've ever stored a single
+`balance` and computed "is this a debit or credit *for this account*" at
+read time rather than duplicating the transaction, same move.
 
 ```
-  the pattern — one stored fact, two derived views
+  Pattern — one edge, derived direction
 
-                    Edge.gradePct = +6   (from→to, the source of truth)
-                         │
-            ┌────────────┴────────────┐
-   from === edge.fromNode      from === edge.toNode
-            │                          │
-            ▼                          ▼
-        +6 (uphill)               −6 (downhill)
-        forward traversal         reverse traversal
+        gradePct = +6  (stored, means A→B rises 6%)
+   A ●━━━━━━━━━━━━━━━━━━● B
+        │                │
+   walk A→B: directedGrade = +6  (uphill, penalized)
+   walk B→A: directedGrade = −6  (downhill, free)
+        the edge is stored once; the sign is a function of WHERE YOU START
 ```
 
-In one sentence: **store the fact once with a sign convention; compute the
-direction-specific value at the point of use.**
+### Move 2 — the walkthrough
 
-### Move 2 — the step-by-step walkthrough
-
-#### The whole derivation is one ternary
+**The derivation — three lines, the whole sign convention.**
+`graph.ts:17-19`:
 
 ```ts
-// graph.ts:16-19 — directedGrade, annotated
-/** Signed grade in the direction of travel: +gradePct forward, -gradePct reverse. */
+// features/routing/graph.ts:17-19
 export function directedGrade(edge: Edge, fromNodeId: string): number {
   return fromNodeId === edge.fromNode ? edge.gradePct : -edge.gradePct;
-  //     └─ which endpoint am I leaving? ─┘   forward    reverse (flip sign)
 }
 ```
 
-That's it. The edge stores `gradePct` as signed from→to (`types.ts:17`). If
-you're leaving the `fromNode`, you experience it as stored. If you're leaving
-the `toNode`, you're going the other way, so flip the sign. **What breaks if
-you don't derive — if you materialize two directed edges instead?** You
-double the edge count, double the storage in `graph.json`, and create the
-classic redundancy bug: nothing structurally stops the forward edge's grade
-and the reverse edge's grade from disagreeing after an edit. Deriving makes
-the disagreement *impossible* — there's only one number.
+Bridge: it's a ternary. If you're starting at the edge's stored
+`fromNode`, you're going "with" the stored direction → keep the sign. If
+you're starting at the other end, you're going against it → negate.
+**This is the only place in the entire codebase that knows the sign
+rule.** That's the load-bearing property — audit lens 3 calls it out.
 
-#### The undirected storage is in the adjacency, not a second edge
+**Storage stays undirected — `buildAdjacency`.** `graph.ts:22-29` lists
+each edge id under *both* its endpoints:
 
 ```ts
-// graph.ts:22-29 — buildAdjacency, annotated
+// features/routing/graph.ts:22-29
 export function buildAdjacency(edges: Edge[]): Record<string, string[]> {
   const adj: Record<string, string[]> = {};
   for (const e of edges) {
-    (adj[e.fromNode] ??= []).push(e.id);   // edge listed under BOTH endpoints
-    (adj[e.toNode]   ??= []).push(e.id);   // → traversable in either direction
+    (adj[e.fromNode] ??= []).push(e.id);   // reachable walking from→to
+    (adj[e.toNode]   ??= []).push(e.id);   // AND walking to→from
   }
   return adj;
 }
 ```
 
-This is the other half. One `Edge` appears in *both* endpoints' adjacency
-lists, so the search can leave it from either side. Combined with `otherEnd`
-(`graph.ts:10-14`), which returns the opposite endpoint regardless of which
-side you came from, the single edge behaves as bidirectional. **What breaks
-if the edge only appeared under `fromNode`?** The graph becomes directed by
-accident — you could never route "downhill" along that street.
+So when `search` expands a node, it sees every incident edge regardless
+of stored orientation, and `otherEnd` (`graph.ts:10`) picks the far
+endpoint. One stored edge, both directions traversable. **The alternative
+flattr rejected:** materialize two directed edges (A→B with +6, B→A with
+−6). That doubles `graph.json`, doubles the adjacency, and creates a
+*second* place the sign lives — so a sign bug could now exist in the data
+rather than in one function. Deriving keeps the sign in code, where one
+test covers it.
+
+**Every consumer asks the same function.** The directed grade is needed
+in four places, and all four call `directedGrade` rather than re-deriving
+the sign:
 
 ```
-  layers-and-hops — how one edge serves both directions
-
-  ┌─ adjacency (graph.ts) ──────────────────────────────┐
-  │  adj["A"] = [e1]      adj["B"] = [e1]   ← same edge  │
-  └─────────┬──────────────────────┬─────────────────────┘
-     leave A│                leave B│
-            ▼                       ▼
-  ┌─ otherEnd(e1, "A")=B ┐  ┌─ otherEnd(e1, "B")=A ┐
-  │ directedGrade=+6     │  │ directedGrade=−6     │
-  └──────────────────────┘  └──────────────────────┘
-        uphill cost              downhill = free
+  cost.ts:32      gradeCostDirected → penalty(directedGrade(edge, from), max)
+  astar.ts:126    summarizePath    → directedGrade(edge, from) > userMax (flag)
+  geojson.ts:55   routeToGeoJSON   → classifyDirected(directedGrade(...), max)
+  summary.ts:16   routeSummary     → directedRise (the same sign rule, inlined ⚠)
 ```
 
-#### Two consumers, both ask the same function
+**One honest wrinkle.** `summary.ts:16` computes the directed *rise*
+(meters climbed) by re-deriving the sign inline rather than calling a
+shared helper:
 
 ```ts
-// cost.ts:32-33 — routing asks for directed grade
-gradeCostDirected = (edge, from, max) =>
-  edge.lengthM * (1 + penalty(directedGrade(edge, from), max));
-
-// summary.ts:15-17 — the summary independently derives directed rise
+// features/routing/summary.ts:16
 const directedRise = fromNode === edge.fromNode ? edge.riseM : -edge.riseM;
 ```
 
-Here's an honest wrinkle. `cost.ts` calls `directedGrade`. But `summary.ts`
-re-derives the *same flip* for `riseM` inline (`summary.ts:16`) rather than
-calling a shared `directedRise(edge, from)` helper. The grade is centralized;
-the rise direction is not. It's a *minor* echo of the same logic — the kind
-of thing the audit flags under information leakage (the sign-flip convention
-known in two spots). The fix is small: a `directedRise` sibling next to
-`directedGrade` in `graph.ts`. **What breaks today?** Nothing — but if the
-sign convention ever changed, `graph.ts` and `summary.ts` would both need the
-edit, and one could be missed.
+That's the *same sign convention* as `directedGrade`, applied to `riseM`
+instead of `gradePct`. It's a tiny, contained duplication — the rule
+("from===fromNode keeps sign") now lives in two spots. Not a real leak
+(it's three tokens, both in the same `features/routing` folder), but if
+you wanted to be strict you'd add `directedRise(edge, fromNode)` next to
+`directedGrade` and have summary call it. The reason it's fine today:
+both are trivial and co-located. Worth noting so you don't think the
+single-source-of-truth claim is absolute.
 
 ### Move 3 — the principle
 
-When a value has variants that are pure functions of a stored value plus
-context, store the value and compute the variants. Materializing the variants
-buys a lookup and pays with redundancy that can desync. The general lesson:
-**a single source of truth isn't a database concept — it's a per-edge one.**
-One signed grade, derived two ways, can never contradict itself.
+When a value can be *computed* from what you already store, computing it
+beats storing it — you erase an entire class of "the derived copy drifted
+from the source" bug, and you shrink the artifact. The cost is a function
+call at read time, which for a grade lookup is free. Materialize only
+when the recomputation is expensive *and* the source rarely changes;
+neither is true here.
+
+---
 
 ## Primary diagram
 
-The full move: pipeline stores one sign, adjacency makes it bidirectional,
-`directedGrade` derives the travel-direction value, consumers ask.
-
 ```
-  directed traversal over undirected storage — complete
+  Directed traversal over undirected storage — full recap
 
-  ┌─ build pipeline ───────────────────────────────────────┐
-  │  computeGrades → Edge{ gradePct:+6, riseM:+3 } (from→to)│ STORE once
-  │  buildAdjacency → e1 under adj[A] AND adj[B]            │ undirected
-  └───────────────────────────┬─────────────────────────────┘
-                              │ Graph (one edge per street)
-  ┌─ graph.ts ────────────────▼─────────────────────────────┐
-  │  otherEnd(e, here) → the far endpoint                   │
-  │  directedGrade(e, here) → +6 if here==fromNode else −6  │ ← DERIVE
-  └───────────────────────────┬─────────────────────────────┘
-              ┌───────────────┴────────────────┐
-   ┌─ cost.ts ▼──────────┐         ┌─ summary.ts ▼──────────┐
-   │ penalty(directed)   │         │ directedRise (inline ⚠)│
-   └─────────────────────┘         └────────────────────────┘
+  ┌─ STORAGE (graph.json) ─────────────────────────────────────┐
+  │  Edge: fromNode=A, toNode=B, gradePct=+6, riseM=+3         │
+  │  adjacency:  A → [edge]   B → [edge]   (both, graph.ts:22) │
+  └───────────────────────────┬────────────────────────────────┘
+                              │  directedGrade(edge, from)  graph.ts:17
+                  ┌───────────┴───────────┐
+            from=A │ +6 (uphill)     from=B │ −6 (downhill)
+                  ▼                       ▼
+   ┌─────────────────────────────────────────────────────────┐
+   │  cost.ts:32   astar.ts:126   geojson.ts:55   summary.ts:16│
+   │  (penalty)    (steep flag)   (color)         (climb ⚠inline)│
+   └─────────────────────────────────────────────────────────┘
+            one stored sign → many directed views, derived
 ```
+
+---
 
 ## Elaborate
 
-This is "single source of truth" and the computed-property idea you use daily
-in reactive frontends, applied to a graph edge. It's also why the spec lists
-"grade is signed by travel direction" as a data-model invariant — the
-storage commits to one convention (signed from→to) and everything downstream
-derives from it.
+This is the database-normalization instinct ("don't store what you can
+derive") applied to a graph, and it's also a classic space/time tradeoff
+landing on the right side for a mobile artifact: `graph.json` ships to the
+phone, so halving the edge count matters. The undirected-storage-with-
+derived-direction shape shows up anywhere edges are symmetric in topology
+but asymmetric in cost — elevation routing, current-aware river routing,
+one-way-street modeling. Read `02` for the penalty that consumes the
+derived grade; read `study-data-modeling` for the normalization framing.
 
-It's the same hiding discipline as pattern `02`, one layer down: `02` keeps
-*grade-as-cost* knowledge in one file; `03` keeps *direction-of-travel*
-knowledge in one function. The minor `summary.ts` echo is the one spot where
-the discipline isn't fully held — see `audit.md` Lens 3. For the heatmap, note
-the *opposite* choice: the overview uses `absGradePct` (direction-agnostic
-steepness, `types.ts:18`) because a heatmap has no travel direction. Same data,
-two derived views, picked by what the consumer needs.
+---
+
+## Project exercises
+
+### EX-03-A — Extract `directedRise` to kill the inline duplication
+
+- **What to build:** a `directedRise(edge, fromNodeId)` in `graph.ts`
+  next to `directedGrade`; rewire `summary.ts:16` to call it.
+- **Why it earns its place:** makes the single-source-of-truth claim
+  literally true — the sign rule then lives in exactly one folder, one
+  pattern.
+- **Files to touch:** `features/routing/graph.ts`, `summary.ts`, tests.
+- **Done when:** `summary.ts` has no inline `? : -` sign flip and tests
+  pass.
+- **Estimated effort:** 20 min.
+
+### EX-03-B — Prove derivation beats materialization
+
+- **What to build:** a test asserting `directedGrade(e, e.fromNode) ===
+  -directedGrade(e, e.toNode)` for every edge in a fixture — the
+  antisymmetry the materialized version would have to maintain by hand.
+- **Why it earns its place:** shows the invariant is free when derived
+  and would be a data-integrity burden if stored.
+- **Files to touch:** `features/routing/graph.test.ts`.
+- **Done when:** the property holds across the fixture graph.
+- **Estimated effort:** 25 min.
+
+---
 
 ## Interview defense
 
-**Q: "Why not just store two directed edges? Lookups would be O(1) with no
-ternary, and directed graphs are the normal representation for pathfinding."**
+**Q: Why store edges undirected and derive direction, instead of two
+directed edges?**
 
-The ternary is free and storing two edges doubles the artifact and invites a
-desync bug. `graph.json` ships to the device; doubling the edge count doubles
-what we bundle and parse. More importantly, two directed edges means the
-uphill grade and the downhill grade are *separate stored numbers* — nothing
-enforces that they're negatives of each other. One bad pipeline edit and a
-street is +6% uphill but only −4% downhill, which is physically nonsense and
-silent. Deriving from one signed value makes that contradiction
-unrepresentable. The cost is one comparison per edge expansion, which is
-noise next to the heap operations.
+Two reasons. Size: `graph.json` ships to a phone, and materializing both
+directions doubles the edge count and the adjacency list. Correctness:
+materializing puts the sign in the *data*, so a sign bug becomes a data
+bug across thousands of edges. Deriving puts the sign in *one function*
+(`directedGrade`, `graph.ts:17`), where one unit test covers every case.
+The cost is a ternary at read time — free.
 
 ```
-  two directed edges          vs     one + directedGrade
-  ┌──────────────┐                   ┌──────────────┐
-  │ e_AB: +6     │ can drift          │ e: +6        │ one truth
-  │ e_BA: −4 ⚠   │ apart              └──────┬───────┘
-  └──────────────┘                    ±flip at query → ±6 always consistent
+  materialize:  A→B(+6), B→A(−6)   2 edges, sign lives in DATA (×N)
+  derive:       A—B(+6)            1 edge, sign lives in CODE  (×1 fn)
 ```
 
-*Anchor: derive the directed view from one stored sign so the two directions
-can never contradict each other.*
+**Q: When would you materialize instead?** When the recomputation is
+expensive and the source is near-static — e.g. if "directed grade"
+required a heavy elevation re-sample per read. Here it's a sign flip, so
+never.
 
-**Q: "Where would this design bite you?"**
+**Anchor:** "The sign convention lives in one ternary — `directedGrade`
+in `graph.ts:17`. The edge is stored once; the direction is a function of
+where you start."
 
-The sign convention is implicit knowledge — "gradePct is from→to" lives in a
-comment (`types.ts:17`) and is assumed by `directedGrade`, `cost.ts`, and the
-inline rise flip in `summary.ts`. That last one is the bite: the rise flip is
-re-derived in `summary.ts` instead of calling a shared helper, so the
-convention is known in two places. If it changed, both must change. I'd
-extract a `directedRise` next to `directedGrade` to close that gap.
-
-*Anchor: the one place the single-source-of-truth leaks is the inline rise
-flip in `summary.ts:16` — it should call a shared helper like
-`directedGrade` does.*
+---
 
 ## See also
 
-- `02-penalty-as-the-domain-seam.md` — the same hiding move, one layer up.
-- `01-parametric-search-over-cost-fns.md` — `directedGrade` feeds the cost fn.
-- `audit.md` Lens 3 (the `summary.ts` rise-flip echo).
-- `study-data-modeling/` — single source of truth at the schema level.
+- `02-penalty-as-the-domain-seam.md` — consumes the derived grade.
+- `01-parametric-search-over-cost-fns.md` — the search that traverses.
+- `audit.md` lens 3 (sign convention hidden in one place), lens 7
+  (sign-aware naming).
